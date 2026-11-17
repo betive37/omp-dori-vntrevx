@@ -4,6 +4,8 @@
 
 - `dori voice discord` adds an opt-in, paid, owner-only Discord voice assistant configured by `voice` in the existing Dori config. It reads lanes and reports, searches the web, posts notes and forwards work to the lead once, claiming delivery only after receipt is observed; voice never approves risky work. Daily, cumulative and backend spending caps apply, though in-flight usage can exceed them. Native codecs are optional dependencies loaded only by this command. See [the voice guide](docs/discord-voice.md).
 
+- Isolated consumer install and rollback use the fully verified selected release's reference renderer under the existing launch gate, restoring the older release's exact wrapper bytes instead of retaining the updater's newer automatic-launch template. Missing or changed renderers hold activation. Older clients need the new bootstrap or an explicit same-release reinstall to publish the new launch hook.
+
 - Bound-source admission computes its Git tree through a private index copy, reusing the narrowly reviewed fix from PR #67 without changing its shared index or lock. Parallel consumer launches no longer contend on Git's implicit write-tree index lock; content, mode, postimage and exact-tree checks remain required.
 
 - The reviewed ULW bundle advances to upstream `33b375dc8d289d6fec944a8a5ee8f2db721a8c34`, retaining the managed overlay and its exact admission hashes. Latest upstream code-mode bridges remain intact; local runtime overlay files are unchanged. The port preserves default Claude exclusions and tests the updated task/todo eval-bridge contract. Native task/TUI smoke and full consumer rollout remain separate evidence, not inferred from unit or declaration checks.
