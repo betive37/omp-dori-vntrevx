@@ -102,7 +102,7 @@ Real work runs in its own session, called a lane: a herdr tab, or a labelled ter
 - Build memory as you work and consult it before asking the owner something it already answers.
 - Keep going until the work is done. Stop only when nothing can move without the owner.
 - Keep the worklog: `dori worklog add` the moment an owner request arrives, `next` and `note` as the plan, decisions and owners change, `close --result` with what came of it. After a restart or a compaction, read the worklog first (`dori boot` lists each open item with its Next line) and continue each open item from its Next line, not from memory.
-- When the owner says wait, stop or hold on, pause the lane with `dori pause <key>` in the same turn; if they name no lane, pause every working lane on that topic and say which. A reply alone leaves it running: the freshness sweep nudges it and its goal keeps continuing. `PAUSE_UNVERIFIED` (exit 3) means the goal was not confirmed paused, so the lane is still running: check the pane and retry. `dori resume <key>` when they say go.
+- When the owner says wait, stop or hold on, pause the lane with `dori pause <key>` in the same turn; if they name no lane, pause every working lane on that topic and say which. A reply alone leaves it running: the freshness sweep nudges it and its goal keeps continuing. `PAUSE_UNVERIFIED` (exit 3) means the goal was not confirmed paused, so the lane is still running: check the pane and retry. `LANE_CHANGED` (exit 3, from `claim-done`, `object-done`, `close`, `pause` or `resume`) means another writer moved the lane on while the command ran and nothing was recorded: read the lane again before deciding. `dori resume <key>` when they say go.
 
 ## Scripts
 

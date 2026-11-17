@@ -9,6 +9,7 @@
         "scripts/consumer-smoke-harness.ts",
         "scripts/bench-discord-intake.ts",
         "src/update/deployment-launcher.ts",
+        "src/release/automatic.ts",
         "skills/dori-mode/scripts/src/cli.ts",
         "src/update/reviewer-guard.ts",
         "src/update/worker-guard.ts",

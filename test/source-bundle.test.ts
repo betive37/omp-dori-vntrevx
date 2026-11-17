@@ -158,6 +158,40 @@ test("postimage assertions also reject a changed index even when the working byt
   expect(() => assertSourceBundle(f.checkout, readSourceBundle(f.source), f.root)).toThrow();
 });
 
+test("concurrent guards leave the shared index alone and still reject real content changes", async () => {
+  const f = fixture();
+  const index = join(f.checkout, ".git/index");
+  const before = readFileSync(index);
+  // Hold a writer's lock so the regression fails deterministically, not just when children race.
+  const lock = join(f.checkout, ".git/index.lock");
+  writeFileSync(lock, "another writer\n", { flag: "wx" });
+  const code = `
+    const { assertSourceBundle, readSourceBundle } = await import(${JSON.stringify(
+      join(import.meta.dir, "../src/release/source-bundle.ts"),
+    )});
+    assertSourceBundle(process.argv[1], readSourceBundle(process.argv[2]), process.argv[3]);
+  `;
+  const children = Array.from({ length: 4 }, () =>
+    Bun.spawn([process.execPath, "-e", code, f.checkout, f.source, f.root], { stdout: "pipe", stderr: "pipe" }),
+  );
+  const results = await Promise.all(
+    children.map(async (child) => ({ code: await child.exited, stderr: await new Response(child.stderr).text() })),
+  );
+  expect(results).toEqual(Array.from({ length: 4 }, () => ({ code: 0, stderr: "" })));
+  expect(readFileSync(index)).toEqual(before);
+  expect(readFileSync(lock, "utf8")).toBe("another writer\n");
+  f.put("presets.ts", "owner edit\n");
+  expect(() => assertSourceBundle(f.checkout, readSourceBundle(f.source), f.root)).toThrow("source checkout differs");
+});
+
+test("Git failures name the command, exit code and stderr", () => {
+  const f = fixture();
+  writeFileSync(join(f.checkout, ".git/HEAD"), "ref: refs/heads/missing\n");
+  expect(() => assertSourceBundle(f.checkout, readSourceBundle(f.source), f.root)).toThrow(
+    /git rev-parse HEAD exited 128: fatal: ambiguous argument 'HEAD'/,
+  );
+});
+
 test("a Dori-only port carries native and ULW payloads as frozen source dependencies", () => {
   const f = fixture(true);
   overlayFixture(f.source, join(f.root, "ulw-upstream"));

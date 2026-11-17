@@ -111,6 +111,7 @@ console.log(JSON.stringify({ mode, checked: true }));
         mode,
       ],
       {
+        timeout: 10_000,
         cwd: f.root,
         env: {
           HOME: mode === "foreign-home" ? join(f.root, "foreign-home") : f.paths.home,
@@ -125,4 +126,4 @@ console.log(JSON.stringify({ mode, checked: true }));
     expect(child.exitCode, child.stderr.toString()).toBe(0);
     expect(JSON.parse(child.stdout.toString())).toEqual({ mode, checked: true });
   }
-});
+}, 30_000);

@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
-import { lstatSync, readFileSync, readlinkSync } from "node:fs";
+import { copyFileSync, lstatSync, mkdtempSync, readFileSync, readlinkSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { command } from "../update/deployment-process.ts";
 import { digest } from "../update/source.ts";
@@ -111,20 +112,34 @@ export function assertSourceBundle(checkout: string, bundle: BoundBundle, home: 
   realDirectory(checkout);
   owned(checkout);
   realDirectory(join(checkout, ".git"));
-  const git = (argv: readonly string[], input?: string): string => {
+  const git = (argv: readonly string[], input?: string, env = bundleEnv(home)): string => {
     const proc = Bun.spawnSync(args(argv), {
       cwd: checkout,
-      env: bundleEnv(home),
+      env,
       stdin: input === undefined ? "ignore" : Buffer.from(input),
       stdout: "pipe",
       stderr: "pipe",
     });
-    if (proc.exitCode !== 0) throw new Error("Bound source checkout changed or its Git identity is unavailable");
+    if (proc.exitCode !== 0)
+      throw new Error(
+        `Bound source Git command failed: git ${argv.join(" ")} exited ${proc.exitCode}: ${proc.stderr.toString().trim().split("\n", 1)[0]}`,
+      );
     return proc.stdout.toString().trim();
   };
+  const head = git(["rev-parse", "HEAD"]);
+  // write-tree locks its index even with GIT_OPTIONAL_LOCKS=0. Keep that write private to this admission.
+  const temporary = mkdtempSync(join(tmpdir(), "dori-source-index-"));
+  let tree: string;
+  try {
+    const index = join(temporary, "index");
+    copyFileSync(join(checkout, ".git/index"), index);
+    tree = git(["write-tree"], undefined, { ...bundleEnv(home), GIT_INDEX_FILE: index });
+  } finally {
+    rmSync(temporary, { recursive: true, force: true });
+  }
   if (
-    git(["rev-parse", "HEAD"]) !== bundle.lock.commit ||
-    git(["write-tree"]) !== bundle.lock.resultTree ||
+    head !== bundle.lock.commit ||
+    tree !== bundle.lock.resultTree ||
     git(["diff-files", "--ignore-submodules=none", "--name-only"]) !== ""
   )
     throw new Error("Bound source checkout differs from its upstream, patch or resulting tree");

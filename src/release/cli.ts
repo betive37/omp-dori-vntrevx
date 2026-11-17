@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { isAbsolute, join, resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { acquireBundle } from "./bundle.ts";
+import { runAutomaticCommand } from "./automatic-cli.ts";
 import {
   acquireConsumerLock,
   consumerPaths,
@@ -21,6 +22,7 @@ import { hasConsumerState, loadInstalled, recoverInstalled, verifyRelease } from
 import type { ReleaseManifest } from "./types.ts";
 
 const USAGE = `dori update <check|install|status|rollback|cache> [--version vX.Y.Z] [--from DIST] [--home PATH] [--runtime hc|herdr]
+  auto <status|enable|disable>  manage daily stable-release checks at consumer OMP launch
   check       verify an available public release without activating it
   install     verify and install a fixed release; no messenger, watcher, model or service is started
   status      print verified installed and retained previous release identities
@@ -39,6 +41,7 @@ const identity = (manifest: ReleaseManifest) => ({
 });
 
 export async function runConsumerUpdate(argv: string[]): Promise<number> {
+  if (argv[0] === "auto") return runAutomaticCommand(argv.slice(1));
   let releaseLock: (() => void) | undefined;
   try {
     const args = parseArgs({

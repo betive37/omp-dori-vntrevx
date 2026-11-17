@@ -59,11 +59,12 @@ const tagIds = (forum: DcChannel, names: readonly string[]): string[] =>
     );
   });
 
-export const sendDiscord: Command = async ({ need, opt }) => {
+export const sendDiscord: Command = async ({ need, opt, values }) => {
   const thread = opt("thread");
   const to = thread === undefined ? need("to") : undefined;
   const text = need("text");
-  const edit = opt("edit");
+  // An --edit given empty ("$UNSET") or not a message id is refused before any request: it must never post anew.
+  const edit = values["edit"] === undefined ? undefined : discordInboundEnv("--edit", opt("edit"));
   const dc = client();
   let target: string;
   if (thread !== undefined) target = discordInboundEnv("--thread", thread);
@@ -73,7 +74,7 @@ export const sendDiscord: Command = async ({ need, opt }) => {
       die(`${channel.id} is a forum: post with dori thread discord create, or pass --thread`);
     target = channel.id;
   }
-  if (edit) await dc.edit(target, edit, text);
+  if (edit !== undefined) await dc.edit(target, edit, text);
   else console.log(`SENT ${await dc.send(target, text)}`);
 };
 

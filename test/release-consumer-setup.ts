@@ -113,7 +113,12 @@ export type ConsumerFixture = {
   readonly release: (payload: string) => { bundle: VerifiedBundle; bytes: Buffer; entries: TarEntry[]; dist: string };
 };
 
-export function fixture(side = false): ConsumerFixture {
+/** Match source release metadata independently of the selected installation home. */
+export function portableFixture(side = false): ConsumerFixture {
+  return fixture(side, true);
+}
+
+export function fixture(side = false, portable = side): ConsumerFixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "dori-consumer-")));
   roots.push(root);
   const home = join(root, "home");
@@ -162,7 +167,7 @@ export function fixture(side = false): ConsumerFixture {
       "bin-entry.sh": "#!/bin/sh\nprintf 'release fixture\\n'\n",
       "skills/dori-mode/references/config.example.json": '{"runtime":"herdr","stateDir":"~/.dori/state"}\n',
     };
-    if (side)
+    if (portable)
       contents["release-capabilities.json"] = JSON.stringify({
         version: 1,
         profiles: [

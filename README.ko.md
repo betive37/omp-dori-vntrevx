@@ -40,7 +40,7 @@ flowchart TD
 
 소비자 구현은 manifest가 명시적으로 선언한 macOS arm64/hc 격리 릴리스도 지원합니다. 이전 manifest는 Linux x64/herdr만 지원하며 지원하지 않는 조합은 중단됩니다. 이는 macOS 릴리스가 게시되었거나 배포되었다는 뜻이 아닙니다. Slack과 Telegram은 소스 기능으로 남아 있습니다. 이 범위가 독립 외부 사용자 beta 완료나 모든 provider·기능의 검증을 뜻하지는 않습니다.
 
-**현재 소스 `main`:** 기본 설치는 검증된 소스로 수정 OMP 18.20.0과 고정된 b215 ULW overlay를 준비합니다. PATH의 stock OMP는 필수 조건도 대체품도 아닙니다. 같은 버전의 공식 native addon을 사용하며 Cargo는 필요하지 않습니다. 생성된 `omp` wrapper를 사용하고, 사용자 toolchain은 명시적 override로 취급합니다. [소스 bundle 계약](docs/releases.md#current-source-bundle). 아래의 변경 불가 `v0.1.2` 배포물과 과거 요구 조건은 그대로입니다.
+**현재 소스 `main`:** 기본 설치는 검증된 소스로 수정 OMP 18.20.0과 고정된 33b375dc ULW overlay를 준비합니다. PATH의 stock OMP는 필수 조건도 대체품도 아닙니다. 같은 버전의 공식 native addon을 사용하며 Cargo는 필요하지 않습니다. 생성된 `omp` wrapper를 사용하고, 사용자 toolchain은 명시적 override로 취급합니다. [소스 bundle 계약](docs/releases.md#current-source-bundle). 아래의 변경 불가 `v0.1.2` 배포물과 과거 요구 조건은 그대로입니다.
 
 ## 시작하기
 
@@ -120,6 +120,8 @@ omp --dori-role dori
 ### 업데이트와 rollback
 
 `dori update check --version v0.1.2`, `dori update install --version v0.1.2`, `dori update status`, `dori update rollback`을 사용합니다. 살아 있는 Dori가 있으면 idle이어도 활성화가 보류되므로 세션을 종료한 유지보수 시간을 계획하세요. Rollback에는 검증된 직전 릴리스가 보존되어 있어야 합니다. [업데이트 옵션과 복구](docs/releases.md#updates-and-rollback)를 확인하세요.
+
+새 소비자 빌드는 일반 `omp` 실행 직전에 설치별 24시간 간격으로 검증된 stable 릴리스를 확인하고, Dori·ULW·native pin을 함께 업데이트합니다. 실행 중인 Dori나 lane이 있으면 보류하고 기존 설정은 보존합니다. `dori update auto status|enable|disable`, 실행별 `DORI_AUTO_UPDATE=0`을 지원하며 rollback은 자동 업데이트를 일시 중지합니다. 기존 `v0.1.2`·소스 설치에 소급 적용되지는 않고, 이 기능이 든 릴리스를 먼저 설치해야 합니다. 최신 ULW 후보는 매일 draft PR로 준비되지만 검토·CI·stable 릴리스 발행 전에는 사용자에게 배포되지 않습니다. [자동 업데이트 범위와 시점](docs/releases.md#automatic-ulw-delivery-through-verified-releases)을 확인하세요.
 
 ### 기존 Dori 옆에 소스 설치
 

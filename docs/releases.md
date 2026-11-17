@@ -8,7 +8,7 @@ Current source `main` and newly built release manifests use a bound source toolc
 
 The default command remains literally named `omp`. It validates the bound source, then executes upstream `packages/coding-agent/scripts/omp` through the recorded Bun, retaining that launcher's empty-cwd/preload protection. Every tracked source file and the expected overlay index tree are independently checked; a stock 18.20.0 image, version-only receipt, unchanged launcher hash, malformed patch or partial cache cannot satisfy this bundle. Drift holds installation/reuse/launch instead of fetching around it or falling back to stock.
 
-`omp-ulw.lock` retains the upstream repository/commit protocol and selects [b2159b77fe3acbf9a8c6482f80dc5d4069fda881](https://github.com/dbc-hbin/omp-ulw/tree/b2159b77fe3acbf9a8c6482f80dc5d4069fda881). `omp-ulw.overlay.lock` plus `omp-ulw.patch` bind the reviewed overlay and resulting file hashes/tree. Fetching keeps upstream HEAD and gitlinks intact; the staged index records only the expected overlay. Reuse accepts that exact overlay, not arbitrary dirty source. Native and ULW patch files are consumed during preparation, not stored as inert archives.
+`omp-ulw.lock` retains the upstream repository/commit protocol and selects [33b375dc8d289d6fec944a8a5ee8f2db721a8c34](https://github.com/dbc-hbin/omp-ulw/tree/33b375dc8d289d6fec944a8a5ee8f2db721a8c34). `omp-ulw.overlay.lock` plus `omp-ulw.patch` bind the reviewed overlay and resulting file hashes/tree. Fetching keeps upstream HEAD and gitlinks intact; the staged index records only the expected overlay. Reuse accepts that exact overlay, not arbitrary dirty source. Native and ULW patch files are consumed during preparation, not stored as inert archives.
 
 Primary source sessions use `~/.dori/bin/omp`; side sessions use `omp-dori omp`. Both generated `agentCommand` defaults use their guarded source wrapper. Consumer releases provide their own `<home>/bin/omp` and resolve their frozen wrapper/dependency on update and rollback without rewriting existing config bytes; already loaded release code stays pinned to its own release, including its isolated discovery overlay. Managed deployment omits `promotion.deployment.omp` for the source default, prepares both bundles before admission and retains their identities in toolchain receipts. Its per-process extension selection consumes the prepared ULW dependency exactly once.
 
@@ -222,7 +222,7 @@ For example, after obtaining a compatible asset set in `download_dir`:
 "$HOME/.omp-dori/bin/dori" update rollback --home "$HOME/.omp-dori" --runtime hc
 ```
 
-The operator explicitly checks and installs updates; inclusion of release management does not enable a background updater or publication policy. Neither installation nor update enables watchers, services, messenger intake or presence. A stopped activation remains stopped. Each retained release uses its own exact manifest-bound omp-ulw pin and cache across update and rollback.
+The commands below remain explicit operations. New builds also include the launch-time automatic path described next; historical releases do not acquire it merely because `main` changes. Neither installation nor update enables watchers, services, messenger intake or presence. A stopped activation remains stopped. Each retained release uses its own exact manifest-bound omp-ulw pin and cache across update and rollback.
 
 | Command | Behavior and options |
 |---|---|
@@ -238,6 +238,40 @@ The operator explicitly checks and installs updates; inclusion of release manage
 **Activation holds while a live Dori is detected, even when it is idle.** Plan a maintenance window. Explicitly stop the monitors you own, end the owning Dori session using normal runtime controls, inspect `dori update status`, then retry the install or rollback. The installer and release commands never kill or restart Dori, consume an approval, alter a paused monitor or pretend a busy hold succeeded.
 
 Failed download, integrity verification or preparation leaves the previously active source and user data in place. Rollback validates the previous release identity and source before switching; it does not undo external work, rewrite config or resume providers/monitors. There must be a valid retained previous release to roll back to. Following an interruption, the next `status`, `install` or `rollback` reconciles the pointer/state journal before continuing. Preserve those records for diagnosis instead of manually replacing pointers or deleting journals.
+
+## Automatic ULW delivery through verified releases
+
+New consumer builds check the canonical **stable Dori release** channel before an ordinary primary or isolated `omp` launch, at most once per 24 hours per installation. They install a strictly newer compatible release through the same verified bundle, consumer lock, staging, activation journal and rollback path as `dori update install`. That release supplies its own exact ULW commit, overlay, native source and Dori code together. There is no separate mutable ULW checkout, arbitrary-upstream execution, prerelease opt-in, downgrade or native OMP self-updater. The launch resolves the selected source again before building extension arguments.
+
+The first eligible launch checks immediately; later launches check only when the saved deadline has elapsed. There is no always-running daemon or in-session timer: leaving one session open for days does not update its code. Network release discovery/downloads share a 15-second budget; verified dependency preparation can take longer under the existing bounded preparation commands. A live Dori **or lane**, or another guarded OMP launch/session, holds automatic activation, including a session that appears while staging. Short PID/start-identity launch leases serialize admission with reference/pointer publication, without holding a startup gate over downloads. Independent admissions compute their bound Git trees through private index copies rather than contending on a shared Git index lock. Nothing kills/restarts those sessions. Failed/offline checks retain a verified current install and record a daily retry deadline. Local source, dependency, receipt or pointer drift still blocks launch rather than being repaired silently.
+
+```sh
+dori update auto status                  # last result, next check, enabled state
+dori update auto disable                 # persistent per-installation opt-out
+dori update auto enable                  # re-enable and make the next launch eligible
+DORI_AUTO_UPDATE=0 omp                    # pause only this launch
+# For a separate home, use its bin/dori or append --home /absolute/installation
+```
+
+An explicit rollback pauses automatic updates until `dori update auto enable`; it does not immediately reinstall the release you rejected. Version/help probes, prepared `--no-extensions` launches and managed startup do not start a network check. Explicit native/ULW overrides remain user choices rather than automatic targets. Existing config, authentication and model choices are not rewritten by the automatic path; the native wrapper's update fence remains in force. Primary user-owned `omp.yml` bytes are preserved. An isolated consumer's generated `omp.yml` is an existing hash-owned reference: owner edits hold instead of being overwritten, even with automatic checks disabled. Resolve that ownership conflict deliberately rather than deleting admission checks.
+
+**Distribution boundary:** this only applies after installing a release containing the launch hook. Older clients, source-owned homes and custom source/ref/path installations are not silently migrated. The published `v0.1.2` prerelease does not contain this hook and is not a stable-channel candidate. A merged PR alone does not publish a release or update installed clients; until a compatible newer stable release exists, an eligible launch keeps its current installation. Source users continue their explicit source-install/update procedure.
+
+### Maintainer ULW candidates
+
+The canonical repository's `ULW update candidate` workflow checks upstream `dbc-hbin/omp-ulw` main daily at **03:17 UTC** (GitHub scheduling may be delayed), or on explicit workflow dispatch. It resolves one exact commit, requires a fast-forward from the current pin, reconstructs the admitted old overlay, normalizes its Git blob identities and attempts a three-way application in a disposable checkout. It generates only `omp-ulw.lock`, `omp-ulw.overlay.lock` and `omp-ulw.patch`, verifying the new patch/tree/file identities with the existing source-bundle checks. It never executes upstream code during preparation or touches an installed cache.
+
+A separate trusted job with publication permissions creates a deterministic **draft PR** containing only those three files and dispatches the existing CI workflow on that branch's exact head. The preparation job has no write token, and the publication job executes only trusted `main` tooling, not candidate code. Closed candidates are not reopened; changed branches are never force-pushed. If main advances between preparation/publication, a patch conflicts, history rewinds or identity verification fails, the workflow holds instead of overwriting anything. Repository Actions settings must permit GitHub Actions to create pull requests; if disabled, the workflow reports that failure rather than changing permissions.
+
+A clean three-way merge is not a compatibility review. Maintainers must inspect upstream behavior and local-overlay preservation, satisfy exact-head CI and independent review, then use the existing verified release publication procedure. This workflow neither auto-merges nor tags/publishes a release. Once such a compatible stable release is published, upgraded consumers receive its ULW pin on their next eligible idle launch. This separation prevents unreviewed upstream code from becoming an automatic consumer update.
+
+For local read-only preparation from committed source (the output directory must not already exist):
+
+```sh
+bun scripts/update-ulw.ts --out /absolute/new-candidate-directory
+```
+
+The output is a review artifact, not an installed update. A conflict requires a reviewed port; do not delete integrity checks, drop the overlay or substitute raw upstream main to make preparation pass.
 
 ## Troubleshooting and support reports
 

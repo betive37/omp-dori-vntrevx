@@ -40,7 +40,7 @@ flowchart TD
 
 The consumer implementation also supports isolated macOS arm64/hc releases when the manifest explicitly declares that profile. Legacy manifests support Linux x64/herdr only; unsupported profiles hold. This is not a claim that a macOS release has been published or rolled out. Slack and Telegram remain source features. This scope does not imply an independent external-user beta or that every provider and surface has been tested.
 
-**Current source `main`:** source installation and newly built releases provision patched OMP 18.20.0 plus the bound b215 ULW overlay by default. Stock OMP on PATH is not a prerequisite or a substitute. Both patches and their upstream/result identities are verified, with an official version-matched native addon and no Cargo requirement. Use the generated `omp` wrapper; explicit custom toolchains remain advanced overrides. See [the source-bundle contract](docs/releases.md#current-source-bundle). The published `v0.1.2` instructions below retain their older, immutable contract; this source change does not overwrite those assets or claim new installation QA.
+**Current source `main`:** source installation and newly built releases provision patched OMP 18.20.0 plus the bound 33b375dc ULW overlay by default. Stock OMP on PATH is not a prerequisite or a substitute. Both patches and their upstream/result identities are verified, with an official version-matched native addon and no Cargo requirement. Use the generated `omp` wrapper; explicit custom toolchains remain advanced overrides. See [the source-bundle contract](docs/releases.md#current-source-bundle). The published `v0.1.2` instructions below retain their older, immutable contract; this source change does not overwrite those assets or claim new installation QA.
 
 ## Getting started
 
@@ -120,6 +120,8 @@ In the owning OMP session, explicitly start the native `monitor` with the protec
 ### Updates and rollback
 
 Use `dori update check --version v0.1.2`, `dori update install --version v0.1.2`, `dori update status` and `dori update rollback`. Activation holds while a live Dori exists, including an idle one; plan a stopped maintenance window. Rollback requires a verified retained previous release. See [update options and recovery](docs/releases.md#updates-and-rollback).
+
+New consumer builds also check for a newer compatible stable release before ordinary `omp` launches, at most daily. They update the verified Dori/ULW/native bundle together, defer while Dori or a lane is running, and preserve settings. Use `dori update auto status|enable|disable` or `DORI_AUTO_UPDATE=0`; rollback pauses automatic checks. Existing `v0.1.2` clients need an initial upgrade, and source homes are not migrated. Daily ULW draft candidates still require review, CI and stable-release publication before consumer delivery. See [automatic delivery and its limits](docs/releases.md#automatic-ulw-delivery-through-verified-releases).
 
 ### Source installation next to an existing Dori
 

@@ -24,7 +24,8 @@ test("a listing registry parses a closed record again only after a write, from a
   const writer = new Registry(state.dir);
   for (const key of ["a-lane", "b-lane", "c-lane"]) await writer.write(lane(key, { closedAt: "2026-01-02T00:00:00Z" }));
   const watcher = new Registry(state.dir);
-  const reads = spyOn(Bun, "file");
+  // Every parse reads the record by its key's path, so the path lookups count the parses.
+  const reads = spyOn(watcher, "path");
   try {
     const listed = async (): Promise<{ statuses: string[]; parsed: number }> => {
       reads.mockClear();

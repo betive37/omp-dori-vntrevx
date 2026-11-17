@@ -11,6 +11,13 @@ mkdir -p "$HOME/.cache/omp-dori"
 guard=$(mktemp -d "$HOME/.cache/omp-dori/guard.XXXXXX")
 trap 'rmdir "$guard"' EXIT HUP INT TERM
 cd "$guard"
+selected=$(bun "$source/src/release/automatic.ts" "$source" "$HOME" "$$" "$@")
+if [ "$selected" != "$source" ]; then
+  cd "$launch_cwd"
+  rmdir "$guard"
+  trap - EXIT HUP INT TERM
+  exec "$selected/scripts/consumer/omp" "$@"
+fi
 omp=$(bun "$source/scripts/source-dependencies.ts" consumer "$source" "$HOME")
 cd "$launch_cwd"
 rmdir "$guard"
