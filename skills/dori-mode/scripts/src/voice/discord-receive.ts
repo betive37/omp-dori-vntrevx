@@ -13,8 +13,10 @@ type ReceiveOptions = {
 /**
  * Keeps the owner subscribed while both a ready connection and the owner are present. The library destroys a receive
  * stream on any packet it cannot parse, so a closed stream is resubscribed: immediately after one that lived 10 s,
- * otherwise with a backoff doubling from 100 ms to 2 s. A stall alarm resubscribes when Discord reports the owner
- * speaking but nothing decoded for 3 s. Every stream and timer ends when the owner leaves or the link goes away.
+ * otherwise with a backoff doubling from 100 ms to 2 s. The library keeps a destroyed stream registered, and hands it
+ * back to a new subscription, until that stream's close; so the receiver tracks its own stream and replaces one only
+ * through its close. When Discord reports the owner speaking but nothing decoded for 3 s, a stall alarm destroys the
+ * stream, or subscribes when there is none. Every stream and timer ends when the owner leaves or the link goes away.
  */
 export const ownerReceiver = (o: ReceiveOptions) => {
   const { clock } = o;
@@ -24,26 +26,26 @@ export const ownerReceiver = (o: ReceiveOptions) => {
   let backoff = 0;
   let resubscribe: unknown;
   let stall: unknown;
-  let lastPacketAt = -Infinity;
+  let lastDecodedAt = -Infinity;
   let lastStallLogAt = -Infinity;
 
   const cancel = (timer: unknown) => {
     clock.clearTimeout(timer);
   };
   const subscribe = () => {
-    if (!link || !present || link.subscribed(o.ownerId)) return;
+    if (!link || !present || stream) return;
     const current = link.receive(o.ownerId);
     stream = current;
     const decoder = o.codec();
     const subscribedAt = clock.now();
     current.onData((packet) => {
-      lastPacketAt = clock.now();
       let pcm: Buffer;
       try {
         pcm = decoder.decode(packet);
       } catch {
         return; // A corrupt Opus frame is skipped; the stream and later frames stay usable.
       }
+      lastDecodedAt = clock.now();
       o.onPcm(pcm);
     });
     current.onError((message) => o.log(`OWNER STREAM ERROR ${message}`));
@@ -65,12 +67,13 @@ export const ownerReceiver = (o: ReceiveOptions) => {
       stall = undefined;
       if (!link || !present) return;
       const now = clock.now();
-      if (link.speaking(o.ownerId) && now - lastPacketAt > 3_000 && now - lastStallLogAt > 10_000) {
+      if (link.speaking(o.ownerId) && now - lastDecodedAt > 3_000 && now - lastStallLogAt > 10_000) {
         lastStallLogAt = now;
-        const silentFor = Number.isFinite(lastPacketAt) ? `${Math.round((now - lastPacketAt) / 1000)}s` : "ever";
+        const silentFor = Number.isFinite(lastDecodedAt) ? `${Math.round((now - lastDecodedAt) / 1000)}s` : "ever";
         const subscribed = link.subscribed(o.ownerId);
         o.log(`RECEIVE STALL: owner speaking but no audio decoded for ${silentFor}; subscribed ${subscribed}`);
-        subscribe();
+        if (stream) stream.destroy();
+        else subscribe();
       }
       watch();
     }, 1_000);

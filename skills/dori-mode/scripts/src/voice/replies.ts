@@ -1,13 +1,15 @@
-import { existsSync, readFileSync, renameSync, statSync, writeFileSync } from "node:fs";
+import { closeSync, existsSync, fstatSync, openSync, readFileSync, readSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
 export type LeadReply = { re: string; text: string; start: number };
 
-/** Byte offsets advance only after speech AND playback, never on the commentary acknowledgement. */
+/** Persisted offsets advance only after speech AND playback, never on the commentary acknowledgement. */
 export class Replies {
   readonly file: string;
   private readonly stateFile: string;
   private scanned = 0;
+  private readOffset = 0;
+  private partial = Buffer.alloc(0);
   private identity: string | undefined;
   private readonly queue: LeadReply[] = [];
 
@@ -28,42 +30,71 @@ export class Replies {
         state.offset < 0
       )
         throw new Error("Invalid voice reply offset; restore the reply ledger before starting voice");
-      this.scanned = state.offset;
+      this.scanned = this.readOffset = state.offset;
       this.identity = "identity" in state && typeof state.identity === "string" ? state.identity : undefined;
     }
   }
 
   scan(): void {
-    if (!existsSync(this.file)) return;
-    const info = statSync(this.file);
-    const identity = `${info.dev}:${info.ino}`;
-    const data = readFileSync(this.file);
-    if ((this.identity && this.identity !== identity) || data.length < this.scanned) {
-      this.scanned = 0;
-      this.queue.length = 0;
+    let fd: number;
+    try {
+      fd = openSync(this.file, "r");
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return;
+      throw error;
     }
-    this.identity = identity;
-    for (;;) {
-      const end = data.indexOf(10, this.scanned);
-      if (end < 0) return; // An append still in progress is not a malformed line.
-      const start = this.scanned;
-      const line = data.subarray(start, end).toString("utf8").trim();
-      this.scanned = end + 1;
-      if (!line) continue;
-      try {
-        const reply: unknown = JSON.parse(line);
-        if (
-          !reply ||
-          typeof reply !== "object" ||
-          !("text" in reply) ||
-          typeof reply.text !== "string" ||
-          !reply.text.trim()
-        )
-          throw new Error("Invalid reply");
-        this.queue.push({ re: "re" in reply && typeof reply.re === "string" ? reply.re : "", text: reply.text, start });
-      } catch {
-        this.log("VOICE_REPLY_INVALID_LINE");
+    try {
+      const info = fstatSync(fd);
+      const identity = `${info.dev}:${info.ino}`;
+      if ((this.identity && this.identity !== identity) || info.size < this.readOffset) {
+        this.scanned = this.readOffset = 0;
+        this.partial = Buffer.alloc(0);
+        this.queue.length = 0;
       }
+      this.identity = identity;
+      if (info.size === this.readOffset) return;
+      const bytes = Buffer.alloc(info.size - this.readOffset);
+      let size = 0;
+      while (size < bytes.length) {
+        const count = readSync(fd, bytes, size, bytes.length - size, this.readOffset + size);
+        if (count === 0) break;
+        size += count;
+      }
+      this.readOffset += size;
+      const data = this.partial.length
+        ? Buffer.concat([this.partial, bytes.subarray(0, size)])
+        : bytes.subarray(0, size);
+      let cursor = 0;
+      for (;;) {
+        const end = data.indexOf(10, cursor);
+        if (end < 0) break; // Retain incomplete UTF-8 bytes without rereading them on every tick.
+        const start = this.scanned;
+        const line = data.subarray(cursor, end).toString("utf8").trim();
+        this.scanned += end + 1 - cursor;
+        cursor = end + 1;
+        if (!line) continue;
+        try {
+          const reply: unknown = JSON.parse(line);
+          if (
+            !reply ||
+            typeof reply !== "object" ||
+            !("text" in reply) ||
+            typeof reply.text !== "string" ||
+            !reply.text.trim()
+          )
+            throw new Error("Invalid reply");
+          this.queue.push({
+            re: "re" in reply && typeof reply.re === "string" ? reply.re : "",
+            text: reply.text,
+            start,
+          });
+        } catch {
+          this.log("VOICE_REPLY_INVALID_LINE");
+        }
+      }
+      this.partial = Buffer.from(data.subarray(cursor));
+    } finally {
+      closeSync(fd);
     }
   }
 

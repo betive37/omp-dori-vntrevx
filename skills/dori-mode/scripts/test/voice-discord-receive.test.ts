@@ -88,24 +88,65 @@ test("leaving or losing the link during a pending resubscribe cancels it", () =>
   }
 });
 
-test("the stall alarm reports a speaking owner with no decoded audio, at most every 10 s, and resubscribes", () => {
+test("the stall alarm reports a speaking owner with no decoded audio at most every 10 s, replacing the stream", () => {
   const w = receiverWorld();
   w.receiver.presence(true);
   w.receiver.attach(w.link);
-  w.link.streams[0]!.push(Buffer.from([1]));
+  const stalled = w.link.streams[0]!;
+  stalled.push(Buffer.from([1]));
   w.link.speakingUsers.add(ids.owner);
   w.advance(3_000);
   expect(w.logs).toEqual([]);
   w.advance(1_000);
-  expect(w.logs).toEqual(["RECEIVE STALL: owner speaking but no audio decoded for 4s; subscribed true"]);
-  expect(w.link.streams).toHaveLength(1);
-  // The library dropped the subscription without a close: the alarm restores it on its next report.
+  // Still registered but silent: destroyed, then replaced through the same close path as a stream the library kills.
+  expect(w.logs).toEqual([
+    "RECEIVE STALL: owner speaking but no audio decoded for 4s; subscribed true",
+    "OWNER STREAM closed; resubscribing in 100 ms",
+  ]);
+  expect(stalled.destroyed).toBe(true);
+  w.advance(100);
+  const replacement = w.link.streams[1]!;
+  expect(w.link.subscriptions.get(ids.owner)).toBe(replacement);
+  replacement.push(Buffer.from([2]));
+  // The library dropped the subscription without a close: the alarm destroys the orphan and subscribes anew.
   w.link.subscriptions.clear();
   w.advance(10_000);
-  expect(w.logs).toHaveLength(1);
-  w.advance(1_000);
-  expect(w.logs.at(-1)).toBe("RECEIVE STALL: owner speaking but no audio decoded for 15s; subscribed false");
-  expect(w.link.subscribed(ids.owner)).toBe(true);
+  expect(w.logs).toHaveLength(2);
+  w.advance(900);
+  expect(w.logs.slice(2)).toEqual([
+    "RECEIVE STALL: owner speaking but no audio decoded for 11s; subscribed false",
+    "OWNER STREAM closed; resubscribing in 0 ms",
+  ]);
+  expect(replacement.destroyed).toBe(true);
+  w.advance(0);
+  expect(w.link.streams).toHaveLength(3);
+  expect(w.link.subscriptions.get(ids.owner)).toBe(w.link.streams[2]);
+  w.link.streams[2]!.push(Buffer.from([3]));
+  expect(w.pcm.map((chunk) => chunk[0])).toEqual([1, 2, 3]);
+  expect(w.codecs()).toBe(3);
+  w.receiver.stop();
+  expect(w.pending.size).toBe(0);
+});
+
+test("a stream whose packets all fail to decode is stalled too", () => {
+  const w = receiverWorld();
+  w.receiver.presence(true);
+  w.receiver.attach(w.link);
+  const garbled = w.link.streams[0]!;
+  garbled.push(Buffer.from([5]));
+  w.link.speakingUsers.add(ids.owner);
+  for (let i = 0; i < 4; i++) {
+    w.advance(1_000);
+    garbled.push(Buffer.from([0xff])); // packets keep arriving, but none decodes
+  }
+  expect(w.logs).toEqual([
+    "RECEIVE STALL: owner speaking but no audio decoded for 4s; subscribed true",
+    "OWNER STREAM closed; resubscribing in 100 ms",
+  ]);
+  expect(garbled.destroyed).toBe(true);
+  w.advance(100);
+  w.link.streams[1]!.push(Buffer.from([6]));
+  expect(w.pcm.map((chunk) => chunk[0])).toEqual([5, 6]);
   w.receiver.stop();
   expect(w.pending.size).toBe(0);
 });
