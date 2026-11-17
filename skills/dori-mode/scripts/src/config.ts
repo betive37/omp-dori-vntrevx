@@ -10,6 +10,7 @@ import {
 import type { RuntimeKind } from "../../../../src/runtime/types.ts";
 import type { SupervisionOptions } from "./supervision-observe.ts";
 import type { CommitIdentity } from "./verify-pr-check.ts";
+import type { VoiceSettings } from "./voice/settings.ts";
 
 export type ArgvTemplate = readonly string[];
 
@@ -53,6 +54,8 @@ export type DoriConfig = {
   readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly hooks: Hooks;
+  /** Disabled unless explicitly enabled; models, channels and prices belong to the operator. */
+  readonly voice?: Partial<VoiceSettings>;
   /** Expected Git author and committer per lowercase `owner/repo`, for `verify-pr` and the lane footer. */
   readonly repoIdentities: Readonly<Record<string, CommitIdentity>>;
   readonly supervision: SupervisionOptions;

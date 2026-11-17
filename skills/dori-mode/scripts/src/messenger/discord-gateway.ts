@@ -59,10 +59,13 @@ export const discordGateway = (
   let acknowledged = false;
   let lastIdentify = -Infinity;
   let backoff = 5_000;
+  /** The established connection's sender: set on READY/RESUMED, cleared whenever that socket is retired. */
+  let deliver: ((frame: unknown) => boolean) | undefined;
 
   const dispose = (code: number) => {
     const previous = socket;
     socket = undefined;
+    deliver = undefined;
     if (heartbeat !== undefined) clock.clearTimeout(heartbeat);
     if (handshake !== undefined) clock.clearTimeout(handshake);
     heartbeat = handshake = undefined;
@@ -213,6 +216,7 @@ export const discordGateway = (
         readyAt = clock.now();
         report(`${options.label}_READY discord event=${m.t}`);
         established = true;
+        deliver = send;
         options.onReady?.(m.t);
       } else if (m.op === 0 && established && typeof m.t === "string") {
         options.onDispatch?.(m.t, m.d);
@@ -222,6 +226,8 @@ export const discordGateway = (
   connect();
   return {
     done: done.promise,
+    /** Sends one frame on the current authenticated connection; false before READY/RESUMED, reconnecting or closed. */
+    send: (payload: unknown): boolean => deliver?.(payload) ?? false,
     close() {
       if (stopped) return;
       finish();

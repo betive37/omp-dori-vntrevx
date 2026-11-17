@@ -10,6 +10,7 @@ import { journalCommands, journalErrors } from "./cli-journal.ts";
 import { laneCommands } from "./cli-lanes.ts";
 import { messengerCommands, messengerErrors } from "./cli-messenger.ts";
 import { opsCommands } from "./cli-ops.ts";
+import { voiceCommand } from "./cli-voice.ts";
 import { ConfigError, loadConfig } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { LaunchError } from "./launch.ts";
@@ -61,6 +62,7 @@ const USAGE = `dori <command> [options]
                                        open a forum post or text-channel thread; rename, replace tags, archive or reopen
   react discord --to CHANNEL [--thread ID] --message ID [--emoji E] [--remove]
                                        add or remove the bot's own reaction (eyes by default); --thread needs no --to
+  voice discord                       opt-in owner-only voice assistant (voice.enabled in config; paid provider usage)
   presence <slack|discord>             keep the account shown as online until stopped
   transcribe <audio-file|url>           run hooks.transcribe and print the text; HTTP(S) downloads are private and temporary
   inbound slack|telegram|discord [--loop MIN] [--gateway]
@@ -137,6 +139,7 @@ const commands: Readonly<Record<string, Command>> = {
   ...laneCommands,
   ...opsCommands,
   ...messengerCommands,
+  voice: voiceCommand,
 };
 const handler = Object.hasOwn(commands, command) ? commands[command] : undefined;
 
