@@ -55,12 +55,29 @@ describe("session_stop owes gate", () => {
     recordOwes(stateDir, inbound("100"), at);
     expect((await stop(pi))?.continue).toBe(true);
 
-    recordSent(stateDir, CHANNEL, at + 1);
+    recordSent(stateDir, CHANNEL, "100", ["701"], at + 1);
     const stillBlocked = await stop(pi);
     expect(stillBlocked?.continue).toBe(true);
-    expect(stillBlocked?.additionalContext).toContain("dori-signal check <owner message id>");
+    expect(stillBlocked?.additionalContext).toContain("dori react discord --to <channel> --message <owner message id>");
 
     recordMark(stateDir, CHANNEL, "100", at + 2);
+    expect(await stop(pi)).toBeUndefined();
+  });
+
+  test("answering one request does not settle another request in the same channel", async () => {
+    const pi = await doriSession();
+    const at = Date.now();
+    for (const message of ["100", "200"]) {
+      recordOwes(stateDir, inbound(message), at);
+      recordMark(stateDir, CHANNEL, message, at + 1);
+    }
+    recordSent(stateDir, CHANNEL, "100", ["701", "702"], at + 2);
+    const blocked = await stop(pi);
+    expect(blocked?.continue).toBe(true);
+    expect(blocked?.additionalContext).toContain("owner message 200");
+    expect(blocked?.additionalContext).not.toContain("owner message 100");
+    expect(blocked?.additionalContext).toContain("--reply <owner message id>");
+    recordSent(stateDir, CHANNEL, "200", ["703"], at + 3);
     expect(await stop(pi)).toBeUndefined();
   });
 

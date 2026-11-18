@@ -1,19 +1,12 @@
 /**
- * Owes: one owner message on Discord creates an obligation to answer on Discord, and a turn may not settle while
- * an obligation is open.
- *
- * The failure this exists for (2026-11-17): an owner message woke the lead, the lead answered in its terminal only,
- * and the owner saw silence. A rule in memory did not prevent it, so the obligation is data with a gate on it:
- *
- * - The Dori extension appends an owe for every `INBOUND discord <ch> <msg> from=owner` line it is handed.
- * - `dori send discord` appends a receipt after the API accepts the message.
- * - The extension's `session_stop` handler refuses to settle while an owe has no receipt after it.
- *
- * Two files, two writers, no locking: `inbound.jsonl` is written only by the session process and `sent.jsonl` only
- * by the CLI. Both are append-only, and a torn final line is dropped on read rather than repaired.
+ * A Discord owner request stays owed until its exact read mark and complete reply receipt exist.
+ * Terminal output, reactions alone and unrelated channel sends are not answers. The CLI records every accepted
+ * part only after the complete reply succeeds; legacy channel/time-only receipts cannot settle a request.
+ * The bounded ledgers retain the existing stale-owe and continuation limits. Malformed lines are ignored.
  */
 import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { MessengerError } from "./messenger/http.ts";
 
 /** An obligation older than this is stale: a crash must not resurrect yesterday's unanswered message. */
 export const OWE_TTL_MS = 30 * 60_000;
@@ -29,7 +22,13 @@ export type InboundOwe = {
   readonly text: string;
 };
 
-type SentReceipt = { readonly channel: string; readonly at: number };
+type SentReceipt = {
+  readonly deliveryId: string;
+  readonly requestId: string;
+  readonly channel: string;
+  readonly remoteIds: readonly string[];
+  readonly at: number;
+};
 type MarkReceipt = { readonly channel: string; readonly message: string; readonly at: number };
 
 const dir = (stateDir: string): string => join(stateDir, "owes");
@@ -75,7 +74,18 @@ const isOwe = (v: unknown): v is InboundOwe => {
 const isReceipt = (v: unknown): v is SentReceipt => {
   if (typeof v !== "object" || v === null) return false;
   const r = v as Partial<SentReceipt>;
-  return typeof r.channel === "string" && typeof r.at === "number" && Number.isFinite(r.at);
+  return (
+    typeof r.channel === "string" &&
+    typeof r.requestId === "string" &&
+    r.requestId.match(/^([1-9]\d{0,19}):([1-9]\d{0,19})$/)?.[1] === r.channel &&
+    Array.isArray(r.remoteIds) &&
+    r.remoteIds.length > 0 &&
+    r.remoteIds.every((id) => typeof id === "string" && /^[1-9]\d{0,19}$/.test(id)) &&
+    new Set(r.remoteIds).size === r.remoteIds.length &&
+    r.deliveryId === `discord:${r.channel}:${r.remoteIds[0]}` &&
+    typeof r.at === "number" &&
+    Number.isFinite(r.at)
+  );
 };
 
 const isMark = (v: unknown): v is MarkReceipt => {
@@ -135,10 +145,24 @@ const appendCapped = (path: string, line: string): void => {
   renameSync(temporary, path);
 };
 
-/** Records that a message was accepted by Discord, which is what closes every earlier owe on that channel. */
-export const recordSent = (stateDir: string, channel: string, at: number): void => {
+/** Records one complete reply, after every part was accepted, for exactly the named owner request. */
+export const recordSent = (
+  stateDir: string,
+  channel: string,
+  message: string,
+  remoteIds: readonly string[],
+  at: number,
+): void => {
+  const receipt: SentReceipt = {
+    deliveryId: `discord:${channel}:${remoteIds[0]}`,
+    requestId: `${channel}:${message}`,
+    channel,
+    remoteIds,
+    at,
+  };
+  if (!isReceipt(receipt)) throw new MessengerError("discord send: incomplete delivery receipt; outcome uncertain", 0);
   ensureDir(stateDir);
-  appendCapped(sentPath(stateDir), JSON.stringify({ channel, at }));
+  appendCapped(sentPath(stateDir), JSON.stringify(receipt));
 };
 
 /**
@@ -153,8 +177,8 @@ export const recordMark = (stateDir: string, channel: string, message: string, a
 };
 
 /**
- * An owe is settled only by both halves: a message Discord accepted on the channel, and the read receipt on that
- * exact message. Both must come after the owner wrote, so an earlier reply cannot settle a later question.
+ * Both the complete reply and read mark must name this exact request and follow its admission.
+ * A successful send is evidence of API acceptance, not proof that the owner read the answer.
  */
 export const openOwes = (stateDir: string, now: number): InboundOwe[] => {
   const receipts = readLines(sentPath(stateDir))
@@ -170,7 +194,7 @@ export const openOwes = (stateDir: string, now: number): InboundOwe[] => {
     if (!owe || seen.has(owe.id)) continue;
     seen.add(owe.id);
     if (now - owe.at > OWE_TTL_MS) continue;
-    const answered = receipts.some((r) => r.channel === owe.channel && r.at >= owe.at);
+    const answered = receipts.some((r) => r.requestId === owe.id && r.channel === owe.channel && r.at >= owe.at);
     const marked = marks.some((m) => m.channel === owe.channel && m.message === owe.message && m.at >= owe.at);
     if (answered && marked) continue;
     open.push(owe);
@@ -201,7 +225,7 @@ export const bumpAttempts = (stateDir: string, ids: readonly string[]): Record<s
 
 /** The text the session is continued with: the exact command, never a paraphrase of the rule. */
 export const reminder = (owes: readonly InboundOwe[]): string => {
-  // A burst must not become a wall of text: one command settles the channel, so five lines is already generous.
+  // Bound the reminder, but each listed request still needs its own linked reply.
   const shown = owes.slice(0, 5);
   const lines = shown.map(
     (owe) =>
@@ -211,8 +235,8 @@ export const reminder = (owes: readonly InboundOwe[]): string => {
   return [
     "BLOCKED: the owner wrote to you and this settle is missing one or both halves of the answer.",
     "A terminal-only reply is silence to the owner. Do both now, for every message listed:",
-    "  dori-signal check <owner message id>",
-    '  dori send discord --to <channel> --text "<the answer you just gave>"',
+    "  dori react discord --to <channel> --message <owner message id>",
+    '  dori send discord --to <channel> --reply <owner message id> --text "<the answer you just gave>"',
     ...lines,
   ].join("\n");
 };

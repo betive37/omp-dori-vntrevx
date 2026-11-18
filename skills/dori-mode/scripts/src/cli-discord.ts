@@ -1,8 +1,10 @@
 /** The Discord Gateway plumbing shared by `dori presence discord` and `dori inbound discord --gateway`. */
 import { die, every } from "./cli-context.ts";
 import { Discord } from "./messenger/discord.ts";
+import { DiscordChannels, inboundContext } from "./messenger/discord-channels.ts";
 import type { GatewayClock, GatewaySocket } from "./messenger/discord-gateway.ts";
-import { discordInbound, formatDiscordInbound } from "./messenger/discord-inbound.ts";
+import { discordInbound, formatDiscordInbound, formatInboundContext } from "./messenger/discord-inbound.ts";
+import type { Emit } from "./messenger/discord-inbound-api.ts";
 import { discordInboundLive } from "./messenger/discord-inbound-live.ts";
 import { discordInboundEnv, fileDiscordInboundStore } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
@@ -47,8 +49,16 @@ const idList = (value: string | undefined): string[] =>
     .map((id) => id.trim())
     .filter((id) => id !== "");
 
-/** Channels come from DORI_DISCORD_CHANNEL_ID, DORI_DISCORD_CHANNEL_IDS (comma separated) and DORI_DISCORD_SCOPE=all. */
-export const discordInboundCommand = async (stateDir: string, gateway: boolean, pollMinutes: number) => {
+/**
+ * Channels come from DORI_DISCORD_CHANNEL_ID, DORI_DISCORD_CHANNEL_IDS (comma separated) and DORI_DISCORD_SCOPE=all.
+ * `context` adds an INBOUND_CONTEXT record (channel, thread, topic, recorded purposes) to each message's group.
+ */
+export const discordInboundCommand = async (
+  stateDir: string,
+  gateway: boolean,
+  pollMinutes: number,
+  context = false,
+) => {
   const env = process.env;
   const ownerId = discordInboundEnv("DORI_DISCORD_OWNER_ID", env["DORI_DISCORD_OWNER_ID"]);
   const scope = env["DORI_DISCORD_SCOPE"]?.trim();
@@ -59,17 +69,20 @@ export const discordInboundCommand = async (stateDir: string, gateway: boolean, 
   );
   if (!all && channelIds.length === 0) discordInboundEnv("DORI_DISCORD_CHANNEL_ID", env["DORI_DISCORD_CHANNEL_ID"]);
   const token = env["DORI_DISCORD_TOKEN"] || die("DORI_DISCORD_TOKEN is not set");
-  const intake = await discordInbound(
-    new Discord(fetchHttp, realClock, token),
-    (channelId) => fileDiscordInboundStore(stateDir, channelId),
-    { ownerId, channelIds: [...new Set(channelIds)], all },
-  );
+  const discord = new Discord(fetchHttp, realClock, token);
+  const intake = await discordInbound(discord, (channelId) => fileDiscordInboundStore(stateDir, channelId), {
+    ownerId,
+    channelIds: [...new Set(channelIds)],
+    all,
+  });
   const watching = all ? "all" : intake.channels().join(",");
-  const emit = (message: Parameters<typeof formatDiscordInbound>[0]) => {
+  const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
+  // Resolve the complete group before recording the owe, then emit before the cursor advances.
+  const emit: Emit = async (message) => {
     const text = formatDiscordInbound(message);
-    // One owner message is one obligation to answer on Discord; the extension's settle gate reads this ledger.
+    const group = where ? `${text}\n${formatInboundContext(message, await where(message.channel))}` : text;
     recordOwes(stateDir, text, Date.now());
-    console.log(text);
+    console.log(group);
   };
   console.log(
     `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,

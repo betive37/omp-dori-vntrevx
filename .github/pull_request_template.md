@@ -1,6 +1,6 @@
 Follow the [ready-for-review requirements](https://github.com/vntrevx/omp-dori/blob/main/CONTRIBUTING.md#ready-for-review).
 Keep this PR draft/not ready while applicable local evidence is missing. Explain any N/A.
-Required remote CI may be pending for review; all four jobs must pass before merge.
+Required remote CI may be pending for review; all three jobs must pass before merge.
 
 ## Change
 

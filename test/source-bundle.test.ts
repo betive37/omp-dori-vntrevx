@@ -2,7 +2,7 @@ import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { isOmpArgv } from "../src/runtime/omp.ts";
+import { isOmpArgv } from "../src/runtime/omp-argv.ts";
 import { assertNativeSource, nativeDirectory } from "../src/release/native.ts";
 import { assertSourceBundle, readSourceBundle } from "../src/release/source-bundle.ts";
 import { provisionSourceOverlay } from "../src/release/source-checkout.ts";
@@ -215,4 +215,35 @@ test("ignored untracked source is not admitted as an arbitrary dirty overlay", (
   const f = fixture();
   f.put("shadow.node", "unexpected ignored bytes\n");
   expect(() => assertSourceBundle(f.checkout, readSourceBundle(f.source), f.root)).toThrow("unexpected untracked");
+});
+
+test("batched content hashes preserve path order and reject hidden drift in a later batch", () => {
+  const f = fixture();
+  for (let at = 0; at < 1024; at++)
+    f.put(`bulk/${String(at).padStart(4, "0")}.cmd`, `@echo off\r\nrem unique content ${at}\r\n`);
+  f.put(".gitattributes", "*.cmd text eol=crlf\nbulk/0000.cmd filter=slow\n");
+  // Delay the first batch's real clean filter so later batches can finish first.
+  fixtureGit(f.checkout, "config", "filter.slow.clean", "sleep 0.1; cat");
+  fixtureGit(f.checkout, "add", ".");
+  const bundle = {
+    ...readSourceBundle(f.source),
+    lock: { ...f.lock, resultTree: fixtureGit(f.checkout, "write-tree") },
+  };
+  // Every file has a distinct blob; concatenating completion order would reject this clean tree.
+  expect(() => assertSourceBundle(f.checkout, bundle, f.root)).not.toThrow();
+  const later = "bulk/1023.cmd";
+  for (const flag of ["--assume-unchanged", "--skip-worktree"]) {
+    fixtureGit(f.checkout, "update-index", flag, later);
+    f.put(later, `@echo off\r\nrem hidden edit under ${flag}\r\n`);
+    expect(fixtureGit(f.checkout, "diff-files", "--ignore-submodules=none", "--name-only")).toBe("");
+    expect(fixtureGit(f.checkout, "write-tree")).toBe(bundle.lock.resultTree);
+    expect(() => assertSourceBundle(f.checkout, bundle, f.root)).toThrow("tracked content differs");
+    fixtureGit(f.checkout, "update-index", "--no-assume-unchanged", later);
+    fixtureGit(f.checkout, "update-index", "--no-skip-worktree", later);
+    fixtureGit(f.checkout, "restore", "--worktree", later);
+  }
+  fixtureGit(f.checkout, "update-index", "--assume-unchanged", "bulk/0000.cmd");
+  fixtureGit(f.checkout, "config", "filter.slow.required", "true");
+  fixtureGit(f.checkout, "config", "filter.slow.clean", "exit 1");
+  expect(() => assertSourceBundle(f.checkout, bundle, f.root)).toThrow(/hash-object --stdin-paths exited 128: error:/);
 });

@@ -37,7 +37,7 @@ flowchart TD
 
 **`v0.1.2` 是面向 Linux x64 + herdr + Discord 的 GitHub 预发行版。** Bun **1.4.4** 和原生 OMP **18.18.8** 是经过测试的基准，也是最低版本要求。更新的版本和其他 Linux 发行版并不自动视为已验证。
 
-macOS 和 hc 有 CI 覆盖，源码 `main` 中也保留了适配器，但不属于受支持的用户预览版实际运行环境。Slack 和 Telegram 仍是源码版功能。这一范围并不表示已开展独立的外部用户 beta 测试，也不表示所有提供商和使用界面都已完成验证。
+hc 由 Linux CI 覆盖，macOS 验证仍需手动进行。两者在源码 `main` 中都保留了适配器，但不属于受支持的用户预览版实际运行环境。Slack 和 Telegram 仍是源码版功能。这一范围并不表示已开展独立的外部用户 beta 测试，也不表示所有提供商和使用界面都已完成验证。
 
 **当前源码 `main`：** 默认安装会从已验证的源码准备修改版 OMP 18.20.0 和绑定的 33b375dc ULW overlay；PATH 中的 stock OMP 既不是前提条件，也不能替代它。使用同版本官方 native addon，无需 Cargo。请使用生成的 `omp` wrapper；自定义工具链属于明确覆盖。[源码 bundle 契约](docs/releases.md#current-source-bundle)。下文不可变的 `v0.1.2` 发布资产及其历史要求保持不变。
 

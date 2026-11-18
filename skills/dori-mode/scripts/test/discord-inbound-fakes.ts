@@ -10,7 +10,7 @@ export type TestDiscordMessage = {
   author: { id: string; bot?: boolean; system?: boolean };
   content?: string;
   webhook_id?: string;
-  message_reference?: { message_id?: string };
+  message_reference?: { message_id?: string; type?: number };
   referenced_message?: { id: string; author: { id: string }; content: string } | null;
   flags?: number;
   attachments?: unknown;

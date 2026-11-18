@@ -143,6 +143,26 @@ test("a failed emitter leaves the failed message uncommitted and resumes without
   expect(groups[1]).toBe(groups[0]);
 });
 
+test("an emit promise is awaited: a rejection keeps the cursor, and the retry delivers in order", async () => {
+  const world = discordRestWorld([ownerMessage("100"), ownerMessage("101"), ownerMessage("102"), ownerMessage("103")]);
+  const cursor = memoryDiscordCursor("100");
+  const intake = await discordInbound(world.discord, () => cursor.store, options);
+  const received: string[] = [];
+  const late = async (message: DiscordInbound, fail: string | undefined) => {
+    await new Promise<void>((resolve) => setImmediate(resolve)); // one event-loop turn, as a lookup would take
+    expect(cursor.store.load()).toBe(String(Number(message.message) - 1));
+    if (message.message === fail) throw new Error("late delivery failure");
+    received.push(message.message);
+  };
+  await expect(intake.poll((message) => late(message, "102"))).rejects.toThrow("late delivery failure");
+  expect([received, cursor.store.load()]).toEqual([["101"], "101"]);
+  await intake.poll((message) => late(message, undefined));
+  expect([received, cursor.saved]).toEqual([
+    ["101", "102", "103"],
+    ["101", "102", "103"],
+  ]);
+});
+
 test("a later-page failure emits nothing and retains the cursor for a complete retry", async () => {
   const world = discordRestWorld(Array.from({ length: 150 }, (_, index) => ownerMessage(String(index + 1))));
   const cursor = memoryDiscordCursor("0");

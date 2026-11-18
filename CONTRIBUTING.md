@@ -79,7 +79,7 @@ bun run ci
 - `test:skill` — the skill's script suite.
 - `test:extension` — the OMP extension suite.
 
-`bun run test` remains the sequential harness command for debugging. Linux CI uses `test:ci` with two isolated Bun file workers; the macOS 15 ARM job runs `bun test --parallel=3 --timings=.bun-test-timings.json ./test/` with three. These use native `--parallel` file workers, not `--concurrent`: tests within each file remain sequential, and each file has an isolated global/module registry. The explicit worker limits avoid scaling subprocess-heavy tests to every available CPU. Test discovery, timeouts and the four required CI job names are unchanged. A same-run macOS ABBA comparison (2, 3, 3, 2 workers) observed identical results and lower root-suite time with three workers; two samples per setting are not a guarantee against timing flakes.
+`bun run test` remains the sequential harness command for debugging. Linux CI uses `test:ci` with two isolated Bun file workers. These are native `--parallel` file workers, not `--concurrent`: tests within each file remain sequential, and each file has an isolated global/module registry. The explicit worker limit avoids scaling subprocess-heavy tests to every available CPU. Linux test discovery and timeouts are unchanged. Automatic CI runs the Linux `check`, `e2e-herdr` and `e2e-hc` jobs; it no longer runs a macOS job. Existing macOS tests and the consumer verification scripts remain available for manual QA.
 
 `.bun-test-timings.json` holds measured per-file durations used as scheduling hints. They are intended to start slower files earlier and reduce worker imbalance; their effect on idle time and suite runtime has not been measured. A file missing from the manifest is still run; it only loses its ordering hint, so the file is a performance hint, never a coverage gate. Regenerate it whenever the suite's shape changes enough to matter:
 
@@ -87,11 +87,11 @@ bun run ci
 bun test --parallel=1 --timings=.bun-test-timings.json --update-timings ./test/
 ```
 
-The Linux herdr E2E installer uses the pinned REST release asset and verifies its SHA256 before atomically replacing the binary. Each download attempt is capped at 60 seconds (plus a 5-second termination grace); at most three attempts run, with 20/40-second backoff. A checksum failure fails immediately. The hc job requires its E2E file to exist; a missing file is an error, not a successful skip. These controls keep all four release gates mandatory and do not change macOS coverage or queue capacity.
+The Linux herdr E2E installer uses the pinned REST release asset and verifies its SHA256 before atomically replacing the binary. Each download attempt is capped at 60 seconds (plus a 5-second termination grace); at most three attempts run, with 20/40-second backoff. A checksum failure fails immediately. The hc job requires its E2E file to exist; a missing file is an error, not a successful skip. All three remaining release gates are mandatory.
 
 The unit suites need `bun` and `git` and use recorded stand-ins for `herdr` and `gh`. The root and extension suites also need the installed pinned native-host fixture prepared above. `test/e2e.test.ts` starts a real `herdr` server and is skipped when `herdr` is not on `PATH`.
 
-The extension's `with the real omp-ulw` group executes the bound `ref/omp-ulw/index.ts` fixture. Targeted extension runs retain the existing absent-fixture skip, but the full `ci` gate and macOS CI now reject missing prerequisites before running tests. Prepare the default overlay and separate legacy override using the full-gate recipe above.
+The extension's `with the real omp-ulw` group executes the bound `ref/omp-ulw/index.ts` fixture. Targeted extension runs retain the existing absent-fixture skip, but the full `ci` gate rejects missing prerequisites before running tests. Prepare the default overlay and separate legacy override using the full-gate recipe above.
 
 The extension declares OMP 18.20.0 as a host peer. Its embedded loader import is typed against the genuine
 published declarations in the native fixture; a raw source checkout without `dist/types` is not a substitute
@@ -115,7 +115,7 @@ The compatibility checkout stays outside the repository (`RUNNER_TEMP` in CI) an
 Use the [PR template](.github/pull_request_template.md). Mark a PR ready for review only when the
 applicable local requirements below are met; otherwise keep it draft/not ready. Explain any item
 marked not applicable. A normal PR can have required remote CI pending, but it is not merge-ready
-until all four required jobs pass on the reviewed head and actual combined target content.
+until all three required jobs pass on the reviewed head and actual combined target content.
 Docs-only changes need accurate content and links, not artificial runtime or word-count tests;
 the existing required CI jobs still apply.
 
@@ -132,8 +132,8 @@ the existing required CI jobs still apply.
   results separate; never present their combined counts as a fresh full rerun.
 - Rerun affected checks after new code. Once final content is stable, complete one full local
   `bun run ci` using the [existing setup](#run-the-gates). The [CI workflow](.github/workflows/ci.yml)
-  separately runs `check`, `test-macos`, `e2e-herdr` and `e2e-hc` on the PR head. Partial reruns
-  replace neither the final full local run nor the four required remote jobs.
+  separately runs `check`, `e2e-herdr` and `e2e-hc` on the PR head. Partial reruns
+  replace neither the final full local run nor the three required remote jobs.
 - When CLI, native or runtime behavior changes, exercise that actual surface with isolated state
   and record the runtime/host identity. Identify any mocks or fixtures used and state which live
   capabilities were not exercised.

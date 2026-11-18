@@ -37,7 +37,7 @@ flowchart TD
 
 **`v0.1.2` ist ein GitHub-Prerelease für Linux x64 + herdr + Discord.** Bun **1.4.4** und natives OMP **18.18.8** sind die getestete Basis und zugleich die Mindestversionen. Neuere Versionen und andere Linux-Distributionen sind nicht automatisch geprüft.
 
-macOS und hc haben CI-Abdeckung und Adapter auf Source-`main`; ihr Live-Betrieb gehört nicht zur unterstützten Endnutzer-Vorschau. Slack und Telegram bleiben Funktionen des Quellcodes. Daraus folgt weder eine unabhängige Beta mit externen Nutzern noch eine Prüfung aller Provider und Oberflächen.
+hc hat CI-Abdeckung unter Linux; macOS-Prüfungen bleiben manuell. Beide haben Adapter auf Source-`main`; ihr Live-Betrieb gehört nicht zur unterstützten Endnutzer-Vorschau. Slack und Telegram bleiben Funktionen des Quellcodes. Daraus folgt weder eine unabhängige Beta mit externen Nutzern noch eine Prüfung aller Provider und Oberflächen.
 
 **Aktuelles Source-`main`:** Standardmäßig werden gepatchtes OMP 18.20.0 und das gebundene 33b375dc-ULW-Overlay aus verifizierten Quellen eingerichtet; ein vorhandenes Stock-OMP ist weder Voraussetzung noch Ersatz. Der offizielle versionsgleiche native Zusatz benötigt kein Cargo. Verwende den erzeugten `omp`-Wrapper; eigene Toolchains sind ausdrückliche Sonderkonfigurationen. [Quell-Bundle-Vertrag](docs/releases.md#current-source-bundle). Die unveränderlichen `v0.1.2`-Assets und ihre folgenden Voraussetzungen bleiben historisch unverändert.
 
