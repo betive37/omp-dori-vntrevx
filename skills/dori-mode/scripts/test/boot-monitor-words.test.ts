@@ -145,6 +145,20 @@ test("a shared dori watch inside a loop, a condition, a subshell, a cd or an env
   expect(monitorCleanup(open, [manifest([{ command: "while true; do dori inbound slack; done # api" }])])).toEqual([]);
 });
 
+test("lanes is a command word, but report can still target a lane named lanes", () => {
+  const result = monitorCleanup(
+    [lane("lanes", "closed")],
+    [
+      manifest([
+        { argv: ["dori", "lanes", "--thread", "discord:123", "--open"], monitorId: "mon_ARGV" },
+        { command: "dori lanes --open", monitorId: "mon_COMMAND" },
+        { argv: ["dori", "report", "lanes", "--kind", "done", "--text", "complete"], monitorId: "mon_TARGET" },
+      ]),
+    ],
+  );
+  expect(result.map((m) => [m.monitorId, m.match])).toEqual([["mon_TARGET", ["lanes:argv:key"]]]);
+});
+
 test("the dori command vocabulary is every command the CLI dispatches", async () => {
   const tables = [
     (await import("../src/cli-journal.ts")).journalCommands,
