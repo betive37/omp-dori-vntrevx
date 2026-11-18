@@ -64,6 +64,7 @@ export const nativeComposition = async (
     model?: FixtureModel;
     agent?: ExtensionAgentIdentity;
     observeBefore?: string;
+    compactBetweenTurns?: boolean;
     command?: { name: string; args: string; beforePrompt?: boolean };
   },
 ) => {
@@ -165,7 +166,17 @@ export const nativeComposition = async (
   try {
     await runner.emit({ type: "session_start" });
     if (options.command?.beforePrompt) await invokeCommand();
+    if (options.compactBetweenTurns)
+      session.appendMessage({ role: "user", content: "History-only role instruction", timestamp: 1 });
+    const beforeMessages = session.buildSessionContext().messages;
     const first = await runner.emitBeforeAgentStart("ulw fix the fixture", undefined, base);
+    if (options.compactBetweenTurns) {
+      const kept = session.appendMessage({ role: "user", content: "Continue the assigned work", timestamp: 2 });
+      const id = session.appendCompaction("Earlier work summarized without role instructions.", undefined, kept, 1);
+      const entry = session.getEntry(id);
+      if (entry?.type !== "compaction") throw new Error("native fixture did not retain its compaction entry");
+      await runner.emit({ type: "session_compact", compactionEntry: entry, fromExtension: false });
+    }
     const second = await runner.emitBeforeAgentStart("ulw fix the fixture", undefined, base);
     if (options.command && !options.command.beforePrompt) await invokeCommand();
     return {
@@ -176,6 +187,8 @@ export const nativeComposition = async (
       beforeDori,
       afterAll,
       userMessages,
+      beforeMessages,
+      afterMessages: session.buildSessionContext().messages,
       entries: session.getBranch(),
     };
   } finally {

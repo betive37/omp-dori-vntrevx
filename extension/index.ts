@@ -11,6 +11,7 @@
  *   approvals of the Dori/lane session running in HERDR_PANE_ID or HC_TERMINAL_ID.
  * - Lanes without a goal get omp's `goal` tool so the agent can create its goal from the lane brief.
  * - The Dori session gets the `monitor` tool (monitor.ts).
+ * - Root Dori/lane agents get a compact role core each turn, including after compaction; children do not.
  * - A lane's main agent on GPT-6.1 Sol is told to carry lane bookkeeping along with real work (lane-bookkeeping.ts).
  */
 import { spawnSync } from "node:child_process";
@@ -30,6 +31,7 @@ import { bootstrapMonitors, MONITOR_BOOTSTRAP_FLAG, recordedIntake } from "./boo
 import { RuntimeHealthWriter } from "./deployment-health.ts";
 import { type PromptModel, withLaneBookkeeping } from "./lane-bookkeeping.ts";
 import { MONITOR_DESCRIPTION, Monitors } from "./monitor";
+import { ROLE_INVARIANTS } from "./role-invariants.ts";
 
 interface SessionEntry {
   type: string;
@@ -567,9 +569,13 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
       ctx.abort();
       throw requiredLoadError;
     }
-    if (role !== "lane" || ctx.agent.kind !== "main" || typeof event !== "object" || event === null) return;
-    const systemPrompt = "systemPrompt" in event ? withLaneBookkeeping(event.systemPrompt, ctx.model) : undefined;
-    return systemPrompt && { systemPrompt };
+    if (!role || ctx.agent.kind !== "main" || typeof event !== "object" || event === null) return;
+    const original = "systemPrompt" in event ? event.systemPrompt : undefined;
+    if (!Array.isArray(original) || !original.every((block) => typeof block === "string")) return;
+    const invariant = ROLE_INVARIANTS[role];
+    const withRole = original.includes(invariant) ? original : [...original, invariant];
+    const systemPrompt = role === "lane" ? (withLaneBookkeeping(withRole, ctx.model) ?? withRole) : withRole;
+    if (systemPrompt !== original) return { systemPrompt };
   });
 
   pi.on("before_provider_request", (_event, ctx) => {
