@@ -18,7 +18,7 @@ The native selection must also avoid traversing a command symlink that installat
 
 The primary wrapper captures Bun as an absolute pathname before generating its bound-ULW guard. A relative `PATH` entry therefore keeps selecting the installation-time Bun after the guard changes directory, including when the wrapper is launched from another directory.
 
-Managed release preparation runs Git materialization and frozen dependency installation with a child-local `umask 077` before bundle admission. The caller's mask stays unchanged, and independently group/world-writable bundle files remain rejected.
+Managed release preparation runs Git materialization and frozen dependency installation with a child-local `umask 077` before bundle admission. Root and skill packages use `--production`; the extension retains its full frozen install, including the OMP host dependency. The caller's mask stays unchanged, and independently group/world-writable bundle files remain rejected.
 
 Source-native preparation builds the export viewer with the pinned upstream builder's `--check` mode after frozen dependency installation. The generated filename, size and SHA-256 must match the tracked viewer manifest without rewriting it. Native cache admission and launch require that exact owned asset; missing, modified, writable or additional assets hold admission.
 
