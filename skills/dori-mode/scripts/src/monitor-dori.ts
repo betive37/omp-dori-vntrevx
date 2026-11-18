@@ -26,6 +26,7 @@ export const DORI_COMMANDS: Record<string, true> = {
   pause: true,
   pr: true,
   presence: true,
+  queue: true,
   react: true,
   report: true,
   resume: true,
@@ -44,6 +45,10 @@ export const DORI_COMMANDS: Record<string, true> = {
 export const DORI_VALUE_OPTIONS: Record<string, true> = {
   title: true,
   brief: true,
+  template: true,
+  set: true,
+  after: true,
+  "expires-hours": true,
   done: true,
   thread: true,
   model: true,

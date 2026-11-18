@@ -41,6 +41,28 @@ Done = command ["bun","test"] stdout~" 0 fail"; file qa/report.json json:.passed
 
 Work no script can check (a design review, a judgement call) stays in the lane's own plan. You judge it yourself before the claim.
 
+## Templates and prerequisite queues
+
+Store local Markdown templates under `templates/` beside `DORI_CONFIG` (normally `~/.dori/templates/`). `{{name}}` inserts a required literal variable; `{{>common}}` includes `common.md` from the same directory. Includes may nest, but cycles, missing variables, invalid names and symlink escapes are refused. No shell or template code is evaluated.
+
+```sh
+dori launch deploy-beta --title "Deploy the verified build" --template deploy \
+  --set branch=main --set target=beta --done "file /srv/reports/deploy-beta.json json:.passed=true" --dry-run
+dori launch verify-build --title "Verify the finished build" --brief ~/briefs/verify-build.md \
+  --done "closed acme/app#412" --after build-app --expires-hours 24
+dori queue list
+dori queue start verify-build
+dori queue cancel verify-build
+```
+
+`--template` replaces `--brief`; repeated `--set name=value` supplies variables. `--dry-run` prints the rendered brief and footer without writing files, registering a lane, queueing or opening a terminal. An actual template launch saves its brief under `<stateDir>/briefs/` and uses the existing startup checks.
+
+`--after a,b` snapshots the prepared brief in `<stateDir>/launch-queue/` and reserves its lane key without starting an agent. Predecessors must already be known lanes or queue entries; cycles and self-dependencies are refused. The default expiry is 24 hours. `queue list` and `boot` preserve visibility after a restart; `watch` emits a changed `LANE_QUEUE_READY` or `LANE_QUEUE_HELD` notice but **never starts a queued lane**. Readiness is based only on stored status/receipt/expiry, not permission to run: watch never executes Done commands or host probes. Only an explicit `queue start` performs live checks and launches it. Damaged queue files are reported separately by list/boot/watch without hiding valid entries; list and boot return nonzero for that damage.
+
+Starting rechecks every predecessor's closed status, successful normal-completion receipt and live Done signals, then current host capacity and expiry. Paused, parked, abandoned or merely claimed lanes are not completion. A queue snapshot does not track later brief/template edits. Expired entries require explicit cancellation and a reviewed new queue request. No worktree or running agent is removed by cancellation.
+
+Starts are serialized with immediate launch/adopt for the same key, independently of pause/tell delivery so startup checks cannot block an operator interruption. Dependency graph updates are serialized across keys to prevent concurrent requeues from adding a cycle. A durable `starting` record precedes terminal creation; a crash or uncertain startup never triggers an automatic retry. Inspect the registry and terminal: cancellation can release an unregistered attempt, but a registered lane must use its ordinary lifecycle controls. A `started` receipt means the launch attempt was recorded, not that the goal finished; inspect the printed `STARTUP_*` result.
+
 ## The registry
 
 One JSON file per lane under `<stateDir>/lanes/`, written atomically (temp file + rename), so two writers never leave a half-written file. Each lane records:

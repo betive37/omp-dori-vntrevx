@@ -8,6 +8,8 @@ import { watchTick } from "./done-flow.ts";
 import { freshnessTick } from "./freshness.ts";
 import { acquireSlot, pidAlive, releaseSlot } from "./heavy-slot.ts";
 import { guardTick, sampleHost } from "./host-guard.ts";
+import { LaunchQueue } from "./launch-queue-store.ts";
+import { queueTick } from "./launch-queue.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { Slack } from "./messenger/slack.ts";
 import { Reports } from "./reports.ts";
@@ -41,7 +43,13 @@ const boot: Command = async ({ deps, config }) => {
     monitorDirs: sessionDirs.flatMap((dir) => (dir ? [join(dir, "extensions", "terminal")] : [])),
   });
   for (const line of r.lines) console.log(line);
-  process.exit(r.exitCode);
+  const queue = new LaunchQueue(config.stateDir).scan();
+  for (const entry of queue.entries.filter((e) => e.status === "pending" || e.status === "starting"))
+    console.log(
+      `QUEUE ${entry.input.key} ${entry.status} after=${entry.after.join(",")} expires=${entry.expiresAt}; inspect with dori queue list`,
+    );
+  for (const problem of queue.problems) console.log(`QUEUE_UNREADABLE ${problem}`);
+  process.exit(r.exitCode || (queue.problems.length ? 1 : 0));
 };
 
 const verifyPrCommand: Command = async ({ key, positionals, opt, config }) => {
@@ -91,6 +99,8 @@ export const opsCommands: Readonly<Record<string, Command>> = {
     console.log("LANE_WATCH_READY");
     for (;;) {
       for (const line of await watchTick(deps).catch((e: unknown) => [`LANE_WATCH_WARN ${String(e).slice(0, 200)}`]))
+        console.log(line);
+      for (const line of await queueTick(deps).catch((e: unknown) => [`LANE_QUEUE_WARN ${String(e).slice(0, 200)}`]))
         console.log(line);
       await Bun.sleep(30_000);
     }

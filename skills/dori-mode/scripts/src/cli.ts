@@ -4,6 +4,7 @@ import { releaseVersion } from "../../../../src/release/version.ts";
 
 import type { Command } from "./cli-context.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { QueueError, TemplateError } from "./launch-errors.ts";
 
 const USAGE = `dori <command> [options]
 
@@ -12,6 +13,9 @@ const USAGE = `dori <command> [options]
   upstream <command> --config FILE     maintainer staging: check, stage, watch, status, snapshot, restore, recover, restart
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
          [--wall-minutes N|none] [--token-limit N|none] [--cost-limit N|none] [--activity-path FILE ...] [--dry-run]
+         --template NAME [--set name=value]... replaces --brief; [--after a,b --expires-hours N] queues without starting
+  queue list | start <key> | cancel <key>
+                                       start only on explicit command after verified predecessors, host capacity and expiry checks
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF]
   sync   [--write]                     registry vs live panes; read-only unless --write
   boot                                 read-only check after a restart: Slack auth, vanished panes, journals, open worklog items and decisions, stale watches
@@ -108,6 +112,10 @@ const flags = parseArgs({
   options: {
     title: { type: "string" },
     brief: { type: "string" },
+    template: { type: "string" },
+    set: { type: "string", multiple: true },
+    after: { type: "string" },
+    "expires-hours": { type: "string" },
     done: { type: "string" },
     thread: { type: "string" },
     model: { type: "string" },
@@ -167,6 +175,7 @@ switch (command) {
     commands = (await import("./cli-journal.ts")).journalCommands;
     break;
   case "launch":
+  case "queue":
   case "adopt":
   case "claim-done":
   case "object-done":
@@ -221,6 +230,8 @@ try {
   const { prErrors } = await import("./cli-pr.ts");
   if (
     e instanceof LaunchError ||
+    e instanceof QueueError ||
+    e instanceof TemplateError ||
     [...messengerErrors, ...journalErrors, ...decisionErrors, ...prErrors].some((type) => e instanceof type)
   )
     die((e as Error).message);

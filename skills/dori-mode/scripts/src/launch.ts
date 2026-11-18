@@ -1,34 +1,24 @@
+import { mkdirSync, writeFileSync } from "node:fs";
+import { dirname } from "node:path";
 import { configPath, fill } from "./config.ts";
+import { renderTemplate } from "./launch-template.ts";
+import { type LaunchInput, validateLaunch } from "./launch-input.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { withLaunchLock } from "./delivery-lock.ts";
 import { laneGoalActive } from "./goal-record.ts";
 import { BRIEF_START, footer, originalBrief, quoteForPane } from "./launch-footer.ts";
 import { mayRunOmpArgv } from "../../../../src/runtime/omp-argv.ts";
 import { parseRef } from "../../../../src/runtime/types.ts";
 import { openLaneSession } from "./launch-session.ts";
-import { LANE_KEY, type Lane, RESERVED_LANE_KEY, sessionFields, upgradeLane } from "./registry.ts";
+import { type Lane, sessionFields, upgradeLane } from "./registry.ts";
 import { iso, runtimesOf } from "./run.ts";
 import { Reports } from "./reports.ts";
-import { doneSyntaxErrors } from "./signals.ts";
-import type { BudgetLimits } from "./supervision-observe.ts";
 import { Lessons, renderLessons } from "./lessons.ts";
 import { laneLaunchEnv, TokenFileError } from "./slack-token.ts";
 import { startupFailure } from "./startup-screen.ts";
 import { launchFinished, launchScreen, launchStatus } from "./launch-finished.ts";
 
-export type LaunchInput = {
-  readonly key: string;
-  readonly title: string;
-  readonly brief: string;
-  readonly done: string;
-  readonly thread?: string;
-  readonly model?: string;
-  readonly cwd?: string;
-  readonly budget?: BudgetLimits;
-  readonly activityPaths?: readonly string[];
-};
-
 export class LaunchError extends Error {}
-
 // The first check is 20 s after start, then the screen and status are re-read every 10 s until `startupWaitSeconds`.
 const FIRST_CHECK_MS = 20_000;
 const RECHECK_MS = 10_000;
@@ -44,20 +34,17 @@ const goalShown = (screen: string, marker: string): boolean =>
     .join("\n")
     .includes(marker);
 
-export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
-  if (!LANE_KEY.test(input.key)) throw new LaunchError(`key must match ${LANE_KEY}`);
-  if (input.key === RESERVED_LANE_KEY)
-    throw new LaunchError(`lane key "${RESERVED_LANE_KEY}" is reserved for the lead`);
-  if (await deps.registry.read(input.key)) throw new LaunchError(`lane ${input.key} is already registered`);
-  const errors = doneSyntaxErrors(input.done);
-  if (errors.length) throw new LaunchError(`Done line is not checkable: ${errors.join("; ")}`);
-  for (const [name, value] of Object.entries(input.budget ?? {})) {
-    if (value != null && (!Number.isFinite(value) || value < 0)) throw new LaunchError(`invalid ${name} ceiling`);
-  }
-};
-
-export const adoptLane = async (deps: FlowDeps, input: LaunchInput & { readonly pane: string }): Promise<Lane> => {
+export const adoptLane = async (
+  deps: FlowDeps,
+  input: LaunchInput & { readonly pane: string },
+  locked = false,
+): Promise<Lane> => {
   await validateLaunch(deps, input);
+  if (!locked) {
+    const held = await withLaunchLock(deps, input.key, () => adoptLane(deps, input, true));
+    if (!held.ok) throw new LaunchError(`lane ${input.key} held: ${held.holder}`);
+    return held.value;
+  }
   const base: Lane = {
     key: input.key,
     title: input.title,
@@ -82,7 +69,10 @@ export const prepareLaunch = async (
   const model = input.model ?? deps.config.defaultModel;
   const cwd = input.cwd ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
-  if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
+  if (!input.template && !(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
+  const text = input.template
+    ? renderTemplate(input.template, input.variables ?? {}, deps.env?.["DORI_CONFIG"] ?? configPath())
+    : await briefFile.text();
   const draft: Lane = {
     key: input.key,
     title: input.title,
@@ -112,15 +102,26 @@ export const prepareLaunch = async (
         (lesson) => `LESSON_OMITTED ${lesson.id} (${lesson.scope === "global" ? "global" : lesson.cwd}) ${lesson.rule}`,
       ),
     ],
-    preamble: `${renderLessons(lessons)}${BRIEF_START}\n${originalBrief(await briefFile.text())}\n${footer(draft, deps.config.leadPane, deps.config.repoIdentities, runtimesOf(deps).choice?.kind)}`,
+    preamble: `${renderLessons(lessons)}${BRIEF_START}\n${originalBrief(text)}\n${footer(draft, deps.config.leadPane, deps.config.repoIdentities, runtimesOf(deps).choice?.kind)}`,
   };
 };
 
 export const launchLane = async (
   deps: FlowDeps,
   input: LaunchInput,
+  locked = false,
 ): Promise<{ readonly lane: Lane; readonly startup: string; readonly warnings: string[] }> => {
+  if (!locked) {
+    await validateLaunch(deps, input);
+    const held = await withLaunchLock(deps, input.key, () => launchLane(deps, input, true));
+    if (!held.ok) throw new LaunchError(`lane ${input.key} held: ${held.holder}`);
+    return held.value;
+  }
   const prepared = await prepareLaunch(deps, input);
+  if (input.template && !(await Bun.file(input.brief).exists())) {
+    mkdirSync(dirname(input.brief), { recursive: true });
+    writeFileSync(input.brief, prepared.preamble, { flag: "wx", mode: 0o600 });
+  }
   return { ...(await startLane(deps, input, prepared.lane, prepared.preamble)), warnings: prepared.warnings };
 };
 
