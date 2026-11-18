@@ -2,87 +2,24 @@ import { existsSync } from "node:fs";
 
 import { fill } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { anchoredReportLine, scrubForThread } from "./freshness-report.ts";
 import { checkPausedLane } from "./pause.ts";
 import { runtimesOf } from "./run.ts";
 import { readScreen, sendVerified } from "./sessions.ts";
 import { type Lane, sessionOf, statusOf } from "./registry.ts";
-import { type Progress, ReportError, reportLine, Reports } from "./reports.ts";
+import { type Progress, ReportError, reportId, reportLine, Reports } from "./reports.ts";
 import { Supervision, type SupervisionResult } from "./supervision.ts";
-
-export const lastReportLine = (screen: string, key: string): string | null => {
-  const grammar = new RegExp(
-    `\\[REPORT\\] ${key.replace(/[.]/g, "\\.")} \\| (milestone|blocker|question|halted|done) \\| (?!<what)\\S`,
-  );
-  const template = (l: string) => /["'`]\[REPORT\]/.test(l) && /\$?\{[A-Za-z_][\w.]*\}/.test(l);
-  const hits = screen
-    .split("\n")
-    .flatMap((l) => (grammar.test(l) && !template(l) ? [l.slice(l.indexOf("[REPORT]"))] : []));
-  return hits.at(-1)?.replace(/["'\])\s,]+$/, "") ?? null;
-};
-
-export const scrubForThread = (line: string, home: string): string =>
-  line
-    .replace(/^\[REPORT\]\s*[^|]*\|\s*[^|]*\|\s*/, "")
-    .split(home)
-    .join("~")
-    .replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)")
-    .replace(/\bw\w+:p\w+\b/g, "(pane)")
-    .replace(/`/g, "'")
-    .trim();
-
-// A report is a line that starts with [REPORT], or the last quoted element of an argv row, the shape lanes are told
-// to send it in: an argv array ending in "lead:p1", "[REPORT] key | kind | text". Instructions
-// and prompts that quote the grammar mid-sentence are dropped before parsing, so an example is never posted as the
-// lane's progress. A report whose whole text is one unfilled placeholder ($name, ${name}, {name}, %s, <what>) is a
-// template, quoted or not (#29). The match is anchored to the [REPORT] key | kind | text structure, so
-// 'deployed api | %s' stays a real report.
-const placeholderOnly =
-  /^\s*\[REPORT\][^|]*\|[^|]*\|\s*["'`]?(\$\{?[A-Za-z_]\w*\}?|\{[A-Za-z_][\w.]*\}|%[sdif]|<[^>]+>)["'`)\s]*$/;
-// An argv row is the whole line (optionally inside one spawn call): [ then quoted strings separated by commas, then ]. Only its last element can be the
-// report, which is how lanes are told to send it. Prose that happens to contain a quoted report is not an argv row.
-const argvElements = (line: string): string[] | null => {
-  // A spawn call around the row, such as Bun.spawn([...]) or subprocess.run([...]), is the same row.
-  const call = /^\s*[\w.$]+\(\s*(\[.*\])\s*\)\s*;?\s*$/.exec(line);
-  const row = (call?.[1] ?? line).trim();
-  if (!row.startsWith("[") || !row.endsWith("]")) return null;
-  const element = /\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*(,|$)/y;
-  const inner = row.slice(1, -1);
-  const elements: string[] = [];
-  element.lastIndex = 0;
-  while (element.lastIndex < inner.length) {
-    const m = element.exec(inner);
-    if (!m) return null;
-    elements.push(m[1] ?? m[2] ?? "");
-    if (m[3] === "") break;
-  }
-  return element.lastIndex === inner.length && elements.length > 0 ? elements : null;
-};
-const argvReport = (line: string): string | null => {
-  const last = argvElements(line)?.at(-1);
-  return last !== undefined && last.startsWith("[REPORT]") ? last : null;
-};
-const reportCandidate = (l: string): string | null => {
-  if (!l.includes("[REPORT]")) return l;
-  const report = /^\s*\[REPORT\]/.test(l) ? l : argvReport(l);
-  return report !== null && !placeholderOnly.test(report) ? report : null;
-};
-export const anchoredReportLine = (screen: string, key: string): string | null =>
-  lastReportLine(
-    screen
-      .split("\n")
-      .flatMap((l) => reportCandidate(l) ?? [])
-      .join("\n"),
-    key,
-  );
 
 export type SweepAct = {
   readonly kind:
     | "nudged"
+    | "nudge-failed"
     | "posted"
     | "no-report"
     | "post-failed"
     | "pending-report"
     | "stale-report"
+    | "unrelayed"
     | "working-while-paused"
     | "stalled"
     | "journal-error"
@@ -175,28 +112,56 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
     if (progress?.state === "stalled") continue;
     // A blocker, question, halted or done lane is not nudged, but its report still reaches the thread.
     const running = !progress || progress.state === "running";
-    const heard = Math.max(lastHeard(lane), progress?.lastReport ? Date.parse(progress.lastReport.at) : 0);
+    let current = await deps.registry.read(lane.key);
+    if (!current || statusOf(current) !== "working") continue;
+    const policy = deps.config.freshness;
+    const heard = Math.max(lastHeard(current), progress?.lastReport ? Date.parse(progress.lastReport.at) : 0);
     const silentMin = Math.round((now - heard) / 60_000);
-    let current = lane;
-    if (running && silentMin >= deps.config.nudgeAfterMin && (current.lastNudgeAt ?? 0) < heard) {
+    if (
+      running &&
+      silentMin >= deps.config.nudgeAfterMin &&
+      (current.lastNudgeAt ?? 0) < heard &&
+      (policy?.nudge !== "idle-only" ||
+        (await runtimesOf(deps)
+          .for(ref)
+          .probe(ref)
+          .then(
+            (seen) => seen.status === "idle" && !seen.shellInFront && !seen.approvalPending,
+            () => false,
+          )))
+    ) {
       const delivery = await sendVerified(
         runtimesOf(deps),
         deps.clock,
         ref,
         `[LEAD] your work thread has had no update for ${silentMin} min. Post a 1-2 sentence progress line (done since last, next) and keep its status true.`,
+        policy?.nudge === "idle-only" ? "idle" : undefined,
       );
-      current = { ...current, lastNudgeAt: now };
-      await remember(deps, lane.key, { lastNudgeAt: now });
-      acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+      if (delivery !== "failed" || policy?.nudge !== "idle-only") {
+        current = { ...current, lastNudgeAt: now };
+        await remember(deps, lane.key, { lastNudgeAt: now, lastNudgeFailure: undefined });
+        acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+      } else {
+        const failure = `nudge-failed|${heard}`;
+        if (current.lastNudgeFailure !== failure)
+          acts.push({
+            kind: "nudge-failed",
+            lane: lane.key,
+            detail: "idle-only delivery failed; left unnudged, retrying next tick",
+          });
+        await remember(deps, lane.key, { lastNudgeFailure: failure });
+      }
     }
     const hook = deps.config.hooks.threadReply;
     // The post waits for the thread to be quiet, not the lane: a report resets the nudge clock only, so a lane that
     // reports often still gets its latest report posted, at most once per postAfterMin.
-    const threadQuietMin = Math.round((now - Math.max(lastHeard(lane), lane.lastAutoReplyAt ?? 0)) / 60_000);
+    const threadQuietMin = Math.round(
+      (now - Math.max(lastHeard(current), current.lastAutoReplyAt ?? 0, current.lastRelayedAt ?? 0)) / 60_000,
+    );
     // A report stamped in the same millisecond as the last post still counts (<=); lastPostedReport stops a repeat.
     if (
       threadQuietMin >= deps.config.postAfterMin &&
-      hook &&
+      (hook || policy?.postRaw === false || policy?.autoPostKinds !== undefined) &&
       lane.thread !== "none" &&
       (current.lastAutoReplyAt ?? 0) <= heard
     ) {
@@ -208,6 +173,9 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
         (lane.reportProtocol === "jsonl-v1"
           ? null
           : anchoredReportLine(await readScreen(runtimesOf(deps), ref, 200), lane.key));
+      const summary = progress?.lastReport?.owner;
+      const ownerLine = progress?.lastReport && summary ? reportLine({ ...progress.lastReport, text: summary }) : null;
+      const kind = report?.split("|")[1]?.trim();
       const seenBefore = current.lastSeenReport;
       current = { ...current, lastSeenReport: report ?? undefined };
       let hold: { kind: SweepAct["kind"]; detail: string } | null = null;
@@ -218,15 +186,33 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
         };
       else if (!fromJournal && report !== seenBefore)
         hold = { kind: "pending-report", detail: "a new [REPORT] line; posting once it holds on the next tick" };
-      else if (report === current.lastPostedReport)
-        hold = { kind: "stale-report", detail: "the last [REPORT] line was already posted" };
+      else if (
+        (progress?.lastReport && reportId(progress.lastReport) === current.lastPostedReportId) ||
+        (report === current.lastPostedReport && summary === current.lastPostedReportOwner)
+      )
+        hold = { kind: "stale-report", detail: "the last [REPORT] line was already posted or relayed" };
+      else if (policy?.autoPostKinds && !policy.autoPostKinds.some((allowed) => allowed === kind))
+        hold = { kind: "unrelayed", detail: "report kind requires the lead to relay it" };
+      else if (policy?.postRaw === false && (!ownerLine || !scrubForThread(ownerLine, home)))
+        hold = { kind: "unrelayed", detail: "report needs an owner summary or the lead to relay it" };
+      else if (!hook) hold = { kind: "unrelayed", detail: "no threadReply hook; the lead must relay this report" };
       if (hold) {
-        const note = `${hold.kind}|${hold.detail}|${report ?? ""}`;
+        const note = `${hold.kind}|${hold.detail}|${hold.kind === "unrelayed" && progress?.lastReport ? reportId(progress.lastReport) : (report ?? "")}`;
         if (note !== current.lastFreshnessNote) acts.push({ kind: hold.kind, lane: lane.key, detail: hold.detail });
         await remember(deps, lane.key, { lastSeenReport: current.lastSeenReport, lastFreshnessNote: note });
         continue;
       }
-      const text = `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`;
+      if (!hook) continue;
+      const latest = await deps.registry.read(lane.key);
+      if (
+        !latest ||
+        statusOf(latest) !== "working" ||
+        latest.lastPostedReportId !== current.lastPostedReportId ||
+        latest.lastPostedReport !== current.lastPostedReport ||
+        latest.lastRelayedAt !== current.lastRelayedAt
+      )
+        continue;
+      const text = `Progress (from the lane's last report): ${scrubForThread(ownerLine ?? report ?? "", home)}`;
       const sent = await deps.run(fill(hook, { thread: lane.thread, text, key: lane.key }));
       // Only a delivered report counts as posted: a failed hook leaves it unposted, so the next tick sends it again. Like
       // a held-back report, the same failure is printed once, not on every retry.
@@ -237,12 +223,22 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
         await remember(deps, lane.key, { lastSeenReport: current.lastSeenReport, lastFreshnessNote: note });
         continue;
       }
-      await remember(deps, lane.key, {
-        lastSeenReport: current.lastSeenReport,
-        lastAutoReplyAt: now,
-        lastPostedReport: report ?? undefined,
-        lastFreshnessNote: undefined,
-      });
+      await deps.registry.update(lane.key, (live) =>
+        live &&
+        live.lastPostedReportId === latest.lastPostedReportId &&
+        live.lastPostedReport === latest.lastPostedReport &&
+        live.lastRelayedAt === latest.lastRelayedAt
+          ? {
+              ...live,
+              lastSeenReport: report ?? undefined,
+              lastAutoReplyAt: now,
+              lastPostedReport: report ?? undefined,
+              lastPostedReportId: progress?.lastReport ? reportId(progress.lastReport) : undefined,
+              lastPostedReportOwner: summary,
+              lastFreshnessNote: undefined,
+            }
+          : null,
+      );
       acts.push({ kind: "posted", lane: lane.key, detail: text });
     }
   }

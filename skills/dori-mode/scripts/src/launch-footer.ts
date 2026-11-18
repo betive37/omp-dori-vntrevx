@@ -38,6 +38,7 @@ export const footer = (
   leadPane: string,
   identities: DoriConfig["repoIdentities"] = {},
   runtime?: DoriConfig["runtime"],
+  freshness?: DoriConfig["freshness"],
 ): string => {
   const forward = sendReport(leadPane, runtime);
   return [
@@ -51,8 +52,13 @@ export const footer = (
     "- Persist each milestone, blocker, question, halt and completion with the report command below. It appends reports.jsonl and prints the human [REPORT] line.",
     "- Before forwarding, verify that the lead pane runs a live agent, its input is empty, and no approval or question prompt is open (references/sessions.md). A shell, unknown status or unconfirmed check holds forwarding.",
     "- Supply kind (milestone, blocker, question, halted or done) and text (the report with evidence links) as data, such as environment variables. Never interpolate raw report text into shell source or evaluate the printed line. Record with the command below; when it includes forwarding, run that combined call only after the forwarding checks pass:",
+    ...(freshness?.postRaw === false
+      ? [
+          "- This lane uses summary-only posting. Also set owner to a concise, owner-facing summary as data; keep internal detail and evidence in text. The command below records both, without posting the raw detail.",
+        ]
+      : []),
     "```sh",
-    `line=$(${CLI} report ${lane.key} --kind "$kind" --text "$text") && printf '%s\\n' "$line"${forward ? ` && ${forward}` : ""}`,
+    `line=$(${CLI} report ${lane.key} --kind "$kind" --text "$text"${freshness?.postRaw === false ? ' --owner "$owner"' : ""}) && printf '%s\\n' "$line"${forward ? ` && ${forward}` : ""}`,
     "```",
     ...(forward
       ? [

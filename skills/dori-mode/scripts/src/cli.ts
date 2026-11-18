@@ -15,8 +15,9 @@ const USAGE = `dori <command> [options]
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF]
   sync   [--write]                     registry vs live panes; read-only unless --write
   boot                                 read-only check after a restart: Slack auth, vanished panes, journals, open worklog items and decisions, stale watches
-  report <key> --kind milestone|blocker|question|halted|done --text TEXT
+  report <key> --kind milestone|blocker|question|halted|done --text TEXT [--owner SUMMARY] [--json]
                                        append a durable progress report and print its [REPORT] line
+  relayed <key> --report ID            acknowledge the exact journal report already sent by the lead (--json supplies ID)
   checkpoint <key> --step ID --result TEXT --evidence PATH [--remote-effect RECEIPT]...
                                        record a completed step once; a conflicting rewrite is refused
   checkpoints <key>                    read completed steps before resuming remote work
@@ -133,6 +134,9 @@ const flags = parseArgs({
     emoji: { type: "string" },
     remove: { type: "boolean" },
     kind: { type: "string" },
+    owner: { type: "string" },
+    report: { type: "string" },
+    json: { type: "boolean" },
     step: { type: "string" },
     result: { type: "string" },
     "remote-effect": { type: "string", multiple: true },
@@ -160,6 +164,7 @@ const flags = parseArgs({
 let commands: Readonly<Record<string, Command>> = {};
 switch (command) {
   case "report":
+  case "relayed":
   case "lesson":
   case "worklog":
   case "checkpoint":

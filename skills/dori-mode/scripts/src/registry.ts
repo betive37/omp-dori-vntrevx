@@ -46,6 +46,10 @@ export type Lane = {
   readonly lastAutoReplyAt?: number;
   /** The [REPORT] line the freshness sweep last posted, so a stale screen is never posted twice. */
   readonly lastPostedReport?: string | undefined;
+  readonly lastPostedReportId?: string | undefined;
+  readonly lastPostedReportOwner?: string | undefined;
+  readonly lastRelayedAt?: number;
+  readonly lastNudgeFailure?: string | undefined;
   /** The [REPORT] line seen on the previous freshness tick (a line is posted only once it holds across two ticks). */
   readonly lastSeenReport?: string | undefined;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
@@ -238,10 +242,7 @@ export class Registry {
     return (await this.list()).filter((l) => statusOf(l) !== "closed");
   }
 
-  /**
-   * The open lane in session `ref`. A record keyed `lead` (registered before the key was reserved) is never returned, so a
-   * session lookup cannot mistake the lead for a lane; that record is still read by its key, listed, and closed by hand.
-   */
+  /** The open lane in ref, excluding the legacy reserved lead record (still readable, listable and closable). */
   async bySession(ref: SessionRef | undefined): Promise<Lane | null> {
     if (!ref) return null;
     return (await this.open()).find((l) => sameSession(l.sessionRef, ref) && l.key !== RESERVED_LANE_KEY) ?? null;
