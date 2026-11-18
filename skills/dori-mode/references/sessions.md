@@ -15,10 +15,13 @@ dori launch fix-login --title "Fix the login redirect loop" \
 Write the brief like a careful prompt:
 
 - open with the keywords you would type yourself (for example `ulw set goal and work`);
-- where the code is and what has been learned so far;
-- the ideal end state, from the point of view of whoever uses the result;
-- what not to touch;
-- how and when to report.
+- the original request/source references and only the facts learned that matter to this task, not the whole lead transcript;
+- the allowed repositories, worktree and branch, with the execution directory explicit when it differs from the lead's;
+- the observable acceptance, checks and stop condition, from the point of view of whoever uses the result;
+- resources and user changes to preserve, unfinished external effects and their receipts, and the latest resume checkpoint;
+- the work thread, how to report, and a deadline only if one actually exists.
+
+On a follow-up or resume, read the brief, registry and existing checkpoint history before acting. Keep the original source, allowed repository/branch, acceptance and report route unless the lead explicitly changes the assignment; another session's cwd or an unrelated message is not such a change. The launch footer repeats recorded locations, but those paths grant no additional authority. If a material field is missing or conflicts with live state, resolve it with the lead before the affected work rather than inventing values, permissions or deadlines. Inspect uncertain external effects by their receipts before repeating them.
 
 **Why the `Done =` line has to be checkable:** the watcher closes lanes on its own, so it can only trust what it can read back itself. `launch` and `adopt` refuse any signal outside this list. Signals are joined with `;`, and every one has to pass.
 
