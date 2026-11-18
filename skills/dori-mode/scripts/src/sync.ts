@@ -1,7 +1,7 @@
 import { formatRef } from "../../../../src/runtime/types.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { statusOf } from "./registry.ts";
-import { runtimesOf } from "./run.ts";
+import { type Ran, type Runner, runtimesOf } from "./run.ts";
 import { procTable, resolveSession } from "./session-id.ts";
 import { listSessions, listWatched } from "./sessions.ts";
 
@@ -14,7 +14,21 @@ export type SyncRow = {
 };
 export type SyncResult = { readonly rows: SyncRow[]; readonly drift: string[]; readonly unregistered: SyncRow[] };
 
-export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<SyncResult> => {
+// Share only successful read-only observations for this pass. hc group listings and all action checks stay fresh.
+const PASS_SHARED = /^(?:ps -A -o pid=,ppid=,command=|herdr (?:--session \S+ )?pane list)$/;
+const passRunner = (run: Runner): Runner => {
+  const seen = new Map<string, Ran>();
+  return async (argv, opts) => {
+    const key = JSON.stringify(argv);
+    if (opts || !PASS_SHARED.test(argv.join(" "))) return run(argv, opts);
+    const ran = seen.get(key) ?? (await run(argv));
+    if (ran.code === 0) seen.set(key, ran);
+    return ran;
+  };
+};
+
+export const syncRegistry = async (flow: FlowDeps, write: boolean): Promise<SyncResult> => {
+  const deps = write ? flow : { ...flow, run: passRunner(flow.run) };
   const rts = runtimesOf(deps);
   const lanes = await deps.registry.open();
   const sessions = await listSessions(rts, { lanes });
