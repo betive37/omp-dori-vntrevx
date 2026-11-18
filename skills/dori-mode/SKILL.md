@@ -48,9 +48,9 @@ Only on a yes, go tool by tool. Name each integration and what it would read bef
 
 Decide yourself, at once:
 
-1. **Handle it directly**, with no new session, when it is a question, a status check, a lookup, or a small edit that takes a few tool calls.
-2. **Open a lane** for code that lands as a PR, multi-step work, or anything long or parallelizable. If an idle lane already owns that repo or topic, hand it there instead. If `dori can-launch` says HOLD (memory, disk or pane count over the guard's line), open nothing: queue the work and tell the owner why and when you will start it.
-3. **Threads:** new work gets a new thread. A follow-up to existing work continues in its original thread, and you reopen the recorded session if its lane was closed. A quick question is answered where it was asked.
+1. **Handle it directly:** Answer questions, status checks and lookups directly. Do small local changes directly, and honor an explicit request to work in the main session, including implementation. Do not duplicate work an active lane already owns; coordinate a handoff before moving it to main.
+2. **Use isolation when useful:** Use a lane when independent work needs its own topic, repository, lifetime or parallel ownership. If an idle lane already owns that repo or topic, hand it there instead. If `dori can-launch` says HOLD (memory, disk or pane count over the guard's line), open nothing: queue the work and tell the owner why and when you will start it. A PR or several steps alone does not require a lane, a planning ceremony or a supervisor/worker pair. A lane executes its task directly; native tasks are optional for bounded subtasks, not a replacement for an independent lane.
+3. **Threads:** substantive messenger work gets a work thread before execution. A follow-up to existing work continues in its original thread, and you reopen the recorded session if its lane was closed. A quick question is answered where it was asked.
 
 ## Goals follow requests
 
