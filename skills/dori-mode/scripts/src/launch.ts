@@ -39,7 +39,7 @@ export const adoptLane = async (
   input: LaunchInput & { readonly pane: string },
   locked = false,
 ): Promise<Lane> => {
-  await validateLaunch(deps, input);
+  await validateLaunch(deps, input, LaunchError);
   if (!locked) {
     const held = await withLaunchLock(deps, input.key, () => adoptLane(deps, input, true));
     if (!held.ok) throw new LaunchError(`lane ${input.key} held: ${held.holder}`);
@@ -65,7 +65,7 @@ export const prepareLaunch = async (
   deps: FlowDeps,
   input: LaunchInput,
 ): Promise<{ readonly lane: Lane; readonly preamble: string; readonly warnings: string[] }> => {
-  await validateLaunch(deps, input);
+  await validateLaunch(deps, input, LaunchError);
   const model = input.model ?? deps.config.defaultModel;
   const cwd = input.cwd ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
@@ -112,7 +112,7 @@ export const launchLane = async (
   locked = false,
 ): Promise<{ readonly lane: Lane; readonly startup: string; readonly warnings: string[] }> => {
   if (!locked) {
-    await validateLaunch(deps, input);
+    await validateLaunch(deps, input, LaunchError);
     const held = await withLaunchLock(deps, input.key, () => launchLane(deps, input, true));
     if (!held.ok) throw new LaunchError(`lane ${input.key} held: ${held.holder}`);
     return held.value;

@@ -1,5 +1,4 @@
 import type { FlowDeps } from "./done-flow.ts";
-import { LaunchError } from "./launch.ts";
 import { LaunchQueue } from "./launch-queue-store.ts";
 import { LANE_KEY, RESERVED_LANE_KEY } from "./registry.ts";
 import { doneSyntaxErrors } from "./signals.ts";
@@ -21,7 +20,11 @@ export type LaunchInput = {
   readonly activityPaths?: readonly string[];
 };
 
-export const validateLaunch = async (deps: FlowDeps, input: LaunchInput): Promise<void> => {
+export const validateLaunch = async (
+  deps: FlowDeps,
+  input: LaunchInput,
+  LaunchError: new (message: string) => Error,
+): Promise<void> => {
   if (!LANE_KEY.test(input.key)) throw new LaunchError(`key must match ${LANE_KEY}`);
   if (input.key === RESERVED_LANE_KEY)
     throw new LaunchError(`lane key "${RESERVED_LANE_KEY}" is reserved for the lead`);
