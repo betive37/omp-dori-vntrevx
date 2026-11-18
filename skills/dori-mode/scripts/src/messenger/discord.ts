@@ -1,5 +1,5 @@
 import type { Clock } from "../run.ts";
-import { guardText, type Http, MessengerError, withBackoff } from "./http.ts";
+import { DeliveryUncertainError, guardText, type Http, MessengerError, withBackoff } from "./http.ts";
 import { DISCORD_LIMIT, splitForDiscord } from "./split.ts";
 
 const retryAfter = (body: string): number | undefined => {
@@ -23,6 +23,12 @@ export type DcChannel = {
 /** Forum and media channels contain posts, each represented by a thread. */
 export const isForumType = (type: number): boolean => type === 15 || type === 16;
 
+const responseId = (body: { readonly id?: unknown } | null, operation: string): string => {
+  if (typeof body?.id !== "string" || !body.id)
+    throw new DeliveryUncertainError(`${operation}: missing remote ID`, 200);
+  return body.id;
+};
+
 export class Discord {
   constructor(
     private readonly http: Http,
@@ -41,6 +47,7 @@ export class Discord {
       this.clock,
       {
         method,
+        operation: `discord ${method} ${path}`,
         url: `${this.base}${path}`,
         headers: { Authorization: `Bot ${this.botToken}`, "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}),
@@ -50,7 +57,12 @@ export class Discord {
     );
     if (res.status >= 300)
       throw new MessengerError(`discord ${method} ${path}: ${res.status} ${res.body.slice(0, 160)}`, res.status);
-    return (res.body ? JSON.parse(res.body) : {}) as T;
+    try {
+      return (res.body ? JSON.parse(res.body) : {}) as T;
+    } catch (error) {
+      if (method !== "GET") throw new DeliveryUncertainError(`discord ${method} ${path}`, res.status);
+      throw error;
+    }
   }
 
   /**
@@ -82,7 +94,7 @@ export class Discord {
           allowed_mentions: { parse: [] },
           ...reference,
         });
-        ids.push(sent.id);
+        ids.push(responseId(sent, `discord POST /channels/${channelId}/messages`));
       } catch (e) {
         if (ids.length === 0) throw e;
         // Any failure after a posted part, a transport error or an unreadable answer included, names what stays.
@@ -91,6 +103,7 @@ export class Discord {
           `${why} (part ${ids.length + 1} of ${total}; already posted: ${ids.join(" ")})`,
           e instanceof MessengerError ? e.status : 0,
           e instanceof MessengerError ? e.code : undefined,
+          e instanceof MessengerError ? e.outcome : "uncertain",
         );
       }
     }
@@ -105,7 +118,10 @@ export class Discord {
         `discord edit: text exceeds ${DISCORD_LIMIT} UTF-16 code units; shorten the text or send without --edit`,
         400,
       );
-    await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guarded });
+    responseId(
+      await this.call("PATCH", `/channels/${channelId}/messages/${messageId}`, { content: guarded }),
+      `discord PATCH /channels/${channelId}/messages/${messageId}`,
+    );
   }
 
   async typing(channelId: string): Promise<void> {
@@ -113,24 +129,26 @@ export class Discord {
   }
 
   async startThread(channelId: string, messageId: string, name: string): Promise<string> {
-    return (
-      await this.call<{ id: string }>("POST", `/channels/${channelId}/messages/${messageId}/threads`, {
+    return responseId(
+      await this.call("POST", `/channels/${channelId}/messages/${messageId}/threads`, {
         name: guardText(name).slice(0, 100),
-      })
-    ).id;
+      }),
+      `discord POST /channels/${channelId}/messages/${messageId}/threads`,
+    );
   }
 
   async setThread(
     threadId: string,
     patch: { readonly name?: string; readonly archived?: boolean; readonly appliedTags?: readonly string[] },
   ): Promise<string> {
-    return (
-      await this.call<{ id: string }>("PATCH", `/channels/${threadId}`, {
+    return responseId(
+      await this.call("PATCH", `/channels/${threadId}`, {
         ...(patch.name ? { name: guardText(patch.name).slice(0, 100) } : {}),
         ...(patch.archived !== undefined ? { archived: patch.archived } : {}),
         ...(patch.appliedTags !== undefined ? { applied_tags: patch.appliedTags } : {}),
-      })
-    ).id;
+      }),
+      `discord PATCH /channels/${threadId}`,
+    );
   }
 
   /** Forum posts include a starter message; text-channel threads optionally receive one after creation. */
@@ -153,6 +171,8 @@ export class Discord {
           ...(opts.appliedTags !== undefined ? { applied_tags: opts.appliedTags } : {}),
         },
       );
+      responseId(thread, `discord POST /channels/${channel.id}/threads`);
+      if (thread.message !== undefined) responseId(thread.message, `discord forum starter ${thread.id}`);
       if (more.length > 0)
         await this.post(thread.id, more, undefined, thread.message === undefined ? [] : [thread.message.id]);
       return { id: thread.id, ...(thread.message === undefined ? {} : { messageId: thread.message.id }) };
@@ -161,6 +181,7 @@ export class Discord {
       name: title,
       type: 11,
     });
+    responseId(thread, `discord POST /channels/${channel.id}/threads`);
     return text === undefined ? { id: thread.id } : { id: thread.id, ...(await this.firstOf(thread.id, text)) };
   }
 
