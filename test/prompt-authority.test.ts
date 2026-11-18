@@ -33,8 +33,15 @@ describe("task scope and external-effect authority in delivered prompts", () => 
     expect(lane).toContain("Analysis-only and review-only requests stay read-only.");
     expect(lane).toContain("READY is evidence of work, not authorization for external effects.");
     expect(lane).toContain("Do not merge yourself");
-    const reviewer = prompt("review.md", { pr: "example/repo#1", sha: "a".repeat(40), number: "1", repo: "example/repo" });
+    const reviewer = prompt("review.md", {
+      pr: "example/repo#1",
+      sha: "a".repeat(40),
+      number: "1",
+      repo: "example/repo",
+    });
     expect(reviewer).toContain("Do not modify any files.");
-    expect(reviewer).toContain("A CLEAR verdict is review evidence, not permission to merge, publish, deploy or spend.");
+    expect(reviewer).toContain(
+      "A CLEAR verdict is review evidence, not permission to merge, publish, deploy or spend.",
+    );
   });
 });
