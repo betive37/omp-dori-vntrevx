@@ -4,6 +4,8 @@
 
 - `dori voice discord` adds an opt-in, paid, owner-only Discord voice assistant configured by `voice` in the existing Dori config. It reads lanes and reports, searches the web, posts notes and forwards work to the lead once, claiming delivery only after receipt is observed; forwarded requests carry a written-approval policy, not an effect-point authorization gate. Daily, cumulative and backend spending caps apply, though in-flight usage can exceed them. Native codecs are optional dependencies loaded only by this command. See [the voice guide](docs/discord-voice.md).
 
+- Linux host sampling now reads load and memory directly from `/proc`, avoiding two `cat` children and three failed macOS command attempts per sample. Disk and session sampling, unknown-value behavior, and non-Linux probes are unchanged.
+
 - The skill CLI loads command implementations on demand, avoiding updater, messenger and lane graphs for successful journal commands and all configuration/command graphs for `--version`. Ordinary commands retain configuration and consumer-native admission before execution; usage, exit codes and original error classes remain unchanged.
 
 - Automatic CI now runs only the Linux `check`, `e2e-herdr` and `e2e-hc` jobs; the automatic macOS job is removed. Exact-commit release validation and contributor requirements use the same three required jobs. Existing macOS tests and consumer verification scripts remain available for manual QA.
