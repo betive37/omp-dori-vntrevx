@@ -60,11 +60,11 @@ const cases = [
     detail: "status=matched",
   },
   {
-    name: "case-only mismatch is contradictory",
+    name: "raw exact catalog collisions may differ only by case",
     value: { ...readback, status: "mismatch", requested: { provider: "OPENAI-CODEX", id: "FIXTURE-MODEL" } },
     request: "OPENAI-CODEX/FIXTURE-MODEL",
-    severity: "INFO",
-    detail: "status=unknown",
+    severity: "WARN",
+    detail: "status=mismatch",
   },
   {
     name: "different catalog tags are not the same model",

@@ -174,4 +174,4 @@ The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, pu
 
 - Add read-only `dori doctor` configuration, adoption and monitor diagnostics, canonical `monitor-presets`, and an advisory boot summary; include missing supervision and loop-error events in the documented filters.
 
-- Unreleased: Distinguish source-lock declarations, configured models, trusted native model readbacks and credential presence in read-only doctor diagnostics.
+- Unreleased: Distinguish source-lock declarations, configured models, trusted native model readbacks, historical opaque-launch receipts and credential presence in read-only doctor diagnostics.

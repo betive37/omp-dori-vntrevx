@@ -36,8 +36,10 @@ const modelFinding = (label: string, state: PaneState | null, expected?: string)
   const status = raw["status"];
   const billing = raw["billing"];
   const checkedAt = raw["checkedAt"];
+  const reason = raw["reason"];
   if (
     raw["source"] !== "native-extension" ||
+    (reason !== undefined && typeof reason !== "string") ||
     requested === undefined ||
     observed === undefined ||
     typeof status !== "string" ||
@@ -48,14 +50,14 @@ const modelFinding = (label: string, state: PaneState | null, expected?: string)
     !Number.isFinite(Date.parse(checkedAt)) ||
     Date.parse(checkedAt) < Date.parse(state.startedAt) ||
     (status === "matched" && (!requested || requestedKey !== observedKey)) ||
-    (status === "mismatch" && (!requested || !observed || requestedKey === observedKey)) ||
+    (status === "mismatch" && (!requested || !observed || requested === observed)) ||
     (status === "unrequested" && (requested !== null || !observed)) ||
     (status === "unavailable" && !requested)
   )
     return unknown("modelReadback does not match its session or status contract");
   const exactRequest = expected !== undefined && /^[^/]+\/.+$/.test(expected);
   const legacyRequest = expected !== undefined && !exactRequest;
-  if (exactRequest && requestedKey !== expected?.toLowerCase())
+  if (exactRequest && status !== "unrequested" && status !== "unknown" && requestedKey !== expected?.toLowerCase())
     return unknown(
       `recorded request differs: lane=${JSON.stringify(expected)} native=${JSON.stringify(requested)}`,
       "WARN",
@@ -73,15 +75,65 @@ const modelFinding = (label: string, state: PaneState | null, expected?: string)
       (observed ?? "unknown") +
       " billing=" +
       billing +
+      (reason === undefined ? "" : `; reason=${JSON.stringify(reason)}`) +
       "; billing is not spending authorization or quota evidence" +
-      (legacyRequest
-        ? `; recorded request=${JSON.stringify(expected)}; request comparison=unknown (not exact provider/id)`
-        : ""),
+      (status === "unrequested" && expected !== undefined
+        ? `; recorded request=${JSON.stringify(expected)}; request comparison=unrequested (not native launch verification)`
+        : legacyRequest
+          ? `; recorded request=${JSON.stringify(expected)}; request comparison=unknown (not exact provider/id)`
+          : ""),
     provenance: `native-extension session=${JSON.stringify(state.sessionId)} pid=${state.pid} checkedAt=${checkedAt}`,
     next:
-      status === "matched" || status === "unrequested"
+      status === "matched"
         ? "Verify spending authorization separately before model work."
-        : "Inspect the exact requested provider/model in this session; do not automatically substitute it.",
+        : status === "unrequested"
+          ? "Compare the recorded launch choice separately; an unrequested observation is not launch verification."
+          : "Inspect the exact requested provider/model in this session; do not automatically substitute it.",
+  };
+};
+
+const preflightFinding = (lane: BootLane): DoctorFinding | null => {
+  if (!("modelReadback" in lane)) return null;
+  const unknown: DoctorFinding = {
+    check: "model",
+    severity: "INFO",
+    detail: `lane=${JSON.stringify(lane.key)} preflight status=unknown observed=unknown; invalid launch receipt`,
+    provenance: "untrusted lane registry receipt; not a native model observation",
+    next: "Inspect the launch receipt and the separate live native model observation.",
+  };
+  const value = lane.modelReadback;
+  if (!value || typeof value !== "object") return unknown;
+  const raw = value as Record<string, unknown>;
+  const requested = identity(raw["requested"]);
+  const checkedAt = raw["checkedAt"];
+  const reason = raw["reason"];
+  if (
+    raw["source"] !== "launch-preflight" ||
+    raw["status"] !== "unavailable" ||
+    raw["observed"] !== null ||
+    raw["billing"] !== "unknown" ||
+    !requested ||
+    typeof reason !== "string" ||
+    !reason.trim() ||
+    typeof checkedAt !== "string" ||
+    !Number.isFinite(Date.parse(checkedAt)) ||
+    (lane.model !== undefined &&
+      /^[^/]+\/.+$/.test(lane.model) &&
+      requested?.toLowerCase() !== lane.model.toLowerCase())
+  )
+    return unknown;
+  return {
+    check: "model",
+    severity: "INFO",
+    detail:
+      "lane=" +
+      JSON.stringify(lane.key) +
+      " preflight status=unavailable requested=" +
+      (requested ?? "none") +
+      " observed=unknown billing=unknown; compatibility launch was not model-verified; reason=" +
+      JSON.stringify(reason),
+    provenance: `launch-preflight historical registry receipt checkedAt=${checkedAt}; not a native model observation`,
+    next: "Inspect the separate native observation; this receipt is neither launch verification nor spending authorization.",
   };
 };
 
@@ -143,6 +195,8 @@ export const doctorProvenance = async (
       }
     }
     findings.push(modelFinding(`lane=${JSON.stringify(lane.key)}`, live, lane.model));
+    const preflight = preflightFinding(lane);
+    if (preflight) findings.push(preflight);
   }
   const env = deps.env ?? process.env;
   for (const key of ["DORI_DISCORD_TOKEN", "DORI_TELEGRAM_TOKEN", "DORI_SLACK_TOKEN", "DORI_SLACK_TOKEN_FILE"]) {
