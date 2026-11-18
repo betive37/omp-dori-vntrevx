@@ -28,20 +28,26 @@ export const doctorLocal = (
 ): DoctorFinding[] => {
   const findings = monitorFilterFindings(manifests, liveSession);
   const active = lanes.filter((lane) => !finished(lane));
-  const budgets = [
-    config.supervision.defaults,
-    ...Object.values(config.supervision.lanes ?? {}),
-    ...active.map((lane) => lane.budget),
-  ];
-  const ceilings = budgets.some((budget) =>
-    Object.values(budget ?? {}).some((value) => value !== null && value !== undefined),
-  );
-  if (active.length && (!ceilings || !config.supervision.usageArgv?.length))
+  const unbounded = active.filter((lane) => {
+    // Match Supervision.sweep: only this lane's effective limits can protect it.
+    const limits = {
+      ...config.supervision.defaults,
+      ...config.supervision.lanes?.[lane.key],
+      ...lane.budget,
+    };
+    return !(["wallMinutes", "tokens", "costUsd"] as const).some((name) => {
+      const limit = limits[name];
+      return typeof limit === "number" && Number.isFinite(limit) && limit >= 0;
+    });
+  });
+  if (active.length && (unbounded.length || !config.supervision.usageArgv?.length))
     findings.push({
       check: "supervision",
       severity: "WARN",
       detail: [
-        !ceilings ? "no configured ceilings" : "",
+        unbounded.length
+          ? `no configured ceilings for active lanes: ${unbounded.map((lane) => lane.key).join(", ")}`
+          : "",
         !config.supervision.usageArgv?.length ? "no usage reader (cost is unknown, not zero)" : "",
       ]
         .filter(Boolean)
