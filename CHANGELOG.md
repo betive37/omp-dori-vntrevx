@@ -171,3 +171,7 @@ CI coverage for macOS/hc is distinct from supported live consumer behavior. A so
 The terminal-admission integration group uses a test-local 20-second budget for two distinct real Git/fsync candidate lifecycles. Runtime command deadlines, assertion coverage and the default budget of unrelated tests are unchanged.
 
 The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, public dependency pin and third-party notices remain unchanged.
+
+## Unreleased addendum
+
+- Reuse the existing native goal or durable workflow owner before creating an objective. Preserve paused ownership until an explicit user resume request, and keep questions, external waits and availability monitoring from creating duplicate goals.

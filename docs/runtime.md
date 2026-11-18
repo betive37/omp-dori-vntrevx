@@ -168,7 +168,7 @@ Each session ends with one line:
 
 `--dry-run` prints `PLAN <name> <old> -> <runtime>` with the queued-message count and changes nothing. An interrupted run resumes at its journal phase when started again; a second `dori harness migrate` of the same session cannot start concurrently.
 
-`--resume` starts the replacement on the old OMP session file (`omp --dori-role lane --resume=<path>` for a lane, role `dori` for lead/duty) instead of a handoff brief. It requires a live idle/done old agent and a recorded session path; otherwise nothing moves. Explicit custom agent commands retain their upstream `--session <path>` form. OMP role restoration does not imply its native goal resumed: inspect the goal and resume it deliberately when paused.
+`--resume` starts the replacement on the old OMP session file (`omp --dori-role lane --resume=<path>` for a lane, role `dori` for lead/duty) instead of a handoff brief. It requires a live idle/done old agent and a recorded session path; otherwise nothing moves. Explicit custom agent commands retain their upstream `--session <path>` form. OMP role restoration does not imply its native goal resumed: inspect the goal and preserve paused ownership until the user explicitly directs resumption. A migration or monitor recovery event is not that instruction.
 
 The two loops are plain processes with no inbox and no agent, so they skip steps 2, 3, 5 and 6. The duty loop's old session closes before the new one opens, since the lock allows one per home. The hourly loop's new session opens first, and its own lock keeps the two from running the same hour.
 

@@ -62,7 +62,7 @@ How the session id is found for a pane, in order:
 
 The extension updates its record when the agent switches sessions. A stale PID, wrong terminal or approval-pending record never becomes permission to type into another process. On hc, OMP reports native OSC 7501 status so the runtime's conditional send gate remains active; unknown status stays held.
 
-When the owner writes in a closed lane's thread, reopen its recorded session with `omp --resume=<id>` in a new runtime session and continue in that thread. OMP restores the recorded Dori/lane role and the Dori's monitors. A resumed goal is paused until `/goal resume` is confirmed through extension state.
+When the owner asks to continue work in a closed lane's thread, reopen its recorded session with `omp --resume=<id>` in a new runtime session and answer in that thread. OMP restores the recorded Dori/lane role and the Dori's monitors, not permission to unpause work. If the goal is paused, resume it only when the user's message explicitly directs resumption, and confirm `/goal resume` through extension state; otherwise report the held work and wait for that instruction. An explicit request to continue that lane's work is a resume instruction; a question or status-only message is not.
 
 ## Messaging a session
 
@@ -81,4 +81,4 @@ For a registered lane, `dori tell <key> --text TEXT` does steps 1, 3 and 4 throu
 
 - Sessions that turn blocked or ask a question: answer them or bring them to the owner.
 - Sessions that report a bug: reproduce it before it counts, then give it its own thread.
-- `dori dead-panes` reports agent sessions that stopped; reopen the recorded OMP session with `omp --resume=<id>` unless its work is finished.
+- `dori dead-panes` reports agent sessions that stopped; within the scope of the owner's still-open request for that lane's work, reopen the recorded OMP session with `omp --resume=<id>` unless its work is finished. Restoring that process does not resume a paused goal. If it is paused, report the held work and wait for the user's explicit resume instruction.
