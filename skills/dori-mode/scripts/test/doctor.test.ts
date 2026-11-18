@@ -44,6 +44,7 @@ test("doctor diagnoses configuration and missing filter outcomes without modifyi
     title: "demo",
     brief: "/brief",
     done: "merged Acme/App#1",
+    reportProtocol: "jsonl-v1",
     thread: "none",
     openedAt: new Date(now).toISOString(),
   });

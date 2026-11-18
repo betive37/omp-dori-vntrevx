@@ -28,7 +28,15 @@ export const doctorLocal = (
 ): DoctorFinding[] => {
   const findings = monitorFilterFindings(manifests, liveSession);
   const active = lanes.filter((lane) => !finished(lane));
-  const unbounded = active.filter((lane) => {
+  const launched = active.filter((lane) => lane.reportProtocol === "jsonl-v1");
+  const adopted = active.filter((lane) => lane.reportProtocol !== "jsonl-v1");
+  if (adopted.length)
+    findings.push({
+      check: "supervision",
+      severity: "INFO",
+      detail: `not supervised (adopted/legacy lanes): ${adopted.map((lane) => lane.key).join(", ")}; configured ceilings do not apply`,
+    });
+  const unbounded = launched.filter((lane) => {
     // Match Supervision.sweep: only this lane's effective limits can protect it.
     const limits = {
       ...config.supervision.defaults,
@@ -40,7 +48,7 @@ export const doctorLocal = (
       return typeof limit === "number" && Number.isFinite(limit) && limit >= 0;
     });
   });
-  if (active.length && (unbounded.length || !config.supervision.usageArgv?.length))
+  if (launched.length && (unbounded.length || !config.supervision.usageArgv?.length))
     findings.push({
       check: "supervision",
       severity: "WARN",

@@ -16,6 +16,7 @@ const lane = (key: string, extra: Partial<BootLane> = {}): BootLane => ({
   brief: "/brief",
   thread: "none",
   done: "file /done",
+  reportProtocol: "jsonl-v1",
   openedAt: new Date(now).toISOString(),
   ...extra,
 });
@@ -97,6 +98,41 @@ test.each(scenarios)("doctor uses each active lane's effective budget: $name", (
     state.done();
   }
 });
+
+test.each([true, false])(
+  "adopted lanes stay explicitly unsupervised even with a journal and configured limits=%s",
+  async (configured) => {
+    const state = withState();
+    try {
+      const deps = depsFor(newWorld(), fakeClock(now), state.dir, {
+        leadPane: "",
+        sessionsDir: join(state.dir, "sessions"),
+        doctor: { ignore: ["runtime"] },
+      });
+      const config = {
+        ...deps.config,
+        supervision: {
+          ...deps.config.supervision,
+          defaults: configured ? { ...unlimited, tokens: 1 } : unlimited,
+          usageArgv: configured ? ["fixture-usage-must-not-run"] : [],
+        },
+      };
+      await deps.registry.write(lane("adopted", { reportProtocol: undefined }));
+      new Reports(state.dir).report("adopted", "milestone", "a journal does not opt an adopted lane in", now);
+      const result = await doctorCheck({ ...deps, config });
+      expect(result.findings.filter((finding) => finding.check === "supervision")).toEqual([
+        {
+          check: "supervision",
+          severity: "INFO",
+          detail: "not supervised (adopted/legacy lanes): adopted; configured ceilings do not apply",
+        },
+      ]);
+      expect(result.exitCode).toBe(0);
+    } finally {
+      state.done();
+    }
+  },
+);
 
 test("doctor and boot both warn when only a completed journal's lane has configured ceilings", async () => {
   const state = withState();
