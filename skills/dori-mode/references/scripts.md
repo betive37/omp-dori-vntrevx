@@ -2,6 +2,8 @@
 
 `scripts/` is a bun + TypeScript package with one CLI, `dori`. Every external command runs as an argv array; nothing builds a shell string.
 
+The CLI loads only the selected command graph, including its existing dependencies. `--version` needs no command/configuration graph; `harness`, `update` and `upstream` retain their separate entry paths. Ordinary commands, including journals and usage, still load and validate configuration and consumer-native dependencies before command execution. Lazy loading does not skip native integrity checks. Errors retain their original classes, messages and exit codes.
+
 ## Install and test
 
 ```sh
