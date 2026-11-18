@@ -100,7 +100,8 @@ It runs in the foreground until stopped. A service is optional; see [Running as 
 - After `idleCloseSec` (2 minutes by default) of silence with no backend work pending, the session closes. Speaking above `wakeRmsDbfs` opens a new one; the last 2.5 seconds of audio before the wake are sent with it, so the first words are kept.
 - Speaking over the assistant stops its playback. A discarded lead-reply chunk is not consumed; it is offered again at a later pause or session.
 - A short voice-link interruption mutes output and invalidates queued reply audio without closing the owner's Live session. A disconnect lasting 5 seconds ends that session and rejoins 3 seconds later; all initial and SDK-internal recovery paths have a 30-second readiness deadline. Moving the bot to a different channel stops the bridge rather than playing the owner's answer there.
-- On a Live, delegated Responses or summary provider failure, voice is held and a notice is posted. It never retries a paid call automatically; restart it explicitly.
+- New sessions wait until the previous session has finished provider accounting and summary delivery. On a Live, delegated Responses or summary provider failure (including a backend with no progress for 120 seconds), voice is held and a notice is posted. It never retries a paid call automatically; restart it explicitly.
+- Running delegations, hosted searches and tool continuations prevent idle closure. Completed backend work gets the existing 10-second answer window before idle closure can resume.
 
 ### Tools
 
@@ -115,7 +116,7 @@ Quick part first offers verified status while independent lead work is pending, 
 
 ### Risky work
 
-Deploys, deletion, payments and production changes are never authorized or executed by voice. Every forwarded message tells the lead that a voice request is not approval for risky work; the owner must confirm in writing.
+Voice tools do not directly deploy, delete, pay or change production. Every forwarded message instructs the lead that a voice request is not approval for risky work and that the owner must confirm in writing. This is a prompt/operating policy, not an effect-point permission check: the `risky` field is a label, and downstream execution does not mechanically enforce voice provenance or written approval. The lead and its execution tools remain responsible for obtaining and checking the required authorization.
 
 ### Delivery to the lead
 

@@ -1,13 +1,14 @@
 import { VoiceAssistant } from "../src/voice/assistant.ts";
 import { Playback } from "../src/voice/audio.ts";
 import { Replies } from "../src/voice/replies.ts";
+import type { VoiceSession } from "../src/voice/session.ts";
 import type { VoiceSettings } from "../src/voice/settings.ts";
 import type { LiveEvent, OpenVoiceSocket, Wire } from "../src/voice/types.ts";
 import { VoiceUsage } from "../src/voice/usage.ts";
 import { flush, settings, temporaryVoice } from "./voice-fixture.ts";
 
 type Handlers = { open(): void; event(event: LiveEvent): void; closed(): void; error(): void };
-export const fixture = (patch: Partial<VoiceSettings> = {}) => {
+export const fixture = (patch: Partial<VoiceSettings> = {}, summarize?: (session: VoiceSession) => Promise<void>) => {
   const temp = temporaryVoice();
   const config = settings(patch);
   let now = 1000;
@@ -42,6 +43,7 @@ export const fixture = (patch: Partial<VoiceSettings> = {}) => {
     summarize: async (session) => {
       failedSummaries.push(session.failed);
       summaries++;
+      await summarize?.(session);
     },
   });
   const start = async () => {

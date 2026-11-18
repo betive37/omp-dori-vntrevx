@@ -75,10 +75,8 @@ export class VoiceAssistant {
           this.prerollBytes = 0;
         },
         finished: async (session) => {
-          if (this.current === session) {
-            this.current = undefined;
-            this.ports.playback.clear();
-          }
+          // Keep admission closed until provider accounting and Discord delivery have settled.
+          if (this.current === session) this.ports.playback.clear();
           if (session.failed) {
             this.halted = true;
             await this.ports.notify(
@@ -86,10 +84,8 @@ export class VoiceAssistant {
             );
           }
           await this.ports.summarize(session);
-          if (session.failed) {
-            this.halted = true;
-            this.current?.close("provider summary failure");
-          }
+          this.halted ||= session.failed;
+          if (this.current === session) this.current = undefined;
         },
       },
       greet,

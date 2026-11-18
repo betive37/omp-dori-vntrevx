@@ -192,7 +192,7 @@ export class VoiceSession {
       this.send({ type: "session.input_audio.append", audio: pcm.toString("base64") });
     if (this.state !== "live") return;
     if (this.backend.expired()) {
-      this.close("backend stalled");
+      this.close("provider backend stalled");
       return;
     }
     if (now - this.lastCommentaryAt >= 1000) {
@@ -200,7 +200,7 @@ export class VoiceSession {
       this.lastCommentaryAt = now;
     }
     const quiet = now - Math.max(this.lastOwnerAt, this.startedAt, this.lastOutputAt);
-    if (quiet > this.settings.idleCloseSec * 1000 && !this.backend.pending.size) this.close("idle");
+    if (quiet > this.settings.idleCloseSec * 1000 && !this.backend.blocksReply()) this.close("idle");
   }
 
   private timing() {

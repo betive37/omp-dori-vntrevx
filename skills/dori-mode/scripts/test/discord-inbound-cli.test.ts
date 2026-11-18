@@ -4,9 +4,14 @@ import { join } from "node:path";
 import { fileDiscordInboundStore } from "../src/messenger/discord-inbound-state.ts";
 import { withState } from "./fakes.ts";
 
-const inboundCli = async (args: string[], environment: Record<string, string> = {}) => {
+const inboundCli = async (
+  args: string[],
+  environment: Record<string, string> = {},
+  prepare: (stateDir: string) => void = () => {},
+) => {
   const state = withState();
   try {
+    prepare(state.dir);
     const config = join(state.dir, "config.json");
     writeFileSync(config, JSON.stringify({ stateDir: state.dir, runtime: "herdr", hooks: {} }));
     const child = Bun.spawn(
@@ -99,4 +104,39 @@ test("invalid owner, authentication, permission and content-intent setup never a
     expect(err.trim().split("\n")).toHaveLength(1);
     expect(err).not.toContain("invalid-token");
   }
+});
+
+test("--context ends each group with where it was posted and the purposes recorded there", async () => {
+  const purposes = (dir: string) =>
+    writeFileSync(
+      join(dir, "discord-channels.json"),
+      JSON.stringify({
+        "30": { purpose: "omp-dori development", name: "dev", updatedAt: "2026-11-17T00:00:00.000Z" },
+        "20": { purpose: "one task", updatedAt: "2026-11-17T00:00:00.000Z" },
+      }),
+    );
+  const message = 'INBOUND discord 20 101 from=owner ref=- "first owner text"';
+  const where = await inboundCli(["--loop", "0", "--context"], { DORI_TEST_DISCORD_CASE: "context" }, purposes);
+  expect({ code: where.code, err: where.err, cursor: where.cursor }).toEqual({ code: 0, err: "", cursor: "102" });
+  expect(where.out.trim().split("\n").slice(1)).toEqual([
+    message,
+    `INBOUND_CONTEXT discord 20 101 ${JSON.stringify({
+      channel: { id: "30", name: "dev", topic: "editable topic", purpose: "omp-dori development" },
+      thread: { id: "20", name: "task thread", purpose: "one task" },
+    })}`,
+  ]);
+  // A failed lookup still delivers the message and commits it; the record says what is known, without the body.
+  const denied = await inboundCli(["--loop", "0", "--context"], { DORI_TEST_DISCORD_CASE: "context-denied" }, purposes);
+  expect({ code: denied.code, cursor: denied.cursor }).toEqual({ code: 0, cursor: "102" });
+  expect(denied.out.trim().split("\n").slice(1)).toEqual([
+    message,
+    `INBOUND_CONTEXT discord 20 101 ${JSON.stringify({
+      channel: { id: "20", purpose: "one task" },
+      thread: null,
+      error: "channel lookup failed (HTTP 403)",
+    })}`,
+  ]);
+  // Without --context nothing is looked up and the output is unchanged, even where lookups would fail.
+  const plain = await inboundCli(["--loop", "0"], { DORI_TEST_DISCORD_CASE: "context-denied" }, purposes);
+  expect(plain.out.trim().split("\n").slice(1)).toEqual([message]);
 });

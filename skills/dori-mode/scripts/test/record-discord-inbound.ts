@@ -44,6 +44,12 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
       .filter((item) => before === null || BigInt(item.id) < BigInt(before))
       .sort((a, b) => (BigInt(a.id) > BigInt(b.id) ? -1 : 1))
       .slice(0, limit);
+  } else if (url.pathname === "/api/v10/channels/20" && scenario === "context") {
+    body = { id: "20", type: 11, name: "task thread", parent_id: "30" };
+  } else if (url.pathname === "/api/v10/channels/30" && scenario === "context") {
+    body = { id: "30", type: 0, name: "dev", topic: "editable topic" };
+  } else if (url.pathname === "/api/v10/channels/20" && scenario === "context-denied") {
+    return new Response('{"diagnostic":"private channel body"}', { status: 403 });
   } else throw new Error("unexpected Discord REST endpoint in test");
   return new Response(JSON.stringify(body), { status: 200 });
 }) as typeof fetch;

@@ -59,6 +59,7 @@ export type DoriConfig = {
   /** Expected Git author and committer per lowercase `owner/repo`, for `verify-pr` and the lane footer. */
   readonly repoIdentities: Readonly<Record<string, CommitIdentity>>;
   readonly supervision: SupervisionOptions;
+  readonly prAutoTrack: boolean; // opt-in: claim and checkpoint PR links are tracked for `dori pr watch`
 };
 
 export const defaultConfig = (home = homedir()): DoriConfig => ({
@@ -89,6 +90,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
     staleAfterMinutes: 20,
     defaults: { wallMinutes: null, tokens: null, costUsd: null },
   },
+  prAutoTrack: false,
 });
 
 export const configPath = (): string => process.env["DORI_CONFIG"] ?? join(homedir(), ".dori", "config.json");
@@ -145,12 +147,11 @@ const SUPERVISION_KEYS = new Set([
 ]);
 const CEILINGS = new Set(["wallMinutes", "tokens", "costUsd"]);
 const checkCeilingNames = (where: string, budget: Record<string, unknown>): void => {
-  for (const name of Object.keys(budget)) {
+  for (const name of Object.keys(budget))
     if (!CEILINGS.has(name))
       throw new ConfigError(
         `invalid supervision ${where}.${name}: unknown ceiling (expected wallMinutes, tokens or costUsd)`,
       );
-  }
 };
 
 // A malformed supervision entry stops with its name: dropping it could turn a ceiling off, and keeping it would crash
@@ -158,13 +159,11 @@ const checkCeilingNames = (where: string, budget: Record<string, unknown>): void
 const checkSupervision = (value: unknown): void => {
   if (value === undefined) return;
   if (!isRecord(value)) throw new ConfigError("invalid supervision: expected an object");
-  for (const name of Object.keys(value)) {
+  for (const name of Object.keys(value))
     if (!SUPERVISION_KEYS.has(name)) throw new ConfigError(`invalid supervision ${name}: unknown setting`);
-  }
-  for (const name of ["defaults", "lanes"] as const) {
+  for (const name of ["defaults", "lanes"] as const)
     if (value[name] !== undefined && !isRecord(value[name]))
       throw new ConfigError(`invalid supervision ${name}: expected an object`);
-  }
   if (isRecord(value["defaults"])) checkCeilingNames("defaults", value["defaults"]);
   for (const [key, budget] of Object.entries(isRecord(value["lanes"]) ? value["lanes"] : {})) {
     if (!isRecord(budget)) throw new ConfigError(`invalid supervision lanes.${key}: expected an object`);
@@ -192,6 +191,8 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const raw = (await file.exists()) ? ((await file.json()) as Partial<DoriConfig>) : {};
   checkRuntime(raw.runtime);
   checkSupervision(raw.supervision);
+  if (raw.prAutoTrack !== undefined && typeof raw.prAutoTrack !== "boolean")
+    throw new ConfigError("invalid prAutoTrack: expected true or false");
   const merged: DoriConfig = {
     ...base,
     ...raw,

@@ -55,39 +55,6 @@ bun install --frozen-lockfile
 (cd extension && bun install --frozen-lockfile)
 (cd test/fixtures/omp-native-host && bun install --frozen-lockfile)
 export DORI_TEST_OMP_ROOT="$PWD/test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent"
-bun run ci
-```
-
-`bun run ci` is the same chain CI runs:
-
-- `check` — Biome lint and format.
-- `typecheck` — `tsc --noEmit` for the harness, skill scripts and extension, run concurrently.
-- `knip` — no unused files, exports or dependencies.
-- `lint:loc` — the TypeScript file-length gate, with a 250-line limit per capped file.
-- `test:ci` — the harness suite in two isolated Bun worker processes.
-- `test:skill` — the skill's script suite.
-- `test:extension` — the OMP extension suite.
-
-`bun run test` remains the sequential harness command for debugging. Linux CI uses `test:ci` with two isolated Bun file workers; the macOS 15 ARM job runs `bun test --parallel=3 --timings=.bun-test-timings.json ./test/` with three. These use native `--parallel` file workers, not `--concurrent`: tests within each file remain sequential, and each file has an isolated global/module registry. The explicit worker limits avoid scaling subprocess-heavy tests to every available CPU. Test discovery, timeouts and the four required CI job names are unchanged. A same-run macOS ABBA comparison (2, 3, 3, 2 workers) observed identical results and lower root-suite time with three workers; two samples per setting are not a guarantee against timing flakes.
-
-`.bun-test-timings.json` holds measured per-file durations used as scheduling hints. They are intended to start slower files earlier and reduce worker imbalance; their effect on idle time and suite runtime has not been measured. A file missing from the manifest is still run; it only loses its ordering hint, so the file is a performance hint, never a coverage gate. Regenerate it whenever the suite's shape changes enough to matter:
-
-```sh
-bun test --parallel=1 --timings=.bun-test-timings.json --update-timings ./test/
-```
-
-The Linux herdr E2E installer uses the pinned REST release asset and verifies its SHA256 before atomically replacing the binary. Each download attempt is capped at 60 seconds (plus a 5-second termination grace); at most three attempts run, with 20/40-second backoff. A checksum failure fails immediately. The hc job requires its E2E file to exist; a missing file is an error, not a successful skip. These controls keep all four release gates mandatory and do not change macOS coverage or queue capacity.
-
-The unit suites need `bun` and `git` and use recorded stand-ins for `herdr` and `gh`. `test/e2e.test.ts` starts a real `herdr` server and is skipped when `herdr` is not on `PATH`.
-
-The extension's `with the real omp-ulw` group executes the bound `ref/omp-ulw/index.ts` fixture and retains its existing absent-fixture skip. When it is present, the native guard requires the isolated OMP 18.20.0 host and exact explicit-override compatibility entry; a missing host fails. Prepare the same default overlay and separate legacy override as the Linux/macOS CI jobs:
-
-The extension declares OMP 18.20.0 as a host peer. Its embedded loader import is typed against the genuine
-published declarations in the native fixture; a raw source checkout without `dist/types` is not a substitute
-for that consumer typecheck. Runtime composition uses the selected host's canonical extension loader and
-native settings scope.
-
-```sh
 fixture_home="$(mktemp -d)"
 bun scripts/source-dependencies.ts ulw "$PWD" "$fixture_home" "$PWD/ref/omp-ulw"
 compat_pin=cbfe5ee72e5b2783af01616e7f4d3da5e3f9180d
@@ -97,10 +64,43 @@ git -C "$compat" fetch --quiet --no-tags https://github.com/dbc-hbin/omp-ulw.git
 git -C "$compat" -c advice.detachedHead=false checkout --quiet "$compat_pin"
 test "$(git -C "$compat" rev-parse HEAD)" = "$compat_pin"
 export DORI_TEST_COMPAT_ULW_ENTRY="$compat/index.ts"
-(cd test/fixtures/omp-native-host && bun install --frozen-lockfile)
-export DORI_TEST_OMP_ROOT="$PWD/test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent"
-bun run test:extension
+bun run ci
 ```
+
+`bun run ci` is the same chain CI runs:
+
+- `check:fixtures` — fail fast when the real ULW, compatibility entry or exact native host is missing.
+  This checks prerequisites; it does not replace the unchanged native behavior tests.
+- `check` — Biome lint and format.
+- `typecheck` — `tsc --noEmit` for the harness, skill scripts and extension, run concurrently.
+- `knip` — no unused files, exports or dependencies.
+- `lint:loc` — the TypeScript file-length gate, with a 250-line limit per capped file.
+- `test:ci` — the harness suite in two isolated Bun worker processes.
+- `test:skill` — the skill's script suite.
+- `test:extension` — the OMP extension suite.
+
+`bun run test` remains the sequential harness command for debugging. Linux CI uses `test:ci` with two isolated Bun file workers. These are native `--parallel` file workers, not `--concurrent`: tests within each file remain sequential, and each file has an isolated global/module registry. The explicit worker limit avoids scaling subprocess-heavy tests to every available CPU. Linux test discovery and timeouts are unchanged. Automatic CI runs the Linux `check`, `e2e-herdr` and `e2e-hc` jobs; it no longer runs a macOS job. Existing macOS tests and the consumer verification scripts remain available for manual QA.
+
+`.bun-test-timings.json` holds measured per-file durations used as scheduling hints. They are intended to start slower files earlier and reduce worker imbalance; their effect on idle time and suite runtime has not been measured. A file missing from the manifest is still run; it only loses its ordering hint, so the file is a performance hint, never a coverage gate. Regenerate it whenever the suite's shape changes enough to matter:
+
+```sh
+bun test --parallel=1 --timings=.bun-test-timings.json --update-timings ./test/
+```
+
+The Linux herdr E2E installer uses the pinned REST release asset and verifies its SHA256 before atomically replacing the binary. Each download attempt is capped at 60 seconds (plus a 5-second termination grace); at most three attempts run, with 20/40-second backoff. A checksum failure fails immediately. The hc job requires its E2E file to exist; a missing file is an error, not a successful skip. All three remaining release gates are mandatory.
+
+The unit suites need `bun` and `git` and use recorded stand-ins for `herdr` and `gh`. The root and extension suites also need the installed pinned native-host fixture prepared above. `test/e2e.test.ts` starts a real `herdr` server and is skipped when `herdr` is not on `PATH`.
+
+The extension's `with the real omp-ulw` group executes the bound `ref/omp-ulw/index.ts` fixture. Targeted extension runs retain the existing absent-fixture skip, but the full `ci` gate rejects missing prerequisites before running tests. Prepare the default overlay and separate legacy override using the full-gate recipe above.
+
+The extension declares OMP 18.20.0 as a host peer. Its embedded loader import is typed against the genuine
+published declarations in the native fixture; a raw source checkout without `dist/types` is not a substitute
+for that consumer typecheck. Runtime composition uses the selected host's canonical extension loader and
+native settings scope.
+
+After that setup, use `bun run test:extension` for a focused extension run. The same native-host
+validator is used by the prerequisite check and prompt-composition tests; a same-version foreign
+host cannot substitute for the imported fixture.
 
 Fixture preparation needs network access unless the exact packages are already available. Confirm that the real-fixture tests ran without being skipped: role gating and native Sol composition must execute. The guard invokes the real OMP `loadExtensionFromFactory` and `ExtensionRunner.emitBeforeAgentStart`, asserting on the combined result, not FakePI's per-handler returns. It covers an imported dependency and both standalone extension orders, retains one model preset, one bookkeeping block and downstream context, replaces the host role, leaves the base untouched and stays stable across repeated turns. A final declining handler must preserve the earlier winner; excluded roles, models and subagents leave the prompt they receive unchanged. A fail-on-access model registry and forbidden action callbacks prevent auth, provider and unrelated work. The private fixture package and its lock are test-only: root/consumer dependencies, model defaults and installer pins are unchanged. These checks do not establish live TUI, messenger or provider behavior; no performance gain is claimed.
 
@@ -110,13 +110,54 @@ The required-source regression also runs genuine SDK sessions through the shared
 
 The compatibility checkout stays outside the repository (`RUNNER_TEMP` in CI) and selects no production dependency. Its exact `cbfe5ee72e5b2783af01616e7f4d3da5e3f9180d` factory runs alone on the genuine 18.20.0 host to establish the legacy prompt as opaque baseline data. Dori's explicit embedded import must preserve that baseline plus one Sol lane-main bookkeeping block, with unchanged base and stable repeat turns. Dori, ordinary, non-Sol and subagent prompts retain the applicable legacy behavior and role gate; no current model-preset marker or standalone legacy mode is assumed. The current default instead uses 33b375dc plus its bound overlay. This guard does not mutate global model/auth settings or external dependencies, and never authorizes a stock/version-only cache as a source-bundle substitute.
 
-## A pull request
+## Ready for review
 
-- One concern per pull request, with a title that says what changed and a body that says why.
-- Evidence, not adjectives: the command you ran and what it printed, or the file and line you read. A claim you did not verify is written as unverified.
-- Tests where behaviour changed; a test that cannot fail is not a test.
+Use the [PR template](.github/pull_request_template.md). Mark a PR ready for review only when the
+applicable local requirements below are met; otherwise keep it draft/not ready. Explain any item
+marked not applicable. A normal PR can have required remote CI pending, but it is not merge-ready
+until all three required jobs pass on the reviewed head and actual combined target content.
+Docs-only changes need accurate content and links, not artificial runtime or word-count tests;
+the existing required CI jobs still apply.
+
+- Keep one concern per PR, with a title saying what changed and a body explaining why. Link related
+  PRs and list unmerged dependencies explicitly (or say none). Record the final source/head SHA and
+  target branch/base SHA, and identify the revisions each evidence run covers.
+- Describe the state/config the change owns, defaults before and after, and compatibility with
+  earlier accepted behavior. Preserve existing isolation fences and regressions, including the
+  bound-source and native contracts above; passing the newest scenario must not undo an earlier fix.
+- For bugs, record a reproduction that fails before the fix and passes after it. Add regressions
+  for the relevant boundaries and failure paths; a test that cannot fail is not a test.
+- Report actual commands and results, including failures and skips, with environment/capability
+  limits and reasons for unrun checks. Label unverified claims. Keep carried-forward and partial-run
+  results separate; never present their combined counts as a fresh full rerun.
+- Rerun affected checks after new code. Once final content is stable, complete one full local
+  `bun run ci` using the [existing setup](#run-the-gates). The [CI workflow](.github/workflows/ci.yml)
+  separately runs `check`, `e2e-herdr` and `e2e-hc` on the PR head. Partial reruns
+  replace neither the final full local run nor the three required remote jobs.
+- When CLI, native or runtime behavior changes, exercise that actual surface with isolated state
+  and record the runtime/host identity. Identify any mocks or fixtures used and state which live
+  capabilities were not exercised.
+- Performance claims need pinned baseline/candidate results for the same workload and environment,
+  including correctness and relevant time/memory measurements. State measurement limits; an
+  optimization title or promised speedup is not evidence.
+- Do not weaken assertions, tests, skips or timeouts to get a pass. Keep credentials, private
+  transcripts, account data and private config out of patches, fixtures and evidence.
 - Public surfaces — issues, pull requests, commits, review comments — are English.
 - Do not edit another person's work to make your change pass; report it instead.
+
+## Integrate without repeating work
+
+- Freeze a bounded batch and declare dependencies before validation. New arrivals belong to the
+  next batch; do not silently grow the active goal to include every open PR.
+- Start with two active candidates, not an unbounded pool. Keep one integration owner; serialize
+  shared-file edits and actual merges. Adjust concurrency only from resource and timing evidence.
+- Resolve contracts and earlier regressions before expensive gates. Use focused checks while
+  fixing, then freeze final content for the full gate and fresh review.
+- While one frozen candidate waits for read-only review or remote CI, prepare the next in an
+  independent worktree. Reuse evidence only for unchanged content, dependencies and test environment.
+- Merge the reviewed head only after required checks pass for the actual combined target content.
+  A moving target branch needs a new integration check; commit metadata alone does not justify
+  repeating identical local checks or bypassing required remote checks.
 
 ## Licences and notices
 

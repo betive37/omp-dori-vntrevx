@@ -59,6 +59,13 @@ export class Backend {
   }
 
   async event(event: BackendEvent, delegationId?: string | null): Promise<void> {
+    const item = event.item;
+    // Provider work is billable even after close/cap or when its delegation cannot be resolved.
+    if (event.type === "response.output_item.done" && item?.type === "web_search_call" && !this.searches.has(item.id)) {
+      this.searches.add(item.id);
+      this.ports.search();
+      this.ports.action({ tool: "web_search", ok: item.status === "completed", result: "Search completed" });
+    }
     const d = this.resolve(event, delegationId);
     if (!d) return;
     const id = event.response?.id ?? d.activeResponseId;
@@ -88,7 +95,6 @@ export class Backend {
       r.firstTextAt ??= now;
       r.text += event.delta ?? "";
     }
-    const item = event.item;
     if (
       (event.type === "response.output_item.added" || event.type === "response.output_item.done") &&
       item?.type === "function_call"
@@ -106,11 +112,6 @@ export class Backend {
         .filter((part) => part.type === "output_text")
         .map((part) => part.text ?? "")
         .join("");
-    if (event.type === "response.output_item.done" && item?.type === "web_search_call" && !this.searches.has(item.id)) {
-      this.searches.add(item.id);
-      this.ports.search();
-      this.ports.action({ tool: "web_search", ok: item.status === "completed", result: "Search completed" });
-    }
     if (!terminal) return;
     r.terminal = event.type.slice("response.".length);
     r.terminalAt = now;

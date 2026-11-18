@@ -10,7 +10,7 @@ export const liveWorld = async (
   history: TestDiscordMessage[],
   options: DiscordInboundOptions,
   cursors: Record<string, string> = {},
-  onEmit?: () => void,
+  onEmit?: () => unknown,
 ) => {
   const rest = discordRestWorld(history);
   const stores = new Map<string, ReturnType<typeof memoryDiscordCursor>>();
@@ -35,9 +35,14 @@ export const liveWorld = async (
     "unit-private-token",
     timers.clock,
     (message) => {
-      onEmit?.();
-      received.push(`${message.channel}:${message.message}`);
-      lines.push(formatDiscordInbound(message));
+      const record = () => {
+        received.push(`${message.channel}:${message.message}`);
+        lines.push(formatDiscordInbound(message));
+      };
+      // An emitter that returns a promise (the --context path) records only once it resolves.
+      const pending = onEmit?.();
+      if (pending instanceof Promise) return pending.then(record);
+      record();
     },
     (line) => logs.push(line),
   );

@@ -33,7 +33,7 @@
     },
     "test/fixtures/omp-native-host": {
       "entry": ["compose.ts"],
-      "project": ["compose.ts"]
+      "project": ["compose.ts", "host.ts"]
     }
   },
   "ignoreExportsUsedInFile": true

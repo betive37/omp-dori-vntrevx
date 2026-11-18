@@ -6,6 +6,7 @@ import {
   mkdirSync,
   openSync,
   readFileSync,
+  readSync,
   readlinkSync,
   renameSync,
   rmdirSync,
@@ -92,6 +93,22 @@ export function regularFile(path: string): boolean {
   if (!stat.isFile() || stat.isSymbolicLink()) throw new Error(`Expected a real file: ${path}`);
   owned(path);
   return true;
+}
+
+/** Hash every byte through one descriptor without allocating a whole-file Buffer. */
+export function fileDigest(path: string): string {
+  const fd = openSync(path, "r");
+  try {
+    const hash = createHash("sha256");
+    const buffer = Buffer.allocUnsafe(1024 * 1024);
+    for (;;) {
+      const count = readSync(fd, buffer, 0, buffer.length, null);
+      if (count === 0) return hash.digest("hex");
+      hash.update(buffer.subarray(0, count));
+    }
+  } finally {
+    closeSync(fd);
+  }
 }
 
 export function readJson(path: string): unknown {
