@@ -10,6 +10,7 @@
         "scripts/bench-discord-intake.ts",
         "src/update/deployment-launcher.ts",
         "src/release/automatic.ts",
+        "src/release/references.ts",
         "skills/dori-mode/scripts/src/cli.ts",
         "src/update/reviewer-guard.ts",
         "src/update/worker-guard.ts",
@@ -35,7 +36,7 @@
     },
     "test/fixtures/omp-native-host": {
       "entry": ["compose.ts"],
-      "project": ["compose.ts"]
+      "project": ["compose.ts", "host.ts"]
     }
   },
   "ignoreExportsUsedInFile": true

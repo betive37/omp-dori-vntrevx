@@ -9,6 +9,7 @@ import {
   writeFileSync,
 } from "node:fs";
 import { dirname, join, relative } from "node:path";
+import { pathToFileURL } from "node:url";
 import { freezeSource } from "../update/source.ts";
 import { extractArchive } from "./archive.ts";
 import { setAutomaticEnabled } from "./automatic-state.ts";
@@ -28,7 +29,7 @@ import { assertNoConsumerLaunches, waitLaunchGate } from "./launch-leases.ts";
 import { validateReleaseManifest } from "./manifest.ts";
 import { provisionNativeSource } from "./native.ts";
 import { assertLock, provisionDependency } from "./provision.ts";
-import { installIsolatedReferences, preflightReferences } from "./references.ts";
+import { preflightReferences } from "./references.ts";
 import {
   activateRelease,
   assertInstalledPointer,
@@ -91,7 +92,19 @@ async function installReferences(
         ];
       writeFileSync(paths.config, `${JSON.stringify(example, null, 2)}\n`, { flag: "wx", mode: 0o600 });
     }
-    installIsolatedReferences(paths, source);
+    if (paths.dori !== join(paths.home, ".dori")) {
+      // Wrappers are release behavior too. Using this updater's renderer would retain newer bytes on rollback.
+      const renderer = "src/release/references.ts";
+      if (!manifest.source.files.some((file) => file.path === renderer))
+        throw new Error("Selected release has no authenticated consumer reference renderer");
+      if (verifyRelease(paths, manifest) !== source || !regularFile(join(source, renderer)))
+        throw new Error("Selected consumer reference renderer is unavailable");
+      const target = await import(pathToFileURL(join(source, renderer)).href);
+      if (typeof target.installIsolatedReferences !== "function")
+        throw new Error("Selected consumer reference renderer has no installer");
+      await target.installIsolatedReferences(paths, source);
+      preflightReferences(paths);
+    }
     for (const [path, target] of paths.links) {
       realDirectory(dirname(path), true);
       owned(dirname(path));

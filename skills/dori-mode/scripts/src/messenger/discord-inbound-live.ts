@@ -1,5 +1,5 @@
 import { discordGateway, type GatewayClock, type GatewaySocket } from "./discord-gateway.ts";
-import { type DiscordInbound, isTransient, type Message } from "./discord-inbound-api.ts";
+import { type Emit, isTransient, type Message } from "./discord-inbound-api.ts";
 import type { DiscordInboundQueue } from "./discord-inbound-queue.ts";
 
 const GUILD_MESSAGES = 1 << 9;
@@ -8,8 +8,8 @@ const MESSAGE_CONTENT = 1 << 15; // Privileged: enable it for the bot in the Dev
 
 type Intake = {
   accepts(message: Message): boolean;
-  sync(emit: (message: DiscordInbound) => void): Promise<void>;
-  accept(message: Message, emit: (message: DiscordInbound) => void): void;
+  sync(emit: Emit): Promise<void>;
+  accept(message: Message, emit: Emit): void | Promise<void>;
 };
 
 /**
@@ -22,7 +22,7 @@ export const discordInboundLive = (
   open: (url: string) => GatewaySocket,
   token: string,
   clock: GatewayClock,
-  emit: (message: DiscordInbound) => void,
+  emit: Emit,
   report: (line: string) => void,
   queue: DiscordInboundQueue,
 ) => {

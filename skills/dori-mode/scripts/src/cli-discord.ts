@@ -1,8 +1,10 @@
 /** The Discord Gateway plumbing shared by `dori presence discord` and `dori inbound discord --gateway`. */
 import { die, every } from "./cli-context.ts";
 import { Discord } from "./messenger/discord.ts";
+import { DiscordChannels, inboundContext } from "./messenger/discord-channels.ts";
 import type { GatewayClock, GatewaySocket } from "./messenger/discord-gateway.ts";
-import { discordInbound, formatDiscordInbound } from "./messenger/discord-inbound.ts";
+import { discordInbound, formatDiscordInbound, formatInboundContext } from "./messenger/discord-inbound.ts";
+import type { Emit } from "./messenger/discord-inbound-api.ts";
 import { discordInboundLive } from "./messenger/discord-inbound-live.ts";
 import { discordInboundQueue } from "./messenger/discord-inbound-queue.ts";
 import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
@@ -47,8 +49,16 @@ const idList = (value: string | undefined): string[] =>
     .map((id) => id.trim())
     .filter((id) => id !== "");
 
-/** Channels come from DORI_DISCORD_CHANNEL_ID, DORI_DISCORD_CHANNEL_IDS (comma separated) and DORI_DISCORD_SCOPE=all. */
-export const discordInboundCommand = async (stateDir: string, gateway: boolean, pollMinutes: number) => {
+/**
+ * Channels come from DORI_DISCORD_CHANNEL_ID, DORI_DISCORD_CHANNEL_IDS (comma separated) and DORI_DISCORD_SCOPE=all.
+ * `context` adds an INBOUND_CONTEXT record (channel, thread, topic, recorded purposes) to each message's group.
+ */
+export const discordInboundCommand = async (
+  stateDir: string,
+  gateway: boolean,
+  pollMinutes: number,
+  context = false,
+) => {
   const env = process.env;
   const ownerId = discordInboundEnv("DORI_DISCORD_OWNER_ID", env["DORI_DISCORD_OWNER_ID"]);
   const scope = env["DORI_DISCORD_SCOPE"]?.trim();
@@ -63,13 +73,22 @@ export const discordInboundCommand = async (stateDir: string, gateway: boolean, 
   try {
     if (!gateway && queue.first())
       die("Discord inbound has pending Gateway work; restart with --gateway before REST mode");
-    const intake = await discordInbound(new Discord(fetchHttp, realClock, token), queue.storeFor, {
+    const discord = new Discord(fetchHttp, realClock, token);
+    const intake = await discordInbound(discord, queue.storeFor, {
       ownerId,
       channelIds: [...new Set(channelIds)],
       all,
     });
     const watching = all ? "all" : intake.channels().join(",");
-    const emit = (message: Parameters<typeof formatDiscordInbound>[0]) => console.log(formatDiscordInbound(message));
+    const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
+    // The whole group, context included, is one write before the cursor moves past the message.
+    const emit: Emit = where
+      ? async (message) => {
+          const context = await where(message.channel);
+          console.log(`${formatDiscordInbound(message)}
+${formatInboundContext(message, context)}`);
+        }
+      : (message) => console.log(formatDiscordInbound(message));
     console.log(
       `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
     );
