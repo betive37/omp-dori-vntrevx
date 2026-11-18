@@ -94,7 +94,11 @@ export const opsCommands: Readonly<Record<string, Command>> = {
     const result = await doctorCheck(deps, repo);
     if (values["json"]) console.log(JSON.stringify(result));
     else {
-      for (const finding of result.findings) console.log(`${finding.severity} ${finding.check}: ${finding.detail}`);
+      for (const finding of result.findings) {
+        console.log(`${finding.severity} ${finding.check}: ${finding.detail}`);
+        if (finding.provenance) console.log(`  source: ${finding.provenance}`);
+        if (finding.next) console.log(`  next: ${finding.next}`);
+      }
       console.log(
         `DOCTOR warn=${result.warnings} ignored=${result.ignored.join(",") || "none"} read-only; nothing changed`,
       );

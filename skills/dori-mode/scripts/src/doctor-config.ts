@@ -1,5 +1,8 @@
 const checks = [
   "runtime",
+  "source",
+  "model",
+  "credentials",
   "registry",
   "monitors",
   "monitor-filter",
