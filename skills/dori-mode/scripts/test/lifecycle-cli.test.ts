@@ -46,6 +46,10 @@ test("real CLI requires explicit park and abandon reasons before effects", async
   const park = await cli("park", f.lane.key);
   expect(park.code).toBe(1);
   expect(park.err).toContain("--note is required");
+  const emptyNote = await cli("park", f.lane.key, "--note", "", "--resume-when", "review complete");
+  expect(emptyNote.code).toBe(1);
+  expect(emptyNote.err).toContain("--note is required");
+  expect(emptyNote.out).not.toContain("dori <command>");
   const abandon = await cli("close", f.lane.key, "--abandon");
   expect(abandon.code).toBe(1);
   expect(abandon.err).toContain("requires --reason");
