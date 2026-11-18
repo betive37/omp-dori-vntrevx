@@ -1,12 +1,13 @@
 import { existsSync } from "node:fs";
 
-import { type DoriConfig, fill } from "./config.ts";
+import type { DoriConfig } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import { type Lane, type Registry, sessionOf, statusOf, withStatus } from "./registry.ts";
 import { type ChosenRuntimes, type Clock, iso, type Runner, runtimesOf } from "./run.ts";
 import { closeSession, sendVerified } from "./sessions.ts";
 import { checkDone, type SignalIo } from "./signals.ts";
 import { Supervision } from "./supervision.ts";
+import { commitThreadClose, finishThread } from "./thread-groups.ts";
 import { Lessons, type LessonInput } from "./lessons.ts";
 
 export type FlowDeps = {
@@ -149,13 +150,14 @@ export const closeLane = async (
   // The close is committed before anything irreversible, and only if nothing moved the lane on since it was read: an
   // objection or new claim written meanwhile keeps it open, and one written after this finds it closed.
   const at = iso(deps.clock);
-  const commit = () =>
-    deps.registry.transition(lane, (current) => withStatus(current, "closed", note, at, { closedAt: at }));
+  const commit = () => commitThreadClose(deps, lane, note, at);
   // A tell is sent before the close or refused after it (`locked`: the watch holds the lock); a held lock refuses.
   const held = locked ? { ok: true as const, value: await commit() } : await withDeliveryLock(deps, lane.key, commit);
   if (!held.ok)
     return { closed: false, lines: [...lines, `HELD ${lane.key} a message to the lane is in flight (${held.holder})`] };
-  if (!held.value) return { closed: false, lines: [...lines, await movedOn(deps, lane, "close")] };
+  if (held.value.held)
+    return { closed: false, lines: [...lines, `HELD ${lane.key} thread close in flight (${held.value.held})`] };
+  if (!held.value.closed) return { closed: false, lines: [...lines, await movedOn(deps, lane, "close")] };
   // Cost is recorded on a best-effort basis: a failing hook is printed and never keeps a verified lane open.
   try {
     const cost = await new Supervision({ ...deps, stateDir: deps.config.stateDir }, deps.config.supervision).close(
@@ -165,12 +167,7 @@ export const closeLane = async (
   } catch (error) {
     lines.push(`COST ${lane.key} not recorded: ${error instanceof Error ? error.message : String(error)}`);
   }
-  const cleanup: string[] = [];
-  const hook = deps.config.hooks.threadDone;
-  if (hook && lane.thread !== "none") {
-    const r = await deps.run(fill(hook, { thread: lane.thread, text: note, key: lane.key }));
-    cleanup.push(r.code === 0 ? "thread marked done" : `thread hook failed: ${r.err.slice(0, 160)}`);
-  }
+  const cleanup = await finishThread(deps, lane, note, held.value.remaining);
   const ref = sessionOf(lane);
   if (ref) cleanup.push(await closeSession(deps, ref));
   const root = lane.cwd ?? deps.config.defaultCwd;
@@ -207,7 +204,9 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
     );
     if (!verified) return movedOn(deps, lane, "verification");
     const result = await closeLane(deps, verified, `Done: ${evidence}`, undefined, true);
-    if (!result.closed)
+    if (!result.closed) {
+      const wait = result.lines.find((line) => line.startsWith("HELD "));
+      if (wait) return `LANE_${wait}; retried next tick`;
       return (
         result.lines.find((l) => l.startsWith("LANE_CHANGED")) ??
         objectDone(
@@ -216,6 +215,7 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
           result.lines.filter((l) => l.startsWith("SIGNAL NOT")),
         )
       );
+    }
     return `LANE_CLOSED ${lane.key} ${result.lines.at(-1)?.split(" ").slice(2).join(" ") ?? ""}`;
   });
   return held.ok
@@ -226,7 +226,7 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
 export const watchTick = async (deps: FlowDeps): Promise<string[]> => {
   const out: string[] = [];
   for (const listed of await deps.registry.list()) {
-    if (statusOf(listed) !== "done-claimed" || !listed.claim) continue;
+    if (!["done-claimed", "verified-done"].includes(statusOf(listed)) || !listed.claim) continue;
     let lane = listed;
     const claim = listed.claim;
     if (!claim.emitted) {

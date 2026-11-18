@@ -102,7 +102,12 @@ const worklog: Command = async ({ key, positionals, values, need, config }) => {
     case "add":
       console.log(
         JSON.stringify(
-          worklog.add(positionals.slice(1).join(" ").trim() || die("worklog add needs a title"), need("source"), now),
+          worklog.add(
+            positionals.slice(1).join(" ").trim() || die("worklog add needs a title"),
+            need("source"),
+            now,
+            values["thread"] === undefined ? undefined : need("thread"),
+          ),
         ),
       );
       break;

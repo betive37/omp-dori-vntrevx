@@ -43,7 +43,6 @@ export type DoriConfig = {
   /** How long `launch` waits for the agent's ready status and goal after it starts; a slow host is a host property. */
   readonly startupWaitSeconds: number;
   readonly sessionsDir: string;
-  /** omp-ulw's index.ts, loaded only for Dori and lane sessions by the OMP extension. */
   readonly ompUlwPath: string;
   readonly nudgeAfterMin: number;
   readonly postAfterMin: number;
@@ -53,6 +52,7 @@ export type DoriConfig = {
   readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly hooks: Hooks;
+  readonly threadDonePolicy?: "every-lane" | "last-lane";
   /** Expected Git author and committer per lowercase `owner/repo`, for `verify-pr` and the lane footer. */
   readonly repoIdentities: Readonly<Record<string, CommitIdentity>>;
   readonly supervision: SupervisionOptions;
@@ -107,7 +107,6 @@ const isIdentity = (value: unknown): value is CommitIdentity => {
   );
 };
 
-// The file is untrusted JSON: keep only well-formed identities, so a bad entry reads as an unconfigured repo.
 const repoIdentities = (value: unknown): Record<string, CommitIdentity> =>
   typeof value !== "object" || value === null || Array.isArray(value)
     ? {}
@@ -152,8 +151,7 @@ const checkCeilingNames = (where: string, budget: Record<string, unknown>): void
   }
 };
 
-// A malformed supervision entry stops with its name: dropping it could turn a ceiling off, and keeping it would crash
-// every sweep later. A misspelt name is refused for the same reason.
+// Refuse malformed supervision settings rather than silently disabling a ceiling.
 const checkSupervision = (value: unknown): void => {
   if (value === undefined) return;
   if (!isRecord(value)) throw new ConfigError("invalid supervision: expected an object");
@@ -191,6 +189,8 @@ export const loadConfig = async (path = configPath(), home = homedir()): Promise
   const raw = (await file.exists()) ? ((await file.json()) as Partial<DoriConfig>) : {};
   checkRuntime(raw.runtime);
   checkSupervision(raw.supervision);
+  if (raw.threadDonePolicy !== undefined && !["every-lane", "last-lane"].includes(raw.threadDonePolicy))
+    throw new ConfigError("invalid threadDonePolicy: expected every-lane or last-lane");
   if (raw.prAutoTrack !== undefined && typeof raw.prAutoTrack !== "boolean")
     throw new ConfigError("invalid prAutoTrack: expected true or false");
   const merged: DoriConfig = {

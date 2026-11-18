@@ -13,6 +13,7 @@ const USAGE = `dori <command> [options]
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
          [--wall-minutes N|none] [--token-limit N|none] [--cost-limit N|none] [--activity-path FILE ...] [--dry-run]
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF]
+  lanes [--thread REF] [--open]        list registered lane identities and completion states, optionally for one exact thread
   sync   [--write]                     registry vs live panes; read-only unless --write
   boot                                 read-only check after a restart: Slack auth, vanished panes, journals, open worklog items and decisions, stale watches
   report <key> --kind milestone|blocker|question|halted|done --text TEXT
@@ -32,7 +33,8 @@ const USAGE = `dori <command> [options]
                                        the lead's lesson for every lane, whatever its repo
   lesson list [--cwd DIR]             show current lessons (global ones included), newest first
   lesson mark <id> --outcome pending|helped|no-effect|harmful|encoded
-  worklog add <title> --source REF     record an owner request when it arrives
+  worklog add <title> --source REF [--thread REF]
+                                       record an owner request when it arrives
   worklog next|note <id> <text>        set the item's next step, or add a note (a decision, an owner)
   worklog close <id> --result TEXT     close the item with what came of it
   worklog list [--open]                items as JSON; <stateDir>/worklog.md holds the same for reading
@@ -65,6 +67,8 @@ const USAGE = `dori <command> [options]
                                        --message opens the thread on that message of a text channel
   thread discord set <thread> [--title T] [--tag NAME]... [--archive|--unarchive]
                                        open a forum post or text-channel thread; rename, replace tags, archive or reopen
+  thread discord status <thread> done|working
+                                       lead-only: change just the done prefix of the current title; never archive
   react discord --to CHANNEL [--thread ID] --message ID [--emoji E] [--remove]
                                        add or remove the bot's own reaction (eyes by default); --thread needs no --to
   channel discord set <channel> --purpose T | clear <channel> | list
@@ -166,6 +170,7 @@ switch (command) {
   case "checkpoints":
     commands = (await import("./cli-journal.ts")).journalCommands;
     break;
+  case "lanes":
   case "launch":
   case "adopt":
   case "claim-done":

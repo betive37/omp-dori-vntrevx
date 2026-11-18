@@ -21,6 +21,7 @@ export type WorklogItem = {
   readonly id: string;
   readonly title: string;
   readonly source: string;
+  readonly thread?: string;
   readonly openedAt: string;
   readonly next?: string;
   readonly notes: readonly { readonly at: string; readonly text: string }[];
@@ -28,7 +29,7 @@ export type WorklogItem = {
   readonly result?: string;
 };
 type Event =
-  | { readonly op: "add"; readonly id: string; readonly at: string; readonly title: string; readonly source: string }
+  | ({ readonly op: "add"; readonly at: string } & Pick<WorklogItem, "id" | "title" | "source" | "thread">)
   | { readonly op: "next"; readonly id: string; readonly at: string; readonly text: string }
   | { readonly op: "note"; readonly id: string; readonly at: string; readonly text: string }
   | { readonly op: "close"; readonly id: string; readonly at: string; readonly result: string };
@@ -62,7 +63,15 @@ const parseEvent = (value: unknown): Event => {
   };
   const wanted = typeof record["op"] === "string" ? fields[record["op"]] : undefined;
   if (!wanted) throw new WorklogError('worklog field "op" must be add, next, note or close');
-  const unknown = Object.keys(record).find((name) => !["op", "id", "at", ...Object.keys(wanted)].includes(name));
+  const optional = record["op"] === "add" ? ["thread"] : [];
+  const unknown = Object.keys(record).find(
+    (name) => !["op", "id", "at", ...Object.keys(wanted), ...optional].includes(name),
+  );
+  if (
+    record["thread"] !== undefined &&
+    (!singleLine(record["thread"], 400) || /\s/.test(record["thread"]) || record["thread"] === "none")
+  )
+    throw new WorklogError("worklog thread must be a nonempty reference without whitespace");
   if (unknown !== undefined) throw new WorklogError(`unknown worklog field "${unknown}"`);
   for (const [name, max] of Object.entries(wanted)) {
     if (!singleLine(record[name], max))
@@ -97,10 +106,7 @@ export const publishWorklog = (path: string, markdown: string, beforeCheck: () =
   }
 };
 
-/**
- * The lead's list of owner requests. worklog.jsonl is the record: one O_APPEND write per change, so concurrent
- * writers never lose each other's lines. worklog.md is rendered from it after every change for the lead to read.
- */
+/** Owner requests: atomic O_APPEND lines in worklog.jsonl; regenerate worklog.md after every change. */
 export class Worklog {
   readonly path: string;
   readonly markdownPath: string;
@@ -118,11 +124,18 @@ export class Worklog {
     return this.read().items.filter((item) => item.closedAt === undefined);
   }
 
-  add(title: string, source: string, now: number): WorklogItem {
+  add(title: string, source: string, now: number, thread?: string): WorklogItem {
     const known = new Set(this.read().items.map((item) => item.id));
     let id = randomBytes(4).toString("hex");
     while (known.has(id)) id = randomBytes(4).toString("hex");
-    return this.write({ op: "add", id, at: new Date(now).toISOString(), title: title.trim(), source: source.trim() });
+    return this.write({
+      op: "add",
+      id,
+      at: new Date(now).toISOString(),
+      title: title.trim(),
+      source: source.trim(),
+      ...(thread === undefined ? {} : { thread }),
+    });
   }
 
   next(id: string, text: string, now: number): WorklogItem {
@@ -170,6 +183,7 @@ export class Worklog {
             id: event.id,
             title: event.title,
             source: event.source,
+            ...(event.thread === undefined ? {} : { thread: event.thread }),
             openedAt: event.at,
             notes: [],
           });

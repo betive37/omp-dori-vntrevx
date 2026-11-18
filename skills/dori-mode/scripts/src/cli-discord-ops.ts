@@ -9,7 +9,8 @@ import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { DISCORD_LIMIT } from "./messenger/split.ts";
 import { TranscriptionError } from "./messenger/voice.ts";
-import { realClock } from "./run.ts";
+import { realClock, runtimesOf } from "./run.ts";
+import { setThreadStatus } from "./thread-status.ts";
 
 const client = () =>
   new Discord(fetchHttp, realClock, process.env["DORI_DISCORD_TOKEN"] ?? die("DORI_DISCORD_TOKEN is not set"));
@@ -87,10 +88,27 @@ export const sendDiscord: Command = async (cli) => {
   else console.log(`SENT ${(await dc.send(target, text, reply === undefined ? {} : { replyTo: reply })).join(" ")}`);
 };
 
-export const threadDiscord: Command = async ({ positionals, need, opt, strings, values }) => {
+export const threadDiscord: Command = async ({ positionals, need, opt, strings, values, deps }) => {
   const action = positionals[1];
   const tags = strings("tag");
   if (values["archive"] === true && values["unarchive"] === true) die("choose --archive or --unarchive");
+  if (action === "status") {
+    if (positionals.length !== 4 || ["title", "tag", "archive", "unarchive"].some((flag) => values[flag] !== undefined))
+      die("thread status takes only <thread> done|working; use thread set for title, tags or archive changes");
+    const id = discordInboundEnv("thread", positionals[2]);
+    const status = positionals[3];
+    if (status !== "done" && status !== "working") return die("thread status needs done or working");
+    const caller = await deps.registry.bySession(runtimesOf(deps).selfAny(process.env));
+    if (caller) die(`thread status is the lead's; this pane is lane ${caller.key}`);
+    const open = (await deps.registry.open()).filter((lane) => lane.thread === `discord:${id}` || lane.thread === id);
+    if (status === "done" && open.length)
+      die(`thread still has open lanes: ${open.map((lane) => lane.key).join(", ")}`);
+    const result = await setThreadStatus(client(), id, status);
+    console.log(
+      `THREAD_STATUS ${id} ${status} ${result.changed ? "changed" : "unchanged"} ${JSON.stringify(result.name)}`,
+    );
+    return;
+  }
   const dc = client();
   if (action === "create") {
     // A thread on an existing message: checked before any request, so a bad id never opens a thread without one.
@@ -134,7 +152,7 @@ export const threadDiscord: Command = async ({ positionals, need, opt, strings, 
       ...(archived === undefined ? {} : { archived }),
     });
     console.log(`THREAD ${id}`);
-  } else die("thread discord needs create or set");
+  } else die("thread discord needs create, set or status");
 };
 
 /** The operator's purpose notes per channel or thread: `set <channel> --purpose T`, `clear <channel>`, `list`. */
