@@ -218,5 +218,11 @@ export const laneLaunchEnv = (
   const raw = env["DORI_CONFIG"];
   const relativeConfig = raw !== undefined && !isAbsolute(raw);
   const osPath = relativeConfig ? `${process.cwd()}${sep}${raw}` : (raw ?? config);
-  return { ...doriLaunchEnv(env, osPath, resolved), ...laneTokenEnv(env, osPath) };
+  // The terminal server can retain tokens absent from the launcher. Only explicit messenger children need these.
+  return {
+    ...doriLaunchEnv(env, osPath, resolved),
+    ...laneTokenEnv(env, osPath),
+    DORI_DISCORD_TOKEN: "",
+    DORI_TELEGRAM_TOKEN: "",
+  };
 };

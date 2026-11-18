@@ -52,6 +52,17 @@ Ask which mode, give the trade-off as a short list, and wait for the choice:
 
 Record the choice. With a user token, set `DORI_SLACK_TOKEN` and `DORI_SLACK_COOKIE` (the `d` cookie from that member's browser session). With a bot token, set `DORI_SLACK_TOKEN` to the `xoxb-` token. If you run a second Dori home on the same machine, also write that home's token to `slack-token` next to its `config.json` (`chmod 600`): `dori launch` then hands its lanes the file's path, never the token (see `dori launch` in `scripts.md`).
 
+### Credential scope by process
+
+| Process | Credential source |
+|---|---|
+| Lane agent | Native provider authentication remains available through the existing HOME/agent-directory and provider environment. `dori launch` explicitly empties `DORI_DISCORD_TOKEN` and `DORI_TELEGRAM_TOKEN`, including stale values inherited from a terminal server. |
+| Discord/Telegram monitor or send hook | Load the selected installation's protected token only inside the explicitly authorized messenger child. Direct sends from a lane require the same child-local loading; exporting tokens before `dori launch` no longer supplies them. |
+| Slack lane operations | Preserve the existing home-bound `slack-token` file path and owner/mode checks. The retained single-home environment-token flow is unchanged when no token file is configured. |
+| Upstream model/reporter/check | Reuse the updater's capability allowlists: `modelEnv` only for models, `reporterEnv` only for reporters, and neither for checks. `modelAgentDir` retains the selected native authentication location. |
+
+The general command runner still inherits its caller's environment; keep tokens out of the parent agent and load them at the messenger boundary. These rules reduce accidental propagation, not same-user file access: they are not an OS sandbox. Credential presence does not establish account identity, model availability, quota or permission to spend.
+
 ## 3. Bot
 
 For Discord, create/invite the owner's own bot through the Developer Portal and finish the explicit bot setup below. Other retained messengers have their own browser/login flows. Then give the bot its avatar: the default is `assets/dori-avatar.png` in this skill, and the owner can swap in any image.

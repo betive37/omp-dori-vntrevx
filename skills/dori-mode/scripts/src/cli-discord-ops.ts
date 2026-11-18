@@ -12,7 +12,7 @@ import { TranscriptionError } from "./messenger/voice.ts";
 import { realClock } from "./run.ts";
 
 const client = () =>
-  new Discord(fetchHttp, realClock, process.env["DORI_DISCORD_TOKEN"] ?? die("DORI_DISCORD_TOKEN is not set"));
+  new Discord(fetchHttp, realClock, process.env["DORI_DISCORD_TOKEN"] || die("DORI_DISCORD_TOKEN is not set"));
 
 /** Local paths pass through; downloaded audio belongs only to this invocation and is always removed. */
 export const withLocalAudio = async (source: string, use: (file: string) => Promise<string>): Promise<string> => {
