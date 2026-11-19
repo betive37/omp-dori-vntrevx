@@ -1,38 +1,33 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { generation, type Lane, LANE_KEY, Registry, sessionOf } from "./registry.ts";
-import { sameSession } from "../../../../src/refs.ts";
-import { readWait, renderWait, type Wait, waitKey } from "../../../../src/wait.ts";
+import { type Lane, LANE_KEY, Registry } from "./registry.ts";
+import { type WaitProof, waitRejection } from "./report-wait.ts";
+import { readWait, renderWait, type Wait } from "../../../../src/wait.ts";
 
 export type ReportKind = "milestone" | "blocker" | "question" | "halted" | "done";
 export type ProgressState = "running" | "blocked" | "halted" | "done" | "stalled";
-export type Report = {
-  readonly type: "report";
+type EventFields = {
   readonly key: string;
   readonly at: string;
-  readonly kind: ReportKind;
   readonly text: string;
+  readonly generation?: string;
+};
+export type Report = EventFields & {
+  readonly type: "report";
+  readonly kind: ReportKind;
   readonly wait?: Wait;
 };
-export type Activity = {
+export type Activity = EventFields & {
   readonly type: "activity";
-  readonly key: string;
-  readonly at: string;
   readonly state: "running" | "stalled";
-  readonly text: string;
 };
-export type LaneEvent = Report | Activity;
+export type LaneEvent = Report | Activity | (EventFields & { readonly type: "reopen" });
+type EventScope = { readonly generation: string | undefined };
 export type Progress = {
   readonly state: ProgressState;
   readonly lastReport: Report | null;
   readonly lastEvent: LaneEvent;
-};
-
-type WaitProof = {
-  readonly wait: Wait;
-  readonly lane: Lane;
-  readonly report: Report | null | undefined;
 };
 
 export class ReportError extends Error {}
@@ -79,11 +74,18 @@ export const parseEvent = (line: string, key: string): LaneEvent => {
     !("text" in value) ||
     typeof value.text !== "string" ||
     !value.text.trim() ||
-    !("type" in value)
+    !("type" in value) ||
+    ("generation" in value && typeof value.generation !== "string")
   ) {
     throw new ReportError(`invalid report record for ${key}`);
   }
-  const common = { key, at: value.at, text: value.text };
+  const common = {
+    key,
+    at: value.at,
+    text: value.text,
+    ...("generation" in value && typeof value.generation === "string" ? { generation: value.generation } : {}),
+  };
+  if (value.type === "reopen") return { ...common, type: "reopen" };
   if (value.type === "report" && "kind" in value && isReportKind(value.kind)) {
     const wait = value.kind === "blocker" && "wait" in value ? readWait(value.wait) : undefined;
     return { ...common, type: "report", kind: value.kind, ...(wait ? { wait } : {}) };
@@ -104,7 +106,8 @@ export class Reports {
     return join(this.stateDir, "lanes", key, "reports.jsonl");
   }
 
-  read(key: string): Progress | null {
+  // With no scope, inspect the raw journal. An explicit undefined generation selects only legacy records.
+  read(key: string, scope?: EventScope): Progress | null {
     const path = this.path(key);
     if (!existsSync(path)) return null;
     let progress: Progress | null = null;
@@ -118,7 +121,11 @@ export class Reports {
         if (!(error instanceof SyntaxError || error instanceof ReportError)) throw error;
         throw new ReportError(`${path}:${index + 1}: ${error.message}`);
       }
-      if (event.type === "report") {
+      if (scope && event.generation !== scope.generation) continue;
+      if (event.type === "reopen") {
+        lastReport = null;
+        progress = { state: "running", lastReport, lastEvent: event };
+      } else if (event.type === "report") {
         lastReport = event;
         progress = { state: reportState(event.kind), lastReport: event, lastEvent: event };
       } else if (!progress || progress.state === "running" || progress.state === "stalled") {
@@ -138,26 +145,35 @@ export class Reports {
     appendFileSync(path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
-  append(event: Activity): void {
+  append(event: Exclude<LaneEvent, Report>): void {
     this.writeEvent(event);
   }
 
-  report(key: string, kind: ReportKind, text: string, now: number, waiting?: WaitProof): Promise<Report>;
   report(
     key: string,
     kind: ReportKind,
     text: string,
     now: number,
+    generation?: string,
+    waiting?: WaitProof,
+  ): Promise<Report>;
+  report(
+    key: string,
+    kind: ReportKind,
+    text: string,
+    now: number,
+    generation: string | undefined,
     waiting: WaitProof | undefined,
-    shouldReport: (progress: Progress | null) => boolean,
+    shouldReport: (progress: Progress | null, current: Lane | null) => boolean,
   ): Promise<Report | null>;
   async report(
     key: string,
     kind: ReportKind,
     text: string,
     now: number,
+    generation?: string,
     waiting?: WaitProof,
-    shouldReport?: (progress: Progress | null) => boolean,
+    shouldReport?: (progress: Progress | null, current: Lane | null) => boolean,
   ): Promise<Report | null> {
     if (waiting && kind !== "blocker") throw new ReportError("a structured wait needs a blocker report");
     const report: Report = {
@@ -166,30 +182,19 @@ export class Reports {
       kind,
       text: text.trim(),
       at: new Date(now).toISOString(),
+      ...(generation === undefined ? {} : { generation }),
       ...(waiting ? { wait: waiting.wait } : {}),
     };
     this.path(key);
     parseEvent(JSON.stringify(report), key);
     let appended = false;
     await new Registry(this.stateDir).update(key, (current) => {
+      const scope = { generation };
       if (waiting) {
-        if (!current || current.key !== waiting.lane.key || generation(current) !== generation(waiting.lane))
-          throw new ReportError("lane state changed while observing its wait; report again");
-        const ref = sessionOf(waiting.lane);
-        const liveRef = sessionOf(current);
-        if (ref ? !liveRef || !sameSession(ref, liveRef) : liveRef !== undefined)
-          throw new ReportError("lane session changed while observing its wait; report again");
-        const latest = this.read(key)?.lastReport;
-        if (
-          JSON.stringify(latest) !== JSON.stringify(waiting.report) ||
-          current.lastWaitNotice !== waiting.lane.lastWaitNotice
-        )
-          throw new ReportError("a newer report or wait observation arrived; report again");
-        const wait = waiting.wait;
-        if (current.lastWaitNotice === `ended|${current.openedAt}|${waitKey(wait.target)}|${wait.startedAt}`)
-          throw new ReportError("this wait has already ended; report a currently pending identity");
+        const reason = waitRejection(current, waiting, generation, () => this.read(key, scope)?.lastReport);
+        if (reason) throw new ReportError(reason);
       }
-      if (shouldReport && !shouldReport(this.read(key))) return null;
+      if (shouldReport && !shouldReport(this.read(key, scope), current)) return null;
       this.writeEvent(report);
       appended = true;
       return null; // The journal changes, not the registry record; no second write can leave a partial transition.
@@ -197,8 +202,15 @@ export class Reports {
     return appended ? report : null;
   }
 
-  observe(key: string, screen: string, now: number, staleAfterMs: number, resumeOnWorking = true): Progress | null {
-    const progress = this.read(key);
+  observe(
+    key: string,
+    screen: string,
+    now: number,
+    staleAfterMs: number,
+    resumeOnWorking = true,
+    scope?: EventScope,
+  ): Progress | null {
+    const progress = this.read(key, scope);
     if (!progress || (progress.state !== "running" && progress.state !== "stalled")) return progress;
     const visible = Bun.stripANSI(screen);
     const lastAt = (pattern: RegExp): number => {
@@ -218,11 +230,13 @@ export class Reports {
     const state =
       failed || (idle && !working && stale) ? "stalled" : working && resumeOnWorking ? "running" : progress.state;
     if (state === progress.state) return progress;
+    const { generation } = progress.lastEvent;
     const event: Activity = {
       type: "activity",
       key,
       at: new Date(now).toISOString(),
       state,
+      ...(generation === undefined ? {} : { generation }),
       text: failed
         ? "compaction failed"
         : state === "stalled"
@@ -230,6 +244,6 @@ export class Reports {
           : "Working activity resumed",
     };
     this.append(event);
-    return this.read(key);
+    return this.read(key, scope);
   }
 }

@@ -1,10 +1,11 @@
 import { configPath, fill } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { laneGoalActive } from "./goal-record.ts";
-import { BRIEF_START, footer, originalBrief, quoteForPane } from "./launch-footer.ts";
+import { BRIEF_START, footer, originalBrief } from "./launch-footer.ts";
 import { mayRunOmpArgv } from "../../../../src/runtime/omp-argv.ts";
 import { parseRef } from "../../../../src/runtime/types.ts";
-import { openLaneSession } from "./launch-session.ts";
+import { laneStartCommand, openLaneSession } from "./launch-session.ts";
+import { selectionFor } from "./launch-selection.ts";
 import { LANE_KEY, type Lane, RESERVED_LANE_KEY, sessionFields, upgradeLane } from "./registry.ts";
 import { iso, runtimesOf } from "./run.ts";
 import { Reports } from "./reports.ts";
@@ -79,7 +80,6 @@ export const prepareLaunch = async (
   input: LaunchInput,
 ): Promise<{ readonly lane: Lane; readonly preamble: string; readonly warnings: string[] }> => {
   await validateLaunch(deps, input);
-  const model = input.model ?? deps.config.defaultModel;
   const cwd = input.cwd ?? deps.config.defaultCwd;
   const briefFile = Bun.file(input.brief);
   if (!(await briefFile.exists())) throw new LaunchError(`brief not found: ${input.brief}`);
@@ -90,7 +90,8 @@ export const prepareLaunch = async (
     brief: input.brief,
     done: input.done,
     cwd,
-    model,
+    model: input.model ?? deps.config.defaultModel,
+    launchSelection: selectionFor(deps.config),
     openedAt: iso(deps.clock),
     reportProtocol: "jsonl-v1",
     budget: {
@@ -169,7 +170,7 @@ const startLane = async (
   // The session can be written while start is still returning; its goal must belong to this invocation.
   const launchedAt = deps.clock.now();
   try {
-    await rts.for(ref).start(ref, fill(deps.config.agentCommand, { model, prompt }).map(quoteForPane).join(" "));
+    await rts.for(ref).start(ref, laneStartCommand(lane, fill(deps.config.agentCommand, { model, prompt })));
   } catch (e) {
     return { lane, startup: `STARTUP_ERROR ${input.key} ${pane}: start failed: ${lastLines(String(e))}` };
   }

@@ -23,11 +23,11 @@ const report: Command = async ({ key, need, opt, lane, config, deps }) => {
   const reports = new Reports(config.stateDir);
   const selection = opt("for");
   if (selection === undefined) {
-    console.log(reportLine(await reports.report(target.key, kind, text, realClock.now())));
+    console.log(reportLine(await reports.report(target.key, kind, text, realClock.now(), target.lifecycleEpoch)));
     return;
   }
   if (kind !== "blocker") throw new ReportError("--for needs --kind blocker");
-  const before = reports.read(target.key)?.lastReport;
+  const before = reports.read(target.key, { generation: target.lifecycleEpoch })?.lastReport;
   const previous = before && Date.parse(before.at) >= Date.parse(target.openedAt) ? before.wait : undefined;
   const request = parseWait(selection);
   const ref = sessionOf(target);
@@ -48,7 +48,11 @@ const report: Command = async ({ key, need, opt, lane, config, deps }) => {
   }
   const now = realClock.now();
   const wait = recordWait(bound.target, bound.lastObservedState, bound.observedAt, now, previous);
-  const written = await reports.report(target.key, kind, text, now, { wait, lane: target, report: before });
+  const written = await reports.report(target.key, kind, text, now, target.lifecycleEpoch, {
+    wait,
+    lane: target,
+    report: before,
+  });
   console.log(reportLine(written));
 };
 

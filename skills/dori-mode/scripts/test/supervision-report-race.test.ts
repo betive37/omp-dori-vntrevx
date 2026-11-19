@@ -7,9 +7,16 @@ import { Reports } from "../src/reports.ts";
 import { withState } from "./fakes.ts";
 import { marker } from "./report-race-fixture.ts";
 
-test.each(["done", "halted", "blocker"] as const)(
-  "a supervision writer waiting behind %s rechecks terminal state and duplicate blockers",
-  async (kind) => {
+test.each([
+  ["done", false],
+  ["halted", false],
+  ["blocker", false],
+  ["done", true],
+  ["halted", true],
+  ["blocker", true],
+] as const)(
+  "a supervision writer waiting behind %s rechecks terminal state and duplicate blockers (registry: %s)",
+  async (kind, registered) => {
     const state = withState();
     const children: ReturnType<typeof Bun.spawn>[] = [];
     const release = join(state.dir, "release");
@@ -49,6 +56,7 @@ Reports.prototype.writeEvent = function(event) {
 `,
       );
       const resultPath = join(state.dir, "result.json");
+      const registration = registered ? `registry: new Registry(${JSON.stringify(state.dir)}),` : "";
       const sweep = join(state.dir, "sweep.mjs");
       writeFileSync(
         sweep,
@@ -62,7 +70,8 @@ Registry.prototype.update = function(...args) {
 };
 const delivered = [];
 const supervisor = new Supervision({
-  stateDir: ${JSON.stringify(state.dir)}, clock: { now: () => ${now} },
+  stateDir: ${JSON.stringify(state.dir)}, ${registration}
+  clock: { now: () => ${now}, sleep: (ms) => Bun.sleep(ms) },
   run: async () => { throw new Error("unexpected external command"); },
   alert: (_lane, message) => { delivered.push(message); },
 }, { defaults: { wallMinutes: 0 } });

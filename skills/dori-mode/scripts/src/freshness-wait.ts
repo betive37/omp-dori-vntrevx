@@ -49,13 +49,16 @@ export async function checkWaiting(
     const currentRef = sessionOf(current);
     if (
       statusOf(current) !== "working" ||
+      current.nativeCloseIntent ||
       !currentRef ||
       !sameSession(ref, currentRef) ||
-      JSON.stringify(new Reports(deps.config.stateDir).read(lane.key)?.lastReport) !== JSON.stringify(report) ||
+      JSON.stringify(
+        new Reports(deps.config.stateDir).read(lane.key, { generation: lane.lifecycleEpoch })?.lastReport,
+      ) !== JSON.stringify(report) ||
       current.lastWaitNotice !== lane.lastWaitNotice ||
       current.lastWaitNotice === note
     )
-      return current;
+      return null;
     emitted = outcome;
     return { ...current, lastWaitNotice: note };
   });
