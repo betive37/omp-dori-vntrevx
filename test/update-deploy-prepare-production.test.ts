@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { lstatSync, readFileSync, writeFileSync } from "node:fs";
+import { lstatSync, readFileSync, symlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { prepareRelease } from "../src/update/deployment-prepare.ts";
 import { sourceManifest } from "../src/update/source.ts";
@@ -49,6 +49,11 @@ test.each([true, false])(
     // Records each install's physical cwd and argv (tab-separated, one line per call), then runs the real Bun.
     const log = join(f.directory, "install-argv.log");
     const bun = join(f.directory, "recording-bun");
+    // Preparation intentionally admits only the selected Bun directory and system tools.
+    // Keep the real Git reachable on hosts where Git is installed only in a user directory.
+    const gitBinary = Bun.which("git");
+    if (!gitBinary) throw new Error("Git is required for real deployment preparation");
+    symlinkSync(gitBinary, join(f.directory, "git"));
     writeFileSync(
       bun,
       `#!/bin/sh
