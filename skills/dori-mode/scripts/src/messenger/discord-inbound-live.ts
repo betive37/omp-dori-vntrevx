@@ -29,6 +29,9 @@ export const discordInboundLive = (
   report: (line: string) => void,
   queue: DiscordInboundQueue,
 ): DiscordInboundLive => {
+  const admission = new AbortController();
+  const cancelled = new Error("Discord inbound closed before ledger admission");
+  const deliver: Emit = (message) => emit(message, admission.signal);
   let running = Promise.resolve();
   let recover = queue.first()?.kind === "message";
   let draining = false;
@@ -45,7 +48,7 @@ export const discordInboundLive = (
   const backfill = async () => {
     for (let delay = 2_000; ; delay = Math.min(delay * 2, 30_000)) {
       try {
-        return await intake.sync(emit, queue);
+        return await intake.sync(deliver, queue);
       } catch (error) {
         if (dead || !isTransient(error)) throw error;
         report(`DISCORD_GATEWAY_BACKFILL_RETRY discord retry_in=${delay / 1000}s`);
@@ -57,7 +60,7 @@ export const discordInboundLive = (
   const fail = (error: unknown) => {
     failure = error;
     dead = true; // Leave the failed record and every successor on disk, without advancing their cursors.
-    gateway.close();
+    close();
   };
   const drain = () => {
     if (draining || dead) return;
@@ -75,7 +78,7 @@ export const discordInboundLive = (
           } else {
             job = queue.before(job.id) ?? job; // Earlier known same-channel frames precede this delivery boundary.
             const message = JSON.parse(job.payload) as Message;
-            await intake.accept(message, emit, job.admittedAfter);
+            await intake.accept(message, deliver, job.admittedAfter);
             if (!dead) {
               if (intake.accepts(message)) queue.acknowledge(message.channel_id, message.id);
               else queue.remove(job.id);
@@ -83,7 +86,7 @@ export const discordInboundLive = (
           }
         }
       } catch (error) {
-        fail(error);
+        if (error !== cancelled || !admission.signal.aborted) fail(error);
       } finally {
         draining = false;
       }
@@ -109,6 +112,7 @@ export const discordInboundLive = (
     },
   });
   const close = () => {
+    admission.abort(cancelled);
     dead = true;
     if (timer !== undefined) clock.clearTimeout(timer);
     wake?.();

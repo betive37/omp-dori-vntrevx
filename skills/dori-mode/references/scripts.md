@@ -306,7 +306,18 @@ The queue records the durable cursor at admission, not proof of delivery. An old
 
 Legacy rows have no admission position. A pending owner below the cursor is replayed conservatively because older intake may have skipped it; this migration/recovery window can repeat an already delivered request. It cannot restore payloads already deleted by older code. This is not unconditional exactly-once delivery or ordering across arbitrary late arrivals.
 
-Gateway shutdown retains pending work and waits for an active backfill reconciliation, including merged deliveries and cursor commits, to drain. It does not cancel an in-flight HTTP request. Later queued work remains for restart. Storage, protocol and delivery failures retain undelivered records; restore storage before restarting after a disk error. Messages not successfully written still rely on REST cursor recovery.
+Gateway shutdown retains pending work and aborts its own waiting local obligation-ledger admission before awaiting active work. It does not cancel an in-flight HTTP request; an undelivered payload and its cursor remain recoverable on the next Gateway start. Later queued work remains for restart. Genuine storage, protocol, context and delivery failures are not treated as cancellation. Restore storage before restarting after a disk error. Messages not successfully written still rely on REST cursor recovery.
+
+### Discord owner obligation reminders
+
+Dori MAIN tracks owner `INBOUND discord` lines from its CLI or monitor delivery. A complete accepted `dori send discord` and an accepted added reaction from `dori react discord --to <channel> --message <owner-message>` supply its two receipts. The default reaction is eyes. Send matching remains channel-level, including with `--reply`; marks match the exact owner message. Edits, removals and incomplete split sends do not qualify. Direct SDK/API writes bypass this ledger. Check existing remote results before retrying: a remote send or reaction can succeed before a later local receipt write fails.
+
+The synchronous settle hook requests at most three continuations per open obligation younger than 30 minutes; lanes and subagents are exempt. This does not prove answer relevance, a human read or eventual completion. The reminder names each shown message's supported reaction command; do not repeat an already accepted answer or reaction merely because its local receipt is absent.
+
+The private `<stateDir>/owes` directory stores inbound previews (up to 500 characters), send receipts, marks and continuation attempts. Each JSONL snapshot retains at most 200 nonempty rows. Expiry is logical, not deletion; a crash can also leave private temporary snapshot files containing previews outside that row cap. Neither snapshot replacement nor expiry is secure erasure.
+
+Writers reuse per-file owner locks, wait asynchronously and publish capped snapshots atomically. A live holder has no automatic wait timeout; a stale lock whose PID has been reused may look live and require operator repair. Session changes abort waiting monitor admissions rather than waking an old session. An aborted Gateway admission retains its payload and cursor for restart; unrelated failures remain errors.
+
 
 ### `dori inbound slack [--loop MIN]`
 Prints `INBOUND <source> <channel> <thread> <ts> <user> <text>`. It reads from three places, each message once:

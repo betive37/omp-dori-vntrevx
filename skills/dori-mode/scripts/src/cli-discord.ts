@@ -9,6 +9,7 @@ import { discordInboundLive } from "./messenger/discord-inbound-live.ts";
 import { discordInboundQueue } from "./messenger/discord-inbound-queue.ts";
 import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
+import { recordOwes } from "./owes.ts";
 import { realClock } from "./run.ts";
 
 export const openDiscordSocket = (url: string): GatewaySocket => {
@@ -81,13 +82,15 @@ export const discordInboundCommand = async (
     });
     const watching = all ? "all" : intake.channels().join(",");
     const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
-    // The whole group, context included, is one write before the cursor moves past the message.
-    const emit: Emit = where
-      ? async (message) => {
-          const context = await where(message.channel);
-          console.log(`${formatDiscordInbound(message)}\n${formatInboundContext(message, context)}`);
-        }
-      : (message) => console.log(formatDiscordInbound(message));
+    // Context and the owner line remain one stdout group, after the owe is published.
+    const emit: Emit = async (message, signal) => {
+      const text = where
+        ? `${formatDiscordInbound(message)}\n${formatInboundContext(message, await where(message.channel))}`
+        : formatDiscordInbound(message);
+      await recordOwes(stateDir, text, Date.now(), signal);
+      signal?.throwIfAborted();
+      console.log(text);
+    };
     console.log(
       `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
     );
