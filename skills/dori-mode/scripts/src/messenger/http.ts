@@ -9,6 +9,7 @@ export type HttpRequest = {
   readonly operation?: string;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string | FormData | Uint8Array<ArrayBuffer>;
+  readonly redirect?: "error" | "follow" | "manual";
   readonly signal?: AbortSignal;
 };
 export type HttpResponse = {
@@ -23,6 +24,7 @@ export const fetchHttp: Http = async (req) => {
     method: req.method,
     ...(req.headers === undefined ? {} : { headers: req.headers }),
     ...(req.body === undefined ? {} : { body: req.body }),
+    ...(req.redirect === undefined ? {} : { redirect: req.redirect }),
     ...(req.signal === undefined ? {} : { signal: req.signal }),
   });
   const headers: Record<string, string> = {};

@@ -107,19 +107,44 @@ export class Slack {
     title?: string,
   ): Promise<string> {
     const slot = await this.call("files.getUploadURLExternal", { filename, length: bytes.byteLength });
+    // Ticket and receipt validation adapted from omp-superagent; see NOTICE.
+    const fileId = slot["file_id"];
+    const uploadUrl = slot["upload_url"];
+    if (typeof fileId !== "string" || !/^F[A-Z0-9]+$/.test(fileId) || typeof uploadUrl !== "string")
+      throw new MessengerError("slack external upload: invalid upload ticket", 200);
+    let target: URL;
+    try {
+      target = new URL(uploadUrl);
+    } catch {
+      throw new MessengerError("slack external upload: invalid upload URL", 200);
+    }
+    if (
+      target.origin !== "https://files.slack.com" ||
+      target.username ||
+      target.password ||
+      !target.pathname.startsWith("/upload/v1/")
+    )
+      throw new MessengerError("slack external upload: unauthorized upload URL", 200);
     const put = await withBackoff(this.http, this.clock, {
       method: "POST",
       operation: "slack external upload",
-      url: String(slot["upload_url"]),
+      url: uploadUrl,
       body: bytes,
+      redirect: "error",
     });
     if (put.status !== 200) throw new MessengerError(`slack upload: ${put.status}`, put.status);
-    await this.call("files.completeUploadExternal", {
-      files: [{ id: slot["file_id"], title: title ?? filename }],
+    const completed = await this.call("files.completeUploadExternal", {
+      files: [{ id: fileId, title: title ?? filename }],
       channel_id: channel,
       ...(threadTs ? { thread_ts: threadTs } : {}),
     });
-    return String(slot["file_id"]);
+    const files = completed["files"];
+    if (
+      !Array.isArray(files) ||
+      !files.some((file: unknown) => file !== null && typeof file === "object" && "id" in file && file.id === fileId)
+    )
+      throw new DeliveryUncertainError("slack files.completeUploadExternal: missing file receipt", 200);
+    return fileId;
   }
 
   async setPresence(presence: "auto" | "away"): Promise<void> {
