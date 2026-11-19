@@ -29,7 +29,10 @@ export type Lane = {
   readonly pane?: string | undefined;
   readonly tab?: string;
   readonly session?: string;
+  readonly sessionFile?: string;
   readonly sessionVia?: string;
+  /** A parked lane's reason and operator-defined condition; never an automatic resume trigger. */
+  readonly hold?: { readonly reason: string; readonly resumeWhen?: string };
   readonly brief: string;
   readonly done: string;
   readonly cwd?: string;
@@ -87,11 +90,8 @@ const sameSession = (a: SessionRef | undefined, b: SessionRef): boolean =>
 
 export const statusOf = (lane: Lane): LaneStatus => (lane.closedAt ? "closed" : (lane.status ?? "working"));
 
-/**
- * The lane's status generation: every status change (a claim, objection, verification, pause, resume or close) goes
- * through `withStatus` and appends one history entry, even when the status stays the same, as a second objection does.
- * Bookkeeping fields (freshness notes, `claim.emitted`, a receipt) leave it as it is.
- */
+// withStatus advances the generation for every transition, even repeated objections or reopen.
+// Bookkeeping fields (freshness notes, claim.emitted, receipt) leave the generation unchanged.
 const generation = (lane: Lane): string => `${lane.openedAt} ${lane.history?.length ?? 0} ${statusOf(lane)}`;
 
 export const withStatus = (

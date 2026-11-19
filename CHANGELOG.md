@@ -183,3 +183,4 @@ The terminal-admission integration group uses a test-local 20-second budget for 
 The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, public dependency pin and third-party notices remain unchanged.
 
 - Verify exact native provider/model readback before delivering readable interactive lane launches; preserve opaque and non-interactive launch compatibility with unavailable provenance and opt-in strict rejection (comparison F01).
+- Unreleased: add explicit lane parking, exact-session reopening, abandonment receipts and a read-only hold ledger; preserve worktrees and ordinary Done verification.
