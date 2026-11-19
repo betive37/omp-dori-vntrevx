@@ -2,13 +2,15 @@ import { randomUUID } from "node:crypto";
 import { HeadlessRuntime, headlessArgv } from "../../../../src/runtime/headless.ts";
 import { mayRunOmpArgv } from "../../../../src/runtime/omp-argv.ts";
 import type { SessionRef } from "../../../../src/runtime/types.ts";
-import { configPath, fill } from "./config.ts";
+import { configPath } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import { type FlowDeps, movedOn } from "./done-flow.ts";
 import { recordExecution, runContext } from "./lane-run.ts";
 import { quoteForPane, runCommandPrefix } from "./launch-footer.ts";
 import { LaunchError } from "./launch.ts";
+import { removePrepared } from "./prepared-file.ts";
 import { confirmedLaneState, isBareLaneShell, nativeGoalStatus, resumeFile } from "./lifecycle-session.ts";
+import { awaitReopened, prepareNativeReopen, recordReopenedModel } from "./reopen-confirm.ts";
 import { resumeLane, type PauseResult } from "./pause.ts";
 import { type Lane, sameLaneGeneration, sessionFields, sessionOf, statusOf, withStatus } from "./registry.ts";
 import { Reports } from "./reports.ts";
@@ -17,7 +19,15 @@ import { listSessions, sendVerified } from "./sessions.ts";
 import { laneLaunchEnv } from "./slack-token.ts";
 import { withThreadLock } from "./thread-groups.ts";
 
-type ReopenCommit = { ref: SessionRef; opened: Lane | null; at: string; epoch: string; env: Record<string, string> };
+type ReopenCommit = {
+  ref: SessionRef;
+  opened: Lane | null;
+  at: string;
+  epoch: string;
+  env: Record<string, string>;
+  argv: readonly string[] | undefined;
+  profileFile: string | undefined;
+};
 
 /** Reopen is an explicit operator action; neither a timer nor a ready condition calls it. */
 export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Promise<PauseResult> => {
@@ -78,14 +88,21 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       if (!headless && lane.requestId !== undefined) env["CATALY_LANE_RUN"] = "";
       const oldGroup = oldRef?.group;
       const group = headless ? oldGroup : (oldGroup ?? deps.config.laneWorkspace);
-      const ref = await rts.for(oldRef ?? { runtime: kind, id: "" }).create({
-        name: lane.key,
-        role: "lane",
-        container: "tab",
-        cwd: lane.cwd ?? deps.config.defaultCwd,
-        env,
-        ...(group ? { group } : {}),
-      });
+      const { profileFile, argv } = prepareNativeReopen(deps, template, file, headless);
+      let ref: SessionRef;
+      try {
+        ref = await rts.for(oldRef ?? { runtime: kind, id: "" }).create({
+          name: lane.key,
+          role: "lane",
+          container: "tab",
+          cwd: lane.cwd ?? deps.config.defaultCwd,
+          env,
+          ...(group ? { group } : {}),
+        });
+      } catch (error) {
+        removePrepared(profileFile);
+        throw error;
+      }
       const at = iso(deps.clock);
       const epoch = randomUUID();
       const opened = await deps.registry.transition(lane, (current) => {
@@ -105,6 +122,7 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
         const next = withStatus(rest, "paused", `reopening: ${note ?? "explicit operator request"}`, at, {
           ...sessionFields(ref),
           sessionFile: file,
+          ...(profileFile ? { modelProfileFile: profileFile } : {}),
           openedAt: at,
           lifecycleEpoch: epoch,
           pausedFrom: "working",
@@ -123,13 +141,14 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
         recordExecution(deps.config.stateDir, next, deps.clock.now());
         return next;
       });
-      return { ref, opened, at, epoch, env };
+      return { ref, opened, at, epoch, env, argv, profileFile };
     });
     if (!group.ok) return fail(`HELD ${lane.key} thread close in flight (${group.holder})`);
     if ("code" in group.value) return group.value;
-    const { ref, opened, at, epoch, env } = group.value;
+    const { ref, opened, at, epoch, env, argv, profileFile } = group.value;
     if (!opened) {
       await rts.for(ref).close(ref, "session");
+      removePrepared(profileFile);
       return fail(await movedOn(deps, lane, "reopen"));
     }
     // The new paused generation exists even if startup/readback fails and the operator later uses resume.
@@ -161,10 +180,7 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
           },
         );
       } else {
-        const argv = [
-          ...fill(template.slice(0, -1), { model: lane.model ?? deps.config.defaultModel }),
-          `--resume=${file}`,
-        ];
+        if (!argv) throw new Error("native reopen argv missing");
         await rts.terminal(ref.runtime).start(ref, `${runCommandPrefix(opened)}${argv.map(quoteForPane).join(" ")}`);
       }
     } catch (error) {
@@ -174,28 +190,18 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       );
     }
     // Never resume a foreign/new session or treat an unknown receipt as an idle agent.
-    const attempts = Math.max(1, Math.ceil(deps.config.startupWaitSeconds));
-    let confirmed: string | undefined;
-    for (let n = 0; n < attempts; n++) {
-      const state = await confirmedLaneState(deps, opened, ref);
-      const goal = nativeGoalStatus(state);
-      if (
-        state &&
-        (!headless || state.sessionFile === file) &&
-        (goal === "paused" || goal === "none" || goal === "complete" || goal === "dropped")
-      ) {
-        confirmed = state.sessionId;
-        break;
-      }
-      await deps.clock.sleep(1000);
-    }
-    if (!confirmed)
+    const confirmed = await awaitReopened(deps, opened, ref, file, headless, profileFile);
+    if ("problem" in confirmed)
       return fail(
-        `REOPEN_UNVERIFIED ${lane.key}: same paused session not confirmed in ${ref.id}; inspect before resume`,
+        profileFile
+          ? `REOPEN_UNVERIFIED ${lane.key}: same paused session and saved model not confirmed in ${ref.id} (${confirmed.problem}); inspect before resume`
+          : `REOPEN_UNVERIFIED ${lane.key}: same paused session not confirmed in ${ref.id}; inspect before resume`,
         opened,
       );
+    const resumedLane = await recordReopenedModel(deps, opened, confirmed);
+    if (!resumedLane) return fail(await movedOn(deps, opened, "reopen model readback"), opened);
     // Bind only the proved session in this run's new runtime address, before resuming the goal.
-    const native = confirmed;
+    const native = confirmed.sessionId;
     if (
       provenance &&
       !(await deps.registry.withCurrent(lane.key, (current) => {
@@ -217,7 +223,7 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       }))
     )
       return fail(await movedOn(deps, opened, "reopen"), opened);
-    const resumed = await resumeLane(deps, opened, note ?? "explicit reopen", true);
+    const resumed = await resumeLane(deps, resumedLane, note ?? "explicit reopen", true);
     if (resumed.code !== 0) return resumed;
     if (note) {
       const state = await confirmedLaneState(deps, resumed.lane, ref);

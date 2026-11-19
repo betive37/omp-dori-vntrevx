@@ -9,6 +9,7 @@ import { Registry, statusOf, withStatus } from "../src/registry.ts";
 import { type Execution, type LaneEvent, Reports } from "../src/reports.ts";
 import { isRequestId, isRunId } from "../src/request-identity.ts";
 import { sessionDirFor } from "../src/session-id.ts";
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import {
   agentIn,
   depsFor,
@@ -73,20 +74,21 @@ const launch = async (
   );
   const [provider = "", id = ""] = base.config.defaultModel.split("/", 2);
   const model = { provider, id };
-  laneState(state.dir, "w:p9", {
+  const idle = {
     sessionId,
     sessionFile,
-    agentStatus: "idle",
-    goal: { status: "none" },
+    agentStatus: "idle" as const,
+    goal: { status: "none" as const },
     modelReadback: {
       requested: model,
       observed: model,
-      status: "matched",
-      billing: "unknown",
+      status: "matched" as const,
+      billing: "unknown" as const,
       checkedAt: at,
-      source: "native-extension",
+      source: "native-extension" as const,
     },
-  });
+  };
+  laneState(state.dir, "w:p9", idle);
   const deps = {
     ...base,
     run: async (argv: readonly string[]) => {
@@ -101,6 +103,10 @@ const launch = async (
       if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "run") {
         seen.command = argv.at(-1) ?? "";
         seen.atStart = new Reports(state.dir).events(key);
+        // The native process reports its own profile overlay and the snapshot it captured from it.
+        const modelProfileFile = (await base.registry.read(key))?.modelProfileFile;
+        if (!modelProfileFile) throw new Error("launch fixture missing its allocated model profile");
+        laneState(state.dir, "w:p9", { ...idle, modelProfileFile, modelSnapshot: snapshotFor(`${provider}/${id}`) });
       }
       const response = await base.run(argv);
       if (argv[0] === "herdr" && argv[2] === "send-keys" && argv[4] === "enter" && response.code === 0) {

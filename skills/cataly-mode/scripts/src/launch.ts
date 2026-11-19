@@ -12,6 +12,7 @@ import { requirePolicyLaneCommand } from "./lane-policy-launch.ts";
 import { policyBinding, prepareLanePolicy, writeLanePolicy } from "./lane-policy-store.ts";
 import { BRIEF_START, laneFooterFor, originalBrief } from "./launch-footer.ts";
 import { deliverModelBrief, modelLaunchCommand, modelLaunchProblem, unavailableLaunchModel } from "./launch-model.ts";
+import { launchProfileDir } from "./prepared-file.ts";
 import { selectionFor } from "./launch-selection.ts";
 import { laneStartCommand, openLaneSession, type OpenedLane, startLaunchRun } from "./launch-session.ts";
 import { type Lane, sameLaneGeneration, sessionFields, sessionOf, upgradeLane } from "./registry.ts";
@@ -162,6 +163,7 @@ export const openLaunch = async (deps: FlowDeps, input: LaunchInput, queuedBrief
     preamble,
     runtime,
     generated: queuedBrief !== undefined || Boolean(input.template),
+    profileStateDir: launchProfileDir(deps, runtime, draft),
   });
   if (opened.kind === "failed") {
     const why = opened.error instanceof Error ? opened.error.message : String(opened.error);
@@ -184,7 +186,8 @@ const startLane = async (
   { opened, rts }: { readonly opened: Extract<OpenedLane, { kind: "opened" }>; readonly rts: ChosenRuntimes },
 ): Promise<{ readonly lane: Lane; readonly startup: string }> => {
   const model = input.model ?? deps.config.defaultModel;
-  const { lane, ref } = opened;
+  const { ref } = opened;
+  let lane = opened.lane;
   const pane = ref.id;
   const prompt = `${deps.config.launchKeywords}. Read and execute the lane brief at ${input.brief} in full. You are the ${input.key} lane; report as the brief's footer says.`;
   const command = deps.config.agentCommand;
@@ -203,7 +206,9 @@ const startLane = async (
     // The session can be written while start is still returning; its goal must belong to this invocation.
     const launchedAt = deps.clock.now();
     try {
-      await rts.terminal(ref.runtime).start(ref, laneStartCommand(lane, modelLaunchCommand(command, model, prompt)));
+      const argv = modelLaunchCommand(command, model, prompt);
+      if (lane.modelProfileFile) argv.push(`--config=${lane.modelProfileFile}`);
+      await rts.terminal(ref.runtime).start(ref, laneStartCommand(lane, argv));
       return { launchedAt };
     } catch (error) {
       return { startup: `STARTUP_ERROR ${input.key} ${pane}: start failed: ${lastLines(String(error))}` };
@@ -220,7 +225,7 @@ const startLane = async (
   const { launchedAt } = submitted.value;
   const deliverBrief =
     !lane.modelReadback && mayRunOmpArgv(command)
-      ? async (): Promise<string | null> => {
+      ? async (): Promise<Lane | string> => {
           const delivery = await withDeliveryLock(deps, lane.key, async () => {
             const current = await deps.registry.read(lane.key);
             const live = current && sessionOf(current);
@@ -234,7 +239,9 @@ const startLane = async (
               live.id !== ref.id
             )
               return "lane changed before verified delivery; brief not sent";
-            return deliverModelBrief(deps, ref, model, prompt, launchedAt);
+            const delivered = await deliverModelBrief(deps, current, ref, model, prompt, launchedAt);
+            if (typeof delivered !== "string") lane = delivered;
+            return delivered;
           });
           return delivery.ok ? delivery.value : `delivery lock held (${delivery.holder}); brief not sent`;
         }

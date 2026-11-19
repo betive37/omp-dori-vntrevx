@@ -167,7 +167,7 @@ test("a background call is evidence once its job completes, and a rerun with the
   expect(toolEvidence(currentDialect, "c1", pi.ctx().cwd)).toEqual(evidence);
   if (retainedSource) {
     const retained: { toolEvidence: typeof toolEvidence } = await import(
-      join(retainedSource, "skills/dori-mode/scripts/src/tool-evidence.ts")
+      join(retainedSource, "skills/cataly-mode/scripts/src/tool-evidence.ts")
     );
     expect(retained.toolEvidence(pi.session.entries, "c1", pi.ctx().cwd)).toEqual(evidence);
   }

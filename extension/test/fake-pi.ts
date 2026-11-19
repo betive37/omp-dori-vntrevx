@@ -1,6 +1,12 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { join, resolve } from "node:path";
+import type * as NativeConfig from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/config/settings.d.ts";
+
+const host = resolve(import.meta.dir, "../../test/fixtures/omp-native-host");
+const { Settings, withActiveSettings }: typeof NativeConfig = await import(
+  Bun.resolveSync("@oh-my-pi/pi-coding-agent/config/settings", host)
+);
 
 import type { CommandOptions as Command, CatalyApi, CatalyContext, ToolDefinition as Tool } from "../index";
 
@@ -9,6 +15,9 @@ export const calls: string[] = [];
 export type Entry = {
   id?: string;
   type: string;
+  model?: string;
+  thinkingLevel?: string | null;
+  configured?: string | null;
   customType?: string;
   data?: unknown;
   mode?: string;
@@ -26,11 +35,21 @@ export type FakeOptions = {
   model?: CatalyContext["model"];
   catalog?: NonNullable<CatalyContext["model"]>[];
   subscription?: boolean;
+  settings?: NativeConfig.Settings;
+  thinkingLevel?: string;
   thinking?: string;
+  autoThinking?: boolean;
+  native?: CatalyApi["pi"];
+  idle?: boolean;
+  pendingMessages?: boolean;
+  asyncJobs?: ReturnType<NonNullable<CatalyContext["getAsyncJobSnapshot"]>>;
+  descendantJobs?: readonly unknown[];
+  setModel?: (model: NonNullable<CatalyContext["model"]>) => Promise<boolean>;
 };
 
 export type FakePi = {
   api: CatalyApi;
+  settings: NativeConfig.Settings;
   handlers: Map<string, Array<(event: unknown, ctx: CatalyContext) => unknown>>;
   commands: Map<string, Command>;
   tools: Map<string, Tool>;
@@ -51,7 +70,10 @@ const schema = { optional: () => schema, describe: () => schema };
 export const fakePi = (options: FakeOptions): FakePi => {
   const flags = new Map<string, boolean | string>(Object.entries(options.flags ?? {}));
   const agent: Agent = options.agent ?? { kind: "main", id: "Main" };
+  const settings = options.settings ?? Settings.isolated();
+  const nativeListeners = new Set<(event: { readonly type: string }) => void>();
   const fake: FakePi = {
+    settings,
     handlers: new Map(),
     commands: new Map(),
     tools: new Map(),
@@ -64,10 +86,18 @@ export const fakePi = (options: FakeOptions): FakePi => {
     ctx: () => ({
       cwd: tmpdir(),
       abort: () => void calls.push("abort"),
+      isIdle: () => options.idle ?? true,
+      hasPendingMessages: () => options.pendingMessages ?? false,
+      getAsyncJobSnapshot: () =>
+        options.asyncJobs === undefined
+          ? { running: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } }
+          : options.asyncJobs,
       mode: options.mode ?? "print",
       ...(options.hasUI === undefined ? {} : { hasUI: options.hasUI }),
       agent,
-      model: options.model,
+      get model() {
+        return options.model;
+      },
       modelRegistry: {
         getAvailableForProviders: (providers) =>
           (options.catalog ?? (options.model ? [options.model] : [])).filter(
@@ -90,10 +120,12 @@ export const fakePi = (options: FakeOptions): FakePi => {
       },
     }),
     emit: async (event, payload = { type: event }) => {
+      for (const listener of [...nativeListeners]) listener({ type: event });
       const results: unknown[] = [];
       let current = payload;
       for (const handler of [...(fake.handlers.get(event) ?? [])]) {
-        const result = await handler(current, fake.ctx());
+        // Native runs every handler in its session's settings scope.
+        const result = await withActiveSettings(settings, () => handler(current, fake.ctx()));
         results.push(result);
         if (
           event === "before_agent_start" &&
@@ -113,9 +145,19 @@ export const fakePi = (options: FakeOptions): FakePi => {
     command: async (name, args = "") => {
       const command = fake.commands.get(name);
       if (!command) throw new Error(`no command ${name}`);
-      await command.handler(args, fake.ctx());
+      await withActiveSettings(settings, () => command.handler(args, fake.ctx()));
     },
     api: {
+      pi: options.native ?? {
+        MAIN_AGENT_ID: agent.kind === "main" ? agent.id : "Main",
+        AgentRegistry: { global: () => ({ get: () => ({ session: nativeSession }) }) },
+      },
+      getThinkingLevel: () => options.thinking ?? options.thinkingLevel,
+      setModel: async (model) => {
+        const accepted = options.setModel ? await options.setModel(model) : true;
+        if (accepted) options.model = model;
+        return accepted;
+      },
       zod: {
         object: () => schema,
         string: () => schema,
@@ -129,7 +171,6 @@ export const fakePi = (options: FakeOptions): FakePi => {
         if (flag.default !== undefined && !flags.has(name)) flags.set(name, flag.default);
       },
       getFlag: (name) => flags.get(name),
-      getThinkingLevel: () => options.thinking,
       registerCommand: (name, command) => void fake.commands.set(name, command),
       registerTool: (tool) => void fake.tools.set(tool.name, tool as Tool),
       on: (event: string, handler: (event: never, ctx: CatalyContext) => unknown) => {
@@ -147,6 +188,35 @@ export const fakePi = (options: FakeOptions): FakePi => {
       },
     },
   };
+  const nativeSession = {
+    settings,
+    sessionManager: {
+      ...fake.ctx().sessionManager,
+      appendModelChange: (model: string) => void fake.session.entries.push({ type: "model_change", model }),
+      appendThinkingLevelChange: (thinkingLevel?: string, configured?: string) =>
+        void fake.session.entries.push({
+          type: "thinking_level_change",
+          thinkingLevel: thinkingLevel ?? null,
+          configured: configured ?? null,
+        }),
+    },
+    agent: {
+      state: {
+        get model() {
+          return options.model;
+        },
+      },
+    },
+    getAsyncJobTree: () => ({ running: options.descendantJobs ?? [] }),
+    configuredThinkingLevel: () => (options.autoThinking ? "auto" : options.thinkingLevel),
+    subscribe: (listener: (event: { readonly type: string }) => void) => {
+      nativeListeners.add(listener);
+      return () => {
+        nativeListeners.delete(listener);
+      };
+    },
+  };
+  // omp-ulw talks to these too; they are outside omp-dori's own API surface.
   // omp-ulw talks to these too; they are outside omp-cataly's own API surface.
   Object.assign(fake.api, {
     recordTestCall: (event: string) => void calls.push(event),

@@ -13,6 +13,7 @@ const result = await requiredSourceRequest(
   "lane",
   boundary,
   availability === "unavailable" ? "openai/absent" : `openai/required-source-local${thinking ? ":high" : ""}`,
+  undefined,
   thinking,
 );
 assert.deepEqual(result.errors.filter((error) => error.event === "session_start"), []);

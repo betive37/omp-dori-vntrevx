@@ -1,11 +1,13 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
-import { existsSync, symlinkSync } from "node:fs";
+import { existsSync, mkdirSync, readdirSync, rmSync, symlinkSync } from "node:fs";
 import { join } from "node:path";
 import { closeLane } from "../src/done-flow.ts";
+import { readPaneState } from "../src/lane-state.ts";
 import { parkLane } from "../src/park.ts";
 import { pauseLane, resumeLane } from "../src/pause.ts";
 import { reopenLane } from "../src/reopen.ts";
 import { Reports } from "../src/reports.ts";
+import { runtimesOf } from "../src/run.ts";
 import { Supervision } from "../src/supervision.ts";
 import { laneState, sent } from "./fakes.ts";
 import { lifecycleFixture, type LifecycleFixture } from "./lifecycle-fixture.ts";
@@ -104,6 +106,41 @@ test("a failed reopen can be explicitly abandoned from its shell, then reopened 
   expect((await reopenLane(f.deps, abandoned.lane)).code).toBe(0);
 });
 
+test.each(["missing", "replaced-with-directory"])(
+  "reopen keeps create failure when profile cleanup is %s",
+  async (fault) => {
+    const parked = await parkLane(f.deps, f.lane, "wait");
+    const dir = join(f.state.dir, "model-profiles");
+    const before = new Set(readdirSync(dir));
+    runtimesOf(f.deps).default.create = async () => {
+      const name = readdirSync(dir).find((entry) => !before.has(entry));
+      if (!name) throw new Error("fixture missing prepared reopen profile");
+      const file = join(dir, name);
+      rmSync(file);
+      if (fault === "replaced-with-directory") mkdirSync(file);
+      throw new Error("native pane creation failed");
+    };
+    await expect(reopenLane(f.deps, parked.lane)).rejects.toThrow("native pane creation failed");
+    expect(await f.deps.registry.read(f.lane.key)).toEqual(parked.lane);
+    expect(f.creates()).toBe(0);
+  },
+);
+
+test("an opaque wrapper cannot reopen a pinned snapshot with uninspectable model selectors", async () => {
+  const parked = await parkLane(f.deps, f.lane, "wait");
+  await expect(
+    reopenLane(
+      { ...f.deps, config: { ...f.deps.config, agentCommand: ["sh", "-c", 'exec omp "$@"', "--", "{prompt}"] } },
+      parked.lane,
+    ),
+  ).rejects.toThrow(
+    "OMP agentCommand is opaque.\nFix: use an explicit OMP executable, source launcher or package-runner argv.",
+  );
+  expect(f.creates()).toBe(0);
+  expect(await f.deps.registry.read(f.lane.key)).toEqual(parked.lane);
+  expect(sent(f.world)).toEqual(["/goal pause"]);
+});
+
 test("an unreadable peer probe holds reopen without creating a pane", async () => {
   const parked = await parkLane(f.deps, f.lane, "wait");
   f.world.panes.push({ pane_id: "w1:p9", workspace_id: "w1", foreground: "bash" });
@@ -145,21 +182,25 @@ test("ordinary resume after failed reopen readback still resets old terminal rep
   const reports = new Reports(f.state.dir);
   await reports.report(f.lane.key, "done", "previous completion", f.deps.clock.now());
   const parked = await parkLane(f.deps, f.lane, "wait");
-  const state = { cwd: f.lane.cwd!, pid: 4250, sessionId: f.session, goal: { status: "paused" as const } };
+  const native = () => {
+    const state = readPaneState(f.state.dir, "w1:p8");
+    if (!state) throw new Error("reopen fixture missing native state");
+    return state;
+  };
   const failed = await reopenLane(
     {
       ...f.deps,
       run: async (argv) => {
         const result = await f.deps.run(argv);
         if (argv[1] === "pane" && argv[2] === "run")
-          laneState(f.state.dir, "w1:p8", { ...state, approvalPending: true });
+          laneState(f.state.dir, "w1:p8", { ...native(), approvalPending: true });
         return result;
       },
     },
     parked.lane,
   );
   expect(failed.code).toBe(3);
-  laneState(f.state.dir, "w1:p8", state);
+  laneState(f.state.dir, "w1:p8", { ...native(), approvalPending: false });
   expect((await resumeLane(f.deps, failed.lane, "approval resolved")).code).toBe(0);
   expect(reports.read(f.lane.key)?.state).toBe("running");
   expect(reports.read(f.lane.key)?.lastReport).toBeNull();

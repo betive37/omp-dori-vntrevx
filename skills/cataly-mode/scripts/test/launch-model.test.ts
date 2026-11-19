@@ -3,7 +3,8 @@ import { writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ModelReadback, PaneState } from "../src/lane-state.ts";
 import { launchLane } from "../src/launch.ts";
-import { modelLaunchCommand, modelLaunchProblem } from "../src/launch-model.ts";
+import { modelLaunchProblem } from "../src/launch-model.ts";
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, sent, withState, type TestState } from "./fakes.ts";
 
 let state: TestState;
@@ -12,7 +13,12 @@ beforeEach(() => {
 });
 afterEach(() => state.done());
 
-const launch = async (model: string, patch: Partial<PaneState> = {}, launchKeywords?: string) => {
+const launch = async (
+  model: string,
+  patch: Partial<PaneState> = {},
+  options: { launchKeywords?: string; snapshot?: boolean } = {},
+) => {
+  const { launchKeywords } = options;
   const world = newWorld();
   const clock = fakeClock(Date.parse("2026-01-01T12:00:00.000Z"));
   const brief = join(state.dir, "brief.md");
@@ -41,6 +47,19 @@ const launch = async (model: string, patch: Partial<PaneState> = {}, launchKeywo
           out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }),
           err: "",
         };
+      if (argv[0] === "herdr" && argv[2] === "run") {
+        const lane = await base.registry.read("model-gate");
+        if (!lane?.modelProfileFile) throw new Error("launch fixture missing its allocated model profile");
+        const observed = patch.modelReadback?.observed;
+        laneState(state.dir, "w:p9", {
+          agentStatus: "idle",
+          modelProfileFile: lane.modelProfileFile,
+          ...(observed && options.snapshot !== false
+            ? { modelSnapshot: snapshotFor(`${observed.provider}/${observed.id}`, model) }
+            : {}),
+          ...patch,
+        });
+      }
       const response = await base.run(argv);
       if (argv[0] === "herdr" && argv[2] === "send-keys" && argv[4] === "enter" && response.code === 0)
         laneState(state.dir, "w:p9", { ...patch, agentStatus: "working" });
@@ -76,6 +95,12 @@ const matched = {
 test("an exact live readback delivers once after starting without the brief", async () => {
   const { result, world } = await launch("subscription/exact", { modelReadback: matched });
   expect(result.startup).toBe("STARTUP_OK model-gate w:p9");
+  expect(result.lane.model).toBe("subscription/exact");
+  expect(result.lane.modelSnapshot).toMatchObject({
+    model: matched.observed,
+    provenance: { kind: "launch", requested: "subscription/exact" },
+  });
+  expect(result.lane.modelProfileFile).toContain("model-profiles/");
   expect(sent(world)).toHaveLength(1);
   expect(sent(world)[0]).toContain("Read and execute");
   const command = world.calls.find((argv) => argv[2] === "run")?.at(-1);
@@ -147,7 +172,11 @@ test("a thinking record must name the request's own effort suffix before it sele
 });
 
 test("unsafe typed launch text is held without a send or an unhandled delivery error", async () => {
-  const { result, world } = await launch("subscription/exact", { modelReadback: matched }, "ulw $(work)");
+  const { result, world } = await launch(
+    "subscription/exact",
+    { modelReadback: matched },
+    { launchKeywords: "ulw $(work)" },
+  );
   expect(result.startup).toStartWith("STARTUP_MODEL_HOLD");
   expect(result.startup).toContain("refusing to send text");
   expect(sent(world)).toEqual([]);
@@ -168,60 +197,22 @@ test("mismatch, unavailable, stale and foreign-provider evidence never dispatche
   }
 });
 
-test("the launch guard stays in the native option region and never becomes an initial message", () => {
-  const template = ["omp", "--cataly-role", "lane", "--model", "{model}", "--", "{prompt}"];
-  expect(modelLaunchProblem(template, "subscription/exact")).toBeNull();
-  expect(modelLaunchCommand(template, "subscription/exact", "Do the work")).toEqual([
-    "omp",
-    "--cataly-launch-model=subscription/exact",
-    "--cataly-role=lane",
-    "--model=subscription/exact",
-  ]);
-  expect(modelLaunchProblem([...template, "another message"], "subscription/exact")).not.toBeNull();
-});
-
-test("native launch preserves env and package-runner option separators", () => {
-  for (const prefix of [
-    ["env", "-i", "--"],
-    ["npm", "exec", "--"],
-    ["npx", "--yes", "--"],
+test("matched identity alone cannot dispatch without its process-bound snapshot", async () => {
+  for (const patch of [
+    null,
+    { modelProfileFile: "/another/process.json" },
+    { modelSnapshotError: "native profile drift" },
+    { modelSnapshot: snapshotFor("subscription/other") },
   ]) {
-    const template = [...prefix, "omp", "--model", "{model}", "--", "{prompt}"];
-    expect(modelLaunchProblem(template, "subscription/exact")).toBeNull();
-    expect(modelLaunchCommand(template, "subscription/exact", "Do the work")).toEqual([
-      ...prefix,
-      "omp",
-      "--cataly-launch-model=subscription/exact",
-      "--model=subscription/exact",
-    ]);
-  }
-});
-
-test("native option values and an overriding text mode remain eligible for verified delivery", () => {
-  const template = [
-    "omp",
-    "--append-system-prompt",
-    "--print",
-    "--mode",
-    "json",
-    "--mode",
-    "text",
-    "--model",
-    "{model}",
-    "{prompt}",
-  ];
-  expect(modelLaunchProblem(template, "subscription/exact", true)).toBeNull();
-  const command = modelLaunchCommand(template, "subscription/exact", "Do the work");
-  expect(command).toContain("--append-system-prompt=--print");
-  expect(command).toContain("--cataly-launch-model=subscription/exact");
-  expect(command).not.toContain("Do the work");
-});
-
-test("native launch refuses initial positional, file and automatic work in its template", () => {
-  for (const initial of [["Do work now"], ["@/tmp/brief.md"], ["--goal", "Do work now"], ["--restore"]]) {
-    expect(
-      modelLaunchProblem(["omp", "--model", "{model}", ...initial, "{prompt}"], "subscription/exact"),
-    ).not.toBeNull();
+    const { result, world } = await launch(
+      "subscription/exact",
+      { modelReadback: matched, ...patch },
+      { snapshot: patch !== null },
+    );
+    expect(result.startup).toStartWith("STARTUP_MODEL_HOLD");
+    expect(sent(world)).toEqual([]);
+    state.done();
+    state = withState();
   }
 });
 

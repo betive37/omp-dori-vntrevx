@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { accessSync, constants, readFileSync, realpathSync, rmSync, writeFileSync } from "node:fs";
+import { accessSync, constants, readFileSync, realpathSync, writeFileSync } from "node:fs";
 
 import { ToolError } from "../../../../src/runtime/exec.ts";
 import { HcError, isReportedKind } from "../../../../src/runtime/hc/exec.ts";
@@ -14,6 +14,8 @@ import {
   stageGeneratedBrief,
 } from "./launch-generated.ts";
 import { isDiscordSnowflake } from "./messenger/discord-inbound-state.ts";
+import { createModelProfileFile } from "./model-profile.ts";
+import { removePrepared } from "./prepared-file.ts";
 import { type Lane, type Registry, sameLaneGeneration, sessionFields, sessionOf } from "./registry.ts";
 import { Reports } from "./reports.ts";
 import type { ReportProvenance } from "./request-identity.ts";
@@ -88,15 +90,6 @@ export const bindLaunchRun = async (
   });
 };
 
-// Each cleanup step is tried on its own: one that fails is reported and never stops the others.
-const removeStaged = (staged: string): void => {
-  try {
-    rmSync(staged, { force: true });
-  } catch (error) {
-    process.stderr.write(`cataly: could not remove the staged brief ${staged} (${why(error)})\n`);
-  }
-};
-
 // A nonzero exit alone is not proof: the transport may have failed after terminal creation.
 const creationWasRejected = (rts: ChosenRuntimes, error: unknown): boolean => {
   if (rts.failure !== undefined && error === rts.failure) return true;
@@ -133,11 +126,10 @@ const briefTarget = (brief: string): string => {
 
 /**
  * Opens a lane's session and registers it before its agent starts (cataly report refuses an unknown key, so a fast
- * lane's first report would be lost). Stage generated briefs privately before terminal creation and publish
- * them only when it returns a terminal identity. A confirmed rejection can discard just that private attempt.
- * An explicit brief is staged beside its path, then rewritten in place only once this launch owns the key. A failed
- * rewrite puts its original bytes back. A key that another launch or adopt registered meanwhile is `taken`; its
- * record and explicit brief stay. On failure, close the created session and remove temporary files and our record.
+ * lane's first report would be lost). Generated briefs are staged privately before terminal creation and published only
+ * when it returns a terminal identity; a confirmed rejection can discard just that attempt. An explicit brief is staged
+ * beside its path, then rewritten in place once this launch owns the key; a failed rewrite restores its bytes. A key
+ * another launch registered meanwhile is `taken`; its record and brief stay. A failure closes the session and cleans up.
  */
 export const openLaneSession = async (
   registry: Registry,
@@ -148,7 +140,13 @@ export const openLaneSession = async (
     preamble,
     generated,
     runtime,
-  }: { readonly preamble: string; readonly generated: boolean; readonly runtime: RuntimeKind },
+    profileStateDir,
+  }: {
+    readonly preamble: string;
+    readonly generated: boolean;
+    readonly runtime: RuntimeKind;
+    readonly profileStateDir?: string | undefined;
+  },
 ): Promise<OpenedLane> => {
   let generatedAttempt: GeneratedBrief | undefined;
   let staged:
@@ -156,8 +154,8 @@ export const openLaneSession = async (
     | undefined;
   const cleanup = (keepBackup = false): void => {
     if (!staged) return;
-    removeStaged(staged.pending);
-    if (!keepBackup) removeStaged(staged.backup);
+    removePrepared(staged.pending);
+    if (!keepBackup) removePrepared(staged.backup);
   };
   try {
     if (generated) {
@@ -179,11 +177,13 @@ export const openLaneSession = async (
     cleanup();
     return { kind: "failed", what: generated ? "generated brief not writable" : "brief not writable", error };
   }
-  let ref: SessionRef;
+  let ref: SessionRef, modelProfileFile: string | undefined;
   try {
+    if (profileStateDir) modelProfileFile = createModelProfileFile(profileStateDir);
     ref = await rts.for({ runtime, id: "" }).create(spec);
   } catch (error) {
     cleanup();
+    removePrepared(modelProfileFile);
     if (generatedAttempt && creationWasRejected(rts, error)) {
       discardGeneratedBrief(generatedAttempt);
       generatedAttempt = undefined;
@@ -197,6 +197,7 @@ export const openLaneSession = async (
     ...draft,
     ...sessionFields(ref),
     ...(ref.runtime === "headless" ? { lifecycleEpoch: ref.id } : {}),
+    ...(modelProfileFile ? { modelProfileFile } : {}),
   };
   let registered = false;
   let keepBackup = false;
@@ -232,6 +233,7 @@ export const openLaneSession = async (
     }
   }
   cleanup(keepBackup);
+  removePrepared(modelProfileFile);
   if (registered)
     await registry.discard(lane).catch((error: unknown) => {
       process.stderr.write(`cataly: could not remove lane ${lane.key} after its launch failed (${why(error)})\n`);

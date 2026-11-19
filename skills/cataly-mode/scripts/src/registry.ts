@@ -79,7 +79,7 @@ export type Lane = {
   /** The last supervision failure printed by `freshness`, so the same one is printed once. */
   readonly lastSupervisionError?: string | undefined;
   readonly receipt?: unknown;
-};
+} & import("./model-switch-state.ts").LaneModelPin;
 
 /** Records written before runtimes existed name a herdr pane (and tab): the only runtime the skill spoke then. */
 const LEGACY_RUNTIME = "herdr" as const;

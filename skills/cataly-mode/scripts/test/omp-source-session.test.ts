@@ -1,11 +1,11 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
-
 import { isOmpArgv } from "../../../../src/runtime/omp-argv.ts";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { laneGoalActive } from "../src/goal-record.ts";
 import { launchLane } from "../src/launch.ts";
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import { pauseLane } from "../src/pause.ts";
 import { runtimesOf } from "../src/run.ts";
 import { resolveSession, sessionDirFor, trustedPaneState } from "../src/session-id.ts";
@@ -32,7 +32,6 @@ const forms = [
   ["timing source", source("/home/user/.cache/omp-cataly/native/source", true)],
   ["relative Bun", ["bun", ...source("/opt/native/source").slice(1)]],
 ] as const;
-
 let state: TestState;
 let world: World;
 beforeEach(() => {
@@ -41,9 +40,16 @@ beforeEach(() => {
 });
 afterEach(() => state.done());
 
+const working = (sessionFile: string) => ({
+  cwd: state.dir,
+  sessionId: SID,
+  sessionFile,
+  agentStatus: "working" as const,
+});
+
 const setup = (argv: readonly string[], key: string, record = true) => {
   const sessionsDir = join(state.dir, "store");
-  const dir = sessionDirFor(sessionsDir, "/repo");
+  const dir = sessionDirFor(sessionsDir, state.dir);
   mkdirSync(dir, { recursive: true });
   const sessionFile = join(dir, `2026-01-01T12-00-03-000Z_${SID}.jsonl`);
   const user = { type: "message", message: { role: "user", content: `You are the ${key} lane; report as told.` } };
@@ -57,16 +63,16 @@ const setup = (argv: readonly string[], key: string, record = true) => {
       workspace_id: "w",
       agent: "omp",
       agent_status: "working",
-      cwd: "/repo",
+      cwd: state.dir,
       foreground: [{ name: "bun", argv: [...argv], pid: 4242 }],
     },
   ];
   agentIn(world, REF.id);
   const agent = world.procs?.find((p) => p.pid === 4242);
   if (agent) agent.cmd = argv.join(" ");
-  if (record) laneState(state.dir, REF.id, { sessionId: SID, sessionFile, agentStatus: "working" });
+  if (record) laneState(state.dir, REF.id, { cwd: state.dir, sessionId: SID, sessionFile, agentStatus: "working" });
   const clock = fakeClock(T0);
-  const base = depsFor(world, clock, state.dir, { sessionsDir, startupWaitSeconds: 20 });
+  const base = depsFor(world, clock, state.dir, { sessionsDir, defaultCwd: state.dir, startupWaitSeconds: 20 });
   let onSubmit: (() => void) | undefined;
   const deps = {
     ...base,
@@ -86,12 +92,15 @@ const setup = (argv: readonly string[], key: string, record = true) => {
           checkedAt: new Date(T0).toISOString(),
           source: "native-extension" as const,
         };
-        // A guarded native start is idle until verified delivery; opaque launches keep the original fixture.
+        const modelSnapshot = snapshotFor("anthropic/claude-opus-5-5");
+        const modelProfileFile = (await base.registry.read(key))?.modelProfileFile;
+        if (!modelProfileFile) throw new Error("native source fixture missing profile");
+        const native = { cwd: state.dir, sessionId: SID, sessionFile, modelReadback, modelSnapshot, modelProfileFile };
         world.panes[0]!.agent_status = "idle";
-        laneState(state.dir, REF.id, { sessionId: SID, sessionFile, agentStatus: "idle", modelReadback });
+        laneState(state.dir, REF.id, { ...native, agentStatus: "idle" });
         onSubmit = () => {
           world.panes[0]!.agent_status = "working";
-          laneState(state.dir, REF.id, { sessionId: SID, sessionFile, agentStatus: "working", modelReadback });
+          laneState(state.dir, REF.id, { ...native, agentStatus: "working" });
         };
       }
       const result = await base.run(cmd);
@@ -112,13 +121,13 @@ test.each(forms)("%s OMP vouches for its session, goal, launch, sync and pause",
   const { deps, rts, sessionsDir, sessionFile, brief } = setup(argv, key);
   expect((await trustedPaneState(deps.run, state.dir, REF, rts))?.sessionId).toBe(SID);
   const deps2 = { run: deps.run, rts, stateDir: state.dir, sessionsDir };
-  expect(await resolveSession(REF, "/repo", world.procs ?? [], deps2)).toEqual({
+  expect(await resolveSession(REF, state.dir, world.procs ?? [], deps2)).toEqual({
     id: SID,
     via: "extension",
     pid: 4242,
   });
   const omp = { run: deps.run, rts, stateDir: state.dir, ref: REF };
-  expect(await laneGoalActive(sessionsDir, "/repo", key, T0, omp)).toBe(true);
+  expect(await laneGoalActive(sessionsDir, state.dir, key, T0, omp)).toBe(true);
   const launched = await launchLane(
     { ...deps, config: { ...deps.config, agentCommand: [...argv, "--model", "{model}", "{prompt}"] } },
     { key, title: key, brief, done: "file /never-checked" },
@@ -126,8 +135,7 @@ test.each(forms)("%s OMP vouches for its session, goal, launch, sync and pause",
   expect(launched.startup).toBe(`STARTUP_OK ${key} ${REF.id}`);
   expect((await syncRegistry(deps, false)).rows[0]?.session).toBe(`${SID} (extension)`);
   world.onSendText = (_id, text) => {
-    if (text === "/goal pause")
-      laneState(state.dir, REF.id, { sessionId: SID, sessionFile, agentStatus: "working", goal: { status: "paused" } });
+    if (text === "/goal pause") laneState(state.dir, REF.id, { ...working(sessionFile), goal: { status: "paused" } });
   };
   const paused = await pauseLane(deps, launched.lane, "owner said wait");
   expect(paused.code).toBe(0);
@@ -166,8 +174,7 @@ test.each(wrapped)("an OMP lane started through %s is proven by its session reco
   const launched = await wrappedLaunch(deps, prefix, "wrapped", brief);
   expect(launched.startup).toBe(`STARTUP_OK wrapped ${REF.id}`);
   world.onSendText = (_id, text) => {
-    if (text === "/goal pause")
-      laneState(state.dir, REF.id, { sessionId: SID, sessionFile, agentStatus: "working", goal: { status: "paused" } });
+    if (text === "/goal pause") laneState(state.dir, REF.id, { ...working(sessionFile), goal: { status: "paused" } });
   };
   expect((await pauseLane(deps, launched.lane, "owner said wait")).code).toBe(0);
 });
@@ -209,7 +216,7 @@ test("a source OMP without its extension record falls back to OMP's start-time s
     cmd[0] === "ps" && cmd.includes("lstart=")
       ? { code: 0, out: "Thu Jan  1 12:00:01 2026 GMT", err: "" }
       : deps.run(cmd);
-  const hit = await resolveSession(REF, "/repo", world.procs ?? [], { run, rts, stateDir: state.dir, sessionsDir });
+  const hit = await resolveSession(REF, state.dir, world.procs ?? [], { run, rts, stateDir: state.dir, sessionsDir });
   expect(hit).toEqual({ id: SID, via: "start-time", pid: 4242 });
   expect(world.calls.some((cmd) => cmd.includes("eww"))).toBe(false);
 });
@@ -227,7 +234,7 @@ test.each([
     cmd[0] === "ps" && cmd.includes("lstart=")
       ? { code: 0, out: "Thu Jan  1 12:00:01 2026 GMT", err: "" }
       : deps.run(cmd);
-  const hit = await resolveSession(REF, "/repo", world.procs ?? [], { run, rts, stateDir: state.dir, sessionsDir });
+  const hit = await resolveSession(REF, state.dir, world.procs ?? [], { run, rts, stateDir: state.dir, sessionsDir });
   expect(hit).toEqual({ id: SID, via: "start-time", pid: 4242 });
 });
 

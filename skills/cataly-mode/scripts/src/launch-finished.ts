@@ -109,10 +109,11 @@ export const observeLaunch = async (
     readonly ref: SessionRef;
     readonly rts: ChosenRuntimes;
     readonly launchedAt: number;
-    readonly deliverBrief?: () => Promise<string | null>;
+    readonly deliverBrief?: () => Promise<Lane | string>;
   },
 ): Promise<{ readonly lane: Lane; readonly startup: string }> => {
-  const { lane, ref, rts, launchedAt } = launch;
+  const { ref, rts, launchedAt } = launch;
+  let lane = launch.lane;
   const cwd = input.cwd ?? deps.config.defaultCwd;
   const pane = ref.id;
   const started = deps.clock.now();
@@ -157,8 +158,10 @@ export const observeLaunch = async (
     for (let check = 0; ; check++) {
       if (ready(current) && (!deliverBrief || current === "idle")) {
         if (deliverBrief) {
-          const hold = await deliverBrief();
-          if (hold !== null) return { lane, startup: `STARTUP_MODEL_HOLD ${input.key} ${pane}: ${hold}` };
+          const delivered = await deliverBrief();
+          if (typeof delivered === "string")
+            return { lane, startup: `STARTUP_MODEL_HOLD ${input.key} ${pane}: ${delivered}` };
+          lane = delivered;
           deliverBrief = undefined;
         }
         const goal = marker === "" || (await hasGoal(shown));

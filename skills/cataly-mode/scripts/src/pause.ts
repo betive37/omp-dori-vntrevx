@@ -6,6 +6,7 @@ import { type FlowDeps, movedOn } from "./done-flow.ts";
 import type { GoalStatus } from "./lane-state.ts";
 import { confirmedLaneState, nativeGoalStatus } from "./lifecycle-session.ts";
 import { type Lane, type LaneStatus, sameLaneGeneration, sessionOf, statusOf, withStatus } from "./registry.ts";
+import { MODEL_SNAPSHOT_FIX, modelSnapshotHeld } from "./launch-model.ts";
 import { runtimesOf } from "./run.ts";
 import { trustedPaneState } from "./session-id.ts";
 import { readScreen, sendVerified, statusLookup } from "./sessions.ts";
@@ -45,6 +46,7 @@ const goalCommand = async (
   | "goal unverified before send"
   | "goal unverified during readback"
   | "lane changed before send"
+  | "native model snapshot unverified"
 > => {
   const rts = runtimesOf(deps);
   if (ref.runtime === "headless") {
@@ -75,6 +77,7 @@ const goalCommand = async (
       return "identity unverified before send";
     if (state && !nativeGoalStatus(state)) return "goal unverified before send";
     expectedSessionId = state?.sessionId;
+    if (target === "active" && modelSnapshotHeld(lane, state)) return "native model snapshot unverified";
   }
   const shown = native ? NO_GOAL_SHOWN : target === "paused" ? PAUSED_SHOWN : RESUMED_SHOWN;
   const before = count(await readScreen(rts, ref, 200), shown);
@@ -191,7 +194,14 @@ export const resumeLane = async (deps: FlowDeps, seen: Lane, note: string, locke
     return { lane, lines: [`RESUME_UNVERIFIED ${lane.key} has no pane, so its goal cannot be resumed`], code: 3 };
   const goal = await goalCommand(deps, ref, "/goal resume", "active", lane);
   if (goal !== "confirmed")
-    return { lane, lines: [`RESUME_UNVERIFIED ${lane.key} /goal resume ${goal}; lane left paused`], code: 3 };
+    return {
+      lane,
+      code: 3,
+      lines: [
+        `RESUME_UNVERIFIED ${lane.key} /goal resume ${goal}; lane left paused`,
+        ...(goal === "native model snapshot unverified" ? [MODEL_SNAPSHOT_FIX] : []),
+      ],
+    };
   const now = deps.clock.now();
   // Quiet time starts again at the resume: a long pause must not turn into an instant nudge.
   const resumed = await deps.registry.transition(lane, (current) => {

@@ -98,7 +98,7 @@ async function fixture(options?: { role?: "cataly" | "lane"; mode?: string; sub?
     hasPendingMessages: () => state.pending,
     getAsyncJobSnapshot: () => ({
       running: state.job ? [{}] : [],
-      delivery: { queued: 0, delivering: false },
+      delivery: { queued: 0, delivering: false, pendingJobIds: [] },
     }),
   });
   fake.api.setModel = async (model) => {

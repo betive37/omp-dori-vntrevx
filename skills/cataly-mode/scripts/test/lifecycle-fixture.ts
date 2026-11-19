@@ -1,11 +1,12 @@
 import { expect } from "bun:test";
-import { mkdirSync, realpathSync, writeFileSync } from "node:fs";
+import { mkdirSync } from "node:fs";
 import { join } from "node:path";
 import type { FlowDeps } from "../src/done-flow.ts";
 import { readPaneState } from "../src/lane-state.ts";
 import { parkLane } from "../src/park.ts";
 import { sessionOf, upgradeLane, withStatus, type Lane } from "../src/registry.ts";
 import { reopenLane } from "../src/reopen.ts";
+import { savedNativeSession } from "./model-snapshot-fixture.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, withState, type TestState, type World } from "./fakes.ts";
 
@@ -32,9 +33,7 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
   const session = "01a11440-ee81-7f90-b2ed-dcc7d51a0adf";
   const dir = sessionDirFor(sessionsDir, cwd);
   mkdirSync(dir, { recursive: true });
-  // Lifecycle receipts and resume commands use canonical transcript paths, even under a symlinked TMPDIR.
-  const file = join(realpathSync(dir), `2026-01-01T12-00-00-000Z_${session}.jsonl`);
-  writeFileSync(file, `${JSON.stringify({ type: "session", id: session, cwd })}\n`);
+  const { file, initialProfile, nativeModel } = savedNativeSession(dir, state.dir, session, cwd);
   const lane: Lane = {
     key: "lifecycle-lane",
     title: "lifecycle",
@@ -47,8 +46,10 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
     sessionFile: file,
     done: "merged acme/app#1",
     openedAt: "2026-01-01T12:00:00.000Z",
+    modelProfileFile: initialProfile,
+    ...nativeModel,
   };
-  const attach = (pane: string, goal: "active" | "paused", pid: number) => {
+  const attach = (pane: string, goal: "active" | "paused", pid: number, modelProfileFile: string) => {
     world.panes = world.panes.filter((p) => p.pane_id !== pane);
     world.panes.push({
       pane_id: pane,
@@ -58,9 +59,17 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
       agent_status: "idle",
     });
     agentIn(world, pane, pid);
-    laneState(state.dir, pane, { cwd, pid, sessionFile: file, goal: { status: goal } });
+    laneState(state.dir, pane, {
+      cwd,
+      pid,
+      sessionFile: file,
+      goal: { status: goal },
+      agentStatus: "idle",
+      modelProfileFile,
+      ...nativeModel,
+    });
   };
-  attach("w1:p7", "active", 4242);
+  attach("w1:p7", "active", 4242, initialProfile);
   world.onSendText = (id, text) => {
     const current = readPaneState(state.dir, id);
     if (current && (text === "/goal pause" || text === "/goal resume"))
@@ -110,7 +119,9 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
       }
       if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "run") {
         if (startFails) return { code: 1, out: "", err: "agent start failed" };
-        attach("w1:p8", "paused", 4250);
+        const opened = await deps.registry.read(lane.key);
+        if (!opened?.modelProfileFile) throw new Error("reopen fixture missing allocated profile");
+        attach("w1:p8", "paused", 4250, opened.modelProfileFile);
         if (wrongSession)
           laneState(state.dir, "w1:p8", { cwd, pid: 4250, sessionId: "foreign", goal: { status: "paused" } });
       }

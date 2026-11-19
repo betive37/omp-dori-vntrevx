@@ -35,7 +35,13 @@
       "project": ["src/**/*.ts", "test/**/*.ts"]
     },
     "extension": {
-      "entry": ["index.ts", "test/**/*.test.ts", "test/fake-ulw.ts", "test/record-head-inbound.ts"],
+      "entry": [
+        "index.ts",
+        "test/**/*.test.ts",
+        "test/fake-ulw.ts",
+        "test/record-head-inbound.ts",
+        "test/lane-model-worker-probe.ts"
+      ],
       "project": ["**/*.ts"]
     },
     "test/fixtures/omp-native-host": {

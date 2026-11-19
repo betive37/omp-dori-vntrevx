@@ -2,6 +2,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { PaneState } from "../src/lane-state.ts";
 import { launchLane } from "../src/launch.ts";
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import { Reports } from "../src/reports.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, type TestState } from "./fakes.ts";
@@ -74,14 +75,21 @@ export const startOmpLane = async (
     checkedAt: "2026-01-01T12:00:00.000Z",
     source: "native-extension" as const,
   };
+  const modelSnapshot = snapshotFor(`${provider}/${modelId}`);
+  let modelProfileFile: string | undefined;
+  const nativeState = () => ({
+    sessionId: id,
+    sessionFile,
+    modelReadback: readback,
+    modelSnapshot,
+    ...(modelProfileFile === undefined ? {} : { modelProfileFile }),
+  });
   let delivered = false;
-  laneState(state.dir, "w:p9", { sessionId: id, sessionFile, modelReadback: readback, agentStatus: "idle", ...patch });
+  laneState(state.dir, "w:p9", { ...nativeState(), agentStatus: "idle", ...patch });
   const onSubmit = () => {
     delivered = true;
     laneState(state.dir, "w:p9", {
-      sessionId: id,
-      sessionFile,
-      modelReadback: readback,
+      ...nativeState(),
       agentStatus: "working",
       ...patch,
     });
@@ -107,9 +115,7 @@ export const startOmpLane = async (
         }
         if (options.slow && ms === 10_000)
           laneState(state.dir, "w:p9", {
-            sessionId: id,
-            sessionFile,
-            modelReadback: readback,
+            ...nativeState(),
             agentStatus: delivered ? "working" : "idle",
             goal: { status: "active" },
           });
@@ -146,7 +152,11 @@ export const startOmpLane = async (
           out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }),
           err: "",
         };
-      if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "run") clock.at += options.startDelay ?? 0;
+      if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "run") {
+        clock.at += options.startDelay ?? 0;
+        modelProfileFile = (await base.registry.read(key))?.modelProfileFile;
+        laneState(state.dir, "w:p9", { ...nativeState(), agentStatus: "idle", ...patch });
+      }
       const result = await base.run(argv);
       if (argv[0] === "herdr" && argv[2] === "send-keys" && argv[4] === "enter" && result.code === 0) onSubmit();
       return result;

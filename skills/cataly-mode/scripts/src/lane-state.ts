@@ -1,5 +1,6 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type { ModelSwitchReceipt } from "./model-switch-state.ts";
 
 /**
  * Per-pane state written by the omp-cataly extension from inside a Cataly or lane session and read by the `cataly` CLI.
@@ -21,6 +22,26 @@ export interface ModelReadback {
   readonly thinking?: { readonly requested: string; readonly observed: string | null };
 }
 
+/** One native observation, replaced only by an explicit idle lane-model change. */
+export interface ModelSnapshot {
+  readonly version: 1;
+  readonly id: string;
+  readonly model: NonNullable<ModelReadback["observed"]>;
+  readonly modelRoles: Readonly<Record<string, string>>;
+  readonly defaultThinkingLevel: string;
+  /** The native selection, including auto; its resolved per-turn level is only an observation below. */
+  readonly configuredThinkingLevel: string | null;
+  /** null is the native session's unset level, not an inferred default. */
+  readonly thinkingLevel: string | null;
+  readonly capturedAt: string;
+  readonly provenance: {
+    readonly kind: "launch" | "idle-switch";
+    readonly requested: string;
+    readonly modelRoles: Readonly<Record<string, "env" | "runtime" | "overlay" | "project" | "global" | "default">>;
+    readonly defaultThinkingLevel: "env" | "runtime" | "overlay" | "project" | "global" | "default";
+  };
+}
+
 export type PaneState = {
   readonly paneId: string;
   readonly role: CatalyRole;
@@ -40,6 +61,12 @@ export type PaneState = {
   readonly agentStatus?: "idle" | "working";
   /** Native catalog and selected-model agreement, never billing authorization or a quota balance. */
   readonly modelReadback?: ModelReadback;
+  readonly modelSnapshot?: ModelSnapshot;
+  readonly modelProfileFile?: string;
+  /** A saved selection exists but cannot safely govern this native session. */
+  readonly modelSnapshotError?: string;
+  /** This process's receipt for the last `/dori-model-apply` nonce it claimed; validated where read. */
+  readonly modelSwitch?: ModelSwitchReceipt;
 };
 
 /** The native catalog distinguishes literal colon-tagged ids from thinking suffixes. */
@@ -74,6 +101,50 @@ export const expectedLaunchModel = (
   return suffix && record?.["requested"] === suffix.level && record["observed"] === suffix.level
     ? { model: suffix.base, thinking: { requested: suffix.level, observed: suffix.level } }
     : null;
+};
+
+const record = (value: unknown): value is Record<string, unknown> =>
+  typeof value === "object" && value !== null && !Array.isArray(value);
+const MODEL_PROVENANCE: ReadonlySet<unknown> = new Set(["env", "runtime", "overlay", "project", "global", "default"]);
+
+/** Session entries and pane JSON are input boundaries; a malformed latest snapshot never falls back to an old one. */
+export const isModelSnapshot = (value: unknown): value is ModelSnapshot => {
+  if (
+    !record(value) ||
+    value["version"] !== 1 ||
+    typeof value["id"] !== "string" ||
+    !value["id"] ||
+    !record(value["model"]) ||
+    typeof value["model"]["provider"] !== "string" ||
+    typeof value["model"]["id"] !== "string" ||
+    !record(value["modelRoles"]) ||
+    typeof value["defaultThinkingLevel"] !== "string" ||
+    !value["defaultThinkingLevel"] ||
+    !(
+      value["configuredThinkingLevel"] === null ||
+      (typeof value["configuredThinkingLevel"] === "string" && value["configuredThinkingLevel"].length > 0)
+    ) ||
+    !(
+      value["thinkingLevel"] === null ||
+      (typeof value["thinkingLevel"] === "string" && value["thinkingLevel"].length > 0)
+    ) ||
+    typeof value["capturedAt"] !== "string" ||
+    !Number.isFinite(Date.parse(value["capturedAt"])) ||
+    !record(value["provenance"]) ||
+    (value["provenance"]["kind"] !== "launch" && value["provenance"]["kind"] !== "idle-switch") ||
+    typeof value["provenance"]["requested"] !== "string" ||
+    !exactModelIdentity(value["provenance"]["requested"]) ||
+    !record(value["provenance"]["modelRoles"]) ||
+    !MODEL_PROVENANCE.has(value["provenance"]["defaultThinkingLevel"])
+  )
+    return false;
+  const identity = exactModelIdentity(`${value["model"]["provider"]}/${value["model"]["id"]}`);
+  if (!identity || identity.provider !== value["model"]["provider"] || identity.id !== value["model"]["id"])
+    return false;
+  const sources = value["provenance"]["modelRoles"];
+  return Object.entries(value["modelRoles"]).every(
+    ([role, model]) => typeof model === "string" && model.length > 0 && MODEL_PROVENANCE.has(sources[role]),
+  );
 };
 
 export const paneStateDir = (stateDir: string): string => join(stateDir, "sessions");
