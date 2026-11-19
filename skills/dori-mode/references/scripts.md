@@ -237,6 +237,9 @@ Prints `HOST_GUARD ALERT <reasons>` when load, free memory, free disk or the pan
 ### `dori can-launch`
 Prints `CAN_LAUNCH` and exits 0 when the host has room for another lane. Otherwise it prints `HOLD <reasons>` and exits 4. The reasons come from the guard's memory, disk and pane-count thresholds. CPU load alone never holds a launch, because it moves too fast to plan around.
 
+### Discord REST test endpoint
+With `DORI_DISCORD_API_BASE` unset or empty, Discord REST requests use `https://discord.com/api/v10`. For an isolated test server, set it to an HTTP URL on `127.0.0.1`, `localhost` or `[::1]`, optionally with a path prefix; trailing slashes are removed. Credentials, query strings and fragments are refused without echoing the configured value. The local server receives the normal Bot authorization header, so use a synthetic token for tests. This overrides REST only, not Gateway or attachment/CDN URLs.
+
 ### `dori send <slack|telegram|discord> --to TARGET (--text TEXT | --text-file PATH) [--thread ID] [--edit ID] [--reply ID]`
 The body comes from `--text`, or from `--text-file PATH` read as UTF-8 (`-` reads standard input), so a long report or a body with quotes never passes through a shell string. Choose one; both, an unreadable file (the error names its code, such as `ENOENT`) or a body that is empty after trimming are refused before any request. A file body is trimmed like `--text` and gets the same `$(` refusal.
 
