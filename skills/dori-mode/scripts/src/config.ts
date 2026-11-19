@@ -53,6 +53,7 @@ export type DoriConfig = {
   readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly hooks: Hooks;
+  readonly transcribeMaxBytes: number;
   /** Expected Git author and committer per lowercase `owner/repo`, for `verify-pr` and the lane footer. */
   readonly repoIdentities: Readonly<Record<string, CommitIdentity>>;
   readonly supervision: SupervisionOptions;
@@ -81,6 +82,7 @@ export const defaultConfig = (home = homedir()): DoriConfig => ({
   deadPanePatterns: ["has stopped", "no suitable jobs"],
   guard: { loadAlert: 150, loadOk: 80, memFreeMinPct: 20, diskFreeMinGb: 50, panesMax: 20 },
   hooks: {},
+  transcribeMaxBytes: 25 * 1024 * 1024,
   repoIdentities: {},
   supervision: {
     hungAfterMinutes: 20,
@@ -100,10 +102,7 @@ const isIdentity = (value: unknown): value is CommitIdentity => {
   return (
     typeof v === "object" &&
     v !== null &&
-    typeof v.name === "string" &&
-    !!v.name.trim() &&
-    typeof v.email === "string" &&
-    !!v.email.trim()
+    [v.name, v.email].every((field) => typeof field === "string" && !!field.trim())
   );
 };
 
