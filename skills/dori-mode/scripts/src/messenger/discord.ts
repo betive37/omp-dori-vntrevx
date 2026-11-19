@@ -30,6 +30,9 @@ const responseId = (body: { readonly id?: unknown } | null, operation: string): 
   return body.id;
 };
 
+/** Only these channel types give parent_id the meaning of a thread parent. */
+export const isThreadType = (type: unknown): boolean => type === 10 || type === 11 || type === 12;
+
 export class Discord {
   constructor(
     private readonly http: Http,
