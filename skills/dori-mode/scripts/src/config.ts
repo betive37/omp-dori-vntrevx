@@ -50,10 +50,10 @@ export type DoriConfig = {
   readonly closeAfterMin: number;
   readonly heavySlots: number;
   readonly heavyMaxLoad: number;
+  readonly transcribeMaxBytes: number;
   readonly deadPanePatterns: readonly string[];
   readonly guard: GuardThresholds;
   readonly hooks: Hooks;
-  readonly transcribeMaxBytes: number;
   /** Expected Git author and committer per lowercase `owner/repo`, for `verify-pr` and the lane footer. */
   readonly repoIdentities: Readonly<Record<string, CommitIdentity>>;
   readonly supervision: SupervisionOptions;
