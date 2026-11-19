@@ -33,6 +33,7 @@ import { MONITOR_DESCRIPTION, Monitors } from "./monitor";
 import { MONITOR_ENTRY, recordedMonitors, recordedMonitorStates, type RecordedMonitor } from "./monitor-state.ts";
 import type { MonitorSpec } from "../src/update/deployment-types.ts";
 import { sameMonitorSpecs } from "../src/update/deployment-monitors.ts";
+import { bumpAttempts, MAX_CONTINUATIONS, openOwes, recordOwes, reminder } from "../skills/dori-mode/scripts/src/owes";
 
 interface SessionEntry {
   type: string;
@@ -197,8 +198,17 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
   const approvals = new Set<string>();
   let managedRestorePending = process.env.DORI_MANAGED_STARTUP === "1";
   const monitors = new Monitors(
-    (content) =>
-      pi.sendMessage({ customType: "dori-monitor", content, display: true }, { triggerTurn: true, deliverAs: "aside" }),
+    async (content, delivery) => {
+      const root = stateDir;
+      if (!delivery.isCurrent()) return;
+      // Monitor delivery is an admission path in its own right; its message must follow committed persistence.
+      if (role === "dori" && root !== undefined) await recordOwes(root, content, Date.now(), delivery.signal);
+      if (delivery.isCurrent())
+        pi.sendMessage(
+          { customType: "dori-monitor", content, display: true },
+          { triggerTurn: true, deliverAs: "aside" },
+        );
+    },
     () => (role === "dori" ? session?.id : undefined),
   );
   const runtimeHealth = new RuntimeHealthWriter(monitors);
@@ -543,6 +553,23 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     if (ctx.agent.kind !== "main" || !role) return;
     agentStatus = "idle";
     savePane(ctx);
+  });
+
+  /**
+   * Recent Discord obligations request bounded continuations until both send and exact-message mark exist.
+   * MAX_CONTINUATIONS limits the reminder loop; lanes and subagents never receive this gate.
+   */
+  pi.on("session_stop", (_event, ctx) => {
+    if (role !== "dori" || ctx.agent.kind !== "main" || stateDir === undefined) return;
+    const owes = openOwes(stateDir, Date.now());
+    if (owes.length === 0) return;
+    const attempts = bumpAttempts(
+      stateDir,
+      owes.map((owe) => owe.id),
+    );
+    const live = owes.filter((owe) => (attempts[owe.id] ?? 0) <= MAX_CONTINUATIONS);
+    if (live.length === 0) return;
+    return { continue: true, additionalContext: reminder(live) };
   });
 
   // OMP chains prompt replacements in extension/handler order; append to the prompt this handler receives.
