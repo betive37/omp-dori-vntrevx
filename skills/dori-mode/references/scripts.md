@@ -44,6 +44,7 @@ Each budget retains raw `currentBytes` and `chargedFreePct`. Admission uses `fre
 | `guard` | load 150/80, 20% memory, 50 GB disk, 20 panes | `guard` |
 | `hooks.threadReply`, `hooks.threadDone` | none | `freshness`, `close` |
 | `hooks.transcribe` | none | `transcribe` (argv with `{file}`, prints the text) |
+| `transcribeMaxBytes` | 26214400 (25 MiB) | `transcribe` HTTP(S) URLs: positive safe integer cap on actual streamed bytes; local files are unchanged |
 | `supervision` | no ceilings by default (set wallMinutes, tokens or costUsd to enable); hung after 20 min | `freshness`, `launch`, `close` (see Supervision below) |
 | `repoIdentities` | none | `verify-pr`, `launch` footer: expected Git name and email per `owner/repo` (keys match without case) |
 | `prAutoTrack` | `false` | `claim-done`, `checkpoint`: when `true`, pull-request links in a recorded claim's evidence or a checkpoint's `--remote-effect` receipts are tracked for `dori pr watch` with the lane and its thread. Any value other than `true` or `false` stops every command with `invalid prAutoTrack` |
@@ -341,7 +342,13 @@ Prints `LAG n=<count> p50=<ms>ms p90=<ms>ms p99=<ms>ms max=<ms>ms[ skipped=<n>]`
 - `skipped=<n>` counts records without a finite numeric lag in the window, including missing dates, malformed JSON and the partial last line a kill mid-write leaves behind.
 
 ### `dori transcribe <audio-file|url>`
-Runs the existing `hooks.transcribe` argv with `{file}` and prints the transcript. Local paths pass through unchanged. An HTTP(S) URL is downloaded to a unique private temporary directory, with an owner-only audio file, before the same hook runs. The download and its directory are removed after success, failed downloads, and failed or empty transcription; local source files are retained. Failed downloads and failed or empty transcription exit with an error.
+Runs the existing `hooks.transcribe` argv with `{file}` and prints the transcript. Local paths pass through unchanged: no URL size or format policy is applied to them, and local source files are retained.
+
+HTTP(S) downloads stream into a unique private temporary directory and owner-only file. `transcribeMaxBytes` defaults to **26214400 bytes (25 MiB)** and accepts a positive safe integer in the Dori config. The limit counts actual streamed, decompressed bytes across all chunks, not a missing, zero or claimed `Content-Length`; exceeding it aborts the download before the hook. A declared over-limit size is rejected before reading the body.
+
+Before calling the hook, Dori checks the downloaded WAV, MP3, Ogg, M4A/MP4 or FLAC container signature against a declared MIME type. A missing MIME or generic octet-stream type is accepted only with a recognized signature. MP3 metadata alone is insufficient: the MPEG frame header after an ID3 tag must be present. This is bounded container identification, not full codec decoding.
+
+**Compatibility change:** raw PCM, unknown/truncated signatures and MIME/signature contradictions in URLs now fail before transcription. Convert unsupported input to one of the listed containers, fix an incorrect server MIME, or supply a local file path for a custom hook format. Size errors name `transcribeMaxBytes` and how to adjust it; other download refusals give their reason, the setting and a corrective action on one line. The downloaded file and directory are removed on success, overflow, failed downloads, rejected formats, and failed or empty transcription. Errors exit nonzero.
 
 ### `dori heavy <label> -- <command ...>`
 Waits until load is under `heavyMaxLoad` and one of `heavySlots` is free, then runs the command and frees the slot when it exits. A slot held by a process that no longer exists (or a zombie) is taken over. Use it for full builds and test suites. Installs, focused tests and git do not need it.
