@@ -9,6 +9,7 @@ import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { DISCORD_LIMIT } from "./messenger/split.ts";
 import { TranscriptionError } from "./messenger/voice.ts";
+import { recordMark, recordSent } from "./owes.ts";
 import { realClock } from "./run.ts";
 
 const client = () =>
@@ -62,7 +63,7 @@ const tagIds = (forum: DcChannel, names: readonly string[]): string[] =>
   });
 
 export const sendDiscord: Command = async (cli) => {
-  const { need, opt, values } = cli;
+  const { need, opt, values, config } = cli;
   const thread = opt("thread");
   const to = thread === undefined ? need("to") : undefined;
   const text = await messageText(cli);
@@ -84,7 +85,12 @@ export const sendDiscord: Command = async (cli) => {
     target = channel.id;
   }
   if (edit !== undefined) await dc.edit(target, edit, text);
-  else console.log(`SENT ${(await dc.send(target, text, reply === undefined ? {} : { replyTo: reply })).join(" ")}`);
+  else {
+    const ids = await dc.send(target, text, reply === undefined ? {} : { replyTo: reply });
+    // A partially posted split send is not a complete answer.
+    await recordSent(config.stateDir, target, Date.now());
+    console.log(`SENT ${ids.join(" ")}`);
+  }
 };
 
 export const threadDiscord: Command = async ({ positionals, need, opt, strings, values }) => {
@@ -165,11 +171,13 @@ export const channelDiscord: Command = async ({ positionals, opt, config }) => {
   console.log(`PURPOSE ${channel.id} ${JSON.stringify(entry.purpose)}`);
 };
 
-export const reactDiscord: Command = async ({ need, opt, values }) => {
+export const reactDiscord: Command = async ({ need, opt, values, config }) => {
   const thread = opt("thread");
   const channel = thread === undefined ? discordInboundEnv("--to", need("to")) : discordInboundEnv("--thread", thread);
   const message = discordInboundEnv("--message", need("message"));
   const remove = values["remove"] === true;
   await client().react(channel, message, opt("emoji") || "\u{1f440}", remove);
+  // A read receipt on the owner's exact message is half of the answer; the gate reads this to settle the owe.
+  if (!remove) await recordMark(config.stateDir, channel, message, Date.now());
   console.log(`REACTED ${channel} ${remove ? "-" : "+"}`);
 };
