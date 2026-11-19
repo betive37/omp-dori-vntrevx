@@ -170,6 +170,17 @@ With the protected token file prepared above and the non-secret IDs inherited fr
 
 The token value never appears in this argv or its monitor receipt: only the child shell reads and exports it. No private helper, external watch script, Node or agent-messenger is needed. A different token-file path is an explicit local choice; keep it owned, regular and mode `0600`.
 
+For a long-running receiver, optionally set `"restart": "on-failure"` in the
+same monitor start request. The monitor retries a nonzero exit or signal after
+five seconds, up to three times in a failure streak. A run of at least one minute
+resets that streak. This option is stored with the monitor and applies when the
+same session resumes. Clean exits, including successful `--loop 0`, are not
+retried. Explicit stop, session shutdown, output storage failure, and uncertain
+monitor delivery do not retry the child. Existing monitors with no policy keep
+their current behavior. The monitor itself still belongs to the OMP session:
+use the same session's resume path after OMP exits. This is receiver-process
+recovery, not an end-to-end delivery acknowledgement.
+
 By default the command polls continuously every **three seconds**. `--loop` uses **minutes**: `--loop 0.1` means six seconds, and `--loop 0` runs once. Append those flags after `inbound discord` in the opted-in argv when needed.
 
 Startup validates bot authentication, application Message Content Intent and View Channel/Read Message History access before `INBOUND_READY discord owner=<id> channel=<id[,id...]|all> bot=<id>` (`mode=gateway` is appended with `--gateway`). Each channel without a stored cursor baselines its latest message ID without replaying history; an empty channel starts at `0`. This also applies to channels first found by a later REST discovery. In scope `all`, a channel first seen through a live dispatch starts just before that message, so earlier history in that channel is skipped. Existing stored cursors resume instead of baselining again. **Wait for readiness, then send a fresh owner message.** Subsequent owner messages appear as `INBOUND discord <channel> <message> from=owner ref=<id|-> <JSON text>` for native monitor delivery to the owning OMP session.

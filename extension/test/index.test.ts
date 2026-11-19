@@ -236,7 +236,7 @@ describe("monitor restore", () => {
     const s = session("dori-r1");
     const first = await load({ session: s, flags: { "dori-role": "dori" } });
     await first.emit("session_start");
-    await monitorCall(first, tick);
+    await monitorCall(first, { ...tick, restart: "on-failure" });
     await first.emit("session_shutdown"); // omp exits: the monitor process dies with it
 
     // herdr restores the pane with `omp --resume`: a new process, no flag, nobody asks for the monitor again
@@ -248,6 +248,11 @@ describe("monitor restore", () => {
     });
     await until(() => resumed.messages.some((m) => m.content === "[tick] up"));
     expect(await monitorCall(resumed, { op: "list" })).toContain("tick (pid");
+    expect(s.entries.find((entry) => entry.customType === "omp-dori:monitor")?.data).toMatchObject({
+      op: "start",
+      name: "tick",
+      restart: "on-failure",
+    });
     await resumed.emit("session_shutdown");
   });
 
@@ -612,7 +617,7 @@ describe.skipIf(!existsSync(REAL_ULW))("with the real omp-ulw", () => {
     expect(lane.userMessages).toEqual(["ulw fix it"]);
   });
 
-  test.each(["gpt-6.2-astra", "gpt-6.2-sol"])(
+  test.each(["gpt-6.2-astra", "gpt-6.2-sol", "gpt-6.2-sol-ultrafast"])(
     "native OMP loads the standalone %s preset without losing the retained host boundary",
     async (id) => {
       const { nativeComposition, SOL_MODEL } = await import("../../test/fixtures/omp-native-host/compose.ts");

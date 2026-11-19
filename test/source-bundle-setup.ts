@@ -2,7 +2,7 @@ import { chmodSync, mkdirSync, readFileSync, realpathSync, symlinkSync, writeFil
 import { dirname, join } from "node:path";
 import { nativeDirectory, nativeLauncher, type NativeReceipt } from "../src/release/native.ts";
 import { type ProcessCwds, processCwds } from "../src/release/process-cwd.ts";
-import { type ProcessFiles, processFiles, processFilesForPids } from "../src/release/process-files.ts";
+import { type ProcessFiles, processFiles } from "../src/release/process-files.ts";
 import { readSourceBundle, type SourceBundle } from "../src/release/source-bundle.ts";
 import { digest } from "../src/update/source.ts";
 
@@ -161,6 +161,6 @@ export const ownProcessCwds = (pids: readonly string[]): ProcessCwds | null => {
  */
 export const ownProcessFiles = (pids?: readonly string[]): ProcessFiles | null => {
   if (process.platform !== "linux") return { files: new Map(), unread: [] };
-  const read = pids === undefined ? processFiles() : processFilesForPids(pids);
+  const read = processFiles("linux", pids);
   return read && { files: read.files, unread: [] };
 };

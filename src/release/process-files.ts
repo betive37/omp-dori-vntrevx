@@ -32,38 +32,33 @@ function groupFiles(pid: string, tasks: readonly string[]): string[] {
  * every open descriptor (a directory included) and every mapped file, read through any thread that still runs (a
  * leader that exited leaves its threads running); elsewhere what `lsof` lists for this user. `unread` holds live pids
  * whose files could not be read, whatever their working directory shows. Null when nothing at all could be read.
+ * Linux callers inspecting a known process set may provide its PIDs instead of enumerating all of `/proc`.
  */
-export function processFiles(platform = process.platform): ProcessFiles | null {
-  if (platform === "linux") return processFilesForPids(readdirSync("/proc"));
+export function processFiles(platform = process.platform, linuxPids?: readonly string[]): ProcessFiles | null {
   const files = new Map<string, string[]>();
   const unread: string[] = [];
   const uid = process.getuid?.();
-  let lsof: ReturnType<typeof Bun.spawnSync>;
-  try {
-    lsof = Bun.spawnSync(["lsof", "-n", ...(uid === undefined ? [] : ["-u", String(uid)]), "-F", "pn"], {
-      stdout: "pipe",
-      stderr: "pipe",
-      timeout: 60_000,
-    });
-  } catch {
-    return null;
+  if (platform !== "linux") {
+    let lsof: ReturnType<typeof Bun.spawnSync>;
+    try {
+      lsof = Bun.spawnSync(["lsof", "-n", ...(uid === undefined ? [] : ["-u", String(uid)]), "-F", "pn"], {
+        stdout: "pipe",
+        stderr: "pipe",
+        timeout: 60_000,
+      });
+    } catch {
+      return null;
+    }
+    // A failed or cut-short run may have printed only part of the table.
+    if (lsof.exitCode !== 0 || lsof.exitedDueToTimeout || lsof.signalCode || !lsof.stdout?.length) return null;
+    let pid = "";
+    for (const line of lsof.stdout.toString().split("\n")) {
+      if (line.startsWith("p")) pid = line.slice(1);
+      else if (line.startsWith("n/") && pid) files.set(pid, [...(files.get(pid) ?? []), line.slice(1)]);
+    }
+    return { files, unread };
   }
-  // A failed or cut-short run may have printed only part of the table.
-  if (lsof.exitCode !== 0 || lsof.exitedDueToTimeout || lsof.signalCode || !lsof.stdout?.length) return null;
-  let pid = "";
-  for (const line of lsof.stdout.toString().split("\n")) {
-    if (line.startsWith("p")) pid = line.slice(1);
-    else if (line.startsWith("n/") && pid) files.set(pid, [...(files.get(pid) ?? []), line.slice(1)]);
-  }
-  return { files, unread };
-}
-
-/** The Linux file reader for explicit candidates, with the same ownership, thread and unreadability checks as a full scan. */
-export function processFilesForPids(pids: readonly string[]): ProcessFiles | null {
-  const files = new Map<string, string[]>();
-  const unread: string[] = [];
-  const uid = process.getuid?.();
-  for (const pid of pids) {
+  for (const pid of linuxPids ?? readdirSync("/proc")) {
     if (!/^\d+$/.test(pid)) continue;
     try {
       if (uid !== undefined && statSync(`/proc/${pid}`).uid !== uid) continue;

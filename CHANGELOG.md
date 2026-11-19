@@ -4,6 +4,10 @@
 
 - `dori voice discord` adds an opt-in, paid, owner-only Discord voice assistant configured by `voice` in the existing Dori config. It reads lanes and reports, searches the web, posts notes and forwards work to the lead once, claiming delivery only after receipt is observed; forwarded requests carry a written-approval policy, not an effect-point authorization gate. Daily, cumulative and backend spending caps apply, though in-flight usage can exceed them. Native codecs are optional dependencies loaded only by this command. See [the voice guide](docs/discord-voice.md).
 
+- Opted-in Dori monitors can restart unexpectedly exited receiver processes with a bounded retry policy. The policy survives session resume and managed handoff; clean exits, explicit stops, and monitors without the policy retain their existing behavior.
+
+- Document opt-in GPT-6.2 Sol Ultrafast defaults for external OMP 19 lanes and cover the alias in the GPT-6.2 prompt integration. Explicit external commands no longer require a consumer-native receipt; managed launchers retain receipt checks and their pinned runtime.
+
 - Reuse an already-published ULW candidate after unrelated main changes only after verifying its canonical PR, accepted parent and exact metadata-only tree. Preserve closed decisions and exact-head CI deduplication without rewriting branches or repeating Git object uploads.
 
 - Follow the canonical `vntrevx/Cataly` repository identity in the ULW/release workflow guards and their shared publisher/release checks. The exact repository, tag, commit, workflow and trusted check bindings remain enforced; forks and the former identity are refused.
