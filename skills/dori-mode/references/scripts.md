@@ -262,6 +262,9 @@ To attach the runner to an owning native session, explicitly start an ordinary p
 
 `dori schedule adopt [NAME] --systemd UNIT [--system]` registers an existing `.timer` or `.service` for visibility only (`--user` by default; name defaults to the unit). `list` and `boot` use bounded `systemctl show` calls, including a timer's triggered service, to show its next trigger, last observed service result and active state. Never-started services have no invented exit code; missed occurrences remain `systemd-managed`, not a fabricated count. Missing/inaccessible units are explicit errors. Adoption, pause refusal and removal never start, stop, enable, disable or edit a unit. `boot` also reports cron state read-only; it neither claims work nor recovers interrupted jobs.
 
+### Discord REST test endpoint
+With `DORI_DISCORD_API_BASE` unset or empty, Discord REST requests use `https://discord.com/api/v10`. For an isolated test server, set it to an HTTP URL on `127.0.0.1`, `localhost` or `[::1]`, optionally with a path prefix; trailing slashes are removed. Credentials, query strings and fragments are refused without echoing the configured value. The local server receives the normal Bot authorization header, so use a synthetic token for tests. This overrides REST only, not Gateway or attachment/CDN URLs.
+
 ### `dori send <slack|telegram|discord> --to TARGET (--text TEXT | --text-file PATH) [--thread ID] [--edit ID] [--reply ID]`
 The body comes from `--text`, or from `--text-file PATH` read as UTF-8 (`-` reads standard input), so a long report or a body with quotes never passes through a shell string. Choose one; both, an unreadable file (the error names its code, such as `ENOENT`) or a body that is empty after trimming are refused before any request. A file body is trimmed like `--text` and gets the same `$(` refusal.
 
