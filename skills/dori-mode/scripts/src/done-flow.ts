@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 
 import { type DoriConfig, fill } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
+import { pendingDiscordLane } from "./messenger/discord-lane-inbox.ts";
 import { type Lane, type Registry, sessionOf, statusOf, withStatus } from "./registry.ts";
 import { type ChosenRuntimes, type Clock, iso, type Runner, runtimesOf } from "./run.ts";
 import { closeSession, sendVerified } from "./sessions.ts";
@@ -133,7 +134,6 @@ export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]
   }
   return reasons;
 };
-
 export const closeLane = async (
   deps: FlowDeps,
   lane: Lane,
@@ -149,12 +149,16 @@ export const closeLane = async (
   // The close is committed before anything irreversible, and only if nothing moved the lane on since it was read: an
   // objection or new claim written meanwhile keeps it open, and one written after this finds it closed.
   const at = iso(deps.clock);
-  const commit = () =>
-    deps.registry.transition(lane, (current) => withStatus(current, "closed", note, at, { closedAt: at }));
+  const commit = async () =>
+    pendingDiscordLane(deps.config.stateDir, lane)
+      ? ("discord-pending" as const)
+      : deps.registry.transition(lane, (current) => withStatus(current, "closed", note, at, { closedAt: at }));
   // A tell is sent before the close or refused after it (`locked`: the watch holds the lock); a held lock refuses.
   const held = locked ? { ok: true as const, value: await commit() } : await withDeliveryLock(deps, lane.key, commit);
   if (!held.ok)
     return { closed: false, lines: [...lines, `HELD ${lane.key} a message to the lane is in flight (${held.holder})`] };
+  if (held.value === "discord-pending")
+    return { closed: false, lines: [...lines, `HELD ${lane.key}: Discord messages are still pending`] };
   if (!held.value) return { closed: false, lines: [...lines, await movedOn(deps, lane, "close")] };
   // Cost is recorded on a best-effort basis: a failing hook is printed and never keeps a verified lane open.
   try {
@@ -191,7 +195,6 @@ export const closeLane = async (
   }
   return { closed: true, lines: [...lines, `CLOSED ${lane.key} ${JSON.stringify(receipt)}`] };
 };
-
 const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<string> => {
   const blocked = await unpushedWork(deps, lane);
   if (blocked.length) return objectDone(deps, lane, blocked);
@@ -201,6 +204,8 @@ const settle = async (deps: FlowDeps, lane: Lane, evidence: string): Promise<str
   if (failing.length) return objectDone(deps, lane, failing);
   // Verify and close under the delivery lock (see closeLane); a lock held past its wait leaves the claim for next tick.
   const held = await withDeliveryLock(deps, lane.key, async () => {
+    if (pendingDiscordLane(deps.config.stateDir, lane))
+      return `LANE_HELD ${lane.key}: Discord messages are still pending`;
     // The checks above took pane, git and network round trips: an objection or new claim written meanwhile wins.
     const verified = await deps.registry.transition(lane, (current) =>
       withStatus(current, "verified-done", "Done signals read back live", iso(deps.clock)),

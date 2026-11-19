@@ -191,13 +191,44 @@ The cursor is committed under `<stateDir>/discord-inbound/<channelId>.json` in a
 
 Only a remote history-read 403/404 removes an unavailable discovered channel; explicitly configured targets still fail on those responses. Content conversion, delivery and local cursor failures are not permission loss. In Gateway mode they stop intake before later queued messages can advance past the failed message. If an already watched channel's cursor disappears, intake reports the missing-state error rather than silently dropping live messages or recreating a baseline. First-seen scope-all channels still seed their new cursors as described above.
 
+An owner message to an exact Discord channel or thread registered to one
+native OMP lane goes to that lane as a Dori Monitor message, with no terminal
+keystrokes and no new setting. The receiver commits the lane inbox before
+advancing its cursor; pending messages survive a resume of the same session.
+Unbound or ambiguous channels keep the lead's existing intake behavior.
+An exact reply to an open ASK takes precedence over ordinary chat.
+
+To take over an independently configured receiver, stop the old reader before
+starting that exact lane once with `--dori-lane-receiver`. This uses its
+existing explicit receiver state and credentials, requires a separate mailbox
+and cursor root, and remembers the takeover on that session only. The normal
+shared receiver requires no flag. Restart the shared receiver when upgrading
+so it uses the new routing logic.
+
 #### Answering native OMP ASK from Discord
 
-This is off unless you add the exact Dori or lane session ID to
-`<stateDir>/discord-ask.json`. Keep this file and the bot token file owned and
-mode `0600`. The configured bot needs permission to post in the designated
-private channel or thread, and `dori inbound discord` must already watch it
-for the same owner with the same state directory.
+On a supported Discord connection, ASK is enabled automatically once
+`dori inbound discord` is running and has verified the bot, owner and
+channels. It uses that installation's private `$DORI_HOME/discord-token`
+and its existing state directory. No settings file is created or edited.
+Restart the receiver when updating so it reports its current routes.
+
+- A Dori lead uses the single explicitly configured Discord destination.
+  If more than one destination is configured or only discovery is enabled,
+  ASK stays in the terminal rather than guessing.
+- A lane uses only its own registered `discord:<channel-or-thread-id>`
+  destination while the same receiver watches it. New `dori launch` lanes
+  are bound at launch; older lanes need an exact native session identity in
+  the registry (`dori sync --write` can record it).
+- Stopped receivers, unmatched bot credentials and unresolved lanes do not
+  enable automatic delivery. A custom token file or receiver can still use
+  the existing explicit route below.
+
+An explicit route in `<stateDir>/discord-ask.json` takes precedence. Use an
+absolute token file path, keep both files owned and mode `0600`, and make
+sure the bot can post in the selected room. Set a session's entry to `false`
+to keep ASK local for that session. No manual file is needed for the
+standard connection above.
 
 ```json
 {
