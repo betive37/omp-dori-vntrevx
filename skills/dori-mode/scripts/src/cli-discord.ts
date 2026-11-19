@@ -6,7 +6,8 @@ import type { GatewayClock, GatewaySocket } from "./messenger/discord-gateway.ts
 import { discordInbound, formatDiscordInbound, formatInboundContext } from "./messenger/discord-inbound.ts";
 import type { Emit } from "./messenger/discord-inbound-api.ts";
 import { discordInboundLive } from "./messenger/discord-inbound-live.ts";
-import { discordInboundEnv, fileDiscordInboundStore } from "./messenger/discord-inbound-state.ts";
+import { discordInboundQueue } from "./messenger/discord-inbound-queue.ts";
+import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { recordOwes } from "./owes.ts";
 import { realClock } from "./run.ts";
@@ -69,24 +70,35 @@ export const discordInboundCommand = async (
   );
   if (!all && channelIds.length === 0) discordInboundEnv("DORI_DISCORD_CHANNEL_ID", env["DORI_DISCORD_CHANNEL_ID"]);
   const token = env["DORI_DISCORD_TOKEN"] || die("DORI_DISCORD_TOKEN is not set");
-  const discord = new Discord(fetchHttp, realClock, token);
-  const intake = await discordInbound(discord, (channelId) => fileDiscordInboundStore(stateDir, channelId), {
-    ownerId,
-    channelIds: [...new Set(channelIds)],
-    all,
-  });
-  const watching = all ? "all" : intake.channels().join(",");
-  const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
-  // Resolve the complete group before recording the owe, then emit before the cursor advances.
-  const emit: Emit = async (message) => {
-    const text = formatDiscordInbound(message);
-    const group = where ? `${text}\n${formatInboundContext(message, await where(message.channel))}` : text;
-    recordOwes(stateDir, text, Date.now());
-    console.log(group);
-  };
-  console.log(
-    `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
-  );
-  if (!gateway) return await every(pollMinutes, () => intake.poll(emit));
-  await untilStopped(discordInboundLive(intake, openDiscordSocket, token, discordClock, emit, (l) => console.log(l)));
+  const queue = discordInboundQueue(stateDir);
+  try {
+    if (!gateway && queue.first())
+      die("Discord inbound has pending Gateway work; restart with --gateway before REST mode");
+    const discord = new Discord(fetchHttp, realClock, token);
+    const intake = await discordInbound(discord, queue.storeFor, {
+      ownerId,
+      channelIds: [...new Set(channelIds)],
+      all,
+    });
+    const watching = all ? "all" : intake.channels().join(",");
+    const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
+    // Context and the owner line remain one stdout group, after the owe is published.
+    const emit: Emit = async (message, signal) => {
+      const text = where
+        ? `${formatDiscordInbound(message)}\n${formatInboundContext(message, await where(message.channel))}`
+        : formatDiscordInbound(message);
+      await recordOwes(stateDir, text, Date.now(), signal);
+      signal?.throwIfAborted();
+      console.log(text);
+    };
+    console.log(
+      `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
+    );
+    if (!gateway) return await every(pollMinutes, () => intake.poll(emit));
+    await untilStopped(
+      discordInboundLive(intake, openDiscordSocket, token, discordClock, emit, (l) => console.log(l), queue),
+    );
+  } finally {
+    queue.close();
+  }
 };

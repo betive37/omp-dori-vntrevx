@@ -1,18 +1,37 @@
 import { expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
-import { openOwes, recordMark, recordOwes } from "../src/owes.ts";
+import { openOwes, recordMark, recordOwes, recordSent } from "../src/owes.ts";
 import { ids, withDiscordCli } from "./discord-fakes.ts";
 
 const inbound = (message: string) => `INBOUND discord ${ids.thread} ${message} from=owner ref=- "request"`;
 const longAnswer = "verified result\n".repeat(300);
 
+test("missing request or remote IDs are rejected before a marked owe can settle", async () => {
+  await withDiscordCli(async (f) => {
+    const state = dirname(f.tmp);
+    const at = Date.now() - 100;
+    await recordOwes(state, inbound(ids.message), at);
+    await recordMark(state, ids.thread, ids.message, at + 1);
+    for (const [message, remoteIds] of [
+      ["", ["71"]],
+      [ids.message, []],
+    ] as const) {
+      await expect(recordSent(state, ids.thread, message, remoteIds, at + 2)).rejects.toThrow(
+        "discord send: incomplete delivery receipt; outcome uncertain",
+      );
+      expect(openOwes(state, Date.now()).map((owe) => owe.message)).toEqual([ids.message]);
+      expect(existsSync(join(state, "owes", "sent.jsonl"))).toBe(false);
+    }
+  });
+});
+
 test("legacy, malformed and foreign-request receipts never settle an owe", async () => {
   await withDiscordCli(async (f) => {
     const state = dirname(f.tmp);
     const at = Date.now() - 100;
-    recordOwes(state, inbound(ids.message), at);
-    recordMark(state, ids.thread, ids.message, at + 1);
+    await recordOwes(state, inbound(ids.message), at);
+    await recordMark(state, ids.thread, ids.message, at + 1);
     const valid = {
       deliveryId: `discord:${ids.thread}:71`,
       requestId: `${ids.thread}:${ids.message}`,
@@ -42,8 +61,8 @@ test("legacy, malformed and foreign-request receipts never settle an owe", async
 test("an accepted response without a remote message ID remains uncertain", async () => {
   await withDiscordCli(async (f) => {
     const state = dirname(f.tmp);
-    recordOwes(state, inbound(ids.message), Date.now() - 100);
-    recordMark(state, ids.thread, ids.message, Date.now() - 1);
+    await recordOwes(state, inbound(ids.message), Date.now() - 100);
+    await recordMark(state, ids.thread, ids.message, Date.now() - 1);
     const result = await f.invoke(
       ["send", "discord", "--thread", ids.thread, "--reply", ids.message, "--text", "answer"],
       { routes: { [`POST /channels/${ids.thread}/messages`]: { body: {} } } },
@@ -63,8 +82,8 @@ test("a complete split reply settles only its exact request and retains every re
     const state = dirname(f.tmp);
     const at = Date.now() - 100;
     for (const message of [ids.message, "99"]) {
-      recordOwes(state, inbound(message), at);
-      recordMark(state, ids.thread, message, at + 1);
+      await recordOwes(state, inbound(message), at);
+      await recordMark(state, ids.thread, message, at + 1);
     }
     const result = await f.invoke(
       ["send", "discord", "--thread", ids.thread, "--reply", ids.message, "--text", longAnswer],
@@ -91,7 +110,7 @@ test("a complete split reply settles only its exact request and retains every re
 test("an unlinked post and a reaction do not answer an existing request", async () => {
   await withDiscordCli(async (f) => {
     const state = dirname(f.tmp);
-    recordOwes(state, inbound(ids.message), Date.now() - 100);
+    await recordOwes(state, inbound(ids.message), Date.now() - 100);
     const reaction = await f.invoke(["react", "discord", "--thread", ids.thread, "--message", ids.message]);
     expect(reaction.code).toBe(0);
     const posted = await f.invoke(["send", "discord", "--thread", ids.thread, "--text", "unrelated update"]);
@@ -105,8 +124,8 @@ test("a partially accepted reply never produces a complete delivery receipt", as
   await withDiscordCli(async (f) => {
     const state = dirname(f.tmp);
     const at = Date.now() - 100;
-    recordOwes(state, inbound(ids.message), at);
-    recordMark(state, ids.thread, ids.message, at + 1);
+    await recordOwes(state, inbound(ids.message), at);
+    await recordMark(state, ids.thread, ids.message, at + 1);
     for (const failure of [{ status: 403, body: { message: "Denied" } }, { failure: "fetch" as const }]) {
       const result = await f.invoke(
         ["send", "discord", "--thread", ids.thread, "--reply", ids.message, "--text", longAnswer],

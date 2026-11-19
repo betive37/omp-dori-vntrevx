@@ -233,11 +233,16 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
   const approvals = new Set<string>();
   let managedRestorePending = process.env.DORI_MANAGED_STARTUP === "1";
   const monitors = new Monitors(
-    (content) => {
-      // Also record here: a monitor line is the same evidence the CLI writes, and this path works even when the
-      // running `dori inbound` predates the ledger. Idempotent by message id.
-      if (role === "dori" && stateDir !== undefined) recordOwes(stateDir, content, Date.now());
-      pi.sendMessage({ customType: "dori-monitor", content, display: true }, { triggerTurn: true, deliverAs: "aside" });
+    async (content, delivery) => {
+      const root = stateDir;
+      if (!delivery.isCurrent()) return;
+      // Monitor delivery is an admission path in its own right; its message must follow committed persistence.
+      if (role === "dori" && root !== undefined) await recordOwes(root, content, Date.now(), delivery.signal);
+      if (delivery.isCurrent())
+        pi.sendMessage(
+          { customType: "dori-monitor", content, display: true },
+          { triggerTurn: true, deliverAs: "aside" },
+        );
     },
     () => (role === "dori" ? session?.id : undefined),
   );
@@ -567,10 +572,8 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
   });
 
   /**
-   * The owner's message is answered on Discord or the turn does not settle (owner, 2026-11-17: "내가 말하면 너는
-   * 무조건 답을 해야해. 규칙을 코드로 박아버리자"). A terminal-only reply is silence to the owner, so an owe with no
-   * send receipt after it blocks the settle and hands back the exact command. Bounded: the obligation is abandoned
-   * after MAX_CONTINUATIONS so a wedged session cannot loop, and a subagent or a lane never sees the gate.
+   * Recent Discord obligations request bounded continuations until both send and exact-message mark exist.
+   * MAX_CONTINUATIONS limits the reminder loop; lanes and subagents never receive this gate.
    */
   pi.on("session_stop", (_event, ctx) => {
     if (role !== "dori" || ctx.agent.kind !== "main" || stateDir === undefined) return;

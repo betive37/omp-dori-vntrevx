@@ -46,91 +46,91 @@ describe("owesInText", () => {
 });
 
 describe("ledger", () => {
-  test("a reply alone does not settle an owe: the owner's message also needs its read receipt", () => {
+  test("a reply alone does not settle an owe: the owner's message also needs its read receipt", async () => {
     const state = withState();
     try {
-      recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
-      recordSent(state.dir, CHANNEL, "100", ["701"], at + 2);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
+      await recordSent(state.dir, CHANNEL, "100", ["701"], at + 2);
       expect(openOwes(state.dir, at + 3).map((owe) => owe.id)).toEqual([`${CHANNEL}:100`]);
 
-      recordMark(state.dir, CHANNEL, "100", at + 4);
+      await recordMark(state.dir, CHANNEL, "100", at + 4);
       expect(openOwes(state.dir, at + 5)).toEqual([]);
     } finally {
       state.done();
     }
   });
 
-  test("a read receipt alone does not settle it either: the owner still has to be answered", () => {
+  test("a read receipt alone does not settle it either: the owner still has to be answered", async () => {
     const state = withState();
     try {
-      recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
-      recordMark(state.dir, CHANNEL, "100", at + 1);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
+      await recordMark(state.dir, CHANNEL, "100", at + 1);
       expect(openOwes(state.dir, at + 2).map((owe) => owe.id)).toEqual([`${CHANNEL}:100`]);
-      recordSent(state.dir, CHANNEL, "100", ["701"], at + 3);
+      await recordSent(state.dir, CHANNEL, "100", ["701"], at + 3);
       expect(openOwes(state.dir, at + 4)).toEqual([]);
     } finally {
       state.done();
     }
   });
 
-  test("a receipt on a different message does not count: the mark names one message", () => {
+  test("a receipt on a different message does not count: the mark names one message", async () => {
     const state = withState();
     try {
-      recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
-      recordSent(state.dir, CHANNEL, "100", ["701"], at + 1);
-      recordMark(state.dir, CHANNEL, "999", at + 2);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
+      await recordSent(state.dir, CHANNEL, "100", ["701"], at + 1);
+      await recordMark(state.dir, CHANNEL, "999", at + 2);
       expect(openOwes(state.dir, at + 3).map((owe) => owe.id)).toEqual([`${CHANNEL}:100`]);
     } finally {
       state.done();
     }
   });
 
-  test("a receipt from before the message cannot settle it, on either half", () => {
+  test("a receipt from before the message cannot settle it, on either half", async () => {
     const state = withState();
     try {
-      recordSent(state.dir, CHANNEL, "100", ["701"], at - 10);
-      recordMark(state.dir, CHANNEL, "100", at - 10);
-      recordOwes(state.dir, inbound(CHANNEL, "100", "later"), at);
+      await recordSent(state.dir, CHANNEL, "100", ["701"], at - 10);
+      await recordMark(state.dir, CHANNEL, "100", at - 10);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "later"), at);
       expect(openOwes(state.dir, at + 1).map((owe) => owe.id)).toEqual([`${CHANNEL}:100`]);
     } finally {
       state.done();
     }
   });
 
-  test("a send receipt closes only its own channel, and only for answered messages", () => {
+  test("a send receipt closes only its own channel, and only for answered messages", async () => {
     const state = withState();
     try {
-      recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
-      recordOwes(state.dir, inbound("999", "200", "other channel"), at);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "first"), at);
+      await recordOwes(state.dir, inbound("999", "200", "other channel"), at);
       expect(openOwes(state.dir, at + 1).map((owe) => owe.id)).toEqual([`${CHANNEL}:100`, "999:200"]);
 
-      recordSent(state.dir, CHANNEL, "100", ["701"], at + 2);
-      recordMark(state.dir, CHANNEL, "100", at + 2);
+      await recordSent(state.dir, CHANNEL, "100", ["701"], at + 2);
+      await recordMark(state.dir, CHANNEL, "100", at + 2);
       expect(openOwes(state.dir, at + 3).map((owe) => owe.id)).toEqual(["999:200"]);
 
-      recordOwes(state.dir, inbound(CHANNEL, "300", "later"), at + 4);
+      await recordOwes(state.dir, inbound(CHANNEL, "300", "later"), at + 4);
       expect(openOwes(state.dir, at + 5).map((owe) => owe.id)).toEqual(["999:200", `${CHANNEL}:300`]);
     } finally {
       state.done();
     }
   });
 
-  test("the same delivery twice is one owe, so a replay cannot double-count", () => {
+  test("the same delivery twice is one owe, so a replay cannot double-count", async () => {
     const state = withState();
     try {
       const line = inbound(CHANNEL, "100", "once");
-      expect(recordOwes(state.dir, line, at)).toBe(1);
-      expect(recordOwes(state.dir, line, at + 1)).toBe(0);
+      expect(await recordOwes(state.dir, line, at)).toBe(1);
+      expect(await recordOwes(state.dir, line, at + 1)).toBe(0);
       expect(openOwes(state.dir, at + 2)).toHaveLength(1);
     } finally {
       state.done();
     }
   });
 
-  test("a crash's leftovers expire instead of resurrecting yesterday's message", () => {
+  test("a crash's leftovers expire instead of resurrecting yesterday's message", async () => {
     const state = withState();
     try {
-      recordOwes(state.dir, inbound(CHANNEL, "100", "stale"), at);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "stale"), at);
       expect(openOwes(state.dir, at + OWE_TTL_MS - 1)).toHaveLength(1);
       expect(openOwes(state.dir, at + OWE_TTL_MS + 1)).toHaveLength(0);
     } finally {
@@ -138,11 +138,11 @@ describe("ledger", () => {
     }
   });
 
-  test("a torn final line is skipped, and a missing ledger is empty rather than an error", () => {
+  test("a torn final line is skipped, and a missing ledger is empty rather than an error", async () => {
     const state = withState();
     try {
       expect(openOwes(state.dir, at)).toEqual([]);
-      recordOwes(state.dir, inbound(CHANNEL, "100", "kept"), at);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "kept"), at);
       const path = join(state.dir, "owes", "inbound.jsonl");
       writeFileSync(path, `${readFileSync(path, "utf8")}{"id":"trunc"`);
       expect(openOwes(state.dir, at + 1).map((owe) => owe.id)).toEqual([`${CHANNEL}:100`]);
@@ -151,11 +151,11 @@ describe("ledger", () => {
     }
   });
 
-  test("the ledger files are owner-only and never empty", () => {
+  test("the ledger files are owner-only and never empty", async () => {
     const state = withState();
     try {
-      recordOwes(state.dir, inbound(CHANNEL, "100", "secret"), at);
-      recordSent(state.dir, CHANNEL, "100", ["701"], at + 1);
+      await recordOwes(state.dir, inbound(CHANNEL, "100", "secret"), at);
+      await recordSent(state.dir, CHANNEL, "100", ["701"], at + 1);
       bumpAttempts(state.dir, [`${CHANNEL}:100`]);
       const dir = join(state.dir, "owes");
       for (const name of ["inbound.jsonl", "sent.jsonl", "attempts.json"]) {
@@ -170,16 +170,16 @@ describe("ledger", () => {
     }
   });
 
-  test("the ledgers stay capped instead of growing with every send", () => {
+  test("the ledgers stay capped instead of growing with every send", async () => {
     const state = withState();
     try {
-      for (let i = 0; i < 250; i++) recordSent(state.dir, CHANNEL, "100", ["701"], at + i);
+      for (let i = 0; i < 250; i++) await recordSent(state.dir, CHANNEL, "100", ["701"], at + i);
       const lines = readFileSync(join(state.dir, "owes", "sent.jsonl"), "utf8")
         .trim()
         .split("\n");
       expect(lines.length).toBeLessThanOrEqual(200);
       // The newest receipt survives the trim, so an answer sent just now still settles its owe.
-      recordOwes(state.dir, inbound(CHANNEL, "900", "now"), at + 300);
+      await recordOwes(state.dir, inbound(CHANNEL, "900", "now"), at + 300);
       expect(openOwes(state.dir, at + 400).map((owe) => owe.id)).toEqual([`${CHANNEL}:900`]);
     } finally {
       state.done();

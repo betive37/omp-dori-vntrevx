@@ -2,17 +2,19 @@
  * A Discord owner request stays owed until its exact read mark and complete reply receipt exist.
  * Terminal output, reactions alone and unrelated channel sends are not answers. The CLI records every accepted
  * part only after the complete reply succeeds; legacy channel/time-only receipts cannot settle a request.
- * The bounded ledgers retain the existing stale-owe and continuation limits. Malformed lines are ignored.
+ * Inbound deliveries and CLI receipts share capped JSONL snapshots. Each file's writer lock covers deduplication
+ * and atomic publication; corrupt old lines are skipped without swallowing the next admitted record.
+ * The bounded ledgers retain the existing stale-owe and continuation limits.
  */
-import { appendFileSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { MessengerError } from "./messenger/http.ts";
+import { readLines, updateLines } from "./owes-file.ts";
 
 /** An obligation older than this is stale: a crash must not resurrect yesterday's unanswered message. */
 export const OWE_TTL_MS = 30 * 60_000;
 /** Continuations per owe before the gate gives up loudly rather than looping the session forever. */
 export const MAX_CONTINUATIONS = 3;
-const KEEP_LINES = 200;
 export type InboundOwe = {
   /** `<channel>:<message>` — the Discord ids already identify the message uniquely. */
   readonly id: string;
@@ -39,13 +41,6 @@ const attemptsPath = (stateDir: string): string => join(dir(stateDir), "attempts
 
 const ensureDir = (stateDir: string): void => {
   mkdirSync(dir(stateDir), { recursive: true, mode: 0o700 });
-};
-
-const readLines = (path: string): string[] => {
-  if (!existsSync(path)) return [];
-  return readFileSync(path, "utf8")
-    .split("\n")
-    .filter((line) => line.trim() !== "");
 };
 
 /** A torn or foreign line is skipped, never fatal: a broken ledger must not stop the session from settling. */
@@ -121,38 +116,35 @@ export const owesInText = (text: string, at: number): InboundOwe[] => {
   return out;
 };
 
-/** Appends the obligations found in a monitor delivery; returns how many were new. */
-export const recordOwes = (stateDir: string, text: string, at: number): number => {
+/** Publishes obligations from one delivery; the count acknowledges only committed new message IDs. */
+export const recordOwes = async (stateDir: string, text: string, at: number, signal?: AbortSignal): Promise<number> => {
   const found = owesInText(text, at);
   if (found.length === 0) return 0;
   ensureDir(stateDir);
-  const path = inboundPath(stateDir);
-  const known = new Set(readLines(path).map((line) => parse(line, isOwe)?.id));
-  const fresh = found.filter((owe) => !known.has(owe.id));
-  for (const owe of fresh) appendCapped(path, JSON.stringify(owe));
-  return fresh.length;
-};
-
-/** Appends one line to a capped jsonl, rewriting only when the cap is passed so a hot path stays one append. */
-const appendCapped = (path: string, line: string): void => {
-  const previous = readLines(path);
-  if (previous.length < KEEP_LINES) {
-    appendFileSync(path, `${line}\n`, { mode: 0o600 });
-    return;
-  }
-  const temporary = `${path}.${process.pid}.tmp`;
-  writeFileSync(temporary, `${[...previous.slice(-KEEP_LINES + 1), line].join("\n")}\n`, { mode: 0o600 });
-  renameSync(temporary, path);
+  return await updateLines(
+    inboundPath(stateDir),
+    (previous) => {
+      const known = new Set(previous.map((line) => parse(line, isOwe)?.id));
+      const fresh: string[] = [];
+      for (const owe of found) {
+        if (known.has(owe.id)) continue;
+        known.add(owe.id);
+        fresh.push(JSON.stringify(owe));
+      }
+      return { lines: fresh.length ? [...previous, ...fresh] : previous, value: fresh.length };
+    },
+    signal,
+  );
 };
 
 /** Records one complete reply, after every part was accepted, for exactly the named owner request. */
-export const recordSent = (
+export const recordSent = async (
   stateDir: string,
   channel: string,
   message: string,
   remoteIds: readonly string[],
   at: number,
-): void => {
+): Promise<void> => {
   const receipt: SentReceipt = {
     deliveryId: `discord:${channel}:${remoteIds[0]}`,
     requestId: `${channel}:${message}`,
@@ -162,7 +154,10 @@ export const recordSent = (
   };
   if (!isReceipt(receipt)) throw new MessengerError("discord send: incomplete delivery receipt; outcome uncertain", 0);
   ensureDir(stateDir);
-  appendCapped(sentPath(stateDir), JSON.stringify(receipt));
+  await updateLines(sentPath(stateDir), (previous) => ({
+    lines: [...previous, JSON.stringify(receipt)],
+    value: undefined,
+  }));
 };
 
 /**
@@ -170,10 +165,13 @@ export const recordSent = (
  * said twice that the answer arrived with no reaction on their message, which reads as being ignored. A mark names
  * one message, so nothing else can stand in for it.
  */
-export const recordMark = (stateDir: string, channel: string, message: string, at: number): void => {
+export const recordMark = async (stateDir: string, channel: string, message: string, at: number): Promise<void> => {
   if (!/^\d{1,20}$/.test(channel) || !/^\d{1,20}$/.test(message)) return;
   ensureDir(stateDir);
-  appendCapped(marksPath(stateDir), JSON.stringify({ channel, message, at }));
+  await updateLines(marksPath(stateDir), (previous) => ({
+    lines: [...previous, JSON.stringify({ channel, message, at })],
+    value: undefined,
+  }));
 };
 
 /**
@@ -223,19 +221,18 @@ export const bumpAttempts = (stateDir: string, ids: readonly string[]): Record<s
   return next;
 };
 
-/** The text the session is continued with: the exact command, never a paraphrase of the rule. */
+/** Supported CLI guidance with exact per-message mark commands, not an unavailable helper alias. */
 export const reminder = (owes: readonly InboundOwe[]): string => {
   // Bound the reminder, but each listed request still needs its own linked reply.
   const shown = owes.slice(0, 5);
-  const lines = shown.map(
-    (owe) =>
-      `- channel ${owe.channel}, owner message ${owe.message} (${new Date(owe.at).toISOString()}): ${JSON.stringify(owe.text)}`,
-  );
+  const lines = shown.flatMap((owe) => [
+    `- channel ${owe.channel}, owner message ${owe.message} (${new Date(owe.at).toISOString()}): ${JSON.stringify(owe.text)}`,
+    `  dori react discord --to ${owe.channel} --message ${owe.message}`,
+  ]);
   if (owes.length > shown.length) lines.push(`- and ${owes.length - shown.length} more`);
   return [
-    "BLOCKED: the owner wrote to you and this settle is missing one or both halves of the answer.",
-    "A terminal-only reply is silence to the owner. Do both now, for every message listed:",
-    "  dori react discord --to <channel> --message <owner message id>",
+    "BLOCKED: a recent owner message is missing one or both local Discord receipts.",
+    "Check what remains before acting: do not duplicate an accepted answer or reaction. Use each mark command only if missing.",
     '  dori send discord --to <channel> --reply <owner message id> --text "<the answer you just gave>"',
     ...lines,
   ].join("\n");
