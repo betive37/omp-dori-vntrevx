@@ -4,18 +4,52 @@ import { type Cli, type Command, die } from "./cli-context.ts";
 import { autoTrackLinks } from "./cli-pr.ts";
 import { isLessonOutcome, LessonError, Lessons } from "./lessons.ts";
 import { isReportKind, ReportError, Reports, reportLine } from "./reports.ts";
+import { sessionOf } from "./registry.ts";
+import { ghGet } from "./verify-pr.ts";
+import { Refusal } from "../../../../src/refusal.ts";
+import { bindNativeWait, parseWait, recordWait, type Wait } from "../../../../src/wait.ts";
+import { bindCiWait } from "../../../../src/wait-ci.ts";
 import { realClock, runtimesOf } from "./run.ts";
 import { Worklog, WorklogError } from "./worklog.ts";
 
 /** Journal errors are the user's input refused: one line, never a stack. */
-export const journalErrors = [CheckpointError, LessonError, ReportError, WorklogError] as const;
+export const journalErrors = [CheckpointError, LessonError, ReportError, WorklogError, Refusal] as const;
 
-const report: Command = async ({ key, need, lane, config }) => {
+const report: Command = async ({ key, need, opt, lane, config, deps }) => {
   const target = await lane(key ?? die("report needs a lane key"));
   const kind = need("kind");
-  if (isReportKind(kind)) {
-    console.log(reportLine(new Reports(config.stateDir).report(target.key, kind, need("text"), realClock.now())));
-  } else die("--kind must be milestone, blocker, question, halted or done");
+  if (!isReportKind(kind)) return die("--kind must be milestone, blocker, question, halted or done");
+  const text = need("text");
+  const reports = new Reports(config.stateDir);
+  const selection = opt("for");
+  if (selection === undefined) {
+    console.log(reportLine(await reports.report(target.key, kind, text, realClock.now())));
+    return;
+  }
+  if (kind !== "blocker") throw new ReportError("--for needs --kind blocker");
+  const before = reports.read(target.key)?.lastReport;
+  const previous = before && Date.parse(before.at) >= Date.parse(target.openedAt) ? before.wait : undefined;
+  const request = parseWait(selection);
+  const ref = sessionOf(target);
+  let bound: Wait;
+  if (request.kind === "ci") {
+    const api = ghGet(deps.run, target.cwd);
+    const readHead = async () => {
+      const metadata = await api(`repos/${request.repo}/pulls/${request.number}`);
+      const pr = metadata as { head?: { sha?: unknown } } | null;
+      if (typeof pr?.head?.sha !== "string") throw new ReportError("CI wait has no observable PR head");
+      return pr.head.sha;
+    };
+    bound = await bindCiWait(request, readHead, api, realClock.now);
+  } else {
+    if (request.kind !== "label" && !ref) throw new ReportError("native wait needs a registered runtime session");
+    const probe = request.kind === "label" || !ref ? undefined : await runtimesOf(deps).for(ref).probe(ref);
+    bound = bindNativeWait(request, probe, realClock.now(), previous);
+  }
+  const now = realClock.now();
+  const wait = recordWait(bound.target, bound.lastObservedState, bound.observedAt, now, previous);
+  const written = await reports.report(target.key, kind, text, now, { wait, lane: target, report: before });
+  console.log(reportLine(written));
 };
 
 const lessonAdd = async (

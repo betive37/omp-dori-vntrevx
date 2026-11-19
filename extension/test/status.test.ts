@@ -21,12 +21,24 @@ test("HC receives native role-session status, approval holds and role-removal in
     await pi.emit("agent_start");
     expect(frames.at(-1)).toBe("\x1b]7501;state=working:app=omp\x1b\\");
     expect(readPaneState(stateDir, "t7")?.agentStatus).toBe("working");
-    await pi.emit("tool_approval_requested", { toolCallId: "approval" });
+    await pi.emit("tool_approval_requested", {
+      type: "tool_approval_requested",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      approvalMode: "always-ask",
+      toolCallId: "approval",
+    });
     expect(frames.at(-1)).toBe("\x1b]7501;state=blocked:app=omp\x1b\\");
     await pi.emit("agent_end");
     expect(frames.at(-1)).toBe("\x1b]7501;state=blocked:app=omp\x1b\\");
     expect(readPaneState(stateDir, "t7")).toMatchObject({ agentStatus: "idle", approvalPending: true });
-    await pi.emit("tool_approval_resolved", { toolCallId: "approval" });
+    await pi.emit("tool_approval_resolved", {
+      type: "tool_approval_resolved",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      toolCallId: "approval",
+      approved: false,
+    });
     expect(frames.at(-1)).toBe("\x1b]7501;state=idle:app=omp\x1b\\");
     pi.session = { id: "plain", entries: [] };
     await pi.emit("session_switch");

@@ -1,7 +1,9 @@
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
-import { LANE_KEY } from "./registry.ts";
+import { generation, type Lane, LANE_KEY, Registry, sessionOf } from "./registry.ts";
+import { sameSession } from "../../../../src/refs.ts";
+import { readWait, renderWait, type Wait, waitKey } from "../../../../src/wait.ts";
 
 export type ReportKind = "milestone" | "blocker" | "question" | "halted" | "done";
 export type ProgressState = "running" | "blocked" | "halted" | "done" | "stalled";
@@ -11,6 +13,7 @@ export type Report = {
   readonly at: string;
   readonly kind: ReportKind;
   readonly text: string;
+  readonly wait?: Wait;
 };
 export type Activity = {
   readonly type: "activity";
@@ -24,6 +27,12 @@ export type Progress = {
   readonly state: ProgressState;
   readonly lastReport: Report | null;
   readonly lastEvent: LaneEvent;
+};
+
+type WaitProof = {
+  readonly wait: Wait;
+  readonly lane: Lane;
+  readonly report: Report | null | undefined;
 };
 
 export class ReportError extends Error {}
@@ -50,7 +59,9 @@ export const reportState = (kind: ReportKind): ProgressState => {
 // The printed line goes to terminals, so escape sequences and other control characters are dropped from it (a CR or
 // newline becomes one space); the journal keeps the raw text.
 export const reportLine = (report: Report): string =>
-  `[REPORT] ${report.key} | ${report.kind} | ${Bun.stripANSI(report.text)
+  `[REPORT] ${report.key} | ${report.kind} | ${Bun.stripANSI(
+    report.wait ? `${report.text} WAIT ${renderWait(report.wait)}` : report.text,
+  )
     .replace(/\s*[\r\n]+\s*/g, " ")
     // biome-ignore lint/suspicious/noControlCharactersInRegex: the pattern deliberately matches control characters to reject or strip them
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")}`;
@@ -74,7 +85,8 @@ export const parseEvent = (line: string, key: string): LaneEvent => {
   }
   const common = { key, at: value.at, text: value.text };
   if (value.type === "report" && "kind" in value && isReportKind(value.kind)) {
-    return { ...common, type: "report", kind: value.kind };
+    const wait = value.kind === "blocker" && "wait" in value ? readWait(value.wait) : undefined;
+    return { ...common, type: "report", kind: value.kind, ...(wait ? { wait } : {}) };
   }
   if (value.type === "activity" && "state" in value && (value.state === "running" || value.state === "stalled")) {
     return { ...common, type: "activity", state: value.state };
@@ -82,9 +94,8 @@ export const parseEvent = (line: string, key: string): LaneEvent => {
   throw new ReportError(`invalid report kind or activity state for ${key}`);
 };
 
-// One O_APPEND write per event: concurrent lane/lead writers cannot overwrite
-// each other's state. The last event is the persisted progress state; no
-// second mutable snapshot can race with this journal or registry done claims.
+// Reports share the lane registry's writer lock; observation checks and their append are one synchronous section.
+// Activity events use one O_APPEND write and cannot supersede a blocked, halted or done report in read().
 export class Reports {
   constructor(readonly stateDir: string) {}
 
@@ -117,7 +128,7 @@ export class Reports {
     return progress;
   }
 
-  append(event: LaneEvent): void {
+  private writeEvent(event: LaneEvent): void {
     const path = this.path(event.key);
     parseEvent(JSON.stringify(event), event.key);
     const dir = join(this.stateDir, "lanes", event.key);
@@ -127,10 +138,63 @@ export class Reports {
     appendFileSync(path, `${JSON.stringify(event)}\n`, { encoding: "utf8", mode: 0o600 });
   }
 
-  report(key: string, kind: ReportKind, text: string, now: number): Report {
-    const report: Report = { type: "report", key, kind, text: text.trim(), at: new Date(now).toISOString() };
-    this.append(report);
-    return report;
+  append(event: Activity): void {
+    this.writeEvent(event);
+  }
+
+  report(key: string, kind: ReportKind, text: string, now: number, waiting?: WaitProof): Promise<Report>;
+  report(
+    key: string,
+    kind: ReportKind,
+    text: string,
+    now: number,
+    waiting: WaitProof | undefined,
+    shouldReport: (progress: Progress | null) => boolean,
+  ): Promise<Report | null>;
+  async report(
+    key: string,
+    kind: ReportKind,
+    text: string,
+    now: number,
+    waiting?: WaitProof,
+    shouldReport?: (progress: Progress | null) => boolean,
+  ): Promise<Report | null> {
+    if (waiting && kind !== "blocker") throw new ReportError("a structured wait needs a blocker report");
+    const report: Report = {
+      type: "report",
+      key,
+      kind,
+      text: text.trim(),
+      at: new Date(now).toISOString(),
+      ...(waiting ? { wait: waiting.wait } : {}),
+    };
+    this.path(key);
+    parseEvent(JSON.stringify(report), key);
+    let appended = false;
+    await new Registry(this.stateDir).update(key, (current) => {
+      if (waiting) {
+        if (!current || current.key !== waiting.lane.key || generation(current) !== generation(waiting.lane))
+          throw new ReportError("lane state changed while observing its wait; report again");
+        const ref = sessionOf(waiting.lane);
+        const liveRef = sessionOf(current);
+        if (ref ? !liveRef || !sameSession(ref, liveRef) : liveRef !== undefined)
+          throw new ReportError("lane session changed while observing its wait; report again");
+        const latest = this.read(key)?.lastReport;
+        if (
+          JSON.stringify(latest) !== JSON.stringify(waiting.report) ||
+          current.lastWaitNotice !== waiting.lane.lastWaitNotice
+        )
+          throw new ReportError("a newer report or wait observation arrived; report again");
+        const wait = waiting.wait;
+        if (current.lastWaitNotice === `ended|${current.openedAt}|${waitKey(wait.target)}|${wait.startedAt}`)
+          throw new ReportError("this wait has already ended; report a currently pending identity");
+      }
+      if (shouldReport && !shouldReport(this.read(key))) return null;
+      this.writeEvent(report);
+      appended = true;
+      return null; // The journal changes, not the registry record; no second write can leave a partial transition.
+    });
+    return appended ? report : null;
   }
 
   observe(key: string, screen: string, now: number, staleAfterMs: number, resumeOnWorking = true): Progress | null {

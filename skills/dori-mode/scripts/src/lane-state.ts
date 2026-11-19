@@ -1,6 +1,8 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 
+import type { NativeObservation } from "../../../../src/native-observation.ts";
+
 /**
  * Per-pane state written by the omp-dori extension from inside a Dori or lane session and read by the `dori` CLI.
  * omp exposes no session id in argv or the environment and no goal readback on screen that dori can trust, so the
@@ -23,6 +25,8 @@ export type PaneState = {
   readonly approvalPending: boolean;
   /** Last native agent lifecycle event; absent in older records, independent of goal status. */
   readonly agentStatus?: "idle" | "working";
+  /** The main session's async jobs and the open approvals as last observed (src/native-observation.ts); absent in older records. */
+  readonly native?: NativeObservation;
 };
 
 export const paneStateDir = (stateDir: string): string => join(stateDir, "sessions");

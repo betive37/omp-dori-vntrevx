@@ -50,6 +50,7 @@ export type Lane = {
   readonly lastSeenReport?: string | undefined;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
   readonly lastFreshnessNote?: string | undefined;
+  readonly lastWaitNotice?: string | undefined; // Advisory wait outcome, separate from thread posting notes.
   /** A paused lane whose pane read working on the previous freshness tick (two in a row is reported, never a resume). */
   readonly pausedSeenWorking?: boolean | undefined;
   /** The status a paused lane had before it was paused; `resume` restores it. */
@@ -91,7 +92,7 @@ export const statusOf = (lane: Lane): LaneStatus => (lane.closedAt ? "closed" : 
  * through `withStatus` and appends one history entry, even when the status stays the same, as a second objection does.
  * Bookkeeping fields (freshness notes, `claim.emitted`, a receipt) leave it as it is.
  */
-const generation = (lane: Lane): string => `${lane.openedAt} ${lane.history?.length ?? 0} ${statusOf(lane)}`;
+export const generation = (lane: Lane): string => `${lane.openedAt} ${lane.history?.length ?? 0} ${statusOf(lane)}`;
 
 export const withStatus = (
   lane: Lane,

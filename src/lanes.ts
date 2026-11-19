@@ -9,7 +9,10 @@ import { Refusal } from "./refusal.ts";
 import { runHook } from "./hooks.ts";
 import { checkPriority } from "./lock-queue.ts";
 import { applyEvidence, blockerOf, waitingSinceOf, waitingTarget } from "./progress.ts";
-import { refText } from "./refs.ts";
+import { refText, sameSession } from "./refs.ts";
+import { headSha } from "./gate.ts";
+import { bindCiWait } from "./wait-ci.ts";
+import { bindNativeWait, observeWait, parseWait, renderWait, type Wait } from "./wait.ts";
 import { groupId } from "./runtime/group.ts";
 import { openSession } from "./runtime/types.ts";
 import { KEY_RE, reservedKey, type Lane } from "./store-types.ts";
@@ -106,13 +109,52 @@ export async function report(
   opts: { status?: "working" | "waiting"; evidence?: readonly string[]; waitingFor?: string } = {},
 ): Promise<{ sent: SendResult | undefined; progress: string[] }> {
   if (opts.waitingFor !== undefined && opts.status !== "waiting") throw new Refusal("--for needs --status waiting");
+  const listed = openLane(d, key);
+  const request = opts.waitingFor === undefined ? undefined : parseWait(opts.waitingFor);
+  const previous = listed.status === "waiting" ? listed.wait : undefined;
+  let wait: Wait | undefined;
+  if (request?.kind === "ci") {
+    wait = await bindCiWait(
+      request,
+      () => headSha(d, { repo: request.repo, number: request.number, id: `${request.repo}#${request.number}` }),
+      async (endpoint) => {
+        const result = await d.exec("gh", ["api", "--method", "GET", endpoint]);
+        if (result.code !== 0) throw new Refusal(`CI observation failed: ${(result.stderr || result.stdout).trim()}`);
+        return JSON.parse(result.stdout);
+      },
+      d.now,
+      previous,
+    );
+  } else if (request) {
+    const probe =
+      request.kind === "label" ? undefined : await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef);
+    wait = bindNativeWait(request, probe, d.now(), previous);
+  } else if (previous && opts.status !== "working") {
+    wait =
+      previous.target.kind === "job" || previous.target.kind === "approval"
+        ? observeWait(previous, await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef))
+        : previous;
+  }
   const lane = openLane(d, key);
+  if (
+    lane.noticeId !== listed.noticeId ||
+    lane.createdAt !== listed.createdAt ||
+    !sameSession(lane.sessionRef, listed.sessionRef) ||
+    lane.status !== listed.status ||
+    lane.log.length !== listed.log.length ||
+    lane.progressEpoch !== listed.progressEpoch ||
+    JSON.stringify(lane.wait) !== JSON.stringify(listed.wait)
+  )
+    throw new Refusal("lane changed while observing its wait; report again");
   const now = d.now();
   const evidence = opts.evidence ?? [];
   // A lane already waiting keeps its start and target. Both are read before this report touches the record: a record
   // from before `waitingSince`/`--for` infers them from its progress and its last report, and new evidence or this
   // report's text would otherwise move them.
-  const still = lane.status === "waiting" ? { since: waitingSinceOf(lane), target: waitingTarget(lane) } : undefined;
+  const still =
+    lane.status === "waiting"
+      ? { since: waitingSinceOf(lane), target: oneName(lane.waitingFor ?? waitingTarget(lane)).trim() }
+      : undefined;
   // The clock is read before this report joins the log: a record from before the clock falls back to its last report,
   // and that fallback must not count the report being judged (a lane could otherwise talk its way out of a stall).
   const progress = applyEvidence(lane, evidence, now);
@@ -125,7 +167,11 @@ export async function report(
     // --for is stored on one line with boundary whitespace trimmed; printable spaces inside are part of the name.
     lane.waitingSince = still?.since ?? now;
     lane.waitingFor = oneName(opts.waitingFor ?? "").trim() || still?.target || blockerOf(text);
+    lane.wait =
+      wait ?? bindNativeWait({ kind: "label", text: lane.waitingFor }, undefined, now, still ? lane.wait : undefined);
+    if (lane.wait.target.kind !== "label") progress.push(`WAIT ${renderWait(lane.wait)}`);
   } else if (opts.status === "working") {
+    delete lane.wait;
     delete lane.waitingFor;
     delete lane.waitingSince;
   }
@@ -133,7 +179,11 @@ export async function report(
   d.store.saveLane(lane);
   void runHook(d, "onReport", { key, text, evidence: evidence.join(" ") });
   const head = `[REPORT ${key}${lane.status === "waiting" ? " WAITING" : ""}]`;
-  const tail = evidence.length ? `\n${evidenceLine(evidence)}` : "";
+  const tail =
+    (evidence.length ? `\n${evidenceLine(evidence)}` : "") +
+    (lane.status === "waiting" && lane.wait && lane.wait.target.kind !== "label"
+      ? `\nWAIT ${renderWait(lane.wait)}`
+      : "");
   return { sent: await settled(tellLead(d, `${head} ${text}${tail}`, key)), progress };
 }
 

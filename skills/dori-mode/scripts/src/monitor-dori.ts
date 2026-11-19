@@ -63,6 +63,7 @@ export const DORI_VALUE_OPTIONS: Record<string, true> = {
   message: true,
   emoji: true,
   kind: true,
+  for: true,
   step: true,
   result: true,
   "remote-effect": true,

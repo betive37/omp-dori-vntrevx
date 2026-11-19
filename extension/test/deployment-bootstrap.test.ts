@@ -170,7 +170,13 @@ test("a rejected bootstrap leaves no half-initialized role session publishing pa
   sessions.push(dori);
   await expect(dori.emit("session_start")).rejects.toThrow("session or version");
   await dori.emit("agent_start");
-  await dori.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "pending" });
+  await dori.emit("tool_approval_requested", {
+    type: "tool_approval_requested",
+    sessionId: dori.session.id,
+    toolName: "bash",
+    approvalMode: "always-ask",
+    toolCallId: "pending",
+  });
   await dori.emit("goal_updated", { goal: { objective: "work", status: "active" } });
   expect(readPaneState(f.stateDir, "w1:p7")).toBeNull();
   // A tree or branch move in the rejected session finds no recorded role to restore.
@@ -196,7 +202,13 @@ test("a resumed Dori session whose bootstrap is rejected does not get its record
   await dori.emit("session_tree");
   await dori.emit("session_branch");
   await dori.emit("agent_start");
-  await dori.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "pending" });
+  await dori.emit("tool_approval_requested", {
+    type: "tool_approval_requested",
+    sessionId: dori.session.id,
+    toolName: "bash",
+    approvalMode: "always-ask",
+    toolCallId: "pending",
+  });
   expect(readPaneState(f.stateDir, "w1:p7")).toBeNull();
 });
 

@@ -56,8 +56,8 @@ test("get_status reads lanes and reports in one call, each part with its own tim
     { pane_id: "w1:p2", workspace_id: "w1", agent: "omp", agent_status: "working" },
   ];
   const reports = new Reports(state.dir);
-  reports.report("docs-sync", "milestone", "docs drafted", Date.parse("2026-01-01T11:00:00.000Z"));
-  reports.report("api-fix", "blocker", "needs a token\u001b[31m", Date.parse("2026-01-01T11:30:00.000Z"));
+  await reports.report("docs-sync", "milestone", "docs drafted", Date.parse("2026-01-01T11:00:00.000Z"));
+  await reports.report("api-fix", "blocker", "needs a token\u001b[31m", Date.parse("2026-01-01T11:30:00.000Z"));
   const registryBefore = readFileSync(join(state.dir, "lanes", "api-fix.json"), "utf8");
 
   const r = await tool("get_status", { what: ["lanes", "reports"], speak_now: true });
@@ -85,7 +85,7 @@ test("get_status names a damaged journal without failing the others, and accepts
   const deps = depsFor(world, fakeClock(T0), state.dir);
   await deps.registry.write(lane("good-lane", "w1:p2", "2026-01-01T10:00:00.000Z"));
   await deps.registry.write(lane("bad-lane", "w1:p3", "2026-01-01T10:00:00.000Z"));
-  new Reports(state.dir).report("good-lane", "done", "merged", Date.parse("2026-01-01T11:00:00.000Z"));
+  await new Reports(state.dir).report("good-lane", "done", "merged", Date.parse("2026-01-01T11:00:00.000Z"));
   mkdirSync(join(state.dir, "lanes", "bad-lane"), { recursive: true });
   writeFileSync(join(state.dir, "lanes", "bad-lane", "reports.jsonl"), "{not json\n");
 

@@ -1,3 +1,5 @@
+import type { ProbedNativeObservation } from "../native-observation.ts";
+
 export type RuntimeKind = "herdr" | "hc";
 /** One session as its runtime addresses it. `group`: the herdr workspace id or the hc dori.group label. `container`: the herdr tab id (absent on hc). */
 export type SessionRef = {
@@ -15,7 +17,11 @@ export type AgentIdentity = {
   readonly sessionId?: string;
 };
 export type ForegroundProcess = { readonly name: string; readonly argv: readonly string[]; readonly pid?: number };
-/** One snapshot: status, identity, foreground and discovery data together (submitTyped compares all of them; deliver re-reads them). `rootPid`: the session's root process (herdr process_info.shell_pid, hc terminal pid). */
+/**
+ * One snapshot: status, identity, foreground and discovery data together (submitTyped compares all of them; deliver re-reads them). `rootPid`: the session's root process (herdr process_info.shell_pid, hc terminal pid).
+ * `native`: the OMP extension's last observation of its session's jobs and approvals, only from an attested writer's
+ * record and only when it is well formed; it is evidence of what was observed, never of success or permission.
+ */
 export type Probe = {
   readonly status: AgentStatus;
   readonly agent?: string;
@@ -28,6 +34,7 @@ export type Probe = {
   readonly sessionId?: string;
   readonly sessionFile?: string;
   readonly approvalPending?: boolean;
+  readonly native?: ProbedNativeObservation;
   readonly shellInFront: boolean;
   readonly foreground?: readonly ForegroundProcess[];
 };

@@ -8,7 +8,8 @@
  * - A nonempty config `ompUlwPath` applies omp-ulw through a gated API: its event, command and tool handlers run
  *   only in role sessions; load-time registrations stay visible everywhere. Source installs leave it empty for OMP loading.
  * - Pane state (`{stateDir}/sessions/<pane>.json`, read by the `dori` CLI): session id, goal status and open tool
- *   approvals of the Dori/lane session running in HERDR_PANE_ID or HC_TERMINAL_ID.
+ *   approvals of the Dori/lane session running in HERDR_PANE_ID or HC_TERMINAL_ID, and `native`: the main session's
+ *   async jobs as last read (on each lifecycle write and when a tool call finds them changed) and each open approval.
  * - Lanes without a goal get omp's `goal` tool so the agent can create its goal from the lane brief.
  * - The Dori session gets the `monitor` tool (monitor.ts).
  * - A lane's main agent on GPT-6.1 Sol is told to carry lane bookkeeping along with real work (lane-bookkeeping.ts).
@@ -16,7 +17,13 @@
 import { spawnSync } from "node:child_process";
 import { mkdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import type {
+  AsyncJobSnapshot,
+  ToolApprovalRequestedEvent,
+  ToolApprovalResolvedEvent,
+} from "@oh-my-pi/pi-coding-agent";
 import { loadConfig } from "../skills/dori-mode/scripts/src/config";
+import type { NativeApproval, NativeObservation } from "../src/native-observation.ts";
 import { SourceBundleError } from "../src/release/source-bundle.ts";
 import {
   type DoriRole,
@@ -48,6 +55,8 @@ export interface DoriContext {
   model?: PromptModel;
   sessionManager: { getSessionId(): string; getSessionFile(): string | undefined; getBranch(): SessionEntry[] };
   ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
+  /** The async jobs this context's own agent owns; null when its session has no job manager. */
+  getAsyncJobSnapshot(): AsyncJobSnapshot | null;
 }
 interface Goal {
   objective: string;
@@ -97,10 +106,8 @@ export interface DoriApi {
   registerCommand(name: string, options: CommandOptions): void;
   registerTool<Params>(tool: ToolDefinition<Params>): void;
   on(event: "goal_updated", handler: (event: { goal: Goal | null }, ctx: DoriContext) => unknown): void;
-  on(
-    event: "tool_approval_requested" | "tool_approval_resolved",
-    handler: (event: { toolCallId: string }, ctx: DoriContext) => unknown,
-  ): void;
+  on(event: "tool_approval_requested", handler: (event: ToolApprovalRequestedEvent, ctx: DoriContext) => unknown): void;
+  on(event: "tool_approval_resolved", handler: (event: ToolApprovalResolvedEvent, ctx: DoriContext) => unknown): void;
   on(event: string, handler: Handler): void;
   appendEntry(customType: string, data?: unknown): void;
   sendMessage(
@@ -238,7 +245,18 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
   let agentStatus: "idle" | "working" = "idle";
   let goalToolAdded = false;
   let paneWritten: string | undefined;
-  const approvals = new Set<string>();
+  /**
+   * Open tool approvals of this process (the session and its subagents), each under its event's session and tool call,
+   * so an event of one session never resolves another's approval that reuses the call id.
+   */
+  const approvals = new Map<string, NativeApproval>();
+  const approvalKey = (event: { sessionId: string; toolCallId: string }): string =>
+    JSON.stringify([event.sessionId, event.toolCallId]);
+  /**
+   * The main session's last async job snapshot and when it was read. `jobs` stays null, with the time it was cleared,
+   * until the current session's main context is read; a subagent's context reports only its own jobs.
+   */
+  let observed: Pick<NativeObservation, "jobs" | "observedAt"> = { jobs: null, observedAt: Date.now() };
   const discordAsk = new DiscordAsk();
   let managedRestorePending = process.env.DORI_MANAGED_STARTUP === "1";
   const monitors = new Monitors(
@@ -271,14 +289,15 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     paneWritten = undefined;
   };
 
-  // Preserve session identity for a later resume without attesting a live pane owner.
+  // Preserve session identity for a later resume without attesting a live pane owner or its last native observation.
   const retirePane = (): void => {
     runtimeHealth.stop();
     if (paneWritten === undefined || stateDir === undefined) return;
     const state = readPaneState(stateDir, paneWritten);
     if (state !== null && state.pid === process.pid) {
+      const { native: _native, ...kept } = state;
       writePaneState(stateDir, {
-        ...state,
+        ...kept,
         pid: 0,
         agentStatus: "idle",
         approvalPending: false,
@@ -319,7 +338,31 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     return !(ps.status === 0 && Number.isFinite(started) && started > Date.parse(existing.startedAt));
   };
 
-  const savePane = (ctx: DoriContext): void => {
+  /**
+   * Reads the current session's job snapshot through its main context; returns whether its jobs differ from the last
+   * read. Any other context (a subagent, a session that is not the current one) is not read: its snapshot is not the
+   * main session's jobs.
+   */
+  const observeJobs = (ctx: DoriContext): boolean => {
+    if (ctx.agent.kind !== "main" || session === undefined || ctx.sessionManager.getSessionId() !== session.id)
+      return false;
+    const snapshot = ctx.getAsyncJobSnapshot();
+    const jobs = snapshot && {
+      running: snapshot.running.map((job) => ({ id: job.id, startTime: job.startTime })),
+      recent: snapshot.recent.map((job) => ({
+        id: job.id,
+        startTime: job.startTime,
+        status: job.status,
+        ...(job.endTime === undefined ? {} : { endTime: job.endTime }),
+      })),
+    };
+    const changed = JSON.stringify(jobs) !== JSON.stringify(observed.jobs);
+    observed = { jobs, observedAt: Date.now() };
+    return changed;
+  };
+
+  /** `read`: false when the caller has just read the job snapshot itself. */
+  const savePane = (ctx: DoriContext, read = true): void => {
     const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID;
     if (!paneId || stateDir === undefined || !session) return;
     // Only an interactive session taking over the pane clears an inactive resume pointer. Print/RPC children
@@ -330,6 +373,7 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
       return;
     }
     if (paneHeldByAnother(paneId)) return;
+    if (read) observeJobs(ctx);
     const sessionFile = ctx.sessionManager.getSessionFile();
     writePaneState(stateDir, {
       paneId,
@@ -343,6 +387,7 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
       goal,
       agentStatus,
       approvalPending: approvals.size > 0,
+      native: { observedAt: observed.observedAt, jobs: observed.jobs, approvals: [...approvals.values()] },
     });
     if (role === "dori")
       runtimeHealth.update({
@@ -414,15 +459,21 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     lifecycleRegistered = true;
     pi.on("tool_approval_requested", (event, ctx) => {
       if (!role) return;
-      approvals.add(event.toolCallId);
+      approvals.set(approvalKey(event), {
+        sessionId: event.sessionId,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+      });
       savePane(ctx);
     });
     pi.on("tool_approval_resolved", (event, ctx) => {
-      if (!approvals.delete(event.toolCallId) || !role) return;
+      if (!approvals.delete(approvalKey(event)) || !role) return;
       savePane(ctx);
     });
     // The awaited preflight runs before the built-in opens its form; execution events can arrive later.
     pi.on("tool_call", (event, ctx) => {
+      // A changed job set is recorded before the call runs, so a command it starts reads the jobs as of this call.
+      if (role && observeJobs(ctx)) savePane(ctx, false);
       const id = ctx.sessionManager.getSessionId();
       if (role && stateDir && ctx.agent.kind === "main" && id === session?.id && approvals.size === 0)
         discordAsk.arm(event, ctx.ui, stateDir, id);
@@ -443,6 +494,7 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     if (session?.id !== sessionId) {
       session = { id: sessionId, startedAt: new Date().toISOString() };
       approvals.clear();
+      observed = { jobs: null, observedAt: Date.now() };
       agentStatus = "idle";
     }
     if (role && !lifecycleRegistered) registerLifecycle();

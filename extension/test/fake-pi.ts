@@ -1,6 +1,7 @@
 import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent";
 
 import type { CommandOptions as Command, DoriApi, DoriContext, ToolDefinition as Tool } from "../index";
 
@@ -33,6 +34,10 @@ export type FakePi = {
   userMessages: string[];
   notes: string[];
   session: FakeSession;
+  /** The agent the next context names; a subagent's context reads its own jobs. */
+  agent: Agent;
+  /** What `getAsyncJobSnapshot` returns; null is OMP's "no job manager". */
+  jobs: AsyncJobSnapshot | null;
   ctx(): DoriContext;
   /** Runs handlers in registration order, chaining before_agent_start prompt replacements as OMP does. */
   emit(event: string, payload?: unknown): Promise<unknown[]>;
@@ -43,7 +48,6 @@ const schema = { optional: () => schema, describe: () => schema };
 
 export const fakePi = (options: FakeOptions): FakePi => {
   const flags = new Map<string, boolean | string>(Object.entries(options.flags ?? {}));
-  const agent: Agent = options.agent ?? { kind: "main", id: "Main" };
   const fake: FakePi = {
     handlers: new Map(),
     commands: new Map(),
@@ -53,11 +57,13 @@ export const fakePi = (options: FakeOptions): FakePi => {
     userMessages: [],
     notes: [],
     session: options.session,
+    agent: options.agent ?? { kind: "main", id: "Main" },
+    jobs: null,
     ctx: () => ({
       cwd: tmpdir(),
       abort: () => void calls.push("abort"),
       mode: options.mode ?? "print",
-      agent,
+      agent: fake.agent,
       model: options.model,
       sessionManager: {
         getSessionId: () => fake.session.id,
@@ -65,6 +71,7 @@ export const fakePi = (options: FakeOptions): FakePi => {
         getBranch: () => [...fake.session.entries],
       },
       ui: { notify: (message: string) => void fake.notes.push(message) },
+      getAsyncJobSnapshot: () => fake.jobs,
     }),
     emit: async (event, payload = { type: event }) => {
       const results: unknown[] = [];

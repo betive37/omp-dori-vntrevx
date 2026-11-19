@@ -15,16 +15,9 @@ import { mergeForwarded, mergePending } from "./inbox-forward.ts";
 import { destinationOf, lockQueue, mergeOwnSpool, type Queued, queueMessage } from "./inbox-spool.ts";
 import { refFromText, refText, sameSession } from "./refs.ts";
 import type { SessionRef } from "./runtime/types.ts";
-import {
-  KEEP_RUNS,
-  KEY_RE,
-  type Item,
-  type Lane,
-  type LoopRun,
-  type QueuedMessage,
-  type ReviewReceipt,
-  type Role,
-} from "./store-types.ts";
+import { readWait } from "./wait.ts";
+import { KEEP_RUNS, KEY_RE } from "./store-types.ts";
+import type { Item, Lane, LoopRun, QueuedMessage, ReviewReceipt, Role } from "./store-types.ts";
 
 export type { HostLoad } from "./store-types.ts";
 
@@ -32,10 +25,15 @@ export type { HostLoad } from "./store-types.ts";
 type StoredLane = Omit<Lane, "sessionRef"> & { sessionRef?: SessionRef };
 
 /** Reads a record without `sessionRef` as the herdr pane it names; the same input always gives the same lane. */
-const upgrade = (raw: StoredLane): Lane =>
-  raw.sessionRef !== undefined
-    ? (raw as Lane)
-    : { ...raw, sessionRef: { runtime: "herdr", id: raw.paneId, ...(raw.tabId ? { container: raw.tabId } : {}) } };
+const upgrade = (raw: StoredLane): Lane => {
+  const { wait: storedWait, ...rest } = raw;
+  const wait = readWait(storedWait);
+  return {
+    ...rest,
+    sessionRef: raw.sessionRef ?? { runtime: "herdr", id: raw.paneId, ...(raw.tabId ? { container: raw.tabId } : {}) },
+    ...(wait ? { wait } : {}),
+  };
+};
 
 const checkedId = (id: string): string => {
   if (!KEY_RE.test(id)) throw new Error(`invalid id ${JSON.stringify(id)}: must match ${KEY_RE}`);

@@ -106,7 +106,7 @@ Set `notes = false` in `~/.config/herdr-core/config.toml`. With notes on, hc typ
 
 ### OMP identity, goal and approval records
 
-The extension writes `<stateDir>/sessions/<encodeURIComponent(id)>.json`, preferring `HC_TERMINAL_ID` over `HERDR_PANE_ID`. Its schema is `paneId`, `role`, `sessionId`, optional `sessionFile`, `cwd`, `pid`, `startedAt`, `updatedAt`, `goal: {status, objective?}`, `approvalPending` and optional `agentStatus: idle|working` for compatibility with earlier records. `stateDir` follows `DORI_STATE_DIR`, then the `DORI_CONFIG` file's value, then `~/.dori/state`. Production callers pass that configured `stateDir` explicitly to enable OMP refinement. Runtime instances without it preserve native behavior and do not read operator config or extension state.
+The extension writes `<stateDir>/sessions/<encodeURIComponent(id)>.json`, preferring `HC_TERMINAL_ID` over `HERDR_PANE_ID`. Its schema is `paneId`, `role`, `sessionId`, optional `sessionFile`, `cwd`, `pid`, `startedAt`, `updatedAt`, `goal: {status, objective?}`, `approvalPending`, optional `agentStatus: idle|working`, and optional `native: {observedAt, jobs, approvals}`. Earlier records may omit the optional fields. `stateDir` follows `DORI_STATE_DIR`, then the `DORI_CONFIG` file's value, then `~/.dori/state`. Production callers pass that configured `stateDir` explicitly to enable OMP refinement. Runtime instances without it preserve native behavior and do not read operator config or extension state.
 
 Both adapters attest the writer against the live terminal root, process ancestry, foreground and process start time before trusting a record. Missing, malformed, reused-pid, foreign or changing OMP identity stays unknown; an open approval becomes blocked even for force/submit-only delivery. Session IDs and files therefore come from the live OMP writer rather than an unrelated newest transcript. Linux process lookup and OMP's temp-relative, home-relative and absolute session-directory forms are preserved.
 
@@ -115,6 +115,24 @@ Native goals remain agent-owned. Skill pause/resume reads back active/paused sta
 OMP persists native goals as `mode_change` entries with `mode: "goal" | "goal_paused"` and `data: {goal: {objective, status, ...}}`. The extension replays `entry.data.goal` from the current branch on session start and resume, preserving active/paused status in its pane record; another mode ends the recorded goal. An owned OMP v18.18.8 session persisted the active-to-paused transition in this shape. The session JSONL owns this persistence; the pane JSON is the extension's derived state.
 
 Desired monitor state is `<stateDir>/monitors/<encodeURIComponent(sessionId)>.json` with `{version:1,sessionId,monitors:[{name,argv,filter,cwd}]}`. `dori boot` reads it without private transcript access and remains read-only.
+
+## Waiting on an identified operation
+
+Both report paths can name the operation instead of treating a sentence as proof of a pending job:
+
+```bash
+dori harness report build-lane --status waiting --for job:bg_7 --text "Waiting for the build"
+dori report build-lane --kind blocker --for approval:call_7 --text "Waiting for the native approval"
+dori report build-lane --kind blocker --for 'ci:owner/repo#42@12345' --text "Waiting for this check run"
+```
+
+`job:ID` binds the attested native session ID, session start and job start time; `approval:ID` binds a pending tool-call ID in that session. The extension copies the public pinned-host async-job snapshot and approval events into its existing process-bound record. The probe exposes only validated fields from the record that passes its existing writer, ancestry, process-start and session reread checks. A missing job manager is unknown, not an empty successful job list. Subagent approvals continue to hold input, but cannot stand in for a main-session approval.
+
+These are **last observations**, not an atomic live snapshot or a new polling service. Lifecycle events and changed job snapshots at tool calls refresh the record; session switch and retirement discard its former observation. Report output names the complete identity, the latest observed state/time and the waiting interval. Repeating the same identity preserves its start; a reused job ID with a different start, another session or a changed CI head starts a different interval. An already observed finished job cannot be newly bound. Ordinary dependency prose remains an **unverified label**; old reports without structured metadata remain readable.
+
+`ci:owner/repo#N` reads and binds the actual PR head SHA. Appending `@CHECK_RUN_ID` also reads that exact GitHub check run, requires the same head and a pending status, then rereads the PR head to refuse a move during observation. Head-only binding says nothing about whether checks are running. CI is queried only by the explicit report command, not by a new GitHub poll loop; a newer CI state needs another report.
+
+Duty and skill freshness can emit one advisory `wait-ended` notice when a later native observation no longer contains the bound job or approval, or names a replacement session. Missing observations remain unknown, and an older observation cannot end a newer wait. An end is **not success, approval or permission to resume**: no native goal, pause, quota, blocker report, progress clock or completion gate is cleared. The root harness keeps its full waiting/nudge/40-minute escalation clock even if the target changes. The skill journal keeps the blocker until an explicit new report. Native/CI reads happen outside the registry lock. All skill report writers, including ordinary reports and supervision blockers, share that lane lock; the latest report, session generation and wait notice are rechecked in the same synchronous section as a waiting report append. Conditional budget reports recheck terminal state and duplicate blockers under that same lock, and warnings use the checked state. Activity-only observations cannot replace a blocked, halted or done report.
 
 ## Grouping
 

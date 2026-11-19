@@ -2,6 +2,7 @@ import { existsSync } from "node:fs";
 
 import { fill } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { checkWaiting } from "./freshness-wait.ts";
 import { checkPausedLane } from "./pause.ts";
 import { runtimesOf } from "./run.ts";
 import { readScreen, sendVerified } from "./sessions.ts";
@@ -30,16 +31,11 @@ export const scrubForThread = (line: string, home: string): string =>
     .replace(/`/g, "'")
     .trim();
 
-// A report is a line that starts with [REPORT], or the last quoted element of an argv row, the shape lanes are told
-// to send it in: an argv array ending in "lead:p1", "[REPORT] key | kind | text". Instructions
-// and prompts that quote the grammar mid-sentence are dropped before parsing, so an example is never posted as the
-// lane's progress. A report whose whole text is one unfilled placeholder ($name, ${name}, {name}, %s, <what>) is a
-// template, quoted or not (#29). The match is anchored to the [REPORT] key | kind | text structure, so
-// 'deployed api | %s' stays a real report.
+// Reports start with [REPORT] or are the last quoted argv element. Prompt examples and placeholder-only bodies
+// are not reports (#29); the anchored grammar still accepts real text such as 'deployed api | %s'.
 const placeholderOnly =
   /^\s*\[REPORT\][^|]*\|[^|]*\|\s*["'`]?(\$\{?[A-Za-z_]\w*\}?|\{[A-Za-z_][\w.]*\}|%[sdif]|<[^>]+>)["'`)\s]*$/;
-// An argv row is the whole line (optionally inside one spawn call): [ then quoted strings separated by commas, then ]. Only its last element can be the
-// report, which is how lanes are told to send it. Prose that happens to contain a quoted report is not an argv row.
+// Only the last string of a whole argv row (optionally a spawn call) is a report; prose quotes are not argv.
 const argvElements = (line: string): string[] | null => {
   // A spawn call around the row, such as Bun.spawn([...]) or subprocess.run([...]), is the same row.
   const call = /^\s*[\w.$]+\(\s*(\[.*\])\s*\)\s*;?\s*$/.exec(line);
@@ -87,6 +83,7 @@ export type SweepAct = {
     | "stalled"
     | "journal-error"
     | "blocked"
+    | "wait-ended"
     | "warning"
     | "supervision-error";
   readonly lane: string;
@@ -158,6 +155,11 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
         // Only supervision's own hung result replaces the stall line below; a usage warning is not a stall.
         supervisedHung = supervised?.hung ?? false;
         progress = reports.observe(lane.key, screen, now, deps.config.nudgeAfterMin * 60_000, !supervised?.hung);
+        if (progress?.lastReport?.wait) {
+          const waitNotice = await checkWaiting(deps, lane, progress);
+          if (waitNotice) acts.push(waitNotice);
+          if (JSON.stringify(reports.read(lane.key)?.lastReport) !== JSON.stringify(progress.lastReport)) continue;
+        }
       } catch (error) {
         // One corrupt journal skips its own lane, printed once per error, and never ends the sweep for the others.
         if (!(error instanceof ReportError)) throw error;
@@ -190,8 +192,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
       acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
     }
     const hook = deps.config.hooks.threadReply;
-    // The post waits for the thread to be quiet, not the lane: a report resets the nudge clock only, so a lane that
-    // reports often still gets its latest report posted, at most once per postAfterMin.
+    // Reports reset nudges, not thread quiet time: even frequent reports are posted at most once per postAfterMin.
     const threadQuietMin = Math.round((now - Math.max(lastHeard(lane), lane.lastAutoReplyAt ?? 0)) / 60_000);
     // A report stamped in the same millisecond as the last post still counts (<=); lastPostedReport stops a repeat.
     if (
@@ -200,8 +201,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
       lane.thread !== "none" &&
       (current.lastAutoReplyAt ?? 0) <= heard
     ) {
-      // A journal report is durable, so it skips the two-tick hold; a screen-scraped line counts only once it is still
-      // there on the next tick (the two reads are a full loop interval apart).
+      // Journal reports need no hold; scraped screen reports must match on two ticks a full loop interval apart.
       const fromJournal = progress?.lastReport ? reportLine(progress.lastReport) : null;
       const report =
         fromJournal ??

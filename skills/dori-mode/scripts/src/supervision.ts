@@ -5,15 +5,8 @@ import { Checkpoints } from "./checkpoints.ts";
 import { fill } from "./config.ts";
 import { Reports } from "./reports.ts";
 import type { Clock, Runner } from "./run.ts";
-import {
-  type BudgetLimits,
-  laneActivity,
-  type SupervisedLane,
-  type SupervisionOptions,
-  type Usage,
-  type UsageSnapshot,
-  workingTimer,
-} from "./supervision-observe.ts";
+import { laneActivity, workingTimer } from "./supervision-observe.ts";
+import type { BudgetLimits, SupervisedLane, SupervisionOptions, Usage, UsageSnapshot } from "./supervision-observe.ts";
 
 export type SupervisionDeps = {
   readonly stateDir: string;
@@ -144,20 +137,24 @@ export class Supervision {
       Math.abs(now - timer.seconds * 1000 - (previous.at - previous.timer * 1000)) <= timer.step * 1000 + 2000 &&
       timer.seconds >= (this.options.hungAfterMinutes ?? 20) * 60 &&
       now - activeAt >= (this.options.staleAfterMinutes ?? 20) * 60_000;
-    const progress = this.reports.read(lane.key);
-    const terminal = progress?.state === "done" || progress?.state === "halted";
+    let progress = this.reports.read(lane.key);
+    let terminal = progress?.state === "done" || progress?.state === "halted";
+    // A question also reads as blocked; only this same ceiling blocker makes a new report a repeat.
+    const blocker = violations.join("; ");
+    if (!terminal && violations.length) {
+      await this.reports.report(lane.key, "blocker", blocker, now, undefined, (latest) => {
+        progress = latest;
+        terminal = latest?.state === "done" || latest?.state === "halted";
+        return !terminal && !(latest?.lastReport?.kind === "blocker" && latest.lastReport.text === blocker);
+      });
+    }
     const unavailable = (["tokens", "costUsd"] as const)
       .filter((name) => typeof limits[name] === "number" && usage[name] === null)
       .map((name) => `${name} ceiling cannot be checked: usage unavailable`);
     const hungMessage = "Working/Running timer exceeded threshold without fresh report, checkpoint, or file activity";
     const alerts = terminal ? [] : [...(violations.length ? violations : hung ? [hungMessage] : []), ...unavailable];
     const freshAlerts = alerts.filter((message) => !previous?.alerts.includes(message));
-    // A question also reads as blocked; only this same ceiling blocker as the latest report makes a new one a repeat.
-    const blocker = violations.join("; ");
-    const reported = progress?.lastReport?.kind === "blocker" && progress.lastReport.text === blocker;
-    if (!terminal && violations.length && !reported) {
-      this.reports.report(lane.key, "blocker", blocker, now);
-    } else if (!terminal && hung && (!progress || progress.state === "running")) {
+    if (!terminal && !violations.length && hung && (!progress || progress.state === "running")) {
       this.reports.append({
         type: "activity",
         key: lane.key,

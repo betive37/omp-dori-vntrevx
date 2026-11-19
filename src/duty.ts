@@ -8,7 +8,8 @@ import { oweLead } from "./inbox-files.ts";
 import { payLead } from "./inbox-forward.ts";
 import { underInboxLock } from "./duty-inbox.ts";
 import { Refusal } from "./refusal.ts";
-import { refText } from "./refs.ts";
+import { refText, sameSession } from "./refs.ts";
+import { observeWait, renderWait, waitEnded, waitKey } from "./wait.ts";
 import { escalation, progressOf, stalled, waitingOn, waitingSinceOf, waitingTarget } from "./progress.ts";
 import type { SessionRef } from "./runtime/types.ts";
 import type { Lane } from "./store-types.ts";
@@ -101,11 +102,37 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
   for (const listed of d.store.lanes()) {
     if (!watched(listed)) continue;
     try {
-      const { status: st } = await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef);
+      const probe = await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef);
+      const st = probe.status;
       // Re-read right before deciding and saving: a report, a READY or a migration may have landed during the probe.
       const lane = d.store.lane(listed.key);
-      if (lane === undefined || !watched(lane) || lane.sessionRef.id !== listed.sessionRef.id) continue;
+      if (
+        lane === undefined ||
+        !watched(lane) ||
+        !sameSession(lane.sessionRef, listed.sessionRef) ||
+        lane.noticeId !== listed.noticeId ||
+        lane.createdAt !== listed.createdAt
+      )
+        continue;
       const now = d.now();
+      if (
+        lane.wait &&
+        listed.wait &&
+        waitKey(lane.wait.target) === waitKey(listed.wait.target) &&
+        lane.wait.startedAt === listed.wait.startedAt
+      ) {
+        const observed = observeWait(lane.wait, probe);
+        if (JSON.stringify(observed) !== JSON.stringify(lane.wait)) {
+          if (waitEnded(observed) && !waitEnded(lane.wait))
+            events.push({
+              lane: lane.key,
+              action: "wait-ended",
+              detail: `${renderWait(observed)}; lane state and progress unchanged`,
+            });
+          lane.wait = observed;
+          d.store.saveLane(lane);
+        }
+      }
       if (st === "gone") {
         // Marked lost and its hook run whether or not a lead is registered: a lost lane must stop counting as open. The
         // notice is queued first, under a fixed id, so a pass cut short before the lane is saved repeats it without a

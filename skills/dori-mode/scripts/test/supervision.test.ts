@@ -118,10 +118,10 @@ describe("supervision", () => {
     const f = fixture();
     try {
       const reports = new Reports(f.dir);
-      reports.report(lane.key, "milestone", "starting", f.clock.now());
+      await reports.report(lane.key, "milestone", "starting", f.clock.now());
       await f.supervisor.sweep({ ...lane, reportProtocol: undefined }, "Working 21m");
       f.clock.at += 20 * 60_000;
-      reports.report(lane.key, "milestone", "progress", f.clock.now());
+      await reports.report(lane.key, "milestone", "progress", f.clock.now());
       expect((await f.supervisor.sweep(lane, "Working 41m")).state).toBe("running");
       f.clock.at += 20 * 60_000;
       new Checkpoints(f.dir).write(

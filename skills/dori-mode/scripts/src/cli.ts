@@ -16,7 +16,8 @@ const USAGE = `dori <command> [options]
   sync   [--write]                     registry vs live panes; read-only unless --write
   boot                                 read-only check after a restart: Slack auth, vanished panes, journals, open worklog items and decisions, stale watches
   report <key> --kind milestone|blocker|question|halted|done --text TEXT
-                                       append a durable progress report and print its [REPORT] line
+         [--for job:ID|approval:ID|ci:owner/repo#N[@CHECK_RUN]] (blocker only)
+                                       append a durable progress report; ordinary --for prose is unverified
   checkpoint <key> --step ID --result TEXT --evidence PATH [--remote-effect RECEIPT]...
                                        record a completed step once; a conflicting rewrite is refused
   checkpoints <key>                    read completed steps before resuming remote work
@@ -125,6 +126,7 @@ const flags = parseArgs({
     purpose: { type: "string" },
     to: { type: "string" },
     text: { type: "string" },
+    for: { type: "string" },
     edit: { type: "string" },
     "text-file": { type: "string" },
     reply: { type: "string" },

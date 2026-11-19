@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
+import { readNativeObservation } from "../native-observation.ts";
 import type { Exec } from "./exec.ts";
 import type { ForegroundProcess, Probe } from "./types.ts";
 
@@ -15,6 +16,8 @@ type PaneState = {
   readonly updatedAt: string;
   readonly approvalPending: boolean;
   readonly agentStatus?: "idle" | "working";
+  /** Read only through readNativeObservation: a malformed observation is dropped without failing the record. */
+  readonly native?: unknown;
 };
 type Proc = { readonly pid: number; readonly ppid: number; readonly command: string };
 
@@ -156,6 +159,8 @@ export async function withOmpState(exec: Exec, stateDir: string, id: string, pro
       (current.agentStatus === "idle" || current.agentStatus === "working")
         ? current.agentStatus
         : probe.status;
+    // The observation comes from the re-read record that passed every check above, so it names that record's session.
+    const native = readNativeObservation(current.native);
     return {
       ...probe,
       status: current.approvalPending ? "blocked" : status,
@@ -163,6 +168,9 @@ export async function withOmpState(exec: Exec, stateDir: string, id: string, pro
       sessionId: current.sessionId,
       ...(current.sessionFile === undefined ? {} : { sessionFile: current.sessionFile }),
       approvalPending: current.approvalPending,
+      ...(native === undefined
+        ? {}
+        : { native: { ...native, sessionId: current.sessionId, sessionStartedAt: current.startedAt } }),
     };
   } catch {
     return unknown();

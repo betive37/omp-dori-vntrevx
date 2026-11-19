@@ -205,3 +205,5 @@ CI coverage for macOS/hc is distinct from supported live consumer behavior. A so
 The terminal-admission integration group uses a test-local 20-second budget for two distinct real Git/fsync candidate lifecycles. Runtime command deadlines, assertion coverage and the default budget of unrelated tests are unchanged.
 
 The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, public dependency pin and third-party notices remain unchanged.
+
+Waiting reports can bind an attested native job/approval identity or an explicitly read PR head/check run. Repeated identities preserve their waiting interval; later native observations can end that wait without declaring success, granting permission or clearing a blocker. Plain dependency text remains unverified, and existing progress, pause and escalation protections remain in force. CI observation occurs only on explicit reports, without a new polling service.
