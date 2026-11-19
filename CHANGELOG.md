@@ -205,3 +205,5 @@ CI coverage for macOS/hc is distinct from supported live consumer behavior. A so
 The terminal-admission integration group uses a test-local 20-second budget for two distinct real Git/fsync candidate lifecycles. Runtime command deadlines, assertion coverage and the default budget of unrelated tests are unchanged.
 
 The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, public dependency pin and third-party notices remain unchanged.
+
+Unreleased (source only): Discord purpose commands optionally bind to an exact owner source message with `--source "discord CHANNEL MESSAGE"`. Only that physical conversation or its actual thread parent is eligible. Notes and source receipts are atomically stored together, so matching retries return the original result without overwriting later edits and conflicting reuse is refused; manual commands remain available.
