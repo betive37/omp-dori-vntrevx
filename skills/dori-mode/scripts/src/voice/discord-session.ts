@@ -49,6 +49,7 @@ export const voiceIds = async (discord: Discord, channelId: string): Promise<{ g
 };
 
 export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Promise<void>; close(): void } => {
+  if (t.ownerId === t.botId) throw new Error("DORI_DISCORD_OWNER_ID must identify the human owner, not the bot");
   const { clock, driver } = rt;
   const done = Promise.withResolvers<void>();
   let stopped = false;
@@ -154,31 +155,35 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
 
   const join = () => {
     if (stopped || link) return;
-    const current = driver.join({
-      guildId: t.guildId,
-      channelId: t.channelId,
-      adapter: (methods) => {
-        adapter = methods;
-        return {
-          sendPayload: (payload) => gateway.send(payload),
-          destroy: () => {
-            if (adapter === methods) adapter = undefined;
-          },
-        };
-      },
-    });
-    link = current;
-    current.onStatus((from, to) => {
-      // The library also emits same-status changes, e.g. when attach() stores the player subscription; reacting to
-      // those would re-enter attach() without end.
-      if (current !== link || from === to) return;
-      t.log(`VOICE ${from} -> ${to}`);
-      onStatus(current, to);
-    });
-    current.onError((message) => t.log(`VOICE ERROR ${message}`));
-    dave = watchDave(current, { ownerId: t.ownerId, ownerPresent: () => ownerPresent, clock, log: t.log });
-    // A join request that could not be sent leaves the connection disconnected before the listener existed.
-    onStatus(current, current.status());
+    try {
+      const current = driver.join({
+        guildId: t.guildId,
+        channelId: t.channelId,
+        adapter: (methods) => {
+          adapter = methods;
+          return {
+            sendPayload: (payload) => gateway.send(payload),
+            destroy: () => {
+              if (adapter === methods) adapter = undefined;
+            },
+          };
+        },
+      });
+      link = current;
+      current.onStatus((from, to) => {
+        // The library also emits same-status changes, e.g. when attach() stores the player subscription; reacting to
+        // those would re-enter attach() without end.
+        if (current !== link || from === to) return;
+        t.log(`VOICE ${from} -> ${to}`);
+        onStatus(current, to);
+      });
+      current.onError((message) => t.log(`VOICE ERROR ${message}`));
+      dave = watchDave(current, { ownerId: t.ownerId, ownerPresent: () => ownerPresent, clock, log: t.log });
+      // A join request that could not be sent leaves the connection disconnected before the listener existed.
+      onStatus(current, current.status());
+    } catch {
+      finish(new Error("Discord voice join failed"));
+    }
   };
 
   const onDispatch = (type: string, raw: unknown) => {
@@ -216,11 +221,7 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
     intents: GUILDS | GUILD_VOICE_STATES,
     online: false,
     onReady: () => {
-      try {
-        if (!link && rejoinTimer === undefined) join();
-      } catch {
-        finish(new Error("Discord voice join failed"));
-      }
+      if (!link && rejoinTimer === undefined) join();
     },
     onDispatch: (type, data) => {
       try {

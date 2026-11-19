@@ -90,7 +90,6 @@ export class VoiceSession {
     if (next > this.recordedSeconds) this.ports.usage.live(next - this.recordedSeconds);
     this.recordedSeconds = next;
   }
-
   private async event(event: LiveEvent): Promise<void> {
     if (this.finalized) return;
     const now = this.ports.now();
@@ -143,6 +142,9 @@ export class VoiceSession {
         break;
       case "session.closed":
         this.record(event.usage?.seconds ?? this.recordedSeconds);
+        this.failed ||= this.state !== "closing";
+        this.state = "closing";
+        this.closingAt ??= now;
         this.socket?.close();
         break;
       case "error":
@@ -155,7 +157,6 @@ export class VoiceSession {
         break;
     }
   }
-
   tick(): void {
     const now = this.ports.now();
     if (this.state === "closed") return;
@@ -202,7 +203,6 @@ export class VoiceSession {
     const quiet = now - Math.max(this.lastOwnerAt, this.startedAt, this.lastOutputAt);
     if (quiet > this.settings.idleCloseSec * 1000 && !this.backend.blocksReply()) this.close("idle");
   }
-
   private timing() {
     return {
       now: this.ports.now(),

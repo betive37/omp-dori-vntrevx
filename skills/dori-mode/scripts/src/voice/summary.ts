@@ -1,9 +1,8 @@
 import type { Discord } from "../messenger/discord.ts";
-import { parseSummary } from "./provider.ts";
+import { parseSummary, parseUsage } from "./provider.ts";
 import type { VoiceSession } from "./session.ts";
 import type { VoiceSettings } from "./settings.ts";
 import type { VoiceUsage } from "./usage.ts";
-import type { Usage } from "./types.ts";
 
 type SummaryRequest = (url: string, init: RequestInit) => Promise<Response>;
 
@@ -26,7 +25,6 @@ export const summarizeVoice = async (
   if (usage.capReason() || session.failed)
     summary = "Summary not generated: voice stopped at a usage limit or provider failure.";
   else {
-    let result: { text: string; usage?: Usage } | undefined;
     try {
       const response = await request("https://api.openai.com/v1/responses", {
         method: "POST",
@@ -47,16 +45,16 @@ export const summarizeVoice = async (
         }),
       });
       if (!response.ok) throw new Error(`Summary HTTP ${response.status}`);
-      result = parseSummary(await response.json());
+      const body: unknown = await response.json();
+      // An incomplete or refused response can still have billable usage, even without summary text.
+      if (body && typeof body === "object" && "usage" in body && body.usage !== undefined)
+        usage.backend(parseUsage(body.usage), settings.summaryModel);
+      summary = parseSummary(body).text;
     } catch {
       session.failed = true;
-    }
-    if (result) {
-      usage.backend(result.usage, settings.summaryModel);
-      summary = result.text;
-    } else
       summary =
         "Summary unavailable; see the recorded tool outcomes below. No paid retry was made; voice is held until explicit restart.";
+    }
   }
   const actions = session.actions
     .map((a) => `- ${a.tool}: ${a.ok ? "success" : "failed/held/unconfirmed"}: ${a.result}`)

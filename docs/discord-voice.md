@@ -9,7 +9,7 @@ Every voice session costs money. Read [Costs and limits](#costs-and-limits) befo
 Voice has no separate configuration file, token or state root.
 
 - Configuration: the optional `voice` object in the existing Dori config, `~/.dori/config.json` by default, or the path in `DORI_CONFIG`. Managed primary and side wrappers preserve their selected `DORI_HOME` and `DORI_CONFIG`.
-- Discord: the existing bot token in `DORI_DISCORD_TOKEN` and the owner's user ID in `DORI_DISCORD_OWNER_ID`. Only that owner is listened to.
+- Discord: the existing bot token in `DORI_DISCORD_TOKEN` and the human owner's user ID in `DORI_DISCORD_OWNER_ID`. Only that owner is listened to; using the bot's own ID as the owner is refused.
 - Provider key: an environment variable, `OPENAI_API_KEY` unless `voice.apiKeyEnv` names another. Keys are never read from the config file.
 - Lead: the configured `leadPane` receives forwarded requests.
 - State: `<stateDir>/voice/`, holding the usage ledger, the lead-reply ledger and its offset, and a single-owner lock. A second `dori voice discord` on the same state directory refuses to start.
@@ -102,6 +102,8 @@ It runs in the foreground until stopped. A service is optional; see [Running as 
 - A short voice-link interruption mutes output and invalidates queued reply audio without closing the owner's Live session. A disconnect lasting 5 seconds ends that session and rejoins 3 seconds later; all initial and SDK-internal recovery paths have a 30-second readiness deadline. Moving the bot to a different channel stops the bridge rather than playing the owner's answer there.
 - New session admission is blocked until the previous session has finished provider accounting and summary delivery. If the owner rejoins during finalization, they can speak after it settles to wake a session; that rejoin does not queue an automatic greeting. On a Live, delegated Responses or summary provider failure (including a backend with no progress for 120 seconds), voice is held and a notice is posted. It never retries a paid call automatically; restart it explicitly.
 - Running delegations, hosted searches and tool continuations prevent idle closure. Completed backend work gets the existing 10-second answer window before idle closure can resume.
+
+The [Live delegation API](https://developers.openai.com/api/docs/guides/live-delegation) can leave a session open after `responses_validation_failed`. Dori deliberately closes and holds voice on this configuration/provider rejection rather than changing delegation settings or retrying paid work. Correct the configuration before an explicit restart.
 
 ### Tools
 
