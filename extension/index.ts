@@ -47,7 +47,12 @@ export interface DoriContext {
   abort(): void;
   agent: { kind: "main" | "sub"; id: string; parentId?: string };
   model?: PromptModel;
-  sessionManager: { getSessionId(): string; getSessionFile(): string | undefined; getBranch(): SessionEntry[] };
+  sessionManager: {
+    getSessionId(): string;
+    getSessionFile(): string | undefined;
+    getBranch(): SessionEntry[];
+    ensureOnDisk(): Promise<void>;
+  };
   ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
 }
 interface Goal {
@@ -353,7 +358,7 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     return monitors.start(spec.name, spec.argv, spec.filter, spec.cwd, owner, {
       ...(spec.mode ? { mode: spec.mode } : {}),
       ...(id ? { recordId: id } : {}),
-      onExit(exit) {
+      async onExit(exit) {
         if (role !== "dori" || session?.id !== owner || ctx.sessionManager.getSessionId() !== owner) return;
         const current = recordedMonitorStates(ctx.sessionManager.getBranch()).get(spec.name);
         if (!current || current.id !== id || current.completed || !sameMonitorSpecs([current.spec], [spec])) return;
@@ -364,7 +369,17 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
           ...(id ? { id } : {}),
           exit,
         });
+        await ctx.sessionManager.ensureOnDisk();
+        if (role !== "dori" || session?.id !== owner || ctx.sessionManager.getSessionId() !== owner) return;
         const branch = ctx.sessionManager.getBranch();
+        const persisted = recordedMonitorStates(branch).get(spec.name);
+        if (
+          !persisted ||
+          persisted.id !== id ||
+          persisted.exit?.at !== exit.at ||
+          !sameMonitorSpecs([persisted.spec], [spec])
+        )
+          return;
         saveMonitorSpecs(recordedMonitors(branch), branch);
         savePane(ctx);
       },
@@ -454,12 +469,12 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     if (!session) return;
     const records = recordedMonitorStates(branch);
     const wanted = recordedMonitors(branch);
-    for (const running of monitors.list()) {
+    for (const running of monitors.list(true)) {
       const spec = wanted.get(running.name);
       if (!spec || records.get(running.name)?.id !== running.recordId || !sameMonitorSpecs([spec], [running]))
         monitors.stop(running.name);
     }
-    const running = new Set(monitors.list().map((m) => m.name));
+    const running = new Set(monitors.list(true).map((m) => m.name));
     const restored: string[] = [];
     const failed: string[] = [];
     for (const record of records.values()) {

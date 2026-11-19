@@ -18,7 +18,7 @@ type Running = Omit<MonitorInfo, "pid" | "filter"> & {
   readonly proc: Subprocess<"ignore", "pipe", "pipe">;
   /** Session the monitor was started in; its lines are delivered only while that session is current. */
   readonly session: string;
-  readonly onExit: ((exit: MonitorExit) => void) | undefined;
+  readonly onExit: ((exit: MonitorExit) => unknown) | undefined;
   readonly signal: AbortSignal;
   stopped: boolean;
 };
@@ -64,10 +64,11 @@ export class Monitors {
     filter: string,
     cwd: string,
     session: string,
-    options: Pick<MonitorInfo, "mode" | "recordId"> & { onExit?: (exit: MonitorExit) => void } = {},
+    options: Pick<MonitorInfo, "mode" | "recordId"> & { onExit?: (exit: MonitorExit) => unknown } = {},
   ): MonitorInfo {
     if (!name) throw new Error("monitor name is required");
-    if (this.#running.has(name)) throw new Error(`monitor "${name}" is already running; stop it first`);
+    if (this.#running.has(name))
+      throw new Error(`monitor "${name}" is already running or delivering output; stop it first`);
     if (argv.length === 0) throw new Error("argv must name the command to run");
     const pattern = new RegExp(filter);
     const proc = Bun.spawn([...argv], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
@@ -87,20 +88,25 @@ export class Monitors {
     this.#running.set(name, entry);
     void Promise.all([this.#pump(entry, proc.stdout, "stdout"), this.#pump(entry, proc.stderr, "stderr"), proc.exited])
       .then(async ([, , code]) => {
-        if (this.#running.get(name) === entry) this.#running.delete(name);
         if (entry.stopped) return;
-        this.#recordExit(entry, code);
+        await this.#flush();
+        if (entry.stopped || !this.#current(entry) || this.#running.get(name) !== entry) return;
+        this.#running.delete(name);
+        await this.#recordExit(entry, code);
+        const current = this.#running.get(name);
+        if (entry.stopped || !this.#current(entry) || (current && current !== entry)) return;
         await this.#queue(
           entry,
           `[${name}] monitor exited (${proc.signalCode ? `signal ${proc.signalCode}` : `code ${code}`}): ${argv.join(" ")}`,
         );
       })
       .catch(async (error: unknown) => {
-        if (entry.stopped || !this.#current(entry)) return;
+        const current = this.#running.get(name);
+        if (entry.stopped || !this.#current(entry) || (current && current !== entry)) return;
         entry.stopped = true;
         entry.proc.kill();
         if (this.#running.get(name) === entry) this.#running.delete(name);
-        this.#recordExit(entry, proc.exitCode, String(error));
+        await this.#recordExit(entry, proc.exitCode, String(error));
         await this.#queue(
           entry,
           `[monitor] output failed for name=${JSON.stringify(name.slice(0, 256))}${name.length > 256 ? "..." : ""} pid=${proc.pid}; stopped; raw output may be incomplete: ${String(error).slice(0, 2048)}`,
@@ -127,16 +133,18 @@ export class Monitors {
     return true;
   }
 
-  list(): MonitorInfo[] {
-    return [...this.#running.values()].map((entry) => ({
-      name: entry.name,
-      argv: entry.argv,
-      filter: entry.filter.source,
-      pid: entry.proc.pid,
-      cwd: entry.cwd,
-      ...(entry.mode ? { mode: entry.mode } : {}),
-      ...(entry.recordId ? { recordId: entry.recordId } : {}),
-    }));
+  list(includeExited = false): MonitorInfo[] {
+    return [...this.#running.values()]
+      .filter((entry) => includeExited || (entry.proc.exitCode === null && entry.proc.signalCode === null))
+      .map((entry) => ({
+        name: entry.name,
+        argv: entry.argv,
+        filter: entry.filter.source,
+        pid: entry.proc.pid,
+        cwd: entry.cwd,
+        ...(entry.mode ? { mode: entry.mode } : {}),
+        ...(entry.recordId ? { recordId: entry.recordId } : {}),
+      }));
   }
 
   /** Session end: kill every monitor and drop undelivered lines, which belong to the session that is going away. */
@@ -150,17 +158,17 @@ export class Monitors {
     this.#pendingBytes = 0;
   }
 
-  #recordExit(entry: Running, code: number | null, error?: string): void {
+  async #recordExit(entry: Running, code: number | null, error?: string): Promise<void> {
     const signal = entry.proc.signalCode;
     try {
-      entry.onExit?.({
+      await entry.onExit?.({
         code,
         signal: signal === null ? null : String(signal),
         at: new Date().toISOString(),
         ...(error === undefined ? {} : { error }),
       });
     } catch (cause) {
-      this.#queue(
+      await this.#queue(
         entry,
         `[monitor] exit state was not recorded for name=${JSON.stringify(entry.name.slice(0, 256))}; a future resume may restart it: ${String(cause).slice(0, 2048)}`,
       );
