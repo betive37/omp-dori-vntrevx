@@ -10,6 +10,8 @@
 
 - Discord REST intake batches filtered-message cursor writes into the next successful owner checkpoint or one trailing checkpoint. Owner emits still checkpoint individually, live Gateway delivery is unchanged, and failures never commit past an undelivered owner message.
 
+- Bound native OMP binds custom-message delivery and model starts to their owning transcript across `/new` and nested session switches, including asynchronous normalization and preflight. Unique generations prevent abandoned target reuse after rollback; external messages wait for relevant rollback decisions without making transition callbacks wait on themselves. Same-session delivery remains intact. CI runs the ownership regressions against the actual bound native source.
+
 - Linux host sampling now reads load and memory directly from `/proc`, avoiding two `cat` children and three failed macOS command attempts per sample. Disk and session sampling, unknown-value behavior, and non-Linux probes are unchanged.
 
 - The skill CLI loads command implementations on demand, avoiding updater, messenger and lane graphs for successful journal commands and all configuration/command graphs for `--version`. Ordinary commands retain configuration and consumer-native admission before execution; usage, exit codes and original error classes remain unchanged.
