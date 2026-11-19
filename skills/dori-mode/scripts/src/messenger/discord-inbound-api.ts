@@ -38,9 +38,9 @@ export type DiscordInbound = {
 };
 /**
  * Delivers one owner message; the cursor moves past it only after this returns or, when it returns a promise, after
- * that resolves. Any other returned value is ignored.
+ * that resolves. Live intake supplies its lifecycle signal; callbacks that ignore it retain in-flight completion.
  */
-export type Emit = (message: DiscordInbound) => unknown;
+export type Emit = (message: DiscordInbound, signal?: AbortSignal) => unknown;
 export type Request = <T>(path: string, body?: Record<string, unknown>) => Promise<T>;
 
 const REQUEST_FAILED = "Discord inbound request failed; check the connection and Discord API availability";
