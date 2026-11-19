@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/cataly-portrait.webp" width="200" height="200" alt="은빛 머리와 붉은 광륜이 있는 Cataly 캐릭터 초상">
+  <img src="docs/cataly-portrait.webp" width="320" alt="은빛 머리와 붉은 광륜이 있는 Cataly 캐릭터 초상">
 </p>
 
 # Cataly

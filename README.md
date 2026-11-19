@@ -1,5 +1,5 @@
 <p align="center">
-  <img src="docs/cataly-portrait.webp" width="200" height="200" alt="Cataly character portrait: silver hair and a crimson halo">
+  <img src="docs/cataly-portrait.webp" width="320" alt="Cataly character portrait: silver hair and a crimson halo">
 </p>
 
 # Cataly

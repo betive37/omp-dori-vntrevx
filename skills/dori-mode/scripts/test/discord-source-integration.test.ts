@@ -98,3 +98,66 @@ for (const status of [204, 503]) {
     }
   });
 }
+
+for (const method of ["GET", "POST"] as const) {
+  test(`wake error codes survive source-aware Discord ${method} rejection`, async () => {
+    let calls = 0;
+    const dc = new Discord(
+      async () => {
+        calls++;
+        return { status: 404, body: JSON.stringify({ code: 10008, message: "Unknown Message" }), headers: {} };
+      },
+      noWait,
+      "synthetic-token",
+    );
+    const outcome = await (method === "GET"
+      ? dc.call("GET", "/channels/20/messages/101")
+      : dc.startThread("20", "101", "task")
+    ).catch((error: unknown) => error);
+    expect(outcome).toBeInstanceOf(MessengerError);
+    expect(outcome).toMatchObject({ status: 404, code: "10008", outcome: "rejected" });
+    expect(calls).toBe(1);
+  });
+
+  test(`wake error decoding retains ${method} malformed-success semantics`, async () => {
+    let calls = 0;
+    const dc = new Discord(
+      async () => {
+        calls++;
+        return { status: 200, body: "{", headers: {} };
+      },
+      noWait,
+      "synthetic-token",
+    );
+    const outcome = await (method === "GET"
+      ? dc.call("GET", "/channels/20/messages/101")
+      : dc.startThread("20", "101", "task")
+    ).catch((error: unknown) => error);
+    if (method === "GET") expect(outcome).toBeInstanceOf(SyntaxError);
+    else {
+      expect(outcome).toBeInstanceOf(DeliveryUncertainError);
+      expect(outcome).toMatchObject({ status: 200, outcome: "uncertain", receipt: undefined });
+    }
+    expect(calls).toBe(1);
+  });
+}
+
+test("wake error codes do not replace a rejected source mutation cancellation reason", async () => {
+  const controller = new AbortController();
+  const reason = new Error("source mutation canceled");
+  let calls = 0;
+  const dc = new Discord(
+    async () => {
+      calls++;
+      controller.abort(reason);
+      return { status: 404, body: JSON.stringify({ code: 10008 }), headers: {} };
+    },
+    noWait,
+    "synthetic-token",
+  );
+  const outcome = await dc
+    .call("POST", "/channels/20/threads", { name: "task", type: 11 }, controller.signal)
+    .catch((error: unknown) => error);
+  expect(outcome).toBe(reason);
+  expect(calls).toBe(1);
+});
