@@ -90,7 +90,7 @@ For unmanaged source homes, `DORI_INSTALL_MODE=primary` installs into `~/.dori`;
 
 For side operation of a source install, edit `<OMP_DORI_HOME>/config.json`, keep its generated `stateDir` and `agentCommand`, and use `omp-dori <command>`, `omp-dori omp ...` and `omp-dori hc ...`. The wrappers source `env.sh`, set the side Dori environment and `HC_SESSION` (default `omp-dori`, set through `OMP_DORI_HC_SESSION`), and put the side `bin/` first on `PATH`. hc keeps terminals without a `herdr.space` label out of the Herdr app, and a separate `HC_SESSION` is a separate core the app does not show: to watch the side Dori in the app, install with `OMP_DORI_HC_SESSION=default` (the core the app shows) and `OMP_DORI_HC_SPACE` set to a space id from `herdr-app ls`, and its lead and lanes open in that space (`DORI_HC_SPACE` in `env.sh`). Lanes stay apart from another Dori's through their `dori.group` label. The OMP overlay hides `dori-mode` and adds the renamed `omp-dori-mode` skill. The wrapper uses `--no-extensions` and explicit `-e` arguments for this checkout's extension and its selected omp-ulw, with no global extension discovery or second import. An external checkout choice is retained in the side home's `.omp-dori-ulw` symlink across reinstalls. Use a separate messenger bot/channel. To show the lead in the app, source the side home's `env.sh` first and run `omp-dori hc run --label "herdr.space=$DORI_HC_SPACE" --name omp-dori-lead -- omp-dori omp --dori-role dori`; installation starts none of these processes.
 
-The root `install.sh` remains the consumer release bootstrap. Run source installation only from an ordinary checkout outside frozen releases. See [source installation](../../../docs/releases.md#source-checkouts-for-maintainers) for fast-forward behavior and path overrides, and the [README](../../../README.md#source-installation-next-to-an-existing-dori) for the complete side layout. These source instructions add no real OMP, provider or messenger QA claim.
+The root `install.sh` remains the consumer release bootstrap. Run source installation only from an ordinary checkout outside frozen releases. See [source installation](../../../docs/releases.md#source-checkouts-for-maintainers) for fast-forward behavior, path overrides, and the complete side layout. These source instructions add no real OMP, provider or messenger QA claim.
 
 For the Linux consumer preview, configure its home as follows:
 
@@ -112,10 +112,10 @@ Select `DORI_HOME` explicitly before primary startup (`~/.dori`), or launch the 
 |---|---|---|
 | Discord owner intake (opt-in) | `dori inbound discord`, using the [protected-token child argv](../../../docs/releases.md#discord-owner-intake) | `^INBOUND` |
 | done flow | `dori watch` | `^LANE_` |
-| dead panes | `dori dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE)` |
-| host guard | `dori guard --loop 1` | `^HOST_GUARD` |
-| freshness | `dori freshness --loop 5` | `^(NUDGED\|POSTED\|POST-FAILED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT\|STALLED\|JOURNAL-ERROR\|WORKING-WHILE-PAUSED)` |
-| PR follow-up (opt-in, needs `gh` auth) | `dori pr watch --loop 3` | `^PR_(FEEDBACK\|CI_FAIL\|HEAD_MOVED\|MERGED\|CLOSED\|REOPENED\|WATCH_WARN)` |
+| dead panes | `dori dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE\|WARN)` |
+| host guard | `dori guard --loop 1` | `^(HOST_GUARD\|WARN)` |
+| freshness | `dori freshness --loop 5` | `^(NUDGED\|POSTED\|POST-FAILED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT\|STALLED\|JOURNAL-ERROR\|WORKING-WHILE-PAUSED\|BLOCKED\|WARNING\|SUPERVISION-ERROR\|WARN)` |
+| PR follow-up (opt-in, needs `gh` auth) | `dori pr watch --loop 3` | `^(PR_(FEEDBACK\|CI_FAIL\|HEAD_MOVED\|MERGED\|CLOSED\|REOPENED\|WATCH_WARN)\|WARN)` |
 | Slack inbound (Slack only) | `dori inbound slack --loop 1` | `^INBOUND` |
 | Telegram inbound (Telegram only) | `DORI_TELEGRAM_TOKEN=… DORI_TELEGRAM_OWNER_ID=… dori inbound telegram --loop 1` | `^INBOUND` |
 | presence (opt-in) | `dori presence discord` (or retained Slack: `dori presence slack`) | `^PRESENCE_` |

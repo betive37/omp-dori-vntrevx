@@ -9,6 +9,7 @@ export type HttpRequest = {
   readonly operation?: string;
   readonly headers?: Readonly<Record<string, string>>;
   readonly body?: string | FormData | Uint8Array<ArrayBuffer>;
+  readonly signal?: AbortSignal;
 };
 export type HttpResponse = {
   readonly status: number;
@@ -22,6 +23,7 @@ export const fetchHttp: Http = async (req) => {
     method: req.method,
     ...(req.headers === undefined ? {} : { headers: req.headers }),
     ...(req.body === undefined ? {} : { body: req.body }),
+    ...(req.signal === undefined ? {} : { signal: req.signal }),
   });
   const headers: Record<string, string> = {};
   res.headers.forEach((v, k) => {
@@ -43,13 +45,17 @@ export class MessengerError extends Error {
 }
 
 export class DeliveryUncertainError extends MessengerError {
-  constructor(operation: string, status = 0) {
+  /** Unverified ID from a fully read 2xx body, never a confirmed receipt. */
+  declare readonly candidateReceipt?: { readonly id: string };
+
+  constructor(operation: string, status = 0, candidateReceipt?: { readonly id: string }) {
     super(
       `${operation}: delivery uncertain${status ? ` (HTTP ${status})` : ""}; the request may have succeeded; do not resend. Inspect the original remote target and reconcile its IDs before retrying.`,
       status,
       "DELIVERY_UNCERTAIN",
       "uncertain",
     );
+    if (candidateReceipt !== undefined) this.candidateReceipt = candidateReceipt;
   }
 }
 
@@ -75,6 +81,7 @@ export const withBackoff = async (
   const operation = req.operation ?? `messenger ${req.method}`;
   let last: HttpResponse | undefined;
   for (let attempt = 0; attempt < policy.attempts; attempt++) {
+    req.signal?.throwIfAborted();
     try {
       last = await http(req);
     } catch (error) {
@@ -89,8 +96,22 @@ export const withBackoff = async (
       }
       throw error;
     }
-    if (mutation && (last.status === 408 || last.status >= 500))
-      throw new DeliveryUncertainError(operation, last.status);
+    if (
+      mutation &&
+      (last.status === 408 || last.status >= 500 || (last.status >= 200 && last.status < 400 && req.signal?.aborted))
+    ) {
+      let candidateReceipt: { readonly id: string } | undefined;
+      if (last.status >= 200 && last.status < 300) {
+        try {
+          const body = JSON.parse(last.body) as { readonly id?: unknown } | null;
+          if (typeof body?.id === "string" && body.id.length > 0) candidateReceipt = { id: body.id };
+        } catch {
+          // A non-JSON body cannot supply an ID candidate.
+        }
+      }
+      throw new DeliveryUncertainError(operation, last.status, candidateReceipt);
+    }
+    req.signal?.throwIfAborted();
     // Platform 429 responses reject the request; 5xx on reads can be retried safely.
     if (last.status !== 429 && last.status < 500) return last;
     const header = Number(last.headers["retry-after"]);
@@ -99,7 +120,27 @@ export const withBackoff = async (
       (seconds) => seconds !== undefined && Number.isFinite(seconds) && seconds > 0,
     );
     const waitMs = waitS !== undefined ? waitS * 1000 : Math.min(policy.maxMs, policy.baseMs * 2 ** attempt);
-    if (attempt < policy.attempts - 1) await clock.sleep(last.status === 429 ? waitMs : Math.min(policy.maxMs, waitMs));
+    if (attempt < policy.attempts - 1) {
+      const ms = last.status === 429 ? waitMs : Math.min(policy.maxMs, waitMs);
+      if (!req.signal) await clock.sleep(ms);
+      else {
+        const signal = req.signal;
+        const { promise, resolve, reject } = Promise.withResolvers<void>();
+        const abort = () => {
+          clearTimeout(timer);
+          reject(signal.reason);
+        };
+        const timer = setTimeout(resolve, ms);
+        signal.addEventListener("abort", abort, { once: true });
+        if (signal.aborted) abort();
+        try {
+          await promise;
+        } finally {
+          clearTimeout(timer);
+          signal.removeEventListener("abort", abort);
+        }
+      }
+    }
   }
   return last as HttpResponse;
 };

@@ -10,7 +10,7 @@ Bun and addon SHA-256 checks read every byte through a fixed 1 MiB buffer, both 
 
 The default command remains literally named `omp`. It validates the bound source, then executes upstream `packages/coding-agent/scripts/omp` through the recorded Bun, retaining that launcher's empty-cwd/preload protection. Every tracked source file and the expected overlay index tree are independently checked; a stock 18.20.0 image, version-only receipt, unchanged launcher hash, malformed patch or partial cache cannot satisfy this bundle. Drift holds installation/reuse/launch instead of fetching around it or falling back to stock.
 
-`omp-ulw.lock` retains the upstream repository/commit protocol and selects [33b375dc8d289d6fec944a8a5ee8f2db721a8c34](https://github.com/dbc-hbin/omp-ulw/tree/33b375dc8d289d6fec944a8a5ee8f2db721a8c34). `omp-ulw.overlay.lock` plus `omp-ulw.patch` bind the reviewed overlay and resulting file hashes/tree. Fetching keeps upstream HEAD and gitlinks intact; the staged index records only the expected overlay. Reuse accepts that exact overlay, not arbitrary dirty source. Native and ULW patch files are consumed during preparation, not stored as inert archives.
+`omp-ulw.lock` retains the upstream repository/commit protocol and selects [6ec7ecd40b2b5667f37c9802999db1d12ebbc2ae](https://github.com/dbc-hbin/omp-ulw/tree/6ec7ecd40b2b5667f37c9802999db1d12ebbc2ae). `omp-ulw.overlay.lock` plus `omp-ulw.patch` bind the reviewed overlay and resulting file hashes/tree. Fetching keeps upstream HEAD and gitlinks intact; the staged index records only the expected overlay. Reuse accepts that exact overlay, not arbitrary dirty source. Native and ULW patch files are consumed during preparation, not stored as inert archives.
 
 Primary source sessions use `~/.dori/bin/omp`; side sessions use `omp-dori omp`. Both generated `agentCommand` defaults use their guarded source wrapper. Consumer releases provide their own `<home>/bin/omp` and resolve their frozen wrapper/dependency on update and rollback without rewriting existing config bytes; already loaded release code stays pinned to its own release, including its isolated discovery overlay. Managed deployment omits `promotion.deployment.omp` for the source default, prepares both bundles before admission and retains their identities in toolchain receipts. Its per-process extension selection consumes the prepared ULW dependency exactly once.
 
@@ -154,9 +154,13 @@ Installation, update, rollback and `dori boot` do not start a provider, inbound 
 
 ### Discord owner intake
 
-The receiver is **`dori inbound discord [--loop MINUTES] [--gateway]`**. Required child environment is `DORI_DISCORD_TOKEN` plus `DORI_DISCORD_OWNER_ID` and at least one channel through `DORI_DISCORD_CHANNEL_ID` or `DORI_DISCORD_CHANNEL_IDS`, unless `DORI_DISCORD_SCOPE=all` is selected. Only the configured owner's text in the watched channels is admitted. Bots, the bot itself, other users, webhooks and system messages are excluded. A thread is watched by configuring its own channel ID.
+The receiver is **`dori inbound discord [--loop MINUTES] [--gateway]`**. Required child environment is `DORI_DISCORD_TOKEN` plus `DORI_DISCORD_OWNER_ID` and at least one channel through `DORI_DISCORD_CHANNEL_ID` or `DORI_DISCORD_CHANNEL_IDS`, unless `DORI_DISCORD_SCOPE=all` is selected. Only the configured owner's text in watched channels is emitted. Bots, the bot itself, other users, webhooks and system messages are excluded from that output. Threads configured by their own ID remain independent; active threads under configured parent channels are followed by default. `DORI_DISCORD_THREADS=on` or unset enables this following; `off` disables it without changing scope `all`.
 
-More channels are opt-in and leave a single `DORI_DISCORD_CHANNEL_ID` setup unchanged: `DORI_DISCORD_CHANNEL_IDS=ID,ID,...` adds channels or threads (all explicit IDs must be readable, or startup fails), and `DORI_DISCORD_SCOPE=all` additionally discovers readable guild text channels, active threads and the owner's DM with the bot. Discovered channels that return 403/404 are skipped, including an unavailable owner DM; authentication, rate-limit and server failures still propagate. The set is refreshed on every Gateway READY/RESUMED, or every 100 REST polls. Every watched channel has its own cursor.
+Gateway queue admission happens before that owner-output filter. Valid scoped `MESSAGE_CREATE` frames are stored with their full payload in the private SQLite queue, including other users', bots' and webhooks' text, attachment metadata and signed URLs. In scope `all`, this can include valid frames from channels not yet discovered by REST. Nonowner rows are discarded when drained; pending payloads survive shutdown. Private ownership and `0700`/`0600` modes restrict access, but acknowledgement/deletion makes no secure-erasure guarantee for SQLite or its journal.
+
+A first live frame from an unknown channel waits for thread-parent scope resolution in bounded volatile memory: at most 100 frames and 1 MiB aggregate serialized payload bytes, one concurrent resolver and 256 historical lookup results. Known-scoped frames are durably queued immediately even while that lookup stalls. Transient lookup failures retry at the existing 2–30 second backoff; overflow or an oversized candidate stops intake visibly without deleting committed FIFO work. No unscoped payload is written to disk. **A crash, close or overflow can lose unresolved candidates**, including a frame since deleted from Discord; this is not the admitted full-payload recovery guarantee. Once admitted, thread rows retain their parent provenance and payload for recovery while covered by the current intake scope, even when archived, absent from listings or unavailable to metadata/history reads. Queued rows excluded by a scope change, including disabling parent following when relying on that parent, are discarded when drained rather than held for re-enabling.
+
+Additional configured channel IDs are opt-in: `DORI_DISCORD_CHANNEL_IDS=ID,ID,...` adds channels or threads alongside the single-ID configuration (all explicit IDs must be readable, or startup fails), and `DORI_DISCORD_SCOPE=all` additionally discovers readable guild text channels, active threads and the owner's DM with the bot. Discovered channels that return 403/404 are skipped, including an unavailable owner DM; authentication, rate-limit and server failures still propagate. The set is refreshed on every Gateway READY/RESUMED, or every 100 REST polls; followed threads are refreshed on every READY/RESUMED and every tenth REST poll, and threads the bot cannot read are skipped. Every watched channel and thread has its own cursor.
 
 With the protected token file prepared above and the non-secret IDs inherited from the owning OMP session, explicitly start one native `monitor` using these `argv` values and filter `^INBOUND`:
 
@@ -166,21 +170,107 @@ With the protected token file prepared above and the non-secret IDs inherited fr
 
 The token value never appears in this argv or its monitor receipt: only the child shell reads and exports it. No private helper, external watch script, Node or agent-messenger is needed. A different token-file path is an explicit local choice; keep it owned, regular and mode `0600`.
 
+For a long-running receiver, optionally set `"restart": "on-failure"` in the
+same monitor start request. The monitor retries a nonzero exit or signal after
+five seconds, up to three times in a failure streak. A run of at least one minute
+resets that streak. This option is stored with the monitor and applies when the
+same session resumes. Clean exits, including successful `--loop 0`, are not
+retried. Explicit stop, session shutdown, output storage failure, and uncertain
+monitor delivery do not retry the child. Existing monitors with no policy keep
+their current behavior. The monitor itself still belongs to the OMP session:
+use the same session's resume path after OMP exits. This is receiver-process
+recovery, not an end-to-end delivery acknowledgement.
+
 By default the command polls continuously every **three seconds**. `--loop` uses **minutes**: `--loop 0.1` means six seconds, and `--loop 0` runs once. Append those flags after `inbound discord` in the opted-in argv when needed.
 
 Startup validates bot authentication, application Message Content Intent and View Channel/Read Message History access before `INBOUND_READY discord owner=<id> channel=<id[,id...]|all> bot=<id>` (`mode=gateway` is appended with `--gateway`). Each channel without a stored cursor baselines its latest message ID without replaying history; an empty channel starts at `0`. This also applies to channels first found by a later REST discovery. In scope `all`, a channel first seen through a live dispatch starts just before that message, so earlier history in that channel is skipped. Existing stored cursors resume instead of baselining again. **Wait for readiness, then send a fresh owner message.** Subsequent owner messages appear as `INBOUND discord <channel> <message> from=owner ref=<id|-> <JSON text>` for native monitor delivery to the owning OMP session.
 
 Attachment-only and Discord voice messages keep the text `""` on that unchanged `INBOUND discord` line. Available reply context follows as `INBOUND_REPLY`; each attachment follows as `INBOUND_ATTACHMENT` with its filename, optional content type, size, exact signed URL and optional voice/duration metadata ([record format](../skills/dori-mode/references/scripts.md#dori-inbound-discord---loop-minutes---gateway)). Reply context is data, not a new owner request; a deleted target retains only `ref=`. Signed URLs expire, so use them promptly for an explicitly chosen download or `dori transcribe <url>`. Metadata delivery itself starts no transcription or inference. REST and Gateway use the same formatter and one emit per message before cursor commit; a malformed attachment/list or throwing emitter leaves that message uncommitted.
 
-The cursor is committed under `<stateDir>/discord-inbound/<channelId>.json` in a private owned directory with mode-0600 atomic cursor files. Later polls page back to the cursor, deduplicate and emit owner messages chronologically, advancing state as items are handled. Explicitly restarting the monitor resumes its committed cursor. Do not delete the cursor to simulate successful intake. This is new-message intake with reply/media metadata; edit and delete events are not delivered.
+The cursor is committed under `<stateDir>/discord-inbound/<channelId>.json` in a private owned directory with mode-0600 atomic cursor files. Later REST polls page back to the cursor, deduplicate and handle known owner messages in ID order. Explicitly restarting the monitor resumes its committed cursor. Do not delete the cursor to simulate successful intake. This is new-message intake with reply/media metadata; edit and delete events are not delivered.
 
 Only a remote history-read 403/404 removes an unavailable discovered channel; explicitly configured targets still fail on those responses. Content conversion, delivery and local cursor failures are not permission loss. In Gateway mode they stop intake before later queued messages can advance past the failed message. If an already watched channel's cursor disappears, intake reports the missing-state error rather than silently dropping live messages or recreating a baseline. First-seen scope-all channels still seed their new cursors as described above.
 
+An owner message to an exact Discord channel or thread registered to one
+native OMP lane goes to that lane as a Dori Monitor message, with no terminal
+keystrokes and no new setting. The receiver commits the lane inbox before
+advancing its cursor; pending messages survive a resume of the same session.
+Unbound or ambiguous channels keep the lead's existing intake behavior.
+An exact reply to an open ASK takes precedence over ordinary chat.
+
+To take over an independently configured receiver, stop the old reader before
+starting that exact lane once with `--dori-lane-receiver`. This uses its
+existing explicit receiver state and credentials, requires a separate mailbox
+and cursor root, and remembers the takeover on that session only. The normal
+shared receiver requires no flag. Restart the shared receiver when upgrading
+so it uses the new routing logic.
+
+#### Answering native OMP ASK from Discord
+
+On a supported Discord connection, ASK is enabled automatically once
+`dori inbound discord` is running and has verified the bot, owner and
+channels. It uses that installation's private `$DORI_HOME/discord-token`
+and its existing state directory. No settings file is created or edited.
+Restart the receiver when updating so it reports its current routes.
+
+- A Dori lead uses the single explicitly configured Discord destination.
+  If more than one destination is configured or only discovery is enabled,
+  ASK stays in the terminal rather than guessing.
+- A lane uses only its own registered `discord:<channel-or-thread-id>`
+  destination while the same receiver watches it. New `dori launch` lanes
+  are bound at launch; older lanes need an exact native session identity in
+  the registry (`dori sync --write` can record it).
+- Stopped receivers, unmatched bot credentials and unresolved lanes do not
+  enable automatic delivery. A custom token file or receiver can still use
+  the existing explicit route below.
+
+An explicit route in `<stateDir>/discord-ask.json` takes precedence. Use an
+absolute token file path, keep both files owned and mode `0600`, and make
+sure the bot can post in the selected room. Set a session's entry to `false`
+to keep ASK local for that session. No manual file is needed for the
+standard connection above.
+
+```json
+{
+  "sessions": {
+    "<OMP-session-id>": {
+      "channel": "<Discord-channel-or-thread-id>",
+      "owner": "<Discord-owner-id>",
+      "tokenFile": "/absolute/path/to/discord-token"
+    }
+  }
+}
+```
+
+The bot first posts a short preparation message, then fills it in once it can
+receive replies. Use Discord's **Reply** on the completed ASK. For a single
+field, plain text can be enough; for multiple fields, submit a JSON object
+using the field names in the question. When a choice lists **Other**, you
+can include one custom text value. An invalid reply explains the error
+without submitting the form; reply to the original ASK again. A different
+room, a new message, or a reply to another question does not answer the open
+form.
+
+Local input still works and the first valid submission wins. Forms that
+cannot be represented faithfully, including password and file inputs, stay
+local. ASK answers do not approve tools or get queued as ordinary lane input.
+An OMP session switch, cancellation, or restart ends the open question. This
+feature posts question text to the configured room; do not select a public
+room for a session that asks about private work.
+
 #### Real-time Gateway mode
 
-Add `--gateway` to receive owner messages live instead of on the next poll. The receiver keeps one Gateway connection that subscribes only to `GUILD_MESSAGES`, `DIRECT_MESSAGES` and `MESSAGE_CONTENT`; it sends no presence update. **`MESSAGE_CONTENT` is a privileged intent: enable Message Content Intent for the bot in the Developer Portal**, otherwise Discord closes the connection with code 4014 and intake stops with an error naming it. After every `READY` and `RESUMED`, REST reads each watched channel from its cursor before queued live messages run. Both paths share that cursor, so outage history, live copies and resumed replays emit once and in ascending order per channel. **`--gateway` ignores `--loop`, including `--loop 0`; it runs until stopped.** A transient backfill failure (HTTP 429, real HTTP 5xx or an unreachable API, after the usual request retries) is retried every 2 s doubling to 30 s with `DISCORD_GATEWAY_BACKFILL_RETRY` lines while live messages wait. Locally detected malformed responses, channel mismatches and non-advancing pagination stop intake with a sanitized error; they are not treated as transient server responses. A failed delivery, other non-transient backfill failure or terminal close code also exits nonzero; restarting resumes the committed cursors. Gateway progress uses `DISCORD_GATEWAY_READY`, `DISCORD_GATEWAY_RECONNECT` and `DISCORD_GATEWAY_STOPPED` lines, outside the `^INBOUND` filter. Those lines contain no message text, and cursor files hold only message IDs.
+Add `--gateway` to receive owner messages live instead of on the next poll. The receiver keeps one Gateway connection that subscribes only to `GUILD_MESSAGES`, `DIRECT_MESSAGES` and `MESSAGE_CONTENT`; it sends no presence update. **`MESSAGE_CONTENT` is a privileged intent: enable Message Content Intent for the bot in the Developer Portal**, otherwise Discord closes the connection with code 4014 and intake stops with an error naming it. **`--gateway` ignores `--loop`, including `--loop 0`; it runs until stopped.**
 
-Gateway shutdown stops connection/retry scheduling and drops queued dispatches. It drains any already active REST backfill, including its deliveries and cursor commits, before the command finishes. Shutdown is a drain boundary, not cancellation of an in-flight HTTP request.
+After every `READY` and `RESUMED`, backfill merges older REST gaps with eligible durably queued owners before a newer delivery or filtered checkpoint. A queued request is not cancelled when REST no longer returns it. Ordering is per channel for records known before each delivery selection. An older frame admitted during an awaited newer emit can be delivered late without moving the cursor backwards.
+
+A transient backfill failure (HTTP 429, real HTTP 5xx or an unreachable API, after the usual request retries) is retried every 2 s doubling to 30 s with `DISCORD_GATEWAY_BACKFILL_RETRY` lines while live messages wait. Locally detected malformed responses, channel mismatches and non-advancing pagination stop intake with a sanitized error; they are not transient server responses. Failed delivery, cursor persistence, exact acknowledgement or a terminal close also exits nonzero. Gateway progress uses `DISCORD_GATEWAY_READY`, `DISCORD_GATEWAY_RECONNECT` and `DISCORD_GATEWAY_STOPPED` lines, outside the `^INBOUND` filter; they contain no message text.
+
+Gateway shutdown stops connection/retry scheduling and retains pending work in the private `<stateDir>/discord-inbound/gateway.sqlite` queue. It drains active backfill reconciliation, including merged deliveries and cursor commits, before finishing; it does not cancel an in-flight HTTP request. Restart reads older REST gaps before a retained message prefix and preserves queued scope-all channels. A genuinely new queued channel seeds just before its lowest known queued ID, without replaying earlier cold history.
+
+The SQLite page-cache budget is 256 KiB, memory mapping is disabled, and the database is capped at 256 MiB plus journal overhead. Admission metadata and indexes consume that budget; initial index construction also requires disk I/O and temporary space. Disk storage replaces unbounded application backlog retention. WAL `synchronous=NORMAL` preserves process-crash recovery; power-loss recovery still uses durable REST cursors. Storage exhaustion stops intake with committed pending work intact. One intake owns each state directory; REST mode refuses to start while Gateway work is pending. Restart with `--gateway` to drain it.
+
+Admission metadata is not a delivery receipt. An emit/checkpoint crash can repeat a request, as can a crash after late emission but before exact acknowledgement. Legacy pending owners below the cursor replay conservatively and may repeat an already delivered request; payloads already deleted by older intake cannot be recovered. Ordinary stale frames admitted after a completed cursor commit still deduplicate. See the [queue lifecycle and recovery boundaries](../skills/dori-mode/references/scripts.md#dori-inbound-discord---loop-minutes---gateway).
 
 To select Gateway delivery in the monitor recipe above, append `--gateway` after `inbound discord` in its argv. It is opt-in; installation and updates select neither Gateway intake nor scope `all`. Intake and `dori presence discord` use separate Gateway sessions even with the same bot token; sharing the connection implementation does not share their session or lifecycle.
 
@@ -212,7 +302,8 @@ An authentication, configuration or intent failure exits nonzero with a sanitize
 The consumer API runs before normal Dori config loading. Use the local `bin/dori` for an isolated home:
 
 ```text
-dori update <check|install|status|rollback> [--version TAG] [--from DIST] [--home PATH] [--runtime hc|herdr]
+dori update <check|install|status|rollback|cache> [--version TAG] [--from DIST] [--home PATH] [--runtime hc|herdr]
+dori update cache [--prune [--delete-quarantined] [--grace MINUTES]] [--reference DIR]... [--trust-process PID@START]... [--trust-root-cwd] [--home PATH]
 ```
 
 For example, after obtaining a compatible asset set in `download_dir`:
@@ -233,6 +324,35 @@ The commands below remain explicit operations. New builds also include the launc
 | `dori update status` | Inspect installed state and reconcile an interrupted activation journal |
 | `dori update rollback` | Verify and restore the retained previous release |
 | `dori update rollback --version v0.1.2` | Assert that the retained rollback target is exactly this tag |
+| `dori update cache [--reference DIR]...` | Report native cache identities, observed references or unknown uses and exclusive logical bytes; changes nothing |
+| `dori update cache --prune [--reference DIR]... [--trust-process PID@START]... [--trust-root-cwd]` | Quarantine unused identities and restore copies used again; only dead, unused preparation stages may be removed |
+| `dori update cache --prune --delete-quarantined [--grace MINUTES] ...` | Also remove quarantined copies unused through the grace period, after one more check; you accept that a writer without a lease may publish between that check and the removal |
+
+`cache` is read-only by default: it prints `"removes": "nothing"` and takes no writer lock. It scans native identities for the current platform/architecture under the user home cache, the running release, sources and files under both default homes (`~/.dori`, `~/.omp-dori`), selected/loaded installation homes, configured `DORI_HOME`/`OMP_DORI_HOME` homes and every explicit `--reference` root. Files of every size are read whole. `bytes` counts logical inode bytes, including directories and internal hardlinks once, but excluding files with hardlinks outside the entry; it does not count allocated filesystem blocks.
+
+An identity's `protectedBy` lists observed references and uses: a source lock or its receipt source still binding it, files such as wrappers/release state/deployment records naming it, links pointing or resolving into it, process arguments or working directories, same-user executables/open files/mappings (including an entry held open as a directory), live leases and native preparations. Working directories use `/proc` on Linux and `lsof` elsewhere; Linux file inspection uses `/proc/<pid>/exe`, `fd` and `maps`. A thread group whose leader exited remains live while other threads run: its lease holds, and its surviving threads' working directories and files are read.
+
+What cannot be ruled out holds conservatively: unrecognized or incomplete receipts, unreadable source or receipt-source locks or leases, unresolved links other than a missing target, linked directories the walk does not traverse, unavailable process working directories or same-user open files, and each live same-user process whose working directory or files cannot be read. Real `.git` and `node_modules` subdirectories are not traversed and add `unscanned directory ...` against every identity unless another supplied root traverses them. Pass `--reference <that-directory>` to inspect one; nested excluded directories retain their own unknown-use reasons, and symlinks bearing those names are still inspected. Unreadable reference files or a failed process listing abort the scan rather than reporting no use.
+
+A running Dori cache writer keeps every identity, including an older checkout that takes no lease. Recognition uses the base names of command words (`source-dependencies.ts native|assert-native|consumer|lease-path`, `install-source.sh`, `update install|rollback`, `upstream check|stage|watch|restart|recover`), so relative paths count. Its cache is judged by the home it names, relative to its working directory, or its HOME; only another existing, resolved home rules it out. An older `native-stage-*` without an identity/owner also keeps every identity. Root or privileged processes (root, or Linux `CAP_DAC_OVERRIDE`/`CAP_DAC_READ_SEARCH`, excluding kernel threads) whose working directory cannot be read hold every identity. Other users' processes are judged by their arguments only, so an identity directory they can enter is kept.
+
+The report also lists `trustable` (unreadable same-user processes as `PID@START`), `privileged` (unreadable root/privileged working directories) and `pending` (quarantined copies with `since`, intact pre-check interruptions, committed removal remainders with state `"removing"`, dead-owner stages and older preparations). An empty `protectedBy` means only that this point-in-time scan found no use, not exhaustive liveness or permission to delete. References outside the supplied roots are not seen: pass each deployment `releaseRoot` or other checkout as `--reference`.
+
+**Policy: a prune never removes an identity by itself.** `--prune` only quarantines or restores identities; dead, unused preparation stages are the exception described below. An older writer takes no lease and its absence cannot be proven. Removing quarantined identities requires the person's explicit `--delete-quarantined` decision, accepting the residual risk of an unleased writer publishing between the final check and removal.
+
+Native preparation, verification before use, consumer/cache launchers, source installer publication and deployment admission/inspection of explicit cache executables first lease the identity in `~/.cache/omp-dori/native-leases/<identity>/<pid>-<start>-<boot>`. The holder is the process that will use it, or the shell that execs OMP, so a session's lease lasts through exec. Holders are bound to actual PID/start/boot identity and remain live while their thread group runs. Only then does the writer check `native-prune.lock` with shared nonblocking `flock`, waiting up to five minutes for a prune before failing with a retry message.
+
+A prune takes an exclusive kernel `flock` before reading leases and holds it through the run. Either it sees the lease or the writer waits and then verifies/prepares the identity again. A second prune is refused. The kernel releases a killed holder's lock; the lock file stays. A non-file lock path, such as an empty directory, refuses pruning until deliberately resolved.
+
+Unused live identities are recorded with their quarantine time in `native-quarantine/` and renamed `<identity>.pruning`, so launchers fail instead of running a half-removed identity. Later prunes judge copies under both names. A used copy returns to its live name; a copy whose live name exists again is kept for manual resolution; all other copies stay quarantined however old. Only `--delete-quarantined` considers removal after `--grace MINUTES` (default 10). It renames the copy `<identity>.deleting-<nonce>` and rechecks references, receipts, leases, writers, process arguments, working directories and files under all original three names and the prospective terminal name. A held pre-check copy is restored; an interrupted `.deleting-<nonce>` copy is still intact and returns to quarantine.
+
+After that final check passes, the copy is renamed `<identity>.removing-<nonce>` and the cache directory is synced **before** recursive removal begins. This is a committed, irreversible removal state. A partial removal, a missing/damaged receipt or a newly prepared live image never makes it restorable to the live or `.pruning` name. The live name remains free for re-preparation. Reporting lists the remainder in `pending` with state `"removing"`; ordinary `--prune` keeps it and does not continue deletion.
+
+A subsequent explicit `--delete-quarantined` may finish a committed remainder under the prune lock without restarting its already-completed grace period. The exact direct cache child must be a real, owned directory that is not group/world-writable; entry permissions still protect other users' possible use. References, source bindings, leases, writers, process arguments, working directories, open files and mappings are read afresh for its live, `.pruning`, original `.deleting-<nonce>` and actual `.removing-<nonce>` names. Known or unknown use keeps the committed remainder **in place**, never restores it. Its receipt may legitimately be gone after partial removal, so receipt damage does not turn it into a live identity or permanently prevent explicit cleanup. Cleanup removes only that terminal copy, preserves any newer live image and retains the record of another `.pruning` copy. Races with unleased writers after the final check remain possible.
+
+A preparation named `native-stage-<identity>-<pid>-<start>-<boot>-*` whose owner ended may be removed under the lock only when nothing leases its identity and no process names it, works in it or has a file open in it, including detached git/bun children and surviving threads. Its files are inspected afresh before removal. An older preparation without a recognized owner is only listed and holds identities; remove it by hand only after no older checkout prepares anything. Output lists `removed` (directory, identity, bytes, why), `quarantined` (`since`, `removableAfter`) and `kept` (reasons, including restoration).
+
+`--trust-process PID@START` is repeatable and passes only the named unreadable process while its start time still matches, rechecked under the lock; a reused PID is not trusted. START is Linux clock ticks since boot or the macOS start value read by `procStat` (not verified on a Mac). `--trust-root-cwd` opts out of unreadable privileged working-directory holds, counts them as `rootCwdTrusted` and still checks their arguments. It can miss a privileged process whose only use is its hidden working directory. There is no trust-all-processes flag. These options apply only with `--prune`. A quarantined launch fails until a reference causes restoration, the copy is deliberately restored by hand or the identity is prepared again. Neither the final check nor explicit deletion eliminates races with unleased writers.
 
 `status` and `rollback` do not accept `--from`. Rollback is a retained-source operation; use `install --from DIST` to select a local candidate. Network `check`/`install` without `--version` selects stable latest only. No consumer command ports upstream, runs review models, fetches arbitrary `main`, publishes GitHub changes or grants repository write access.
 
@@ -262,9 +382,11 @@ For an isolated home upgrading from an older client, run the verified **new rele
 
 ### Maintainer ULW candidates
 
-The canonical repository's `ULW update candidate` workflow checks upstream `dbc-hbin/omp-ulw` main daily at **03:17 UTC** (GitHub scheduling may be delayed), or on explicit workflow dispatch. It resolves one exact commit, requires a fast-forward from the current pin, reconstructs the admitted old overlay, normalizes its Git blob identities and attempts a three-way application in a disposable checkout. It generates only `omp-ulw.lock`, `omp-ulw.overlay.lock` and `omp-ulw.patch`, verifying the new patch/tree/file identities with the existing source-bundle checks. It never executes upstream code during preparation or touches an installed cache.
+The canonical `vntrevx/Cataly` repository's `ULW update candidate` workflow checks upstream `dbc-hbin/omp-ulw` main daily at **03:00 UTC (12:00 Korea Standard Time, UTC+9)** (GitHub scheduling may be delayed), or on explicit workflow dispatch. It resolves one exact commit, requires a fast-forward from the current pin, reconstructs the admitted old overlay, normalizes its Git blob identities and attempts a three-way application in a disposable checkout. It generates only `omp-ulw.lock`, `omp-ulw.overlay.lock` and `omp-ulw.patch`, verifying the new patch/tree/file identities with the existing source-bundle checks. It never executes upstream code during preparation or touches an installed cache.
 
-A separate trusted job with publication permissions creates a deterministic **draft PR** containing only those three files and dispatches the existing CI workflow on that branch's exact head. The preparation job has no write token, and the publication job executes only trusted `main` tooling, not candidate code. Closed candidates are not reopened; changed branches are never force-pushed. If main advances between preparation/publication, a patch conflicts, history rewinds or identity verification fails, the workflow holds instead of overwriting anything. Repository Actions settings must permit GitHub Actions to create pull requests; if disabled, the workflow reports that failure rather than changing permissions.
+A separate trusted job with publication permissions creates a deterministic **draft PR** containing only those three files and dispatches the existing CI workflow on that branch's exact head. The preparation job has no write token, and the publication job executes only trusted `main` tooling, not candidate code. Closed candidates are not reopened; changed branches are never force-pushed. If main advances between preparation/publication, a patch conflicts, history rewinds or identity verification fails, the workflow holds instead of overwriting anything. Conflicting paths are listed in the preparation error; a reviewed port must retain both upstream behavior and the local overlay. Repository Actions settings must permit GitHub Actions to create pull requests; if disabled, the workflow reports that failure rather than changing permissions.
+
+An already-published candidate is reused after unrelated main changes only when its canonical PR and branch still agree, its parent is an accepted main ancestor, and the exact parent/proposal trees differ solely by the same three authenticated metadata files. An open candidate dispatches CI only when its original exact head has no recorded dispatch; a closed candidate remains closed. Missing or modified branches, changed metadata and an orphan branch based on an older main remain held rather than being recreated or overwritten.
 
 A clean three-way merge is not a compatibility review. Maintainers must inspect upstream behavior and local-overlay preservation, satisfy exact-head CI and independent review, then use the existing verified release publication procedure. This workflow neither auto-merges nor tags/publishes a release. Once such a compatible stable release is published, upgraded consumers receive its ULW pin on their next eligible idle launch. This separation prevents unreviewed upstream code from becoming an automatic consumer update.
 

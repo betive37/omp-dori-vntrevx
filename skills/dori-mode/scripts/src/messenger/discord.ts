@@ -1,5 +1,6 @@
 import type { Clock } from "../run.ts";
-import { DeliveryUncertainError, guardText, type Http, MessengerError, withBackoff } from "./http.ts";
+import { discordApiBase } from "./discord-api-base.ts";
+import { DEFAULT_RETRY, DeliveryUncertainError, guardText, type Http, MessengerError, withBackoff } from "./http.ts";
 import { DISCORD_LIMIT, splitForDiscord } from "./split.ts";
 
 const retryAfter = (body: string): number | undefined => {
@@ -34,13 +35,14 @@ export class Discord {
     private readonly http: Http,
     private readonly clock: Clock,
     private readonly botToken: string,
-    private readonly base = "https://discord.com/api/v10",
+    private readonly base = discordApiBase(process.env["DORI_DISCORD_API_BASE"]),
   ) {}
 
   async call<T = unknown>(
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
     body?: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const res = await withBackoff(
       this.http,
@@ -51,8 +53,10 @@ export class Discord {
         url: `${this.base}${path}`,
         headers: { Authorization: `Bot ${this.botToken}`, "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}),
+        ...(signal === undefined ? {} : { signal }),
       },
-      undefined,
+      // Cancellable live metadata owns its existing 2s–30s retry outside this single HTTP attempt.
+      signal === undefined ? undefined : { ...DEFAULT_RETRY, attempts: 1 },
       retryAfter,
     );
     if (res.status >= 300)
