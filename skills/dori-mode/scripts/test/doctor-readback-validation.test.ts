@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { doctorProvenance } from "../src/doctor-provenance.ts";
+import { type ModelReadback, paneStatePath, readPaneState } from "../src/lane-state.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, withState } from "./fakes.ts";
 
 const now = Date.parse("2026-01-01T12:00:00Z");
@@ -11,7 +12,7 @@ const readback = {
   billing: "subscription",
   checkedAt: new Date(now).toISOString(),
   source: "native-extension",
-};
+} satisfies ModelReadback;
 const cases = [
   {
     name: "legacy lane without a readback",
@@ -110,9 +111,12 @@ for (const scenario of cases) {
       world.panes = [{ pane_id: pane, workspace_id: "w1", agent: "omp", agent_status: "idle", cwd: "/repo" }];
       agentIn(world, pane);
       laneState(state.dir, pane, {
-        ...{ modelReadback: scenario.value },
         ...("observedSession" in scenario ? { sessionId: scenario.observedSession } : {}),
       });
+      await Bun.write(
+        paneStatePath(state.dir, pane),
+        JSON.stringify({ ...readPaneState(state.dir, pane), modelReadback: scenario.value }),
+      );
       const findings = await doctorProvenance(
         depsFor(world, fakeClock(now), state.dir),
         [

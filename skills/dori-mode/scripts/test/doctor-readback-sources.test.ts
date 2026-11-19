@@ -2,6 +2,8 @@ import { expect, test } from "bun:test";
 import { readFileSync } from "node:fs";
 import { join } from "node:path";
 import { doctorCheck } from "../src/doctor.ts";
+import { type ModelReadback, paneStatePath, readPaneState } from "../src/lane-state.ts";
+import { unavailableLaunchModel } from "../src/launch-model.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, withState } from "./fakes.ts";
 
 const now = Date.parse("2026-01-01T12:00:00Z");
@@ -14,7 +16,7 @@ const preflight = {
   checkedAt: new Date(now - 60_000).toISOString(),
   source: "launch-preflight",
   reason: "Opaque runner cannot be inspected before the first prompt",
-};
+} satisfies ModelReadback;
 const native = {
   ...preflight,
   observed: model,
@@ -23,7 +25,7 @@ const native = {
   checkedAt: new Date(now).toISOString(),
   source: "native-extension",
   reason: "Exact native catalog identity observed",
-};
+} satisfies ModelReadback;
 
 const inspect = async (
   receipt: unknown,
@@ -37,10 +39,14 @@ const inspect = async (
     if (live) {
       world.panes = [{ pane_id: pane, workspace_id: "w1", agent: "omp", agent_status: "idle", cwd: "/repo" }];
       agentIn(world, pane);
-      laneState(state.dir, pane, {
-        role: "lane",
-        ...{ modelReadback: "nativeReadback" in options ? options.nativeReadback : native },
-      });
+      laneState(state.dir, pane, { role: "lane" });
+      await Bun.write(
+        paneStatePath(state.dir, pane),
+        JSON.stringify({
+          ...readPaneState(state.dir, pane),
+          modelReadback: "nativeReadback" in options ? options.nativeReadback : native,
+        }),
+      );
     }
     const deps = depsFor(world, fakeClock(now), state.dir, { leadPane: "", sessionsDir: join(state.dir, "sessions") });
     await deps.registry.write({
@@ -53,9 +59,9 @@ const inspect = async (
       pane,
       session: "01a11440-ee81-7f90-b2ed-dcc7d51a0adf",
       model: options.request ?? "openai-codex/fixture-model",
-      ...{ modelReadback: receipt },
     });
-    const path = join(state.dir, "lanes", "fixture-lane.json");
+    const path = deps.registry.path("fixture-lane");
+    await Bun.write(path, JSON.stringify({ ...(await deps.registry.read("fixture-lane")), modelReadback: receipt }));
     const before = readFileSync(path, "utf8");
     const result = await doctorCheck(deps);
     expect(readFileSync(path, "utf8")).toBe(before);
@@ -125,10 +131,42 @@ test("raw exact catalog collisions remain a native mismatch", async () => {
   expect(finding?.detail).toContain("observed=openai-codex/FIXTURE-MODEL");
 });
 
-test("opaque receipt without a selected identity stays unknown for alias requests too", async () => {
-  const findings = await inspect({ ...preflight, requested: null }, false, { request: "fixture-model" });
+test("opaque receipt without the selected exact identity stays unknown", async () => {
+  const findings = await inspect({ ...preflight, requested: null }, false);
   const finding = findings.find((entry) => entry.provenance?.includes("registry receipt"));
   expect(finding?.detail).toContain("status=unknown");
+  expect(finding?.provenance).not.toStartWith("launch-preflight");
+});
+
+for (const request of ["fixture-model", "openai-codex/*"]) {
+  test(`producer alias receipt preserves unavailability and its reason: ${request}`, async () => {
+    const receipt = unavailableLaunchModel(
+      ["sh", "-c", 'exec omp "$@"', "agent", "--model", "{model}", "{prompt}"],
+      request,
+      preflight.checkedAt,
+    );
+    expect(receipt?.requested).toBeNull();
+    expect(receipt?.status).toBe("unavailable");
+    expect(receipt?.source).toBe("launch-preflight");
+    expect(receipt?.reason).toStartWith("Opaque agentCommand:");
+    const findings = await inspect(receipt, false, { request });
+    const finding = findings.find((entry) => entry.provenance?.startsWith("launch-preflight"));
+    expect(finding, JSON.stringify(findings)).toBeDefined();
+    expect(finding?.severity).toBe("INFO");
+    expect(finding?.detail).toContain("status=unavailable requested=none observed=unknown");
+    expect(finding?.detail).toContain(JSON.stringify(receipt?.reason));
+    expect(finding?.detail).toContain(`recorded request=${JSON.stringify(request)}`);
+    expect(finding?.detail).toContain("request comparison=unknown");
+    expect(finding?.provenance).toContain("historical");
+    expect(findings.some((entry) => entry.check === "model" && entry.severity === "OK")).toBe(false);
+  });
+}
+
+test("a missing requested field is not a nullable alias receipt", async () => {
+  const findings = await inspect({ ...preflight, requested: undefined }, false, { request: "fixture-model" });
+  const finding = findings.find((entry) => entry.provenance?.includes("registry receipt"));
+  expect(finding?.detail).toContain("status=unknown");
+  expect(finding?.provenance).not.toStartWith("launch-preflight");
 });
 
 const invalid = [

@@ -3,7 +3,7 @@ import { readSourceBundle } from "../../../../src/release/source-bundle.ts";
 import { type BootLane, finished } from "./boot-monitors.ts";
 import type { DoctorFinding } from "./doctor.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import type { PaneState } from "./lane-state.ts";
+import { exactModelIdentity, type PaneState } from "./lane-state.ts";
 import { sessionOf } from "./registry.ts";
 import { runtimesOf } from "./run.ts";
 import { trustedPaneState } from "./session-id.ts";
@@ -26,7 +26,7 @@ const modelFinding = (label: string, state: PaneState | null, expected?: string)
     next: "Inspect the selected model in this native session; do not infer it from configuration.",
   });
   if (!state) return unknown("no matching live session/PID ownership");
-  const value = "modelReadback" in state ? state.modelReadback : undefined;
+  const value: unknown = state.modelReadback;
   if (!value || typeof value !== "object") return unknown("modelReadback is absent or invalid");
   const raw = value as Record<string, unknown>;
   const requested = identity(raw["requested"]);
@@ -55,7 +55,7 @@ const modelFinding = (label: string, state: PaneState | null, expected?: string)
     (status === "unavailable" && !requested)
   )
     return unknown("modelReadback does not match its session or status contract");
-  const exactRequest = expected !== undefined && /^[^/]+\/.+$/.test(expected);
+  const exactRequest = expected !== undefined && exactModelIdentity(expected) !== null;
   const legacyRequest = expected !== undefined && !exactRequest;
   if (exactRequest && status !== "unrequested" && status !== "unknown" && requestedKey !== expected?.toLowerCase())
     return unknown(
@@ -101,7 +101,7 @@ const preflightFinding = (lane: BootLane): DoctorFinding | null => {
     provenance: "untrusted lane registry receipt; not a native model observation",
     next: "Inspect the launch receipt and the separate live native model observation.",
   };
-  const value = lane.modelReadback;
+  const value: unknown = lane.modelReadback;
   if (!value || typeof value !== "object") return unknown;
   const raw = value as Record<string, unknown>;
   const requested = identity(raw["requested"]);
@@ -112,13 +112,13 @@ const preflightFinding = (lane: BootLane): DoctorFinding | null => {
     raw["status"] !== "unavailable" ||
     raw["observed"] !== null ||
     raw["billing"] !== "unknown" ||
-    !requested ||
+    requested === undefined ||
     typeof reason !== "string" ||
     !reason.trim() ||
     typeof checkedAt !== "string" ||
     !Number.isFinite(Date.parse(checkedAt)) ||
     (lane.model !== undefined &&
-      /^[^/]+\/.+$/.test(lane.model) &&
+      exactModelIdentity(lane.model) !== null &&
       requested?.toLowerCase() !== lane.model.toLowerCase())
   )
     return unknown;
@@ -131,7 +131,10 @@ const preflightFinding = (lane: BootLane): DoctorFinding | null => {
       " preflight status=unavailable requested=" +
       (requested ?? "none") +
       " observed=unknown billing=unknown; compatibility launch was not model-verified; reason=" +
-      JSON.stringify(reason),
+      JSON.stringify(reason) +
+      (requested === null && lane.model !== undefined
+        ? `; recorded request=${JSON.stringify(lane.model)}; request comparison=unknown (not exact provider/id)`
+        : ""),
     provenance: `launch-preflight historical registry receipt checkedAt=${checkedAt}; not a native model observation`,
     next: "Inspect the separate native observation; this receipt is neither launch verification nor spending authorization.",
   };

@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { readFileSync, readdirSync } from "node:fs";
 import { join } from "node:path";
 import { doctorCheck } from "../src/doctor.ts";
+import type { ModelReadback } from "../src/lane-state.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, withState } from "./fakes.ts";
 
 const now = Date.parse("2026-01-01T12:00:00Z");
@@ -13,7 +14,7 @@ const readback = {
   billing: "subscription",
   checkedAt: new Date(now).toISOString(),
   source: "native-extension",
-};
+} satisfies ModelReadback;
 
 test("doctor reports native observations separately from configuration and never prints credentials", async () => {
   const state = withState();
@@ -22,7 +23,7 @@ test("doctor reports native observations separately from configuration and never
     const pane = "w1:p1";
     world.panes = [{ pane_id: pane, workspace_id: "w1", agent: "omp", agent_status: "idle", cwd: "/repo" }];
     agentIn(world, pane);
-    laneState(state.dir, pane, { role: "dori", ...{ modelReadback: readback } });
+    laneState(state.dir, pane, { role: "dori", modelReadback: readback });
     const deps = depsFor(world, fakeClock(now), state.dir, {
       leadPane: pane,
       sessionsDir: join(state.dir, "sessions"),
@@ -72,7 +73,7 @@ test("missing and untrusted native readbacks remain unknown, never configured-mo
     expect(absent.findings).toContainEqual(
       expect.objectContaining({ check: "model", detail: expect.stringContaining("unknown") }),
     );
-    laneState(state.dir, pane, { role: "dori", ...{ modelReadback: readback } });
+    laneState(state.dir, pane, { role: "dori", modelReadback: readback });
     const untrusted = await doctorCheck(deps);
     expect(untrusted.findings.some((finding) => finding.check === "model" && finding.severity === "OK")).toBe(false);
     expect(JSON.stringify(untrusted)).not.toContain("observed=openai-codex/fixture-model");
@@ -92,13 +93,11 @@ for (const status of ["mismatch", "unavailable", "unknown", "unrequested"] as co
       agentIn(world, pane);
       laneState(state.dir, pane, {
         role: "dori",
-        ...{
-          modelReadback: {
-            ...readback,
-            status,
-            requested: status === "unrequested" ? null : model,
-            observed: status === "mismatch" ? { ...model, id: "other-model" } : model,
-          },
+        modelReadback: {
+          ...readback,
+          status,
+          requested: status === "unrequested" ? null : model,
+          observed: status === "mismatch" ? { ...model, id: "other-model" } : model,
         },
       });
       const result = await doctorCheck(
