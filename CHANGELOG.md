@@ -184,3 +184,5 @@ The terminal-admission integration group uses a test-local 20-second budget for 
 The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, public dependency pin and third-party notices remain unchanged.
 
 ## Unreleased: opt-in once monitors retain terminal outcomes without replaying successful work, with mode-aware listings and a managed-restart safety fence; completion waits for owner-output admission and confirmed file-backed journal persistence, while ended children awaiting admission retain restore ownership without reporting live health PIDs.
+
+## Unreleased: opt-in daemon monitors use bounded exponential-backoff retries after confirmed file-backed journal persistence, retain retry budgets and exhausted outcomes across resume, and support one raw-output silence alert per quiet spell; version 3 metadata preserves policy without changing persistent defaults, once protection, or raw-output retention.

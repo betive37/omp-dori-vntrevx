@@ -94,7 +94,13 @@ export const fakePi = (options: FakeOptions): FakePi => {
       await command.handler(args, fake.ctx());
     },
     api: {
-      zod: { object: () => schema, string: () => schema, array: () => schema, enum: () => schema },
+      zod: {
+        object: () => schema,
+        string: () => schema,
+        number: () => schema,
+        array: () => schema,
+        enum: () => schema,
+      },
       setLabel: () => {},
       registerFlag: (name, flag) => {
         if (flag.default !== undefined && !flags.has(name)) flags.set(name, flag.default);

@@ -1,6 +1,7 @@
 import { lstatSync, readFileSync } from "node:fs";
 import { isAbsolute, join } from "node:path";
 import { DeploymentHeld } from "./deployment-process.ts";
+import { monitorPolicy } from "./monitor-policy.ts";
 import type {
   DeploymentConfig,
   DeploymentRecord,
@@ -54,7 +55,7 @@ function readMonitorIntent(path: string, sessionId: string, trusted = false) {
   const value: unknown = JSON.parse(readFileSync(path, "utf8"));
   if (
     !record(value) ||
-    (value["version"] !== 1 && value["version"] !== 2) ||
+    (value["version"] !== 1 && value["version"] !== 2 && value["version"] !== 3) ||
     value["sessionId"] !== sessionId ||
     !Array.isArray(value["monitors"])
   )
@@ -72,7 +73,8 @@ function readMonitorIntent(path: string, sessionId: string, trusted = false) {
       typeof item["filter"] !== "string" ||
       typeof item["cwd"] !== "string" ||
       !isAbsolute(item["cwd"]) ||
-      (item["mode"] !== undefined && item["mode"] !== "persistent" && item["mode"] !== "once")
+      (value["version"] !== 3 &&
+        (item["mode"] === "daemon" || item["restart"] !== undefined || item["silentAfterMin"] !== undefined))
     )
       throw new Error("monitor metadata contains an invalid specification");
     if (item["mode"] === "once")
@@ -81,7 +83,13 @@ function readMonitorIntent(path: string, sessionId: string, trusted = false) {
       );
     names.add(item["name"]);
     new RegExp(item["filter"]);
-    return { name: item["name"], argv: [...item["argv"]] as string[], filter: item["filter"], cwd: item["cwd"] };
+    return {
+      name: item["name"],
+      argv: [...item["argv"]] as string[],
+      filter: item["filter"],
+      cwd: item["cwd"],
+      ...monitorPolicy(item),
+    };
   });
   return { value, names, monitors };
 }
@@ -146,7 +154,7 @@ export function readMonitorSet(path: string, sessionId: string, trusted = false)
     };
   }
   return {
-    version: 1,
+    version: value["version"] === 3 ? 3 : 1,
     sessionId,
     monitors,
     intake,
@@ -168,12 +176,13 @@ export function sameMonitorSpecs(left: readonly MonitorSpec[], right: readonly M
     JSON.stringify(
       [...specs]
         .sort((a, b) => a.name.localeCompare(b.name))
-        .map(({ name, argv, filter, cwd, mode }) => ({
-          name,
-          argv,
-          filter: new RegExp(filter).source,
-          cwd,
-          mode: mode ?? "persistent",
+        .map((spec) => ({
+          name: spec.name,
+          argv: spec.argv,
+          filter: new RegExp(spec.filter).source,
+          cwd: spec.cwd,
+          mode: spec.mode ?? "persistent",
+          ...monitorPolicy(spec),
         })),
     );
   return canonical(left) === canonical(right);

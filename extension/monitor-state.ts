@@ -1,3 +1,4 @@
+import { monitorPolicy } from "../src/update/monitor-policy.ts";
 import type { MonitorSpec } from "../src/update/deployment-types.ts";
 import type { MonitorExit } from "./monitor.ts";
 
@@ -21,7 +22,15 @@ const exitRecord = (value: unknown): MonitorExit | undefined => {
     !(exit["signal"] === null || typeof exit["signal"] === "string") ||
     typeof exit["at"] !== "string" ||
     !Number.isFinite(Date.parse(exit["at"])) ||
-    !(exit["error"] === undefined || typeof exit["error"] === "string")
+    !(exit["error"] === undefined || typeof exit["error"] === "string") ||
+    !(
+      exit["restartAttempt"] === undefined ||
+      (typeof exit["restartAttempt"] === "number" &&
+        Number.isSafeInteger(exit["restartAttempt"]) &&
+        exit["restartAttempt"] >= 0 &&
+        exit["restartAttempt"] <= 100)
+    ) ||
+    !(exit["exhausted"] === undefined || typeof exit["exhausted"] === "boolean")
   )
     return;
   return {
@@ -29,6 +38,8 @@ const exitRecord = (value: unknown): MonitorExit | undefined => {
     signal: exit["signal"],
     at: exit["at"],
     ...(exit["error"] === undefined ? {} : { error: exit["error"] }),
+    ...(exit["restartAttempt"] === undefined ? {} : { restartAttempt: exit["restartAttempt"] }),
+    ...(exit["exhausted"] === undefined ? {} : { exhausted: exit["exhausted"] }),
   };
 };
 
@@ -54,15 +65,13 @@ export function recordedMonitorStates(branch: readonly Entry[]): Map<string, Rec
       typeof data["filter"] === "string" &&
       typeof data["cwd"] === "string"
     ) {
-      if (data["mode"] !== undefined && data["mode"] !== "persistent" && data["mode"] !== "once")
-        throw new Error(`unsupported monitor mode for ${name}`);
       states.set(name, {
         spec: {
           name,
           argv: data["argv"].map(String),
           filter: data["filter"],
           cwd: data["cwd"],
-          ...(data["mode"] === "once" ? { mode: "once" } : {}),
+          ...monitorPolicy(data),
         },
         ...(typeof data["id"] === "string" ? { id: data["id"] } : {}),
         completed: false,
@@ -72,9 +81,22 @@ export function recordedMonitorStates(branch: readonly Entry[]): Map<string, Rec
       const exit = exitRecord(data["exit"]);
       if (!previous || previous.completed || data["id"] !== previous.id || !exit) continue;
       const completed = data["op"] === "stop";
+      const restart = previous.spec.restart;
+      if (restart) {
+        if (
+          exit.restartAttempt === undefined ||
+          exit.restartAttempt > restart.max ||
+          exit.restartAttempt < (previous.exit?.restartAttempt ?? 0) ||
+          (exit.exhausted === true && (!completed || exit.restartAttempt !== restart.max))
+        )
+          continue;
+      } else if (exit.restartAttempt !== undefined || exit.exhausted !== undefined) continue;
       if (
         completed &&
-        !(previous.spec.mode === "once" && exit.code === 0 && exit.signal === null && exit.error === undefined)
+        !(
+          (previous.spec.mode === "once" && exit.code === 0 && exit.signal === null && exit.error === undefined) ||
+          (previous.spec.mode === "daemon" && exit.exhausted === true)
+        )
       )
         continue;
       states.set(name, { ...previous, exit, completed });

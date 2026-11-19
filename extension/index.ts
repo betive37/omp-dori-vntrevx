@@ -34,6 +34,7 @@ import { MONITOR_ENTRY, recordedMonitors, recordedMonitorStates, type RecordedMo
 import type { MonitorSpec } from "../src/update/deployment-types.ts";
 import { sameMonitorSpecs } from "../src/update/deployment-monitors.ts";
 import { bumpAttempts, MAX_CONTINUATIONS, openOwes, recordOwes, reminder } from "../skills/dori-mode/scripts/src/owes";
+import { monitorPolicy } from "../src/update/monitor-policy.ts";
 
 interface SessionEntry {
   type: string;
@@ -91,6 +92,7 @@ export interface DoriApi {
   zod: {
     object(shape: Record<string, Schema>): Schema;
     string(): Schema;
+    number(): Schema;
     array(element: Schema): Schema;
     enum(values: readonly [string, ...string[]]): Schema;
   };
@@ -337,7 +339,11 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
       tmp,
       JSON.stringify(
         {
-          version: session.monitorSpecs.some((spec) => spec.mode === "once") ? 2 : 1,
+          version: session.monitorSpecs.some((spec) => spec.mode === "daemon" || spec.silentAfterMin !== undefined)
+            ? 3
+            : session.monitorSpecs.some((spec) => spec.mode === "once")
+              ? 2
+              : 1,
           sessionId: session.id,
           monitors: session.monitorSpecs,
           intake: session.intake,
@@ -356,30 +362,35 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     const owner = ctx.sessionManager.getSessionId();
     const { spec, id } = record;
     return monitors.start(spec.name, spec.argv, spec.filter, spec.cwd, owner, {
-      ...(spec.mode ? { mode: spec.mode } : {}),
+      ...monitorPolicy(spec),
+      ...(spec.mode === "daemon" ? { restartAttempt: record.exit?.restartAttempt ?? 0 } : {}),
       ...(id ? { recordId: id } : {}),
       async onExit(exit) {
-        if (role !== "dori" || session?.id !== owner || ctx.sessionManager.getSessionId() !== owner) return;
+        if (role !== "dori" || session?.id !== owner || ctx.sessionManager.getSessionId() !== owner) return false;
         const current = recordedMonitorStates(ctx.sessionManager.getBranch()).get(spec.name);
-        if (!current || current.id !== id || current.completed || !sameMonitorSpecs([current.spec], [spec])) return;
-        const completed = spec.mode === "once" && exit.code === 0 && exit.signal === null && exit.error === undefined;
+        if (!current || current.id !== id || current.completed || !sameMonitorSpecs([current.spec], [spec]))
+          return false;
+        const completed =
+          (spec.mode === "once" && exit.code === 0 && exit.signal === null && exit.error === undefined) ||
+          (spec.mode === "daemon" && exit.exhausted === true);
         pi.appendEntry(MONITOR_ENTRY, {
           op: completed ? "stop" : "exit",
           name: spec.name,
           ...(id ? { id } : {}),
           exit,
         });
+        // Native appendEntry reports persistence failures separately instead of throwing.
         await ctx.sessionManager.ensureOnDisk();
-        if (role !== "dori" || session?.id !== owner || ctx.sessionManager.getSessionId() !== owner) return;
+        if (role !== "dori" || session?.id !== owner || ctx.sessionManager.getSessionId() !== owner) return false;
         const branch = ctx.sessionManager.getBranch();
-        const persisted = recordedMonitorStates(branch).get(spec.name);
+        const acknowledged = recordedMonitorStates(branch).get(spec.name);
         if (
-          !persisted ||
-          persisted.id !== id ||
-          persisted.exit?.at !== exit.at ||
-          !sameMonitorSpecs([persisted.spec], [spec])
+          !acknowledged ||
+          acknowledged.id !== id ||
+          acknowledged.exit?.at !== exit.at ||
+          !sameMonitorSpecs([acknowledged.spec], [spec])
         )
-          return;
+          return false;
         saveMonitorSpecs(recordedMonitors(branch), branch);
         savePane(ctx);
       },
@@ -611,7 +622,9 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
     name?: string;
     argv?: string[];
     filter?: string;
-    mode?: "persistent" | "once";
+    mode?: "persistent" | "once" | "daemon";
+    restart?: { max: number; backoffSec: number };
+    silentAfterMin?: number;
   }>({
     name: "monitor",
     label: "Monitor",
@@ -623,9 +636,17 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
         .enum(["start", "stop", "list"])
         .describe("start a monitor, stop and forget one, or list running and recorded monitors"),
       mode: z
-        .enum(["persistent", "once"])
+        .enum(["persistent", "once", "daemon"])
         .optional()
-        .describe("persistent (default), or once: successful exit removes restore intent (start)"),
+        .describe("persistent (default), once (successful completion), or daemon (bounded automatic restart)"),
+      restart: z
+        .object({ max: z.number(), backoffSec: z.number() })
+        .optional()
+        .describe("daemon only: 0..100 retries and positive base delay in seconds; default {max:5,backoffSec:10}"),
+      silentAfterMin: z
+        .number()
+        .optional()
+        .describe("positive quiet interval in minutes; any raw stdout/stderr bytes rearm the one-shot alert"),
       name: z.string().optional().describe("monitor name (start, stop)"),
       argv: z.array(z.string()).optional().describe("command and arguments, run without a shell (start)"),
       filter: z.string().optional().describe("regular expression; matching output lines wake the session (start)"),
@@ -643,7 +664,7 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
             argv: params.argv,
             filter: params.filter,
             cwd: ctx.cwd,
-            ...(params.mode === "once" ? { mode: "once" } : {}),
+            ...monitorPolicy(params),
           },
           id: crypto.randomUUID(),
           completed: false,
@@ -664,7 +685,7 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
         savePane(ctx);
         text = `stopped monitor "${params.name}"`;
       } else {
-        const running = new Map(monitors.list().map((monitor) => [monitor.name, monitor]));
+        const running = new Map(monitors.list(true).map((monitor) => [monitor.name, monitor]));
         const records = recordedMonitorStates(ctx.sessionManager.getBranch());
         for (const monitor of running.values())
           if (!records.has(monitor.name)) records.set(monitor.name, { spec: monitor, completed: false });
@@ -672,11 +693,24 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
           [...records]
             .map(([name, { spec, exit }]) => {
               const active = running.get(name);
-              const status = active ? "running" : exit ? (exit.error === undefined ? "exited" : "failed") : "recorded";
+              const status = active?.waiting
+                ? active.backoffUntil
+                  ? "backoff"
+                  : "recording"
+                : active
+                  ? "running"
+                  : exit?.exhausted
+                    ? "exhausted"
+                    : exit
+                      ? exit.error === undefined
+                        ? "exited"
+                        : "failed"
+                      : "recorded";
+              const policy = `${spec.restart ? ` retries=${active?.restartAttempt ?? exit?.restartAttempt ?? 0}/${spec.restart.max}` : ""}${active?.backoffUntil ? ` next=${active.backoffUntil}` : ""}${spec.silentAfterMin ? ` silentAfterMin=${spec.silentAfterMin}` : ""}`;
               const outcome = exit
                 ? ` ${active ? "lastExit " : ""}code=${exit.code} signal=${exit.signal ?? "none"} at=${exit.at}${exit.error === undefined ? "" : ` error=${JSON.stringify(exit.error)}`}`
                 : "";
-              return `${name}${active ? ` (pid ${active.pid})` : ""} [mode=${spec.mode ?? "persistent"} status=${status}${outcome}] /${spec.filter}/: ${spec.argv.join(" ")}`;
+              return `${name}${active && !active.waiting ? ` (pid ${active.pid})` : ""} [mode=${spec.mode ?? "persistent"} status=${status}${outcome}${policy}] /${spec.filter}/: ${spec.argv.join(" ")}`;
             })
             .join("\n") || "no monitors running or recorded";
       }
