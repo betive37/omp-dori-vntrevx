@@ -1,5 +1,5 @@
 import type { Clock } from "../run.ts";
-import { guardText, type Http, MessengerError, withBackoff } from "./http.ts";
+import { DEFAULT_RETRY, guardText, type Http, MessengerError, withBackoff } from "./http.ts";
 import { DISCORD_LIMIT, splitForDiscord } from "./split.ts";
 
 const retryAfter = (body: string): number | undefined => {
@@ -35,6 +35,7 @@ export class Discord {
     method: "GET" | "POST" | "PATCH" | "PUT" | "DELETE",
     path: string,
     body?: Record<string, unknown>,
+    signal?: AbortSignal,
   ): Promise<T> {
     const res = await withBackoff(
       this.http,
@@ -44,8 +45,10 @@ export class Discord {
         url: `${this.base}${path}`,
         headers: { Authorization: `Bot ${this.botToken}`, "Content-Type": "application/json" },
         ...(body ? { body: JSON.stringify(body) } : {}),
+        ...(signal === undefined ? {} : { signal }),
       },
-      undefined,
+      // Cancellable live metadata owns its existing 2s–30s retry outside this single HTTP attempt.
+      signal === undefined ? undefined : { ...DEFAULT_RETRY, attempts: 1 },
       retryAfter,
     );
     if (res.status >= 300)
