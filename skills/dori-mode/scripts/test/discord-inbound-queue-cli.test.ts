@@ -6,7 +6,7 @@ import { fileDiscordInboundStore } from "../src/messenger/discord-inbound-state.
 import { ownerMessage } from "./discord-inbound-fakes.ts";
 import { withState } from "./fakes.ts";
 
-const start = (dir: string, gateway: boolean, hold = false) => {
+const start = (dir: string, gateway: boolean, hold = false, context?: "context" | "context-denied") => {
   const config = join(dir, "config.json");
   writeFileSync(config, JSON.stringify({ stateDir: dir, runtime: "herdr", hooks: {} }));
   return Bun.spawn(
@@ -18,6 +18,7 @@ const start = (dir: string, gateway: boolean, hold = false) => {
       "inbound",
       "discord",
       ...(gateway ? ["--gateway"] : ["--loop", hold ? "60" : "0"]),
+      ...(context ? ["--context"] : []),
     ],
     {
       env: {
@@ -29,6 +30,7 @@ const start = (dir: string, gateway: boolean, hold = false) => {
         DORI_DISCORD_OWNER_ID: "10",
         DORI_DISCORD_CHANNEL_ID: "20",
         ...(hold ? { DORI_INBOUND_HOLD: "1" } : {}),
+        ...(context ? { DORI_TEST_DISCORD_CASE: context } : {}),
       },
       stdout: "pipe",
       stderr: "pipe",
@@ -37,8 +39,8 @@ const start = (dir: string, gateway: boolean, hold = false) => {
   );
 };
 
-const run = async (dir: string, gateway: boolean) => {
-  const child = start(dir, gateway);
+const run = async (dir: string, gateway: boolean, context?: "context" | "context-denied") => {
+  const child = start(dir, gateway, false, context);
   const [out, err, code] = await Promise.all([
     new Response(child.stdout).text(),
     new Response(child.stderr).text(),
@@ -111,6 +113,42 @@ test("public Gateway CLI backfills, emits live text, persists the cursor and clo
     state.done();
   }
 });
+
+for (const context of ["context", "context-denied"] as const)
+  test(`Gateway CLI preserves message/context groups and cursor commits with ${context}`, async () => {
+    const state = withState();
+    try {
+      const { out, err, code } = await run(state.dir, true, context);
+      expect({ err, code }).toEqual({ err: "", code: 0 });
+      const where = JSON.stringify(
+        context === "context"
+          ? {
+              channel: { id: "30", name: "dev", topic: "editable topic", purpose: null },
+              thread: { id: "20", name: "task thread", purpose: null },
+            }
+          : { channel: { id: "20", purpose: null }, thread: null, error: "channel lookup failed (HTTP 403)" },
+      );
+      expect(
+        out
+          .split("\n")
+          .filter((line) => line.startsWith("INBOUND discord ") || line.startsWith("INBOUND_CONTEXT discord ")),
+      ).toEqual([
+        'INBOUND discord 20 101 from=owner ref=- "first owner text"',
+        `INBOUND_CONTEXT discord 20 101 ${where}`,
+        'INBOUND discord 20 103 from=owner ref=- "live owner text"',
+        `INBOUND_CONTEXT discord 20 103 ${where}`,
+      ]);
+      expect(fileDiscordInboundStore(state.dir, "20").load()).toBe("103");
+      const queue = discordInboundQueue(state.dir);
+      try {
+        expect(queue.first()).toBeNull();
+      } finally {
+        queue.close();
+      }
+    } finally {
+      state.done();
+    }
+  });
 
 test("REST mode refuses pending Gateway work before baselining any channel", async () => {
   const state = withState();

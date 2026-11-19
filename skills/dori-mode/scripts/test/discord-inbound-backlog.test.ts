@@ -19,6 +19,7 @@ test("a stalled backfill retains dispatches on disk, not a growing Promise chain
   const live = discordInboundLive(
     {
       accepts: () => true,
+      cursorFor: () => undefined,
       sync: () => hold.promise,
       accept: (message) => {
         accepted.push(Number(message.id));

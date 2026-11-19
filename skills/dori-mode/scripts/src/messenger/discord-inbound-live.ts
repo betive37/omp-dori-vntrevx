@@ -8,14 +8,17 @@ const MESSAGE_CONTENT = 1 << 15; // Privileged: enable it for the bot in the Dev
 
 type Intake = {
   accepts(message: Message): boolean;
-  sync(emit: Emit): Promise<void>;
-  accept(message: Message, emit: Emit): void | Promise<void>;
+  cursorFor(channel: string): string | undefined;
+  sync(emit: Emit, queue?: DiscordInboundQueue): Promise<void>;
+  accept(message: Message, emit: Emit, admittedAfter?: string | null): void | Promise<void>;
 };
 
+export type DiscordInboundLive = { done: Promise<void>; close(): void };
+
 /**
- * Live owner messages over the Gateway, with the REST history path as backfill. Every (re)connect first reads each
- * watched channel from its cursor; dispatches and backfills run on one queue, so a message that arrives both ways
- * is delivered once (the cursor rejects the second copy) and a channel's messages stay in ascending order.
+ * Gateway dispatches and backfills share one durable queue. Backfills merge already-known queued owners before
+ * each newer delivery; a frame admitted during an awaited newer emit may be delivered late, never checkpointed
+ * backwards. Cursor commits and exact-ID acknowledgements deduplicate completed work, not emit/crash windows.
  */
 export const discordInboundLive = (
   intake: Intake,
@@ -25,8 +28,9 @@ export const discordInboundLive = (
   emit: Emit,
   report: (line: string) => void,
   queue: DiscordInboundQueue,
-) => {
+): DiscordInboundLive => {
   let running = Promise.resolve();
+  let recover = queue.first()?.kind === "message";
   let draining = false;
   let failure: unknown;
   let dead = false;
@@ -41,7 +45,7 @@ export const discordInboundLive = (
   const backfill = async () => {
     for (let delay = 2_000; ; delay = Math.min(delay * 2, 30_000)) {
       try {
-        return await intake.sync(emit);
+        return await intake.sync(emit, queue);
       } catch (error) {
         if (dead || !isTransient(error)) throw error;
         report(`DISCORD_GATEWAY_BACKFILL_RETRY discord retry_in=${delay / 1000}s`);
@@ -60,10 +64,23 @@ export const discordInboundLive = (
     draining = true;
     running = (async () => {
       try {
+        if (recover) {
+          recover = false;
+          await backfill(); // A retained message prefix must not skip older REST gaps on restart.
+        }
         for (let job = queue.first(); job && !dead; job = queue.first()) {
-          if (job.kind === "sync") await backfill();
-          else await intake.accept(JSON.parse(job.payload) as Message, emit);
-          if (!dead) queue.remove(job.id);
+          if (job.kind === "sync") {
+            await backfill();
+            if (!dead) queue.remove(job.id);
+          } else {
+            job = queue.before(job.id) ?? job; // Earlier known same-channel frames precede this delivery boundary.
+            const message = JSON.parse(job.payload) as Message;
+            await intake.accept(message, emit, job.admittedAfter);
+            if (!dead) {
+              if (intake.accepts(message)) queue.acknowledge(message.channel_id, message.id);
+              else queue.remove(job.id);
+            }
+          }
         }
       } catch (error) {
         fail(error);
@@ -75,7 +92,8 @@ export const discordInboundLive = (
   const enqueue = (kind: "sync" | "message", data?: unknown) => {
     if (dead) return;
     try {
-      queue.push(kind, data);
+      const after = kind === "message" ? intake.cursorFor((data as Message).channel_id) : undefined;
+      queue.push(kind, data, after);
       drain();
     } catch (error) {
       fail(error);

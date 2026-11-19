@@ -85,8 +85,7 @@ export const discordInboundCommand = async (
     const emit: Emit = where
       ? async (message) => {
           const context = await where(message.channel);
-          console.log(`${formatDiscordInbound(message)}
-${formatInboundContext(message, context)}`);
+          console.log(`${formatDiscordInbound(message)}\n${formatInboundContext(message, context)}`);
         }
       : (message) => console.log(formatDiscordInbound(message));
     console.log(

@@ -171,3 +171,18 @@ test("a process killed after a WAL commit leaves its pending message recoverable
     state.done();
   }
 });
+
+test("admission cursors retain canonical decimal validation without writing a failed record", () => {
+  const state = withState();
+  const queue = discordInboundQueue(state.dir);
+  try {
+    for (const after of ["-1", "01", "1e3", "18446744073709551616"])
+      expect(() => queue.push("message", ownerMessage("105"), after)).toThrow("admission cursor is invalid");
+    expect(queue.first()).toBeNull();
+    queue.push("message", ownerMessage("105"), "0");
+    expect(queue.first()?.admittedAfter).toBe("0");
+  } finally {
+    queue.close();
+    state.done();
+  }
+});
