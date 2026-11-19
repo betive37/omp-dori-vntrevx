@@ -24,8 +24,8 @@ const nonRoot = test.skipIf(process.getuid?.() === 0);
 
 // All inputs use the original public prune/fixture APIs, including the fresh files callback. No rm implementation is
 // replaced: a real owned, nonempty, unreadable subtree makes native recursive removal fail after unlinking files.
-function partialRemoval() {
-  const c = pruneFixture();
+function partialRemoval(filePids?: readonly string[]) {
+  const c = pruneFixture(filePids);
   const x = c.native("partial", true);
   const backup = join(c.root, "saved-source");
   renameSync(x.source, backup);
@@ -57,7 +57,7 @@ function partialRemoval() {
           chmodSync(join(cache, name, blocker), 0);
           blocked = true;
         }
-        return ownProcessFiles();
+        return ownProcessFiles(filePids);
       },
     });
   } catch (error) {
@@ -83,7 +83,8 @@ function partialRemoval() {
 }
 
 nonRoot("partial removal never returns to live; explicit cleanup preserves a newly prepared image", () => {
-  const f = partialRemoval();
+  // Setup leaves no live child; removal/reprepare uses filesystem references, not an external file holder.
+  const f = partialRemoval([String(process.pid)]);
   const ordinary = f.c.prune({ now: 2 });
   expect(ordinary.removed).toEqual([]);
   expect(existsSync(f.x.directory)).toBe(false);
@@ -178,7 +179,8 @@ test.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
 test.skipIf(process.platform !== "linux" || process.getuid?.() === 0)(
   "an actual open descriptor holds a committed remainder until closed",
   () => {
-    const f = partialRemoval();
+    // Setup leaves no live child; only this worker opens the retained file.
+    const f = partialRemoval([String(process.pid)]);
     const fd = openSync(join(f.remainder, f.blocker, "retained"), "r");
     try {
       const held = f.c.prune({ deleteQuarantined: true });

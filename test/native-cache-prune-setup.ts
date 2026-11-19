@@ -33,8 +33,10 @@ export type PruneFixture = {
  * what the first quarantined. It sees
  * only the fixture's processes: the host's unreadable or privileged processes and its Dori writers (other
  * lanes' launches) stay out unless a test passes its own reader or process table.
+ * `filePids` opts into the real Linux file reader for a test's complete set of possible live file holders, including
+ * this worker. Omit it for thread, descendant and other process-discovery tests to retain the full scan.
  */
-export function pruneFixture(): PruneFixture {
+export function pruneFixture(filePids?: readonly string[]): PruneFixture {
   const root = realpathSync(mkdtempSync(join(tmpdir(), "dori-native-prune-")));
   roots.push(root);
   const home = join(root, "home");
@@ -50,7 +52,7 @@ export function pruneFixture(): PruneFixture {
   const prune = (options: NativeCachePruneOptions = {}, more: readonly string[] = []): NativeCachePrune =>
     pruneNativeCache(home, [], [refs, ...more], {
       readCwds: ownProcessCwds,
-      files: ownProcessFiles,
+      files: () => ownProcessFiles(filePids),
       table: () => "",
       graceMs: 0,
       ...options,
