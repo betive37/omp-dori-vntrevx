@@ -31,7 +31,7 @@
       ]
     },
     "extension": {
-      "entry": ["index.ts", "test/**/*.test.ts", "test/fake-ulw.ts"],
+      "entry": ["index.ts", "test/**/*.test.ts", "test/fake-ulw.ts", "test/record-head-inbound.ts"],
       "project": ["**/*.ts"]
     },
     "test/fixtures/omp-native-host": {

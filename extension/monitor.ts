@@ -4,6 +4,7 @@
  * expects; omp has no built-in equivalent.
  */
 import type { Subprocess } from "bun";
+import type { HeadAdmissions } from "./head-admission.ts";
 import { MonitorOutputFile, readMonitorOutput } from "./monitor-output";
 
 /** Lines arriving within this window after the first one are delivered together. */
@@ -21,6 +22,7 @@ type Running = {
   /** Session the monitor was started in; its lines are delivered only while that session is current. */
   readonly session: string;
   stopped: boolean;
+  admitting: boolean;
 };
 
 export type MonitorInfo = {
@@ -36,12 +38,19 @@ export class Monitors {
   #pending: Array<{ readonly session: string; readonly text: string }> = [];
   #timer: Timer | undefined;
   #pendingBytes = 0;
-  readonly #deliver: (content: string) => void;
+  readonly #deliver: (content: string, details?: unknown) => void;
+  readonly #admissions: HeadAdmissions | undefined;
   readonly #currentSession: () => string | undefined;
   readonly #batchMs: number;
 
-  constructor(deliver: (content: string) => void, currentSession: () => string | undefined, batchMs = BATCH_MS) {
+  constructor(
+    deliver: (content: string, details?: unknown) => void,
+    currentSession: () => string | undefined,
+    batchMs = BATCH_MS,
+    admissions?: HeadAdmissions,
+  ) {
     this.#deliver = deliver;
+    this.#admissions = admissions;
     this.#currentSession = currentSession;
     this.#batchMs = batchMs;
   }
@@ -51,11 +60,33 @@ export class Monitors {
     if (this.#running.has(name)) throw new Error(`monitor "${name}" is already running; stop it first`);
     if (argv.length === 0) throw new Error("argv must name the command to run");
     const pattern = new RegExp(filter);
-    const proc = Bun.spawn([...argv], { cwd, stdin: "ignore", stdout: "pipe", stderr: "pipe" });
-    const entry: Running = { name, argv: [...argv], filter: pattern, cwd, proc, session, stopped: false };
+    const proc = Bun.spawn([...argv], {
+      cwd,
+      stdin: "ignore",
+      stdout: "pipe",
+      stderr: "pipe",
+      ...(this.#admissions
+        ? {
+            env: { ...process.env, DORI_MONITOR_ADMISSION: "1" },
+            serialization: "json" as const,
+            ipc: (message: unknown) => this.#ipc(entry, message),
+          }
+        : {}),
+    });
+    const entry: Running = {
+      name,
+      argv: [...argv],
+      filter: pattern,
+      cwd,
+      proc,
+      session,
+      stopped: false,
+      admitting: false,
+    };
     this.#running.set(name, entry);
     void Promise.all([this.#pump(entry, proc.stdout, "stdout"), this.#pump(entry, proc.stderr, "stderr"), proc.exited])
       .then(([, , code]) => {
+        this.#admissions?.stop(proc.pid);
         if (this.#running.get(name) === entry) this.#running.delete(name);
         if (entry.stopped) return;
         this.#queue(
@@ -79,6 +110,7 @@ export class Monitors {
   stop(name: string): boolean {
     const entry = this.#running.get(name);
     if (!entry) return false;
+    this.#admissions?.stop(entry.proc.pid);
     entry.stopped = true;
     entry.proc.kill();
     this.#running.delete(name);
@@ -97,11 +129,65 @@ export class Monitors {
 
   /** Session end: kill every monitor and drop undelivered lines, which belong to the session that is going away. */
   stopAll(): void {
+    this.#admissions?.stop();
     for (const name of [...this.#running.keys()]) this.stop(name);
     clearTimeout(this.#timer);
     this.#timer = undefined;
     this.#pending = [];
     this.#pendingBytes = 0;
+  }
+
+  #ipc(entry: Running, raw: unknown): void {
+    const admissions = this.#admissions;
+    if (
+      !admissions ||
+      raw === null ||
+      typeof raw !== "object" ||
+      !("protocol" in raw) ||
+      raw.protocol !== "dori-head-admission-v1"
+    )
+      return;
+    const fail = () => {
+      entry.admitting = false;
+      if (entry.stopped) return;
+      entry.stopped = true;
+      if (entry.proc.exitCode === null && entry.proc.signalCode === null) entry.proc.kill();
+      if (this.#running.get(entry.name) === entry) this.#running.delete(entry.name);
+      this.#queue(
+        entry,
+        ["[monitor]", entry.name, "head admission unresolved; receiver stopped; original input remains queued"].join(
+          " ",
+        ),
+      );
+    };
+    if (entry.admitting) {
+      fail();
+      return;
+    }
+    entry.admitting = true;
+    void admissions
+      .receive(raw, {
+        source: entry.proc.pid,
+        session: entry.session,
+        accepts: (content) => {
+          if (entry.stopped || entry.session !== this.#currentSession()) throw new Error("inactive head source");
+          return content.split("\n").some((line) => entry.filter.test(line));
+        },
+        deliver: (content, details) => {
+          if (entry.stopped || entry.session !== this.#currentSession()) throw new Error("inactive head source");
+          this.#flush();
+          const text = content
+            .split("\n")
+            .map((line) => `[${entry.name}] ${line}`)
+            .join("\n");
+          this.#deliver(this.#bounded(entry, text), details);
+        },
+      })
+      .then((reply) => {
+        entry.admitting = false;
+        entry.proc.send(reply);
+      })
+      .catch(fail);
   }
 
   async #pump(entry: Running, stream: ReadableStream<Uint8Array>, source: string): Promise<void> {
@@ -119,8 +205,8 @@ export class Monitors {
     if (!entry.stopped && entry.filter.test(line)) this.#queue(entry, `[${entry.name}] ${line}`);
   }
 
-  #queue(entry: Running, text: string): void {
-    let bytes = Buffer.byteLength(text);
+  #bounded(entry: Running, text: string): string {
+    const bytes = Buffer.byteLength(text);
     if (bytes > BATCH_MAX_BYTES) {
       const output = new MonitorOutputFile();
       try {
@@ -129,8 +215,13 @@ export class Monitors {
         output.close();
       }
       text = `[monitor] message saved for name=${JSON.stringify(entry.name.slice(0, 256))}${entry.name.length > 256 ? "..." : ""} pid=${entry.proc.pid}: ${bytes} bytes; file=${JSON.stringify(output.path)}`;
-      bytes = Buffer.byteLength(text);
     }
+    return text;
+  }
+
+  #queue(entry: Running, text: string): void {
+    text = this.#bounded(entry, text);
+    const bytes = Buffer.byteLength(text);
     if (this.#pendingBytes + bytes + (this.#pending.length ? 1 : 0) > BATCH_MAX_BYTES) this.#flush();
     this.#pendingBytes += bytes + (this.#pending.length ? 1 : 0);
     this.#pending.push({ session: entry.session, text });

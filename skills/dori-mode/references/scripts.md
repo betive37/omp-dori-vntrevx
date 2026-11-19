@@ -284,7 +284,7 @@ Output is `INBOUND discord <channel> <message> from=owner ref=<id|-> <JSON text>
 
 REST polling and Gateway delivery produce identical record groups. The formatter returns one string per owner message for the existing single emit before cursor commit. A malformed attachment or attachment list is a protocol error; the message stays uncommitted, as it does when emit throws. Consumers parsing only `INBOUND discord ` lines retain the same grammar. Metadata delivery downloads no files and starts no transcription or provider inference. This is new-message intake; edits and delete events are not delivered.
 
-Use one opted-in native `monitor` with filter `^INBOUND` and the [protected-token child argv recipe](../../../docs/releases.md#discord-owner-intake). Startup auth, permission, intent or state failures are sanitized nonzero errors; later REST poll failures follow the ordinary `WARN`/retry loop. Gateway backfill retries transient remote failures while holding live messages; local response/protocol faults and failed delivery stop intake without committing the undelivered message. SIGINT/SIGTERM stops intake, and an explicit restart resumes the committed cursor. Intake never sends presence updates; enable or stop the separate presence monitor intentionally. The [offline benchmark](../../../docs/releases.md#real-time-gateway-mode) uses only synthetic loopback traffic and does not measure Discord service latency.
+Use one opted-in native `monitor` with filter `^INBOUND` and the [protected-token child argv recipe](../../../docs/releases.md#discord-owner-intake). Startup auth, permission, intent or state failures are sanitized nonzero errors; later REST polling retries only transient remote failures. Non-retryable delivery, protocol and storage failures terminate nonzero, so the native monitor reports the stopped intake. Gateway backfill retries transient remote failures while holding live messages; local response/protocol faults and failed delivery stop intake without committing the undelivered message. SIGINT/SIGTERM stops intake, and an explicit restart resumes the committed cursor. Intake never sends presence updates; enable or stop the separate presence monitor intentionally. The [offline benchmark](../../../docs/releases.md#real-time-gateway-mode) uses only synthetic loopback traffic and does not measure Discord service latency.
 
 REST and Gateway intake acquire the same state-directory lock before authentication or polling, including a fresh state directory. Gateway work is serialized through the owned private `<stateDir>/discord-inbound/gateway.sqlite` queue. Indexed queries select queued owners one record at a time; no queued-message array or Promise chain grows behind a stalled backfill. The page-cache budget is 256 KiB and database memory mapping is disabled. Incoming frames and an active REST history drain still use their ordinary memory. Invalid IDs and explicitly unwatched channels are rejected before spooling. Successful handling and cursor persistence precede exact-message-ID acknowledgement; an acknowledgement error stops dependent advancement. WAL `synchronous=NORMAL` retains process-crash recovery without adding two fsyncs per dispatch; power-loss recovery still relies on durable REST cursors.
 
@@ -299,6 +299,57 @@ The queue records the durable cursor at admission, not proof of delivery. An old
 Legacy rows have no admission position. A pending owner below the cursor is replayed conservatively because older intake may have skipped it; this migration/recovery window can repeat an already delivered request. It cannot restore payloads already deleted by older code. This is not unconditional exactly-once delivery or ordering across arbitrary late arrivals.
 
 Gateway shutdown retains pending work and waits for an active backfill reconciliation, including merged deliveries and cursor commits, to drain. It does not cancel an in-flight HTTP request. Later queued work remains for restart. Storage, protocol and delivery failures retain undelivered records; restore storage before restarting after a disk error. Messages not successfully written still rely on REST cursor recovery.
+
+#### Native head admission receipts
+
+Inside the native Dori monitor, built-in Discord intake uses IPC, not stdout, to acknowledge source delivery.
+The existing private SQLite queue records the bot, owner, channel and message identity, a normalized-source
+SHA-256, captured original normalized source, original native session file and head process ID before dispatch.
+Reply snapshots and Discord CDN signature parameters do not change the source fingerprint; the original captured
+text and attachment metadata remain unchanged. The native extension acknowledges an on-disk
+`dori-monitor` custom-message entry; an explicit monitor-filter rejection has its own native custom-entry receipt.
+Gateway ordering is raw queue record, durable attempt, native receipt, terminal SQLite receipt, cursor save,
+then exact-ID queue removal. In native admission mode, identical pending source records are not inserted twice; conflicting payloads retain
+and fence the original. REST retains an attempted source in this same ledger even if it later disappears from
+history; it does not add a second raw-event spool. Every cursor save and FIFO removal checks the global unresolved
+fence, including non-owner messages, empty backfill and a restart outside the native monitor. Confirmed native
+receipts retire from SQLite only after their channel cursor is durable and the last exact-ID raw copy is removed.
+Retirement shares the raw ACK transaction, so a crash between cursor save and ACK cannot resend the source.
+Qualified late owner frames retain their original admission cursor and can be delivered below a newer saved cursor;
+that cursor never moves backwards. Operator audit records do not retire.
+Restart completes any saved terminal receipt's cursor from its captured original before reading new history.
+A crash between the receipt and cursor writes never requires that source to remain in history or be resent.
+
+An ACK proves native admission, not a model turn, a reply, or an approval. This protocol performs no goal-resume
+or approval action: delivery still uses the host's existing aside policy. An absent head before dispatch leaves
+the source pending for restart. An attempted handoff without its original native receipt stays unresolved;
+neither stdout, process exit nor restarting authorizes replay or advancing the FIFO fence. Preserve the original
+session file and SQLite state for reconciliation. Reading the exact original receipt finishes a lost ACK without
+sending that source again. Do not erase the attempt or cursor to force a retry.
+
+The native monitor supplies `DORI_MONITOR_ADMISSION=1` with its IPC channel; this is an internal capability, not a
+standalone opt-in flag. Missing or broken IPC fails closed. A dead head releases the receiver's queue owner;
+a successful one-shot receiver removes its disconnect listener and exits normally. Plain console intake remains
+transport-only: its printed lines and `INBOUND_READY` are not proof of native admission. No second Gateway, queue
+service, provider call or automatic retry of an unresolved dispatch is introduced. Native status shows pending
+receipt waits even when a void send produces no event; unconfirmed results also notify the native UI.
+
+#### Explicit operator abandonment
+
+`dori inbound-abandon discord BOT:OWNER:CHANNEL:MESSAGE --reason TEXT` is an explicit operator decision, not
+automatic recovery. Inspect the retained source and original session first; a genuine native receipt should be
+reconciled by restarting intake instead. If the operator explicitly chooses to forgo an unconfirmed input, stop
+the original native head process and its receiver, then run the command for that exact identity with one nonempty
+reason. A live, occupied or uninspectable original PID is refused, as are settled native receipts and conflicting
+reasons. No stop, kill, model call, messenger request or resend is performed by this command.
+
+The result is `ADMISSION_ABANDONED` followed by a JSON audit receipt. The same identity and reason return the same
+receipt after a repeated invocation. Original source, fingerprint, head file/PID, attempt time and decision time
+remain in the private SQLite ledger. An interrupted cursor write resumes from that same saved decision without
+creating another decision or sending anything. Only the abandoned source cursor is advanced; ordinary intake subsequently
+drains its FIFO and may process later inputs without resending that source. This is not evidence that the earlier
+handoff did nothing, nor a cancellation of any action it already caused. Keep the state and receipt; never delete
+rows or reset cursors to force replay.
 
 ### `dori inbound slack [--loop MIN]`
 Prints `INBOUND <source> <channel> <thread> <ts> <user> <text>`. It reads from three places, each message once:

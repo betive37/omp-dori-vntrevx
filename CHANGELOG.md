@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- Native Discord head admission records the original source, target process and attempt in the existing SQLite FIFO before dispatch, and requires an on-disk native receipt before cursor movement. Lost acknowledgements reconcile without redelivery; unresolved attempts fence all cursor and FIFO movement, including REST history changes and standalone restarts. Explicit `inbound-abandon` recovery requires a stopped original head and an operator reason, retains the source and audit receipt, and never resends. Native admission is not model completion or approval.
+
 - Discord REST intake probes one latest message before draining history. Quiet, empty and deleted-head channels avoid downloading up to 100 bodies; active channels pay one additional sequential probe and its rate-limit budget while retaining complete pagination, existing delivery/checkpoint and qualified late-arrival boundaries, and the received head if it is deleted between requests.
 
 - Discord Gateway intake spools pending work to a private SQLite FIFO instead of retaining an unbounded Promise chain during REST backfill failures. A bounded page cache and one decoded record keep application backlog memory independent of queue length; pending work survives shutdown and restart, with existing cursor and delivery-error boundaries preserved. Disk writes and backlog-sized storage replace in-memory retention. Both REST and Gateway acquire the queue lock before authentication or polling, including a fresh state directory. Intake stops at the 256 MiB database limit or when another consumer owns the same queue, and REST-only mode refuses pending Gateway work until it is drained in Gateway mode.

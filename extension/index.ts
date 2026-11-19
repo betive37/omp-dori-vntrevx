@@ -28,8 +28,9 @@ import {
 } from "../skills/dori-mode/scripts/src/lane-state";
 import { bootstrapMonitors, MONITOR_BOOTSTRAP_FLAG, recordedIntake } from "./bootstrap.ts";
 import { RuntimeHealthWriter } from "./deployment-health.ts";
+import { HeadAdmissions } from "./head-admission.ts";
 import { type PromptModel, withLaneBookkeeping } from "./lane-bookkeeping.ts";
-import { MONITOR_DESCRIPTION, Monitors } from "./monitor";
+import { BATCH_MS, MONITOR_DESCRIPTION, Monitors } from "./monitor";
 
 interface SessionEntry {
   type: string;
@@ -43,8 +44,17 @@ export interface DoriContext {
   abort(): void;
   agent: { kind: "main" | "sub"; id: string; parentId?: string };
   model?: PromptModel;
-  sessionManager: { getSessionId(): string; getSessionFile(): string | undefined; getBranch(): SessionEntry[] };
-  ui: { notify(message: string, type?: "info" | "warning" | "error"): void };
+  sessionManager: {
+    getSessionId(): string;
+    getSessionFile(): string | undefined;
+    getBranch(): SessionEntry[];
+    getEntries(): SessionEntry[];
+    ensureOnDisk(): Promise<void>;
+  };
+  ui: {
+    notify(message: string, type?: "info" | "warning" | "error"): void;
+    setStatus(key: string, text: string | undefined): void;
+  };
 }
 interface Goal {
   objective: string;
@@ -101,7 +111,7 @@ export interface DoriApi {
   on(event: string, handler: Handler): void;
   appendEntry(customType: string, data?: unknown): void;
   sendMessage(
-    message: { customType: string; content: string; display: boolean },
+    message: { customType: string; content: string; display: boolean; details?: unknown },
     options?: { triggerTurn?: boolean; deliverAs?: "steer" | "followUp" | "nextTurn" | "aside" },
   ): void;
   getActiveTools(): string[];
@@ -231,10 +241,43 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
   let paneWritten: string | undefined;
   const approvals = new Set<string>();
   let managedRestorePending = process.env.DORI_MANAGED_STARTUP === "1";
+  let headContext: DoriContext | undefined;
+  const admissions = new HeadAdmissions(
+    () => {
+      if (role !== "dori" || !headContext || headContext.sessionManager.getSessionId() !== session?.id) return;
+      const manager = headContext.sessionManager;
+      const file = manager.getSessionFile();
+      return file
+        ? {
+            id: manager.getSessionId(),
+            file,
+            entries: () => manager.getEntries(),
+            ensureOnDisk: () => manager.ensureOnDisk(),
+          }
+        : undefined;
+    },
+    (details) => pi.appendEntry("omp-dori:admission-rejected", details),
+    (pending, unresolved) => {
+      headContext?.ui.setStatus(
+        "dori-head-admission",
+        pending ? `${pending} inbound item(s) awaiting native receipt` : undefined,
+      );
+      if (unresolved)
+        headContext?.ui.notify(
+          `Native admission for ${unresolved} was not confirmed. Intake must retain its cursor; inspect its saved state before explicit recovery.`,
+          "warning",
+        );
+    },
+  );
   const monitors = new Monitors(
-    (content) =>
-      pi.sendMessage({ customType: "dori-monitor", content, display: true }, { triggerTurn: true, deliverAs: "aside" }),
+    (content, details) =>
+      pi.sendMessage(
+        { customType: "dori-monitor", content, display: true, ...(details === undefined ? {} : { details }) },
+        { triggerTurn: true, deliverAs: "aside" },
+      ),
     () => (role === "dori" ? session?.id : undefined),
+    BATCH_MS,
+    admissions,
   );
   const runtimeHealth = new RuntimeHealthWriter(monitors);
 
@@ -402,13 +445,18 @@ export default async function ompDori(pi: DoriApi): Promise<void> {
       if (!approvals.delete(event.toolCallId) || !role) return;
       savePane(ctx);
     });
+    pi.on("message_end", (event, ctx) => {
+      if (ctx.agent.kind === "main" && role === "dori") return admissions.messageEnded(event);
+    });
     pi.on("session_shutdown", () => {
+      headContext = undefined;
       monitors.stopAll();
       retirePane();
     });
   };
 
   const syncMain = async (ctx: DoriContext, branch: readonly SessionEntry[], bootstrap = false): Promise<void> => {
+    headContext = ctx;
     const sessionId = ctx.sessionManager.getSessionId();
     // Monitors belong to the Dori session that started them; their lines must not wake whatever session comes next.
     if (session?.id !== sessionId || role !== "dori") monitors.stopAll();
