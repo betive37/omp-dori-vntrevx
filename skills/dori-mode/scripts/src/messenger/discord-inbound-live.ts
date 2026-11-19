@@ -28,12 +28,30 @@ export const discordInboundLive = (
   emit: Emit,
   report: (line: string) => void,
   queue: DiscordInboundQueue,
+  activity?: { received(message: Message): void; healthy(): void; unavailable(): void },
 ): DiscordInboundLive => {
   let running = Promise.resolve();
   let recover = queue.first()?.kind === "message";
   let draining = false;
   let failure: unknown;
   let dead = false;
+  let synced = false;
+  let connected = false;
+  let connection = 0;
+  let gateway: ReturnType<typeof discordGateway> | undefined;
+  const fail = (error: unknown) => {
+    failure = error;
+    dead = true; // Leave the failed record and every successor on disk, without advancing their cursors.
+    gateway?.close();
+  };
+  const observe = (action: () => void): void => {
+    if (dead) return;
+    try {
+      action();
+    } catch (error) {
+      fail(error);
+    }
+  };
   let timer: unknown;
   let wake: (() => void) | undefined;
   const pause = (ms: number) =>
@@ -43,9 +61,15 @@ export const discordInboundLive = (
     });
   /** Dispatches queue behind this: delivering one before the gap is read would move the cursor past it. */
   const backfill = async () => {
+    const generation = connection;
     for (let delay = 2_000; ; delay = Math.min(delay * 2, 30_000)) {
       try {
-        return await intake.sync(emit, queue);
+        await intake.sync(emit, queue);
+        if (!dead && connected && generation === connection) {
+          synced = true;
+          activity?.healthy();
+        }
+        return;
       } catch (error) {
         if (dead || !isTransient(error)) throw error;
         report(`DISCORD_GATEWAY_BACKFILL_RETRY discord retry_in=${delay / 1000}s`);
@@ -53,11 +77,6 @@ export const discordInboundLive = (
         if (dead) return;
       }
     }
-  };
-  const fail = (error: unknown) => {
-    failure = error;
-    dead = true; // Leave the failed record and every successor on disk, without advancing their cursors.
-    gateway.close();
   };
   const drain = () => {
     if (draining || dead) return;
@@ -94,25 +113,45 @@ export const discordInboundLive = (
     try {
       const after = kind === "message" ? intake.cursorFor((data as Message).channel_id) : undefined;
       queue.push(kind, data, after);
+      if (kind === "message") observe(() => activity?.received(data as Message));
       drain();
     } catch (error) {
       fail(error);
     }
   };
-  const gateway = discordGateway(open, token, clock, report, {
+  gateway = discordGateway(open, token, clock, report, {
     label: "DISCORD_GATEWAY",
     intents: GUILD_MESSAGES | DIRECT_MESSAGES | MESSAGE_CONTENT,
     online: false,
-    onReady: () => enqueue("sync"),
+    onReady: () => {
+      connection++;
+      connected = true;
+      synced = false;
+      observe(() => activity?.unavailable());
+      enqueue("sync");
+    },
+    onHealth: (available) => {
+      if (!available) {
+        connection++;
+        connected = synced = false;
+        observe(() => activity?.unavailable());
+      } else if (synced)
+        observe(() => {
+          if (!queue.first()) activity?.healthy();
+        });
+    },
     onDispatch: (type, data) => {
       if (type === "MESSAGE_CREATE" && intake.accepts(data as Message)) enqueue("message", data);
     },
   });
+  if (dead) gateway.close();
   const close = () => {
+    observe(() => activity?.unavailable());
     dead = true;
+    connection++;
     if (timer !== undefined) clock.clearTimeout(timer);
     wake?.();
-    gateway.close();
+    gateway?.close();
   };
   const done = gateway.done.finally(async () => {
     close();
