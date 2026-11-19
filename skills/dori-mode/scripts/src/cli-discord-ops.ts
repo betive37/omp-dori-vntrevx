@@ -50,7 +50,7 @@ export const channelOf = async (dc: Discord, raw: string): Promise<DcChannel> =>
 };
 
 /** Tags replace the complete applied set; unknown names include the forum's known tag names in the error. */
-const tagIds = (forum: DcChannel, names: readonly string[]): string[] =>
+export const tagIds = (forum: DcChannel, names: readonly string[]): string[] =>
   names.map((name) => {
     const tags = forum.available_tags ?? [];
     return (
@@ -92,7 +92,10 @@ export const sendDiscord: Command = async (cli) => {
   }
 };
 
-export const threadDiscord: Command = async ({ positionals, need, opt, strings, values }) => {
+export const threadDiscord: Command = async (cli) => {
+  if (cli.values["source"] !== undefined)
+    return (await import("./cli-discord-thread-source.ts")).sourceThreadDiscord(cli);
+  const { positionals, need, opt, strings, values } = cli;
   const action = positionals[1];
   const tags = strings("tag");
   if (values["archive"] === true && values["unarchive"] === true) die("choose --archive or --unarchive");

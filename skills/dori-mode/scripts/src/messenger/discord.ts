@@ -19,7 +19,12 @@ export type DcChannel = {
   readonly topic?: string | null;
   readonly parent_id?: string | null;
   readonly available_tags?: readonly { readonly id: string; readonly name: string }[];
+  readonly flags?: number;
+  readonly owner_id?: string;
+  readonly message?: { readonly id: string };
 };
+
+export type ThreadCreated = (thread: DcChannel) => Promise<void>;
 
 /** Forum and media channels contain posts, each represented by a thread. */
 export const isForumType = (type: number): boolean => type === 15 || type === 16;
@@ -135,13 +140,13 @@ export class Discord {
     await this.call("POST", `/channels/${channelId}/typing`);
   }
 
-  async startThread(channelId: string, messageId: string, name: string): Promise<string> {
-    return responseId(
-      await this.call("POST", `/channels/${channelId}/messages/${messageId}/threads`, {
-        name: guardText(name).slice(0, 100),
-      }),
-      `discord POST /channels/${channelId}/messages/${messageId}/threads`,
-    );
+  async startThread(channelId: string, messageId: string, name: string, created?: ThreadCreated): Promise<string> {
+    const thread = await this.call<DcChannel>("POST", `/channels/${channelId}/messages/${messageId}/threads`, {
+      name: guardText(name).slice(0, 100),
+    });
+    const id = responseId(thread, `discord POST /channels/${channelId}/messages/${messageId}/threads`);
+    if (created) await created(thread);
+    return id;
   }
 
   async setThread(
@@ -162,33 +167,31 @@ export class Discord {
   async createThread(
     channel: DcChannel,
     name: string,
-    opts: { readonly text?: string; readonly appliedTags?: readonly string[] } = {},
+    opts: { readonly text?: string; readonly appliedTags?: readonly string[]; readonly created?: ThreadCreated } = {},
   ): Promise<{ readonly id: string; readonly messageId?: string }> {
     const title = guardText(name).slice(0, 100);
     const text = opts.text === undefined ? undefined : guardText(opts.text);
     if (isForumType(channel.type)) {
       // The starter message holds the first part; longer text continues as messages in the new post.
       const [starter = "", ...more] = splitForDiscord(text ?? name);
-      const thread = await this.call<{ id: string; message?: { id: string } }>(
-        "POST",
-        `/channels/${channel.id}/threads`,
-        {
-          name: title,
-          message: { content: starter, allowed_mentions: { parse: [] } },
-          ...(opts.appliedTags !== undefined ? { applied_tags: opts.appliedTags } : {}),
-        },
-      );
+      const thread = await this.call<DcChannel>("POST", `/channels/${channel.id}/threads`, {
+        name: title,
+        message: { content: starter, allowed_mentions: { parse: [] } },
+        ...(opts.appliedTags !== undefined ? { applied_tags: opts.appliedTags } : {}),
+      });
       responseId(thread, `discord POST /channels/${channel.id}/threads`);
+      if (opts.created) await opts.created(thread);
       if (thread.message !== undefined) responseId(thread.message, `discord forum starter ${thread.id}`);
       if (more.length > 0)
         await this.post(thread.id, more, undefined, thread.message === undefined ? [] : [thread.message.id]);
       return { id: thread.id, ...(thread.message === undefined ? {} : { messageId: thread.message.id }) };
     }
-    const thread = await this.call<{ id: string }>("POST", `/channels/${channel.id}/threads`, {
+    const thread = await this.call<DcChannel>("POST", `/channels/${channel.id}/threads`, {
       name: title,
       type: 11,
     });
     responseId(thread, `discord POST /channels/${channel.id}/threads`);
+    if (opts.created) await opts.created(thread);
     return text === undefined ? { id: thread.id } : { id: thread.id, ...(await this.firstOf(thread.id, text)) };
   }
 
@@ -198,9 +201,10 @@ export class Discord {
     messageId: string,
     name: string,
     text?: string,
+    created?: ThreadCreated,
   ): Promise<{ readonly id: string; readonly messageId?: string }> {
     const guarded = text === undefined ? undefined : guardText(text);
-    const id = await this.startThread(channelId, messageId, name);
+    const id = await this.startThread(channelId, messageId, name, created);
     return guarded === undefined ? { id } : { id, ...(await this.firstOf(id, guarded)) };
   }
 
