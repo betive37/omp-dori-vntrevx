@@ -8,7 +8,7 @@ import type { FlowDeps } from "./done-flow.ts";
 const USAGE = `dori <command> [options]
 
   harness <command> [args...]          dispatch every upstream harness command (up, inbox, duty, review, merge, loop, backlog, migrate...)
-  update <command> [options]           verified releases: check, install, status, rollback [--version TAG] [--from DIST]
+  update <command> [options]           verified releases: check, install, status, rollback, cache [--version TAG] [--from DIST]
   upstream <command> --config FILE     maintainer staging: check, stage, watch, status, snapshot, restore, recover, restart
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
          [--wall-minutes N|none] [--token-limit N|none] [--cost-limit N|none] [--activity-path FILE ...] [--dry-run]
@@ -76,7 +76,8 @@ const USAGE = `dori <command> [options]
                                        print INBOUND lines: Slack unread thread replies / Telegram owner DMs, edits and media + configured topic
                                        the Dori posted in (any helper), DMs and channels with unread mentions
                                        Discord requires DORI_DISCORD_TOKEN, DORI_DISCORD_OWNER_ID and configured channel IDs
-                                       (more channels or threads: DORI_DISCORD_CHANNEL_IDS=a,b; every readable one: DORI_DISCORD_SCOPE=all)
+                                       (more channels or threads: DORI_DISCORD_CHANNEL_IDS=a,b; threads of a watched channel are followed unless
+                                       DORI_DISCORD_THREADS=off; every readable one: DORI_DISCORD_SCOPE=all)
                                        Discord polls every 3 seconds by default; --loop MIN overrides the interval;
                                        --gateway delivers owner messages live with REST backfill and ignores --loop, including 0
                                        --context (Discord) adds INBOUND_CONTEXT: channel, thread, topic and recorded purposes

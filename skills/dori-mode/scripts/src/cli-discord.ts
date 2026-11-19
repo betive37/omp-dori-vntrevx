@@ -6,8 +6,10 @@ import type { GatewayClock, GatewaySocket } from "./messenger/discord-gateway.ts
 import { discordInbound, formatDiscordInbound, formatInboundContext } from "./messenger/discord-inbound.ts";
 import type { Emit } from "./messenger/discord-inbound-api.ts";
 import { discordInboundLive } from "./messenger/discord-inbound-live.ts";
-import { discordInboundEnv, fileDiscordInboundStore } from "./messenger/discord-inbound-state.ts";
+import { discordInboundQueue } from "./messenger/discord-inbound-queue.ts";
+import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
+import { recordOwes } from "./owes.ts";
 import { realClock } from "./run.ts";
 
 export const openDiscordSocket = (url: string): GatewaySocket => {
@@ -49,8 +51,8 @@ const idList = (value: string | undefined): string[] =>
     .filter((id) => id !== "");
 
 /**
- * Channels come from DORI_DISCORD_CHANNEL_ID, DORI_DISCORD_CHANNEL_IDS (comma separated) and DORI_DISCORD_SCOPE=all.
- * `context` adds an INBOUND_CONTEXT record (channel, thread, topic, recorded purposes) to each message's group.
+ * Configured parents follow active threads unless DORI_DISCORD_THREADS=off; scope all keeps its own discovery.
+ * `context` adds the channel, thread, topic and recorded purposes to each single stdout group.
  */
 export const discordInboundCommand = async (
   stateDir: string,
@@ -63,29 +65,45 @@ export const discordInboundCommand = async (
   const scope = env["DORI_DISCORD_SCOPE"]?.trim();
   if (scope !== undefined && scope !== "" && scope !== "all") die("DORI_DISCORD_SCOPE must be all or unset");
   const all = scope === "all";
+  const setting = env["DORI_DISCORD_THREADS"]?.trim().toLowerCase();
+  if (setting !== undefined && setting !== "" && setting !== "off" && setting !== "on")
+    die("DORI_DISCORD_THREADS must be on, off or unset");
+  const threads = setting !== "off";
   const channelIds = ["DORI_DISCORD_CHANNEL_ID", "DORI_DISCORD_CHANNEL_IDS"].flatMap((name) =>
     idList(env[name]).map((id) => discordInboundEnv(name, id)),
   );
   if (!all && channelIds.length === 0) discordInboundEnv("DORI_DISCORD_CHANNEL_ID", env["DORI_DISCORD_CHANNEL_ID"]);
   const token = env["DORI_DISCORD_TOKEN"] || die("DORI_DISCORD_TOKEN is not set");
-  const discord = new Discord(fetchHttp, realClock, token);
-  const intake = await discordInbound(discord, (channelId) => fileDiscordInboundStore(stateDir, channelId), {
-    ownerId,
-    channelIds: [...new Set(channelIds)],
-    all,
-  });
-  const watching = all ? "all" : intake.channels().join(",");
-  const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
-  // The whole group, context included, is one write before the cursor moves past the message.
-  const emit: Emit = where
-    ? async (message) => {
-        const context = await where(message.channel);
-        console.log(`${formatDiscordInbound(message)}\n${formatInboundContext(message, context)}`);
-      }
-    : (message) => console.log(formatDiscordInbound(message));
-  console.log(
-    `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
-  );
-  if (!gateway) return await every(pollMinutes, () => intake.poll(emit));
-  await untilStopped(discordInboundLive(intake, openDiscordSocket, token, discordClock, emit, (l) => console.log(l)));
+  const queue = discordInboundQueue(stateDir);
+  try {
+    if (!gateway && queue.first())
+      die("Discord inbound has pending Gateway work; restart with --gateway before REST mode");
+    const discord = new Discord(fetchHttp, realClock, token);
+    const intake = await discordInbound(discord, queue.storeFor, {
+      ownerId,
+      channelIds: [...new Set(channelIds)],
+      all,
+      threads,
+    });
+    const watching = all ? "all" : intake.channels().join(",");
+    const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
+    // Context and the owner line remain one stdout group, after the owe is published.
+    const emit: Emit = async (message, signal) => {
+      const text = where
+        ? `${formatDiscordInbound(message)}\n${formatInboundContext(message, await where(message.channel))}`
+        : formatDiscordInbound(message);
+      await recordOwes(stateDir, text, Date.now(), signal);
+      signal?.throwIfAborted();
+      console.log(text);
+    };
+    console.log(
+      `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
+    );
+    if (!gateway) return await every(pollMinutes, () => intake.poll(emit));
+    await untilStopped(
+      discordInboundLive(intake, openDiscordSocket, token, discordClock, emit, (l) => console.log(l), queue),
+    );
+  } finally {
+    queue.close();
+  }
 };
