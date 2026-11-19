@@ -5,7 +5,7 @@ import { object } from "../src/update/config.ts";
 import { type GitHubReads, verifyMainCi } from "../src/update/github-ci.ts";
 import { githubApi, githubPages } from "./release-process.ts";
 
-export const RELEASE_REPOSITORY = "vntrevx/omp-dori";
+export const RELEASE_REPOSITORY = "vntrevx/Cataly";
 
 function record(value: unknown): Record<string, unknown> {
   if (!object(value)) throw new Error("GitHub release gate response is incomplete");
