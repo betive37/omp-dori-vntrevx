@@ -1,9 +1,17 @@
 import { expect, test } from "bun:test";
-import { parseArgs } from "@oh-my-pi/pi-coding-agent/cli/args";
-import { STRING_VALUE_FLAGS, VALUELESS_FLAGS } from "@oh-my-pi/pi-coding-agent/cli/flag-tables";
+import { resolve } from "node:path";
+import type * as NativeArgs from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/cli/args.d.ts";
+import type * as NativeFlags from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/cli/flag-tables.d.ts";
 import { classifyOmpArgv } from "../../src/runtime/omp-argv.ts";
 import { NATIVE_BOOLEAN_FLAGS, NATIVE_VALUE_FLAGS } from "../../src/update/native-argv.ts";
 import { modelLaunchCommand, modelLaunchProblem } from "../../skills/dori-mode/scripts/src/launch-model.ts";
+
+// CI has no extension peer: exercise the frozen host module boundary instead of an ambient package import.
+const host = resolve(import.meta.dir, "../../test/fixtures/omp-native-host");
+const { parseArgs }: typeof NativeArgs = await import(Bun.resolveSync("@oh-my-pi/pi-coding-agent/cli/args", host));
+const { STRING_VALUE_FLAGS, VALUELESS_FLAGS }: typeof NativeFlags = await import(
+  Bun.resolveSync("@oh-my-pi/pi-coding-agent/cli/flag-tables", host)
+);
 
 const source = "/fixture/packages/coding-agent/";
 const prefixes = [
