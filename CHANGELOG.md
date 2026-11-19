@@ -3,6 +3,15 @@
 ## Unreleased
 
 - Native Discord head admission records the original source, target process and attempt in the existing SQLite FIFO before dispatch, and requires an on-disk native receipt before cursor movement. Lost acknowledgements reconcile without redelivery; unresolved attempts fence all cursor and FIFO movement, including REST history changes and standalone restarts. Explicit `inbound-abandon` recovery requires a stopped original head and an operator reason, retains the source and audit receipt, and never resends. Native admission is not model completion or approval.
+
+- Reuse an already-published ULW candidate after unrelated main changes only after verifying its canonical PR, accepted parent and exact metadata-only tree. Preserve closed decisions and exact-head CI deduplication without rewriting branches or repeating Git object uploads.
+
+- Follow the canonical `vntrevx/Cataly` repository identity in the ULW/release workflow guards and their shared publisher/release checks. The exact repository, tag, commit, workflow and trusted check bindings remain enforced; forks and the former identity are refused.
+
+- Schedule the ULW candidate workflow for 03:00 UTC (12:00 KST) daily, retaining manual dispatch and fail-closed publication. Preparation errors name conflicting paths without executing upstream code.
+
+- Port the bound ULW overlay to `6ec7ecd40b2b5667f37c9802999db1d12ebbc2ae`: preserve upstream GPT-6.2 Astra/Sol standalone prompts alongside the retained DeepSeek profiles, Claude routing and native-host adaptations. Regenerate authenticated patch/tree/postimage identities; reviewed source does not by itself publish a release or update existing installations.
+
 - Discord REST clients accept an optional `DORI_DISCORD_API_BASE` for isolated loopback HTTP tests, retaining the production endpoint by default. Path prefixes are normalized, and credentials, query strings, fragments and non-loopback origins are rejected without exposing the configured value.
 
 - Discord owner intake now follows active threads whose parent is a watched channel, so an owner reply posted in a thread of the intake channel is received without listing the thread ID. Threads are listed at startup and refreshed every tenth REST poll and on every Gateway READY/RESUMED, live dispatches are matched through one cached channel lookup, a channel counts as a thread only for Discord's thread channel types (a text channel's `parent_id` names its category), threads of unwatched channels stay outside intake, an unreadable thread is skipped like scope-all discovery, and an archived thread keeps its cursor for a later reactivation. A thread first seen after startup starts at its own creation, never before the parent's startup position. `DORI_DISCORD_THREADS=off` restores channel-only intake.
