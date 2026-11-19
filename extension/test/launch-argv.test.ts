@@ -4,7 +4,11 @@ import type * as NativeArgs from "../../test/fixtures/omp-native-host/node_modul
 import type * as NativeFlags from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/cli/flag-tables.d.ts";
 import { classifyOmpArgv } from "../../src/runtime/omp-argv.ts";
 import { NATIVE_BOOLEAN_FLAGS, NATIVE_VALUE_FLAGS } from "../../src/update/native-argv.ts";
-import { modelLaunchCommand, modelLaunchProblem } from "../../skills/dori-mode/scripts/src/launch-model.ts";
+import {
+  modelLaunchCommand,
+  modelLaunchProblem,
+  modelResumeCommand,
+} from "../../skills/dori-mode/scripts/src/launch-model.ts";
 
 // CI has no extension peer: exercise the frozen host module boundary instead of an ambient package import.
 const host = resolve(import.meta.dir, "../../test/fixtures/omp-native-host");
@@ -32,6 +36,59 @@ const prefixes = [
     `${source}scripts/../src/cli.ts`,
   ],
 ];
+
+test.each(prefixes.map((prefix) => [prefix.join(" "), prefix] as const))(
+  "native resume through %s keeps its saved model and effort authoritative",
+  (_name, prefix) => {
+    const file = "/fixture/saved-session.jsonl";
+    const command = modelResumeCommand(
+      [
+        ...prefix,
+        "--dori-role",
+        "lane",
+        "--model",
+        "{model}",
+        "--model=provider/new-default",
+        "--provider",
+        "new-provider",
+        "--thinking=high",
+        "--thinking",
+        "low",
+        "--plan=provider/plan",
+        "--append-system-prompt",
+        "--model=literal-not-a-selector",
+        "--owner-option",
+        "",
+        "--no-pty",
+        "--",
+        "{prompt}",
+      ],
+      file,
+    );
+    if (typeof command === "string") throw new Error(command);
+    expect(command.slice(0, prefix.length)).toEqual(prefix);
+    expect(command).toContain("--append-system-prompt=--model=literal-not-a-selector");
+    const classified = classifyOmpArgv(command);
+    if (classified.kind !== "omp") throw new Error("native resume command was lost");
+    const parsed = parseArgs(
+      [...classified.command.slice(classified.argsAt)],
+      new Map([
+        ["dori-role", { type: "string" as const }],
+        ["owner-option", { type: "string" as const }],
+      ]),
+    );
+    expect(parsed.resume).toBe(file);
+    expect(parsed.model).toBeUndefined();
+    expect(parsed.provider).toBeUndefined();
+    expect(parsed.thinking).toBeUndefined();
+    expect(parsed.plan).toBe("provider/plan");
+    expect(parsed.noPty).toBe(true);
+    expect(parsed.unknownFlags.get("owner-option")).toBe("");
+    expect(parsed.unknownFlags.has("dori-launch-model")).toBe(false);
+    expect(parsed.messages).toEqual([]);
+    expect(parsed.fileArgs).toEqual([]);
+  },
+);
 
 test("the shared native value table matches the pinned parser", () => {
   expect(Object.keys(NATIVE_VALUE_FLAGS).sort()).toEqual([...STRING_VALUE_FLAGS].sort());

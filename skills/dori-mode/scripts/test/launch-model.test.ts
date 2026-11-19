@@ -4,6 +4,7 @@ import { join } from "node:path";
 import type { PaneState } from "../src/lane-state.ts";
 import { launchLane } from "../src/launch.ts";
 import { modelLaunchCommand, modelLaunchProblem } from "../src/launch-model.ts";
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, sent, withState, type TestState } from "./fakes.ts";
 
 let state: TestState;
@@ -12,7 +13,12 @@ beforeEach(() => {
 });
 afterEach(() => state.done());
 
-const launch = async (model: string, patch: Partial<PaneState> = {}, launchKeywords?: string) => {
+const launch = async (
+  model: string,
+  patch: Partial<PaneState> = {},
+  options: { launchKeywords?: string; snapshot?: boolean } = {},
+) => {
+  const { launchKeywords } = options;
   const world = newWorld();
   const clock = fakeClock(Date.parse("2026-01-01T12:00:00.000Z"));
   const brief = join(state.dir, "brief.md");
@@ -44,6 +50,19 @@ const launch = async (model: string, patch: Partial<PaneState> = {}, launchKeywo
           out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }),
           err: "",
         };
+      if (argv[0] === "herdr" && argv[2] === "run") {
+        const lane = await base.registry.read("model-gate");
+        if (!lane?.modelProfileFile) throw new Error("launch fixture missing its allocated model profile");
+        const observed = patch.modelReadback?.observed;
+        laneState(state.dir, "w:p9", {
+          agentStatus: "idle",
+          modelProfileFile: lane.modelProfileFile,
+          ...(observed && options.snapshot !== false
+            ? { modelSnapshot: snapshotFor(`${observed.provider}/${observed.id}`, model) }
+            : {}),
+          ...patch,
+        });
+      }
       return base.run(argv);
     },
   };
@@ -76,6 +95,12 @@ const matched = {
 test("an exact live readback delivers once after starting without the brief", async () => {
   const { result, world } = await launch("subscription/exact", { modelReadback: matched });
   expect(result.startup).toBe("STARTUP_OK model-gate w:p9");
+  expect(result.lane.model).toBe("subscription/exact");
+  expect(result.lane.modelSnapshot).toMatchObject({
+    model: matched.observed,
+    provenance: { kind: "launch", requested: "subscription/exact" },
+  });
+  expect(result.lane.modelProfileFile).toContain("model-profiles/");
   expect(sent(world)).toHaveLength(1);
   expect(sent(world)[0]).toContain("Read and execute");
   const command = world.calls.find((argv) => argv[2] === "run")?.at(-1);
@@ -93,7 +118,11 @@ test("native case-insensitive exact readback is accepted without changing the re
 });
 
 test("unsafe typed launch text is held without a send or an unhandled delivery error", async () => {
-  const { result, world } = await launch("subscription/exact", { modelReadback: matched }, "ulw $(work)");
+  const { result, world } = await launch(
+    "subscription/exact",
+    { modelReadback: matched },
+    { launchKeywords: "ulw $(work)" },
+  );
   expect(result.startup).toStartWith("STARTUP_MODEL_HOLD");
   expect(result.startup).toContain("refusing to send text");
   expect(sent(world)).toEqual([]);
@@ -107,6 +136,25 @@ test("mismatch, unavailable, stale and foreign-provider evidence never dispatche
     { ...matched, checkedAt: "2025-12-31T12:00:00.000Z" },
   ]) {
     const { result, world } = await launch("subscription/exact", { modelReadback: patch });
+    expect(result.startup).toStartWith("STARTUP_MODEL_HOLD");
+    expect(sent(world)).toEqual([]);
+    state.done();
+    state = withState();
+  }
+});
+
+test("matched identity alone cannot dispatch without its process-bound snapshot", async () => {
+  for (const patch of [
+    null,
+    { modelProfileFile: "/another/process.json" },
+    { modelSnapshotError: "native profile drift" },
+    { modelSnapshot: snapshotFor("subscription/other") },
+  ]) {
+    const { result, world } = await launch(
+      "subscription/exact",
+      { modelReadback: matched, ...patch },
+      { snapshot: patch !== null },
+    );
     expect(result.startup).toStartWith("STARTUP_MODEL_HOLD");
     expect(sent(world)).toEqual([]);
     state.done();

@@ -1,5 +1,10 @@
+import { removePrepared } from "./launch-session.ts";
+import type { SessionRef } from "../../../../src/runtime/types.ts";
+import { createModelProfileFile } from "./model-profile.ts";
+import type { ModelReadback, ModelSnapshot } from "./lane-state.ts";
 import { mayRunOmpArgv } from "../../../../src/runtime/omp-argv.ts";
-import { configPath, fill } from "./config.ts";
+import { configPath } from "./config.ts";
+import { modelResumeCommand, verifiedModelSnapshot } from "./launch-model.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import { type FlowDeps, movedOn } from "./done-flow.ts";
 import { quoteForPane } from "./launch-footer.ts";
@@ -28,6 +33,8 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       template.slice(0, -1).some((p) => p.includes("{prompt}") || /^--(?:resume|session|continue)(?:=|$)/.test(p))
     )
       throw new LaunchError("reopen requires agentCommand ending in a positional {prompt}, without session selectors");
+    const argv = modelResumeCommand(template, file);
+    if (typeof argv === "string") throw new LaunchError(argv);
     const rts = runtimesOf(deps);
     const oldRef = sessionOf(lane);
     for (const entry of await listSessions(rts, { lanes: [lane] })) {
@@ -41,14 +48,22 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       }
     }
     const env = laneLaunchEnv(deps.env ?? process.env, deps.env?.["DORI_CONFIG"] ?? configPath(), deps.config);
-    const ref = await rts.default.create({
-      name: lane.key,
-      role: "lane",
-      container: "tab",
-      cwd: lane.cwd ?? deps.config.defaultCwd,
-      env,
-      ...(deps.config.laneWorkspace ? { group: deps.config.laneWorkspace } : {}),
-    });
+    const profileFile = createModelProfileFile(deps.config.stateDir);
+    argv.push(`--config=${profileFile}`);
+    let ref: SessionRef;
+    try {
+      ref = await rts.default.create({
+        name: lane.key,
+        role: "lane",
+        container: "tab",
+        cwd: lane.cwd ?? deps.config.defaultCwd,
+        env,
+        ...(deps.config.laneWorkspace ? { group: deps.config.laneWorkspace } : {}),
+      });
+    } catch (error) {
+      removePrepared(profileFile);
+      throw error;
+    }
     const at = iso(deps.clock);
     const opened = await deps.registry.transition(lane, (current) => {
       const {
@@ -65,6 +80,7 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       return withStatus(rest, "paused", `reopening: ${note ?? "explicit operator request"}`, at, {
         ...sessionFields(ref),
         sessionFile: file,
+        modelProfileFile: profileFile,
         openedAt: at,
         pausedFrom: "working",
         lastReplyAt: deps.clock.now(),
@@ -74,6 +90,7 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
     });
     if (!opened) {
       await rts.for(ref).close(ref, "session");
+      removePrepared(profileFile);
       return fail(await movedOn(deps, lane, "reopen"));
     }
     // The new paused generation exists even if startup/readback fails and the operator later uses resume.
@@ -83,10 +100,6 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       at,
       text: `lane reopening in ${ref.id}`,
     });
-    const argv = [
-      ...fill(template.slice(0, -1), { model: lane.model ?? deps.config.defaultModel }),
-      `--resume=${file}`,
-    ];
     try {
       await rts.for(ref).start(ref, argv.map(quoteForPane).join(" "));
     } catch (error) {
@@ -97,27 +110,44 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
     }
     // Never resume a foreign/new session or treat an unknown receipt as an idle agent.
     const attempts = Math.max(1, Math.ceil(deps.config.startupWaitSeconds));
-    let ready = false;
+    let ready: { snapshot: ModelSnapshot; readback: ModelReadback } | undefined;
+    let modelProblem = "native model snapshot not observed";
     for (let n = 0; n < attempts; n++) {
       const state = await trustedPaneState(deps.run, deps.config.stateDir, ref, rts);
       if (
         state &&
+        state.modelReadback &&
         state.sessionId === lane.session &&
+        state.sessionFile === file &&
         state.role === "lane" &&
+        state.agentStatus === "idle" &&
         !state.approvalPending &&
         ["paused", "none", "complete", "dropped"].includes(state.goal.status)
       ) {
-        ready = true;
-        break;
+        const snapshot = verifiedModelSnapshot(state, profileFile);
+        if (typeof snapshot !== "string") {
+          ready = { snapshot, readback: state.modelReadback };
+          break;
+        }
+        modelProblem = snapshot;
+        if (state.modelSnapshotError) break;
       }
       await deps.clock.sleep(1000);
     }
     if (!ready)
       return fail(
-        `REOPEN_UNVERIFIED ${lane.key}: same paused session not confirmed in ${ref.id}; inspect before resume`,
+        `REOPEN_UNVERIFIED ${lane.key}: same paused session and saved model not confirmed in ${ref.id} (${modelProblem}); inspect before resume`,
         opened,
       );
-    const resumed = await resumeLane(deps, opened, note ?? "explicit reopen", true);
+    const { snapshot, readback } = ready;
+    const confirmed = await deps.registry.transition(opened, (current) => ({
+      ...current,
+      model: `${snapshot.model.provider}/${snapshot.model.id}`,
+      modelReadback: readback,
+      modelSnapshot: snapshot,
+    }));
+    if (!confirmed) return fail(await movedOn(deps, opened, "reopen model readback"), opened);
+    const resumed = await resumeLane(deps, confirmed, note ?? "explicit reopen", true);
     if (resumed.code !== 0) return resumed;
     const delivery = note ? await sendVerified(rts, deps.clock, ref, `[LEAD] ${note}`) : undefined;
     return {

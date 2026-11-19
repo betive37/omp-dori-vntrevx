@@ -5,6 +5,7 @@ import { loadConfig } from "../skills/dori-mode/scripts/src/config.ts";
 import { exactModelIdentity } from "../skills/dori-mode/scripts/src/lane-state.ts";
 import { launchLane } from "../skills/dori-mode/scripts/src/launch.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld } from "../skills/dori-mode/scripts/test/fakes.ts";
+import { snapshotFor } from "../skills/dori-mode/scripts/test/model-snapshot-fixture.ts";
 import { recordingOmp } from "./terminal-context-setup.ts";
 import { expectContext, managedTerminal } from "./terminal-managed-setup.ts";
 
@@ -54,7 +55,11 @@ for (const runtime of ["herdr", "hc"] as const) {
             const id = runtime === "herdr" ? args[2]! : args[1]!;
             const status = starting ? "idle" : "working";
             if (starting) agentIn(native, id, 101);
+            const modelProfileFile = (await base.registry.read("skill-transport"))?.modelProfileFile;
+            if (!modelProfileFile) throw new Error("recording transport missing allocated native profile");
             laneState(config.stateDir, id, {
+              modelProfileFile,
+              modelSnapshot: snapshotFor(config.defaultModel),
               pid: 101,
               cwd: f.cwd,
               agentStatus: status,
@@ -99,8 +104,15 @@ for (const runtime of ["herdr", "hc"] as const) {
           DORI_OMP_ULW_PATH: external ? customUlw : f.expected.DORI_OMP_ULW_PATH,
         });
         if (external) {
-          expect(child.argv).toEqual([custom, `--dori-launch-model=${config.defaultModel}`, "--owner-option", ""]);
+          expect(child.argv).toEqual([
+            custom,
+            `--dori-launch-model=${config.defaultModel}`,
+            "--owner-option",
+            "",
+            `--config=${result.lane.modelProfileFile}`,
+          ]);
           expect(child.argv).not.toContain("--config");
+          expect(child.argv).not.toContain(`--config=${f.toolchain.nativeConfig}`);
           expect(config.agentCommand[0]).toBe(custom);
           expect(config.ompUlwPath).toBe(customUlw);
         } else {
@@ -114,6 +126,7 @@ for (const runtime of ["herdr", "hc"] as const) {
             "",
             "--dori-role=lane",
             `--model=${config.defaultModel}`,
+            `--config=${result.lane.modelProfileFile}`,
           ]);
         }
         expect(child.argv.some((arg) => arg.includes(f.brief))).toBe(false);

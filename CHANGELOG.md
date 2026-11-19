@@ -198,3 +198,4 @@ The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, pu
 
 - Verify exact native provider/model readback before delivering readable interactive lane launches; preserve opaque and non-interactive launch compatibility with unavailable provenance and opt-in strict rejection (comparison F01).
 - Unreleased: add explicit lane parking, exact-session reopening, abandonment receipts and a read-only hold ledger; preserve worktrees and ordinary Done verification.
+- Freeze each verified lane's native model and full role/thinking profile across reopen; permit new snapshots only through an explicit head-authorized idle model change, without retargeting other sessions or global defaults (comparison F02).

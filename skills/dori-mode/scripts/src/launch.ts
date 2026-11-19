@@ -138,6 +138,7 @@ const startLane = async (
   } catch (e) {
     throw e instanceof TokenFileError ? new LaunchError(`token file refused: ${e.message}`) : e;
   }
+  const ompAgent = mayRunOmpArgv(deps.config.agentCommand);
   const spec = { name: input.key, role: "lane", container: "tab", cwd, env } as const;
   const opened = await openLaneSession(
     deps.registry,
@@ -146,13 +147,15 @@ const startLane = async (
     draft,
     input.brief,
     preamble,
+    ompAgent && draft.modelReadback?.source !== "launch-preflight" ? deps.config.stateDir : undefined,
   );
   if (opened.kind === "failed") {
     const why = opened.error instanceof Error ? opened.error.message : String(opened.error);
     throw new LaunchError(`${opened.what}: ${why}`);
   }
   if (opened.kind === "taken") throw new LaunchError(`lane ${input.key} is already registered`);
-  const { lane, ref } = opened;
+  const { ref } = opened;
+  let lane = opened.lane;
   const pane = ref.id;
   // The launch is an activity record, not a report: it starts the journal (so the screen is watched for a stall) but is
   // never posted to the thread as if the agent had reported.
@@ -166,8 +169,8 @@ const startLane = async (
   const prompt = `${deps.config.launchKeywords}. Read and execute the lane brief at ${input.brief} in full. You are the ${input.key} lane; report as the brief's footer says.`;
   // The session can be written while start is still returning; its goal must belong to this invocation.
   const launchedAt = deps.clock.now();
-  const ompAgent = mayRunOmpArgv(deps.config.agentCommand);
   const command = modelLaunchCommand(deps.config.agentCommand, model, prompt);
+  if (lane.modelProfileFile) command.push(`--config=${lane.modelProfileFile}`);
   try {
     await rts.for(ref).start(ref, command.map(quoteForPane).join(" "));
   } catch (e) {
@@ -201,8 +204,10 @@ const startLane = async (
     let briefDelivered = !ompAgent || lane.modelReadback?.source === "launch-preflight";
     for (let check = 0; !briefDelivered || !ready(current) || (marker && !(await hasGoal(shown))); check++) {
       if (!briefDelivered && ready(current)) {
-        const hold = await deliverModelBrief(deps, ref, model, prompt, launchedAt);
-        if (hold) return { lane, startup: `STARTUP_MODEL_HOLD ${input.key} ${pane}: ${hold}` };
+        const delivered = await deliverModelBrief(deps, lane, ref, model, prompt, launchedAt);
+        if (typeof delivered === "string")
+          return { lane, startup: `STARTUP_MODEL_HOLD ${input.key} ${pane}: ${delivered}` };
+        lane = delivered;
         briefDelivered = true;
         if (!marker || (await hasGoal(shown))) break;
       }

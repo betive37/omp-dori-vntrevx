@@ -4,7 +4,8 @@ import { basename, join } from "node:path";
 import type { SessionRef } from "../../../../src/runtime/types.ts";
 import { takeLock } from "./checkpoint-lock.ts";
 import type { BudgetLimits } from "./supervision-observe.ts";
-import type { ModelReadback } from "./lane-state.ts";
+import type { ModelReadback, ModelSnapshot } from "./lane-state.ts";
+import type { ModelSwitchRequest } from "./model-switch-state.ts";
 // A writer holds a lane's lock for one synchronous read and write, so a short wait covers any live contention.
 const LOCK_WAIT_MS = 5_000;
 const LOCK_RETRY_MS = 10;
@@ -38,6 +39,10 @@ export type Lane = {
   readonly cwd?: string;
   readonly model?: string;
   readonly modelReadback?: ModelReadback;
+  readonly modelSnapshot?: ModelSnapshot;
+  readonly modelProfileFile?: string;
+  /** The head's one pending lane-model request; validated where read, cleared only by its nonce. */
+  readonly modelSwitchRequest?: ModelSwitchRequest;
   readonly worktrees?: readonly string[];
   readonly status?: LaneStatus;
   readonly claim?: Claim;
@@ -121,10 +126,7 @@ export class Registry {
     return this.readNow(key);
   }
 
-  /**
-   * Runs `fn` under the lane's writer lock. `fn` is synchronous, so the lock is held for one read and one write and
-   * never across pane, git or network I/O. Another writer's lock is waited out; a dead or stale one is taken over.
-   */
+  /** One synchronous read/write under the lane lock; wait for live holders, take over dead or stale ones. */
   private async locked<T>(key: string, fn: () => T): Promise<T> {
     mkdirSync(this.dir, { recursive: true });
     const lock = `${this.path(key)}.lock`;
@@ -177,10 +179,7 @@ export class Registry {
     });
   }
 
-  /**
-   * Read-modify-write of one lane under its lock: `fn` gets the stored lane (or null) and returns the lane to store, or
-   * null to leave it. A lane held across I/O is changed here, never written back whole, so a change meanwhile is kept.
-   */
+  /** Atomic read-modify-write after I/O: read the latest lane (or null); return null to preserve it unchanged. */
   update(key: string, fn: (current: Lane | null) => Lane | null): Promise<Lane | null> {
     return this.locked(key, () => {
       const next = fn(this.readNow(key));
@@ -193,7 +192,7 @@ export class Registry {
    * A change decided from `seen`, applied only while the stored lane has `seen`'s status generation (else null): a later
    * claim, objection, pause or close, even a second objection to a not-done lane, is never overwritten.
    */
-  transition(seen: Lane, next: (current: Lane) => Lane): Promise<Lane | null> {
+  transition(seen: Lane, next: (current: Lane) => Lane | null): Promise<Lane | null> {
     return this.update(seen.key, (current) =>
       current && generation(current) === generation(seen) ? next(current) : null,
     );

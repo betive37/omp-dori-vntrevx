@@ -18,10 +18,11 @@ const start = async (key: string, patch: Partial<PaneState> = {}, options: OmpLa
 };
 
 test("OMP startup reads its own live goal and session launch prompt even when the footer is truncated", async () => {
-  expect((await start("active-lane")).startup).toBe("STARTUP_OK active-lane w:p9");
+  const active = await start("active-lane");
+  expect(active.startup).toBe("STARTUP_OK active-lane w:p9");
   const command = world.calls.find((argv) => argv[2] === "run")?.at(-1) ?? "";
   expect(command).toBe(
-    "omp --dori-launch-model=anthropic/claude-opus-5-5 --dori-role=lane --model=anthropic/claude-opus-5-5",
+    `omp --dori-launch-model=anthropic/claude-opus-5-5 --dori-role=lane --model=anthropic/claude-opus-5-5 --config=${active.lane.modelProfileFile}`,
   );
   expect(command).not.toContain("ulw set goal and work");
   expect(world.calls.filter((argv) => argv[2] === "send-text")).toHaveLength(1);

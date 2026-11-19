@@ -1,7 +1,9 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { FlowDeps } from "../src/done-flow.ts";
-import { readPaneState } from "../src/lane-state.ts";
+import { readPaneState, type PaneState } from "../src/lane-state.ts";
+import { createModelProfileFile } from "../src/model-profile.ts";
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import type { Lane } from "../src/registry.ts";
 import { sessionDirFor } from "../src/session-id.ts";
 import { agentIn, depsFor, fakeClock, laneState, newWorld, withState, type TestState, type World } from "./fakes.ts";
@@ -29,7 +31,28 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
   const dir = sessionDirFor(sessionsDir, cwd);
   mkdirSync(dir, { recursive: true });
   const file = join(dir, `2026-01-01T12-00-00-000Z_${session}.jsonl`);
-  writeFileSync(file, `${JSON.stringify({ type: "session", id: session, cwd })}\n`);
+  const snapshot = snapshotFor("fixture/saved");
+  const initialProfile = createModelProfileFile(state.dir);
+  const nativeModel = {
+    modelSnapshot: snapshot,
+    modelReadback: {
+      requested: snapshot.model,
+      observed: snapshot.model,
+      status: "matched",
+      billing: "unknown",
+      source: "native-extension",
+      checkedAt: snapshot.capturedAt,
+    },
+  } satisfies Partial<PaneState>;
+  writeFileSync(
+    file,
+    `${[
+      { type: "session", id: session, cwd },
+      { type: "custom", customType: "omp-dori:model-snapshot", data: snapshot },
+    ]
+      .map((entry) => JSON.stringify(entry))
+      .join("\n")}\n`,
+  );
   const lane: Lane = {
     key: "lifecycle-lane",
     title: "lifecycle",
@@ -40,14 +63,24 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
     cwd,
     done: "merged acme/app#1",
     openedAt: "2026-01-01T12:00:00.000Z",
+    modelProfileFile: initialProfile,
+    ...nativeModel,
   };
-  const attach = (pane: string, goal: "active" | "paused", pid: number) => {
+  const attach = (pane: string, goal: "active" | "paused", pid: number, modelProfileFile: string) => {
     world.panes = world.panes.filter((p) => p.pane_id !== pane);
     world.panes.push({ pane_id: pane, workspace_id: "w1", agent: "omp", agent_status: "idle" });
     agentIn(world, pane, pid);
-    laneState(state.dir, pane, { cwd, pid, sessionFile: file, goal: { status: goal } });
+    laneState(state.dir, pane, {
+      cwd,
+      pid,
+      sessionFile: file,
+      goal: { status: goal },
+      agentStatus: "idle",
+      modelProfileFile,
+      ...nativeModel,
+    });
   };
-  attach("w1:p7", "active", 4242);
+  attach("w1:p7", "active", 4242, initialProfile);
   world.onSendText = (id, text) => {
     const current = readPaneState(state.dir, id);
     if (current && (text === "/goal pause" || text === "/goal resume"))
@@ -87,7 +120,9 @@ export const lifecycleFixture = async (): Promise<LifecycleFixture> => {
       }
       if (argv[0] === "herdr" && argv[1] === "pane" && argv[2] === "run") {
         if (startFails) return { code: 1, out: "", err: "agent start failed" };
-        attach("w1:p8", "paused", 4250);
+        const opened = await deps.registry.read(lane.key);
+        if (!opened?.modelProfileFile) throw new Error("reopen fixture missing allocated profile");
+        attach("w1:p8", "paused", 4250, opened.modelProfileFile);
         if (wrongSession)
           laneState(state.dir, "w1:p8", { cwd, pid: 4250, sessionId: "foreign", goal: { status: "paused" } });
       }

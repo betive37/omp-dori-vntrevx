@@ -5,6 +5,7 @@ import { withDeliveryLock } from "./delivery-lock.ts";
 import { type FlowDeps, movedOn } from "./done-flow.ts";
 import type { GoalStatus, PaneState } from "./lane-state.ts";
 import { trustedPaneState } from "./session-id.ts";
+import { verifiedModelSnapshot } from "./launch-model.ts";
 import { runtimesOf } from "./run.ts";
 import { readScreen, sendVerified, statusLookup } from "./sessions.ts";
 import { type Lane, type LaneStatus, sessionOf, statusOf, withStatus } from "./registry.ts";
@@ -36,7 +37,12 @@ const goalCommand = async (
   target: GoalStatus,
   lane: Lane,
 ): Promise<
-  "confirmed" | "unconfirmed" | "failed" | "identity unverified before send" | "identity changed during readback"
+  | "confirmed"
+  | "unconfirmed"
+  | "failed"
+  | "identity unverified before send"
+  | "identity changed during readback"
+  | "native model snapshot unverified"
 > => {
   const rts = runtimesOf(deps);
   const omp = mayRunOmpArgv(deps.config.agentCommand);
@@ -48,8 +54,17 @@ const goalCommand = async (
       return false;
     }
   };
-  if (omp && lane.session && !sameSession(await trustedPaneState(deps.run, deps.config.stateDir, ref, rts)))
-    return "identity unverified before send";
+  if (omp) {
+    const state = await trustedPaneState(deps.run, deps.config.stateDir, ref, rts);
+    if (lane.session && !sameSession(state)) return "identity unverified before send";
+    const profileFile = lane.modelProfileFile ?? state?.modelProfileFile;
+    if (
+      target === "active" &&
+      (profileFile || lane.modelReadback?.source !== "launch-preflight") &&
+      (!profileFile || !state || state.role !== "lane" || typeof verifiedModelSnapshot(state, profileFile) === "string")
+    )
+      return "native model snapshot unverified";
+  }
   const shown = omp ? NO_GOAL_SHOWN : target === "paused" ? PAUSED_SHOWN : RESUMED_SHOWN;
   const before = count(await readScreen(rts, ref, 200), shown);
   if ((await sendVerified(rts, deps.clock, ref, text)) === "failed") return "failed";
@@ -139,7 +154,16 @@ export const resumeLane = async (deps: FlowDeps, lane: Lane, note: string, locke
     return { lane, lines: [`RESUME_UNVERIFIED ${lane.key} has no pane, so its goal cannot be resumed`], code: 3 };
   const goal = await goalCommand(deps, ref, "/goal resume", "active", lane);
   if (goal !== "confirmed")
-    return { lane, lines: [`RESUME_UNVERIFIED ${lane.key} /goal resume ${goal}; lane left paused`], code: 3 };
+    return {
+      lane,
+      code: 3,
+      lines: [
+        `RESUME_UNVERIFIED ${lane.key} /goal resume ${goal}; lane left paused`,
+        ...(goal === "native model snapshot unverified"
+          ? ["Fix: park/reopen the lane, then select its model explicitly with /dori-lane-model before resuming"]
+          : []),
+      ],
+    };
   const now = deps.clock.now();
   // Quiet time starts again at the resume: a long pause must not turn into an instant nudge.
   const resumed = await deps.registry.transition(lane, (current) =>
