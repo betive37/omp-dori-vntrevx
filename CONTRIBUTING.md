@@ -171,6 +171,10 @@ Dori or lane roles, including direct dispatch, while ordinary sessions still
 reach the local provider. These tests neither use real provider credentials nor
 establish live TUI, messenger, provider, or external-user behavior.
 
+`native-prompt-matrix.test.ts` adds 30 scenario/load-order cases (plus native parent setup and an orphan-role control) using the pinned native `buildSystemPrompt`, canonical loader and `ExtensionRunner` in an isolated Bun child. Normal, ULW, specialized, parent, child, Dori, non-Sol, profile-excluded and user-profile cases run with embedded ULW and both standalone load orders. The same combined prompt is checked across repeat turns and the real `SessionManager` compaction-entry / `session_compact` hook boundary. Child tool restrictions, inactive-tool exclusion and downstream context must survive together. A profile opt-out preserves the native profile byte-for-byte; Dori's independent Sol lane bookkeeping remains applicable.
+
+The matrix rejects model-registry access and fetch/preconnect calls before native imports, and attaches no provider transport. It tests prompt rendering and extension lifecycle composition, not an interactive OMP CLI, provider-generated compaction, model task completion or messenger ingress/recovery. Those runtime and live-service surfaces need separate evidence.
+
 ## Ready for review
 
 Use the [PR template](.github/pull_request_template.md). Keep one clear concern per
