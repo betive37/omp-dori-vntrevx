@@ -13,8 +13,17 @@ afterEach(async () => {
 
 function setup(
   sync: () => Promise<void>,
-  options: { failHealth?: boolean; failReceive?: boolean; deliver?: () => Promise<void>; retained?: boolean } = {},
+  options: {
+    failHealth?: boolean;
+    failReceive?: boolean;
+    failUnavailable?: boolean;
+    openFailures?: number;
+    deliver?: () => Promise<void>;
+    retained?: boolean;
+    intake?: Partial<Parameters<typeof discordInboundLive>[0]>;
+  } = {},
 ) {
+  let openFailures = options.openFailures ?? 0;
   const timers = gatewayTimers();
   const sockets: FakeGateway[] = [];
   const observed: string[] = [];
@@ -32,8 +41,10 @@ function setup(
         await options.deliver?.();
         delivered++;
       },
+      ...options.intake,
     },
     (url) => {
+      if (openFailures-- > 0) throw new Error("local connect failure");
       const socket = new FakeGateway(url);
       sockets.push(socket);
       return socket;
@@ -53,6 +64,7 @@ function setup(
         health.push(true);
       },
       unavailable: () => {
+        if (options.failUnavailable) throw new Error("activity unavailable write failed");
         health.push(false);
       },
     },
@@ -192,4 +204,46 @@ test("retained offline recovery cannot certify a newer connection before its bac
     old.resolve();
     fresh.resolve();
   }
+});
+
+test("a volatile thread candidate is owner activity and blocks health until its scope is admitted", async () => {
+  const lookup = Promise.withResolvers<string | undefined>();
+  const intake: Partial<Parameters<typeof discordInboundLive>[0]> = {
+    accepts: (message, parent) => message.channel_id === "20" || parent === "20",
+    needsThread: (message) => message.channel_id === "50",
+    resolveThread: () => lookup.promise,
+    adoptThread: () => "100",
+  };
+  const f = setup(async () => {}, { intake });
+  const socket = f.sockets[0]!;
+  try {
+    socket.hello(1000);
+    socket.ready();
+    await settle();
+    expect(f.health).toEqual([false, true]);
+    socket.receive({ op: 0, t: "MESSAGE_CREATE", s: 4, d: ownerMessage("201", { channel_id: "50" }) });
+    expect(f.observed).toEqual(["201"]);
+    expect(f.queue.first()).toBeNull();
+    f.timers.advance(500);
+    socket.receive({ op: 11 });
+    f.timers.advance(1000);
+    socket.receive({ op: 11 });
+    expect(f.health).toEqual([false, true]);
+    lookup.resolve("20");
+    await settle();
+    expect(f.observed).toEqual(["201", "201"]);
+    expect(f.delivered()).toBe(1);
+    f.timers.advance(1000);
+    socket.receive({ op: 11 });
+    expect(f.health).toEqual([false, true, true]);
+  } finally {
+    lookup.resolve(undefined);
+  }
+});
+
+test("an activity failure in a synchronous connect failure stops intake before the Gateway exists", async () => {
+  const f = setup(async () => {}, { failUnavailable: true, openFailures: 1 });
+  await expect(f.live.done).rejects.toThrow("activity unavailable write failed");
+  expect(f.sockets).toHaveLength(0);
+  expect(f.timers.pending.size).toBe(0);
 });
