@@ -15,6 +15,8 @@
         "src/update/reviewer-guard.ts",
         "src/update/worker-guard.ts",
         "test/**/*.test.ts",
+        "test/fixtures/native-ingress-network.ts",
+        "test/fixtures/native-ingress-bridge.ts",
         "skills/dori-mode/scripts/test/**/*.test.ts",
         "skills/dori-mode/scripts/test/record-gateway.ts",
         "skills/dori-mode/scripts/test/record-discord-inbound.ts",
@@ -36,7 +38,7 @@
     },
     "test/fixtures/omp-native-host": {
       "entry": ["compose.ts"],
-      "project": ["compose.ts", "host.ts"]
+      "project": ["compose.ts", "host.ts", "ingress-rpc.ts"]
     }
   },
   "ignoreExportsUsedInFile": true
