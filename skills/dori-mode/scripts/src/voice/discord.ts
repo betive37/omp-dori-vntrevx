@@ -7,9 +7,19 @@ import type * as Voice from "@discordjs/voice";
 import { discordClock, openDiscordSocket } from "../cli-discord.ts";
 import type { Discord } from "../messenger/discord.ts";
 import type { Playback } from "./audio.ts";
-import type { VoiceDriver, VoiceLink } from "./discord-link.ts";
+import type { OpusCodec, VoiceDriver, VoiceLink } from "./discord-link.ts";
 import { voiceServerUpdate, voiceStateUpdate } from "./discord-events.ts";
 import { startDiscordVoice, voiceIds } from "./discord-session.ts";
+
+/** stop(true) idles the player, but 0.19.2 keeps its already prepared packet on the connection's networking. */
+const discardPrepared = (voice: typeof Voice, connection: Voice.VoiceConnection) => {
+  const state = connection.state;
+  if (!("networking" in state)) return;
+  const networking = state.networking.state;
+  if (networking.code === voice.NetworkingStatusCode.Ready || networking.code === voice.NetworkingStatusCode.Resuming) {
+    networking.preparedPacket = undefined;
+  }
+};
 
 const nativeLink = (
   voice: typeof Voice,
@@ -34,7 +44,10 @@ const nativeLink = (
   },
   attach: () => {
     const current = player();
-    if (current) connection.subscribe(current);
+    if (!current) return;
+    const state = connection.state;
+    if (!("subscription" in state) || state.subscription?.player !== current) discardPrepared(voice, connection);
+    connection.subscribe(current);
   },
   destroy: () => {
     if (connection.state.status !== voice.VoiceConnectionStatus.Destroyed) connection.destroy();
@@ -60,15 +73,13 @@ const nativeLink = (
   },
 });
 
-const nativeDriver = async (): Promise<VoiceDriver> => {
-  // Dynamic on purpose: these are optional native dependencies, absent or unloadable where voice is not used.
-  const voice = await import("@discordjs/voice");
-  const { OpusEncoder } = await import("@discordjs/opus");
+/** The production adapter, with optional native imports supplied by the lazy loader below. */
+export const createNativeVoiceDriver = (voice: typeof Voice, codec: () => OpusCodec): VoiceDriver => {
   let player: Voice.AudioPlayer | undefined;
+  let connection: Voice.VoiceConnection | undefined;
   return {
-    codec: () => new OpusEncoder(48_000, 2),
+    codec,
     play: (source, log) => {
-      // Playing with no subscriber keeps the queue draining in real time while the connection is being replaced.
       player = voice.createAudioPlayer({
         behaviors: { noSubscriber: voice.NoSubscriberBehavior.Play, maxMissedFrames: Number.POSITIVE_INFINITY },
       });
@@ -77,7 +88,7 @@ const nativeDriver = async (): Promise<VoiceDriver> => {
       player.play(voice.createAudioResource(source, { inputType: voice.StreamType.Opus }));
     },
     join: ({ guildId, channelId, adapter }) => {
-      const connection = voice.joinVoiceChannel({
+      const current = voice.joinVoiceChannel({
         guildId,
         channelId,
         selfDeaf: false,
@@ -93,12 +104,24 @@ const nativeDriver = async (): Promise<VoiceDriver> => {
             onVoiceStateUpdate: (data) => methods.onVoiceStateUpdate(voiceStateUpdate(data)),
           }),
       });
-      return nativeLink(voice, connection, () => player);
+      connection = current;
+      current.once(voice.VoiceConnectionStatus.Destroyed, () => {
+        if (connection === current) connection = undefined;
+      });
+      return nativeLink(voice, current, () => player);
     },
     stop: () => {
       player?.stop(true);
+      if (connection) discardPrepared(voice, connection);
     },
   };
+};
+
+const nativeDriver = async (): Promise<VoiceDriver> => {
+  // Dynamic on purpose: these are optional native dependencies, absent or unloadable where voice is not used.
+  const voice = await import("@discordjs/voice");
+  const { OpusEncoder } = await import("@discordjs/opus");
+  return createNativeVoiceDriver(voice, () => new OpusEncoder(48_000, 2));
 };
 
 export const connectDiscordVoice = async (options: {

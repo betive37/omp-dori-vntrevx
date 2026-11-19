@@ -71,7 +71,8 @@ test.each(["initial", "rejoin"])("a native join exception settles and stops the 
     expect(await outcome).toBe("Discord voice join failed");
     expect(attempts).toBe(1);
     expect(w.driver.stopped).toBe(true);
-    expect(w.driver.source?.destroyed).toBe(true);
+    if (phase === "initial") expect(w.driver.source).toBeUndefined();
+    else expect(w.driver.source?.destroyed).toBe(true);
     expect(w.driver.links.every((link) => link.current === "destroyed")).toBe(true);
     expect(w.sockets.every((socket) => socket.closed)).toBe(true);
     expect(w.pending.size).toBe(0);

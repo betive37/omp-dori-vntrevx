@@ -80,7 +80,7 @@ export class VoiceAssistant {
           if (session.failed) {
             this.halted = true;
             await this.ports.notify(
-              "Voice provider stopped unexpectedly. Voice is held; inspect the error and restart explicitly. No automatic paid retry.",
+              "Voice stopped after a provider or local safety failure. Voice is held; inspect the error and restart explicitly. No automatic paid retry.",
             );
           }
           await this.ports.summarize(session);

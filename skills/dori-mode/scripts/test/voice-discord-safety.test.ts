@@ -33,7 +33,8 @@ test.each(["signalling", "connecting"])("SDK recovery stuck in %s has its own 30
   );
   w.link().move(state);
   w.advance(29_999);
-  expect(w.driver.stopped).toBe(false);
+  expect(w.link().current).toBe(state);
+  expect(w.socket().closed).toBe(false);
   w.advance(1);
   expect(await outcome).toBe("voice connection was not ready within 30s");
   expect(w.presence).toEqual([true, false]);

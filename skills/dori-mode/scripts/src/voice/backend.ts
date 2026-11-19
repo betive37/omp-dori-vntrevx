@@ -19,6 +19,7 @@ export class Backend {
   readonly pending = new Map<string, { delegationId: string; name: string }>();
   private effects: Promise<unknown> = Promise.resolve();
   private readonly searches = new Set<string>();
+  private readonly usageResponses = new Set<string>();
   constructor(private readonly ports: Ports) {}
 
   created(id: string, responseId?: string): Delegation {
@@ -58,9 +59,19 @@ export class Backend {
     return undefined;
   }
 
+  private recordUsage(id: string, usage: Usage | undefined): void {
+    if (usage === undefined || this.usageResponses.has(id)) return;
+    this.usageResponses.add(id);
+    this.ports.usage(usage);
+  }
+
   async event(event: BackendEvent, delegationId?: string | null): Promise<void> {
     const item = event.item;
     // Provider work is billable even after close/cap or when its delegation cannot be resolved.
+    const terminal = ["response.completed", "response.failed", "response.incomplete", "response.cancelled"].includes(
+      event.type,
+    );
+    if (terminal && event.response?.id) this.recordUsage(event.response.id, event.response.usage);
     if (event.type === "response.output_item.done" && item?.type === "web_search_call" && !this.searches.has(item.id)) {
       this.searches.add(item.id);
       this.ports.search();
@@ -75,13 +86,7 @@ export class Backend {
       r = { id, calls: new Map(), items: new Set(), text: "" };
       d.responses.set(id, r);
     }
-    const terminal = ["response.completed", "response.failed", "response.incomplete", "response.cancelled"].includes(
-      event.type,
-    );
-    if (terminal && !r.usageRecorded) {
-      r.usageRecorded = true;
-      this.ports.usage(event.response?.usage);
-    }
+    if (terminal && !event.response?.id) this.recordUsage(id, event.response?.usage);
     if (!this.ports.active() || d.status === "stale" || r.terminal) return;
     const now = this.ports.now();
     d.lastEventAt = now;

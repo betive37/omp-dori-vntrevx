@@ -5,6 +5,7 @@
 
 /** One 20 ms frame of 48 kHz stereo PCM16, the unit the Discord player consumes. */
 const FRAME_BYTES = 3840;
+const PLAYBACK_MAX_BYTES = 250 * FRAME_BYTES; // 5 s of stereo PCM
 
 /** Averages each pair of 48 kHz stereo sample frames into one 24 kHz mono sample. */
 export const downTo24kMono = (pcm48: Buffer): Buffer => {
@@ -40,16 +41,25 @@ export class Playback {
   private chunks: Buffer[] = [];
   private bytes = 0;
   private previous = 0;
+  private frames = 0;
   private revision = 0;
   audible = true;
   get generation(): number {
     return this.revision;
   }
+  get playedFrames(): number {
+    return this.frames;
+  }
 
-  write(pcm24: Buffer): void {
-    if (!this.audible) return;
-    const n = pcm24.length >> 1;
-    if (!n) return;
+  /** False means the queue overflowed and its generation was discarded. */
+  write(pcm24: Buffer): boolean {
+    if (!this.audible) return true;
+    const n = Math.floor(pcm24.length / 2);
+    if (!n) return true;
+    if (n * 8 > PLAYBACK_MAX_BYTES - this.bytes) {
+      this.clear();
+      return false;
+    }
     const out = Buffer.alloc(n * 8);
     for (let i = 0; i < n; i++) {
       const s = pcm24.readInt16LE(i * 2);
@@ -63,6 +73,7 @@ export class Playback {
     this.chunks.push(out);
     this.bytes += out.length;
     this.onReadable?.();
+    return true;
   }
 
   /** The next 20 ms frame, or null while less than a whole frame is queued. */
@@ -79,7 +90,17 @@ export class Playback {
       else this.chunks[0] = head.subarray(take);
     }
     this.bytes -= FRAME_BYTES;
+    this.frames++;
     return frame;
+  }
+
+  /** Finishes a quiet speech tail without carrying its samples into the next turn. */
+  flushTail(): void {
+    if (!this.audible || this.bytes === 0 || this.bytes >= FRAME_BYTES) return;
+    this.chunks.push(Buffer.alloc(FRAME_BYTES - this.bytes));
+    this.bytes = FRAME_BYTES;
+    this.previous = 0;
+    this.onReadable?.();
   }
 
   clear(): void {
@@ -126,15 +147,19 @@ export const paceInput = (
 export class InputAudio {
   private readonly bucket: { tokens: number; last: number };
   private pending: Buffer[] = [];
+  private pendingBytes = 0;
   private sentSamples = 0;
   constructor(private readonly since: number) {
     this.bucket = { tokens: BUCKET_MAX, last: since };
   }
-  push(pcm: Buffer): void {
-    this.pending.push(pcm);
+  push(pcm: Buffer): boolean {
+    if (pcm.length % 2 !== 0 || pcm.length > BUCKET_MAX * 2 - this.pendingBytes) return false;
+    if (pcm.length) this.pending.push(pcm);
+    this.pendingBytes += pcm.length;
+    return true;
   }
   drain(now: number): Buffer[] {
-    const pending = this.pending.reduce((sum, pcm) => sum + pcm.length / 2, 0);
+    const pending = this.pendingBytes / 2;
     const behind = Math.floor((now - this.since) * 24) - this.sentSamples;
     const paced = paceInput(this.bucket, now, pending, behind);
     const output: Buffer[] = [];
@@ -150,6 +175,7 @@ export class InputAudio {
         remaining -= take;
       }
       output.push(Buffer.concat(parts));
+      this.pendingBytes -= paced.audio * 2;
     }
     if (paced.silence) output.push(Buffer.alloc(paced.silence * 2));
     this.sentSamples += paced.audio + paced.silence;

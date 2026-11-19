@@ -26,7 +26,11 @@ export type GatewayOptions = {
   /** Identify and resume as online; off leaves the account's presence to whoever else holds a connection. */
   online: boolean;
   onReady?: (event: "READY" | "RESUMED") => void;
-  /** Every dispatch other than READY/RESUMED, once the session is established. */
+  /** Opt in to ordered dispatch replay after RESUME is sent, before RESUMED confirms completion. */
+  replayDispatches?: boolean;
+  /** The current socket has been retired; cached admission must wait for READY/RESUMED. */
+  onDisconnect?: () => void;
+  /** Dispatches after establishment, plus authenticated resume replay only when explicitly opted in. */
   onDispatch?: (type: string, data: unknown) => void;
 };
 const GATEWAY = "wss://gateway.discord.gg/?v=10&encoding=json";
@@ -70,6 +74,7 @@ export const discordGateway = (
     if (handshake !== undefined) clock.clearTimeout(handshake);
     heartbeat = handshake = undefined;
     previous?.close(code);
+    if (previous) options.onDisconnect?.();
   };
   const finish = (error?: MessengerError) => {
     stopped = true;
@@ -116,6 +121,7 @@ export const discordGateway = (
     let awaitingAck = false;
     let heartbeatSeq: number | null = null;
     let established = false;
+    let resuming = false;
     const current = () => !stopped && socket === ws;
     const send = (frame: unknown) => {
       try {
@@ -166,6 +172,7 @@ export const discordGateway = (
         }
         hello = true;
         heartbeat = clock.setTimeout(() => tick(interval), clock.random() * interval);
+        resuming = session !== undefined && seq !== null;
         authenticated = send(
           session && seq !== null
             ? { op: 6, d: { token, session_id: session.id, seq } }
@@ -218,7 +225,11 @@ export const discordGateway = (
         established = true;
         deliver = send;
         options.onReady?.(m.t);
-      } else if (m.op === 0 && established && typeof m.t === "string") {
+      } else if (
+        m.op === 0 &&
+        (established || (options.replayDispatches && authenticated && resuming)) &&
+        typeof m.t === "string"
+      ) {
         options.onDispatch?.(m.t, m.d);
       }
     });

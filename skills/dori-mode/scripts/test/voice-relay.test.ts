@@ -110,9 +110,7 @@ test.each(["previous answer", "approved: all checks passed", "allowed operation 
   "ordinary prior output is not an approval prompt: %s",
   async (previous) => {
     world.onEnterStatus = "working";
-    world.onSendText = () => {
-      world.screen = BUSY_SCREEN;
-    };
+    world.onSendText = (_pane, text) => append(record("user", text));
     const r = await tool({ screen: `${previous}\n${IDLE_SCREEN}` })({
       message: "정리해 줘 `rm -rf $HOME` \\ 끝",
       risky: false,
@@ -134,29 +132,29 @@ test.each(["previous answer", "approved: all checks passed", "allowed operation 
 
 test("a risky request is labelled and still carries the written-confirmation guard", async () => {
   world.onEnterStatus = "working";
-  world.onSendText = () => {
-    world.screen = BUSY_SCREEN;
-  };
+  world.onSendText = (_pane, text) => append(record("user", text));
   expect((await tool()({ message: "배포해", risky: true })).ok).toBe(true);
   expect(sent(world)[0]).toStartWith("[VOICE] (RISKY request, voice never approves it) 배포해 -- ");
   expect(sent(world)[0]).toContain(GUARD);
 });
 
-test("a working lead is confirmed only by a new user record carrying this request's id", async () => {
+test.each(["idle", "working"])("a %s lead needs a new request-bound user record", async (status) => {
   world.onSendText = (_pane, text) => append(record("user", text));
-  const r = await tool({ status: "working" })({ message: "레인 정리", risky: false });
+  const r = await tool({ status })({ message: "레인 정리", risky: false });
   expect(r).toMatchObject({ ok: true });
   expect(r.result).toStartWith("confirmed-delivered:");
   expect(r.result).toContain("user record");
   expect(sleeps).toEqual([PASTE_SETTLE_MS]);
 });
 
-test("old history, an assistant echo or another user input is not receipt: unconfirmed, ok:false, never resent", async () => {
+test.each(["idle", "working"])("unrelated activity by a %s lead is unconfirmed and never resent", async (status) => {
   world.onSendText = (_pane, text) => {
     append(record("assistant", text));
     append(record("user", "some other input [voice-request:x]"));
+    world.panes[0]!.agent_status = "working";
+    world.screen = BUSY_SCREEN;
   };
-  const r = await tool({ status: "working" })({ message: "레인 정리", risky: false });
+  const r = await tool({ status })({ message: "레인 정리", risky: false });
   expect(r.ok).toBe(false);
   expect(r.result).toStartWith("sent-but-unconfirmed:");
   expect(r.result).toContain("will not be resent");
@@ -182,30 +180,31 @@ test("a session file replaced by another session is not receipt, and the watch s
   expect(sleeps).toEqual([PASTE_SETTLE_MS]);
 });
 
-test("idle to working in another OMP session of the lead pane is not receipt", async () => {
+test.each(["sessionId", "pid"])("a new user receipt does not confirm after the lead %s changes", async (identity) => {
   world.onEnterStatus = "working";
-  world.onSendText = () => {
+  world.onSendText = (_pane, text) => {
     world.screen = BUSY_SCREEN;
+    append(record("user", text));
   };
   after = (argv) => {
-    if (argv[2] === "send-keys")
-      laneState(state.dir, LEAD, { role: "dori", sessionId: "01a11440-0000-7000-8000-000000000000" });
+    if (argv[2] !== "send-keys") return;
+    if (identity === "pid") agentIn(world, LEAD, 5252);
+    laneState(state.dir, LEAD, {
+      role: "dori",
+      sessionFile,
+      [identity]: identity === "pid" ? 5252 : "01a11440-0000-7000-8000-000000000000",
+    });
   };
-  // No session file to read: only the idle -> working change of the same session could confirm.
-  const r = await tool({ pane: { sessionFile: join(state.dir, "none.jsonl") } })({
-    message: "레인 정리",
-    risky: false,
-  });
+  // Even a real new receipt in the original file is not enough after the process or session changes.
+  const r = await tool()({ message: "레인 정리", risky: false });
   expect(r.ok).toBe(false);
   expect(r.result).toStartWith("sent-but-unconfirmed:");
   expect(sent(world)).toHaveLength(1);
 });
 
-test("a lead with no observable channel left is unconfirmed without waiting", async () => {
-  const r = await tool({ status: "working", pane: { sessionFile: join(state.dir, "missing.jsonl") } })({
-    message: "레인 정리",
-    risky: false,
-  });
+test.each(["idle", "working"])("a %s lead without a session file is unconfirmed", async (status) => {
+  const pane = { sessionFile: join(state.dir, "missing.jsonl") };
+  const r = await tool({ status, pane })({ message: "레인 정리", risky: false });
   expect(r.result).toStartWith("sent-but-unconfirmed:");
   expect(sleeps).toEqual([PASTE_SETTLE_MS]);
 });

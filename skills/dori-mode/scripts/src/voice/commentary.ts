@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { Playback } from "./audio.ts";
 import type { Backend } from "./backend.ts";
 import { type Replies, type ReplyFlight, replySpokenEnough } from "./replies.ts";
 import type { LiveEvent, Wire } from "./types.ts";
@@ -9,8 +10,12 @@ type Timing = {
   lastOutputAt: number;
   queuedMs: number;
   playbackGeneration: number;
+  playedFrames: number;
   audible: boolean;
 };
+
+const played = (flight: ReplyFlight, t: Timing): boolean =>
+  flight.firstSpeechFrame !== undefined && t.playedFrames >= flight.firstSpeechFrame;
 
 export class Commentary {
   private flight: ReplyFlight | undefined;
@@ -29,6 +34,7 @@ export class Commentary {
       if (flight && flight.eventId === event.client_event_id) {
         flight.ackedAt = now;
         flight.spokenChars = 0;
+        flight.firstSpeechFrame = undefined;
       }
       for (const d of this.backend.delegations.values()) {
         const partial = d.partials.find((p) => p.id === event.client_event_id);
@@ -49,6 +55,13 @@ export class Commentary {
     }
   }
 
+  noteAudio(playback: Pick<Playback, "generation" | "queuedMs" | "playedFrames">): void {
+    const flight = this.flight;
+    if (flight?.ackedAt === undefined || flight.playbackGeneration !== playback.generation) return;
+    // Frames already queued before this speech are not evidence that this flight played.
+    flight.firstSpeechFrame ??= playback.playedFrames + Math.floor(playback.queuedMs() / 20) + 1;
+  }
+
   tick(t: Timing): void {
     this.replies.scan();
     if (this.flight && this.flight.playbackGeneration !== t.playbackGeneration) {
@@ -58,11 +71,11 @@ export class Commentary {
     if (!t.audible) return;
     const flight = this.flight;
     if (flight) {
-      const played = t.now - t.lastOutputAt > 1000 && t.queuedMs < 100;
-      if (replySpokenEnough(flight) && played) this.consume(flight);
+      const drained = t.now - t.lastOutputAt > 1000 && t.queuedMs === 0;
+      if (replySpokenEnough(flight) && played(flight, t) && drained) this.consume(flight);
       else if (
         (flight.ackedAt === undefined && t.now - flight.sentAt > 15_000) ||
-        (flight.ackedAt !== undefined && t.now - flight.ackedAt > 30_000 && !replySpokenEnough(flight) && played)
+        (flight.ackedAt !== undefined && t.now - flight.ackedAt > 30_000 && drained)
       ) {
         this.flight = undefined;
         this.log("VOICE_REPLY_PENDING");
@@ -119,6 +132,7 @@ export class Commentary {
       this.flight &&
       this.flight.playbackGeneration === t.playbackGeneration &&
       replySpokenEnough(this.flight) &&
+      played(this.flight, t) &&
       t.lastOutputAt <= t.now &&
       t.queuedMs === 0
     )

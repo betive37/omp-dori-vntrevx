@@ -105,10 +105,10 @@ export class Replies {
   spoken(reply: LeadReply): void {
     // A replaced log cannot be acknowledged by an old session's in-flight reply.
     if (this.queue[0] !== reply) return;
-    this.queue.shift();
-    const offset = this.queue[0]?.start ?? this.scanned;
+    const offset = this.queue[1]?.start ?? this.scanned;
     writeFileSync(`${this.stateFile}.tmp`, `${JSON.stringify({ offset, identity: this.identity })}\n`, { mode: 0o600 });
     renameSync(`${this.stateFile}.tmp`, this.stateFile);
+    this.queue.shift();
   }
 }
 
@@ -119,6 +119,7 @@ export type ReplyFlight = {
   ackedAt?: number;
   spokenChars: number;
   playbackGeneration: number;
+  firstSpeechFrame?: number | undefined;
   text: string;
   end: number;
 };

@@ -13,6 +13,7 @@ const timing = (now: number, patch = {}) => ({
   lastOutputAt: 0,
   queuedMs: 0,
   playbackGeneration: 0,
+  playedFrames: 0,
   audible: true,
   ...patch,
 });
@@ -125,9 +126,10 @@ test("injection interrupted on exit survives restart, acknowledgement alone neve
       { type: "session.output_transcript.delta", delta: "This verified reply must survive an interrupted injection." },
       20_002,
     );
+    next.noteAudio({ generation: 0, queuedMs: () => 0, playedFrames: 0 });
     next.tick(timing(20_003, { lastOutputAt: 22_000, queuedMs: 200 }));
     expect(existsSync(state)).toBe(false);
-    next.tick(timing(24_000));
+    next.tick(timing(24_000, { lastOutputAt: 22_000, playedFrames: 10 }));
     expect(JSON.parse(readFileSync(state, "utf8"))).toMatchObject({ offset: Buffer.byteLength(line) });
     const again = new Replies(tmp.directory, () => {});
     again.scan();
@@ -179,12 +181,39 @@ test("a long reply consumes the JSONL line only after every bounded piece, inclu
       spoken += part.text;
       ack(c, wire, now + 1);
       c.event({ type: "session.output_transcript.delta", delta: part.text }, now + 2);
+      c.noteAudio({ generation: 0, queuedMs: () => 0, playedFrames: index });
       now += 2000;
-      c.tick(timing(now));
+      c.tick(timing(now, { lastOutputAt: now - 1500, playedFrames: index + 1 }));
     }
     expect(spoken).toBe(text);
     expect(replies.first()).toBeUndefined();
     expect(f.wires.length).toBeGreaterThan(2);
+  } finally {
+    tmp.cleanup();
+  }
+});
+
+test.each(["tick", "close"] as const)("transcript with no played audio leaves the reply pending on %s", (finish) => {
+  const tmp = temporaryVoice();
+  try {
+    const f = backendFixture();
+    f.backend.delegations.clear();
+    const replies = new Replies(tmp.directory, () => {});
+    const text = "The transcript is not evidence that this reply was played.";
+    writeFileSync(replies.file, `${JSON.stringify({ re: "request", text })}\n`);
+    const c = new Commentary(
+      replies,
+      f.backend,
+      (e) => f.wires.push(e),
+      () => {},
+    );
+    c.tick(timing(5000));
+    ack(c, f.wires[0]!, 5001);
+    c.event({ type: "session.output_transcript.delta", delta: text }, 5002);
+    // Old audio can finish draining after the acknowledgement; it cannot prove this flight played.
+    c[finish](timing(8000, { lastOutputAt: 6000, playedFrames: 8 }));
+    expect(replies.first()?.text).toBe(text);
+    expect(existsSync(join(tmp.directory, "lead-replies.state.json"))).toBe(false);
   } finally {
     tmp.cleanup();
   }

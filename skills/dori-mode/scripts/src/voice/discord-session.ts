@@ -1,9 +1,4 @@
-/**
- * The Discord side of a voice conversation over the existing Gateway client: owner presence from GUILD_CREATE and
- * VOICE_STATE_UPDATE, the bot's own voice updates handed to the voice library, one connection at a time, and the
- * original recovery: a connection that stays disconnected for 5 s is replaced 3 s later. No connection becoming ready
- * within 30 s of a join, rejoins included, ends the bridge with an error instead of retrying further.
- */
+import type { Readable } from "node:stream";
 import type { Discord } from "../messenger/discord.ts";
 import { discordGateway, type GatewayClock, type GatewaySocket } from "../messenger/discord-gateway.ts";
 import type { Playback } from "./audio.ts";
@@ -40,14 +35,12 @@ const record = (value: unknown): VoiceDispatch | undefined =>
 export const voiceIds = async (discord: Discord, channelId: string): Promise<{ guildId: string; botId: string }> => {
   const channel = record(await discord.call("GET", `/channels/${channelId}`));
   const guildId = channel?.["guild_id"];
-  if (channel?.["type"] !== GUILD_VOICE || typeof guildId !== "string") {
+  if (channel?.["type"] !== GUILD_VOICE || typeof guildId !== "string")
     throw new Error(`Discord channel ${channelId} is not a guild voice channel`);
-  }
   const botId = record(await discord.call("GET", "/users/@me"))?.["id"];
   if (typeof botId !== "string") throw new Error("Discord did not return the bot user id");
   return { guildId, botId };
 };
-
 export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Promise<void>; close(): void } => {
   if (t.ownerId === t.botId) throw new Error("DORI_DISCORD_OWNER_ID must identify the human owner, not the bot");
   const { clock, driver } = rt;
@@ -59,14 +52,12 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
   let ownerPresent = false;
   let observedOwner = false;
   let observedBot = false;
+  let gatewayReady = false;
   t.playback.audible = false;
   let readyTimer: unknown;
   let recoverTimer: unknown;
   let rejoinTimer: unknown;
-  const cancel = (timer: unknown) => {
-    clock.clearTimeout(timer);
-  };
-
+  let source: Readable | undefined;
   const receiver = ownerReceiver({
     ownerId: t.ownerId,
     clock,
@@ -74,8 +65,22 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
     onPcm: t.onPcm,
     log: t.log,
   });
-  const source = playbackSource(t.playback, driver.codec());
-  driver.play(source, t.log);
+  const mute = () => {
+    t.playback.audible = false;
+    if (!source) return;
+    driver.stop();
+    source.destroy();
+    source = undefined;
+    t.playback.clear();
+  };
+  const syncPlayback = () => {
+    if (!gatewayReady || !observedBot || link?.status() !== "ready") return void mute();
+    t.playback.audible = true;
+    if (source) return;
+    source = playbackSource(t.playback, driver.codec());
+    driver.play(source, t.log);
+    link.attach();
+  };
 
   const setPresence = (present: boolean) => {
     if (stopped || present === ownerPresent) return;
@@ -84,12 +89,11 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
     receiver.presence(present);
     t.onOwnerPresence(present);
   };
-
   const teardown = () => {
     const previous = link;
     link = undefined;
     adapter = undefined;
-    cancel(recoverTimer);
+    clock.clearTimeout(recoverTimer);
     recoverTimer = undefined;
     receiver.attach(undefined);
     dave?.stop();
@@ -100,43 +104,36 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
   const finish = (error?: Error) => {
     if (stopped) return;
     setPresence(false);
-    t.playback.audible = false;
-    t.playback.clear();
+    if (source) mute();
+    else driver.stop();
     stopped = true;
     if (error) t.log(`VOICE STOPPED ${error.message}`);
-    cancel(rejoinTimer);
-    cancel(readyTimer);
-    rejoinTimer = readyTimer = undefined;
+    clock.clearTimeout(rejoinTimer);
+    clock.clearTimeout(readyTimer);
     teardown(); // Leaves the channel while the Gateway can still carry the request.
     receiver.stop();
-    driver.stop();
-    source.destroy();
     gateway.close();
     if (error) done.reject(error);
     else done.resolve();
   };
-
   const onStatus = (current: VoiceLink, to: string) => {
     if (current !== link) return;
-    t.playback.audible = to === "ready" && observedBot;
+    syncPlayback();
     if (to !== "ready") {
-      t.playback.clear();
       receiver.attach(undefined);
       // One deadline covers every recovery transition, including the SDK's internal reconnects.
       readyTimer ??= clock.setTimeout(() => {
         readyTimer = undefined;
         finish(new Error("voice connection was not ready within 30s"));
       }, 30_000);
-    }
-    if (to === "ready") {
-      cancel(readyTimer);
+    } else {
+      clock.clearTimeout(readyTimer);
       readyTimer = undefined;
-      current.attach(); // Idempotent in the library: an existing player subscription is reused.
       receiver.attach(current);
-      setPresence(observedOwner && observedBot);
+      setPresence(observedOwner && t.playback.audible);
     }
     if (to === "signalling" || to === "connecting" || to === "ready") {
-      cancel(recoverTimer);
+      clock.clearTimeout(recoverTimer);
       recoverTimer = undefined;
     } else if (to === "disconnected" && recoverTimer === undefined) {
       recoverTimer = clock.setTimeout(() => {
@@ -185,43 +182,56 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
       finish(new Error("Discord voice join failed"));
     }
   };
-
   const onDispatch = (type: string, raw: unknown) => {
     const data = record(raw);
     if (stopped || !data) return;
     if (type === "GUILD_CREATE" && data["id"] === t.guildId) {
       const states: unknown[] = Array.isArray(data["voice_states"]) ? data["voice_states"] : [];
-      const owner = states.map(record).find((state) => state?.["user_id"] === t.ownerId);
-      observedOwner = owner?.["channel_id"] === t.channelId;
-      setPresence(observedOwner && observedBot && link?.status() === "ready");
+      observedOwner = observedBot = false;
+      for (const state of states) {
+        const voice = record(state);
+        const channel = voice?.["channel_id"];
+        if (voice?.["user_id"] === t.ownerId) observedOwner = channel === t.channelId;
+        else if (voice?.["user_id"] === t.botId) {
+          if (typeof channel === "string" && channel !== t.channelId)
+            return void finish(new Error("bot moved outside the configured voice channel"));
+          observedBot = channel === t.channelId;
+        }
+      }
+      syncPlayback();
+      setPresence(observedOwner && t.playback.audible);
     } else if (type === "VOICE_STATE_UPDATE" && data["guild_id"] === t.guildId) {
       if (data["user_id"] === t.ownerId) {
         observedOwner = data["channel_id"] === t.channelId;
-        setPresence(observedOwner && observedBot && link?.status() === "ready");
+        setPresence(observedOwner && t.playback.audible);
       } else if (data["user_id"] === t.botId) {
-        if (data["channel_id"] !== t.channelId && data["channel_id"] !== null) {
-          finish(new Error("bot moved outside the configured voice channel"));
-          return;
-        }
+        if (data["channel_id"] !== t.channelId && data["channel_id"] !== null)
+          return void finish(new Error("bot moved outside the configured voice channel"));
         observedBot = data["channel_id"] === t.channelId;
-        if (!observedBot) {
-          setPresence(false);
-          t.playback.audible = false;
-          t.playback.clear();
-        }
+        if (!observedBot) setPresence(false);
         adapter?.onVoiceStateUpdate(data);
+        syncPlayback();
+        setPresence(observedOwner && t.playback.audible);
       }
     } else if (type === "VOICE_SERVER_UPDATE" && data["guild_id"] === t.guildId) {
       adapter?.onVoiceServerUpdate(data);
     }
   };
-
   const gateway = discordGateway(rt.open, t.token, clock, t.log, {
     label: "VOICE_GATEWAY",
     intents: GUILDS | GUILD_VOICE_STATES,
     online: false,
-    onReady: () => {
-      if (!link && rejoinTimer === undefined) join();
+    replayDispatches: true,
+    onDisconnect: () => {
+      gatewayReady = false;
+      mute();
+      setPresence(false);
+    },
+    onReady: (event) => {
+      gatewayReady = true;
+      if (event === "READY") observedOwner = observedBot = false;
+      if (link) onStatus(link, link.status());
+      else if (rejoinTimer === undefined) join();
     },
     onDispatch: (type, data) => {
       try {
@@ -235,6 +245,5 @@ export const startDiscordVoice = (t: VoiceTarget, rt: VoiceRuntime): { done: Pro
     () => finish(new Error("Discord Gateway stopped")),
     (error: unknown) => finish(error instanceof Error ? error : new Error(String(error))),
   );
-
   return { done: done.promise, close: () => finish() };
 };

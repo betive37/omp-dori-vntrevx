@@ -48,7 +48,7 @@ export type VoiceLink = ReceiveLink & {
   onDebug(cb: (message: string) => void): void;
   onError(cb: (message: string) => void): void;
   dave(): DaveControls | undefined;
-  /** Subscribes the shared player to this connection. */
+  /** Subscribes the current admitted player to this connection. */
   attach(): void;
   /** Destroys the connection, leaving the channel; a no-op once destroyed. */
   destroy(): void;
@@ -56,16 +56,16 @@ export type VoiceLink = ReceiveLink & {
 
 export type VoiceDriver = {
   codec(): OpusCodec;
-  /** Starts the one player that outlives individual connections, reading Opus frames from `source`. */
+  /** Starts a fresh player/resource for an admitted output generation, reading Opus frames from `source`. */
   play(source: Readable, log: (line: string) => void): void;
   join(options: { guildId: string; channelId: string; adapter: AdapterCreator }): VoiceLink;
-  /** Stops the player. */
+  /** Immediately stops the player and discards any packet prepared on its current connection. */
   stop(): void;
 };
 
 /**
- * Feeds the player one Opus frame per demand. With nothing queued the stream waits, and the next write to the
- * playback queue resumes it, so the player never buffers ahead of what the model has produced.
+ * Feeds the player one Opus frame per demand, with at most one encoded frame buffered ahead. With nothing queued the
+ * stream waits for the next write. Admission revocation must destroy this stream as well as clear the PCM queue.
  */
 export const playbackSource = (playback: Playback, encoder: OpusCodec): Readable => {
   let waiting = false;

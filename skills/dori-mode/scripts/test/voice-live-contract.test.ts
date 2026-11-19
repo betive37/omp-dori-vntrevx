@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { readFileSync } from "node:fs";
+import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import { Playback } from "../src/voice/audio.ts";
 import { parseLiveEvent } from "../src/voice/provider.ts";
@@ -187,6 +187,23 @@ test.each([false, true])("session.closed blocks queued writes before WebSocket c
     expect(ledger.days["1970-01-01"].liveSeconds).toBeCloseTo(16.001, 6);
   } finally {
     first.resolve({ ok: true, result: "Settled" });
+    await w.cleanup();
+  }
+});
+
+test("a failed final usage write cannot send a second close or strand the provider socket", async () => {
+  const w = liveWorld();
+  try {
+    w.open();
+    w.event({ type: "session.started", session: { id: "live_fixture" } });
+    mkdirSync(join(w.directory, "usage.json.tmp"));
+    w.event({ type: "session.closed", usage: { seconds: 4 }, session: { id: "live_fixture" } });
+    await flush();
+    expect(w.session.state).toBe("closing");
+    expect(w.session.failed).toBe(true);
+    expect(w.closes()).toBe(1);
+    expect(count(w.wires, "session.close")).toBe(0);
+  } finally {
     await w.cleanup();
   }
 });

@@ -34,8 +34,9 @@ test("duplicate hosted-search and lifecycle events account usage once", async ()
   };
   await f.backend.event(event, "d1");
   await f.backend.event(event, "d1");
-  await f.backend.event(completed("r1"), "d1");
-  await f.backend.event(completed("r1"), "d1");
+  const terminal = { ...completed("r1"), response: { id: "r1", usage: { input_tokens: 10 } } };
+  await f.backend.event(terminal, "d1");
+  await f.backend.event(terminal, "d1");
   expect(f.counts()).toEqual({ searches: 1, usages: 1 });
 });
 

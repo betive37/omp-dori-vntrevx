@@ -5,7 +5,6 @@ import { Commentary } from "./commentary.ts";
 import { startEvent } from "./prompts.ts";
 import type { VoiceSettings } from "./settings.ts";
 import type { Action, LiveEvent, VoiceSessionPorts, VoiceSocket, Wire } from "./types.ts";
-
 export class VoiceSession {
   state: "connecting" | "live" | "capping" | "closing" | "closed" = "connecting";
   readonly openedAt: number;
@@ -15,8 +14,8 @@ export class VoiceSession {
   readonly inputTranscript: string[] = [];
   readonly outputTranscript: string[] = [];
   readonly backend: Backend;
-  readonly done: Promise<void>;
   private readonly completion = Promise.withResolvers<void>();
+  readonly done = this.completion.promise;
   private readonly commentary: Commentary;
   private socket: VoiceSocket | undefined;
   private startedAt: number | undefined;
@@ -29,14 +28,12 @@ export class VoiceSession {
   private input: InputAudio | undefined;
   private tasks = new Set<Promise<void>>();
   private finalized = false;
-
   constructor(
     private readonly settings: VoiceSettings,
     private readonly ports: VoiceSessionPorts,
     private readonly greet: boolean,
   ) {
     this.openedAt = ports.now();
-    this.done = this.completion.promise;
     this.backend = new Backend({
       now: ports.now,
       active: () => this.state === "live" && !ports.usage.capReason(),
@@ -51,7 +48,6 @@ export class VoiceSession {
     });
     this.commentary = new Commentary(ports.replies, this.backend, (event) => this.send(event), ports.log);
   }
-
   open(): void {
     this.socket = this.ports.open(this.ports.key, {
       open: () => {
@@ -76,19 +72,21 @@ export class VoiceSession {
       },
     });
   }
-
   private send(event: Wire): void {
     if (this.state === "live" || (this.state === "capping" && event["type"] === "session.input_audio.append"))
       this.socket?.send(event);
   }
   inputAudio(pcm24: Buffer, voiced: boolean): void {
     if (voiced) this.lastOwnerAt = this.ports.now();
-    if (this.state === "live" || this.state === "capping") this.input?.push(pcm24);
+    if ((this.state !== "live" && this.state !== "capping") || this.input?.push(pcm24) !== false) return;
+    this.failed = true;
+    this.ports.playback.clear();
+    this.close("owner audio buffer overflow");
   }
   private record(seconds: number): void {
-    const next = Math.max(this.recordedSeconds, seconds);
-    if (next > this.recordedSeconds) this.ports.usage.live(next - this.recordedSeconds);
-    this.recordedSeconds = next;
+    const delta = Math.max(0, seconds - this.recordedSeconds);
+    this.recordedSeconds += delta;
+    if (delta) this.ports.usage.live(delta);
   }
   private async event(event: LiveEvent): Promise<void> {
     if (this.finalized) return;
@@ -117,8 +115,9 @@ export class VoiceSession {
         const pcm = Buffer.from(event.delta ?? "", "base64");
         const level = rmsDbfs(pcm);
         if (this.ports.playback.queuedMs() > 200 && level < -55) return;
-        this.ports.playback.write(pcm);
-        if (level > -50) this.lastOutputAt = now + this.ports.playback.queuedMs();
+        if (level > -50 && this.ports.playback.audible) this.commentary.noteAudio(this.ports.playback);
+        if (!this.ports.playback.write(pcm)) this.close("provider audio buffer overflow");
+        else if (this.ports.playback.audible && level > -50) this.lastOutputAt = now + this.ports.playback.queuedMs();
         break;
       }
       case "session.input_transcript.delta":
@@ -141,10 +140,10 @@ export class VoiceSession {
         this.record(event.usage?.seconds ?? 0);
         break;
       case "session.closed":
-        this.record(event.usage?.seconds ?? this.recordedSeconds);
         this.failed ||= this.state !== "closing";
         this.state = "closing";
         this.closingAt ??= now;
+        this.persistClosing(event.usage?.seconds ?? this.recordedSeconds);
         this.socket?.close();
         break;
       case "error":
@@ -185,18 +184,13 @@ export class VoiceSession {
       this.state = "capping";
       this.capAt = now;
     }
-    if (this.capAt !== undefined && now - this.capAt >= 8000) {
-      this.close("usage cap");
-      return;
-    }
+    if (this.capAt !== undefined && now - this.capAt >= 8000) return void this.close("usage cap");
     for (const pcm of this.input!.drain(now))
       this.send({ type: "session.input_audio.append", audio: pcm.toString("base64") });
     if (this.state !== "live") return;
-    if (this.backend.expired()) {
-      this.close("provider backend stalled");
-      return;
-    }
+    if (this.backend.expired()) return void this.close("provider backend stalled");
     if (now - this.lastCommentaryAt >= 1000) {
+      if (now - this.lastOutputAt > 1000) this.ports.playback.flushTail();
       this.commentary.tick(this.timing());
       this.lastCommentaryAt = now;
     }
@@ -210,23 +204,29 @@ export class VoiceSession {
       lastOutputAt: this.lastOutputAt,
       queuedMs: this.ports.playback.queuedMs(),
       playbackGeneration: this.ports.playback.generation,
+      playedFrames: this.ports.playback.playedFrames,
       audible: this.ports.playback.audible,
     };
+  }
+  private persistClosing(seconds?: number): void {
+    try {
+      if (seconds === undefined) this.commentary.close(this.timing());
+      else this.record(seconds);
+    } catch {
+      this.failed = true;
+      this.ports.log("VOICE_CLOSE_PERSIST_FAILED");
+    }
   }
   close(reason: string): void {
     this.failed ||= reason.startsWith("provider") || reason === "session start timeout";
     if (this.state === "closed" || this.state === "closing") return;
-    const started = this.startedAt !== undefined;
-    this.commentary.close(this.timing());
     this.state = "closing";
     this.closingAt = this.ports.now();
+    this.persistClosing();
     this.ports.log(`VOICE_SESSION_CLOSING ${reason}`);
-    if (!this.socket) {
-      void this.finish();
-      return;
-    }
+    if (!this.socket) return void this.finish();
     try {
-      if (started) this.socket.send({ type: "session.close", event_id: randomUUID() });
+      if (this.startedAt !== undefined) this.socket.send({ type: "session.close", event_id: randomUUID() });
       else this.socket.terminate();
     } catch {
       this.socket.terminate();
@@ -238,8 +238,8 @@ export class VoiceSession {
     this.state = "closed";
     this.input = undefined;
     try {
-      if (this.startedAt !== undefined) this.record((this.ports.now() - this.startedAt) / 1000);
-      this.commentary.close(this.timing());
+      if (this.startedAt !== undefined) this.persistClosing((this.ports.now() - this.startedAt) / 1000);
+      this.persistClosing();
       await Promise.allSettled([...this.tasks]);
       await this.ports.finished(this);
       this.completion.resolve();

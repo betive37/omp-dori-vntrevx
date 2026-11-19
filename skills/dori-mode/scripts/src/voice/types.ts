@@ -90,7 +90,6 @@ export type BackendResponse = {
   terminalAt?: number;
   firstTextAt?: number;
   continued?: boolean;
-  usageRecorded?: boolean;
 };
 export type Delegation = {
   id: string;

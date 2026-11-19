@@ -131,8 +131,8 @@ const readNew = (c: Cursor, id: string): "seen" | "pending" | "lost" => {
   }
 };
 
-/** Watches for this request's receipt without ever sending again: idle -> working in the same process and session,
- *  or a new user record carrying the id after the pre-send offset of the same session file. */
+/** Requires a new user record carrying this request's id in the original session file, then checks that the
+ *  receiving process and session still match. Activity alone is not receipt; never sends again. */
 const observe = async (
   deps: FlowDeps,
   rt: SessionRuntime,
@@ -141,27 +141,19 @@ const observe = async (
   start: Cursor | undefined,
   id: string,
 ): Promise<ToolResult> => {
-  const watchStatus = before.status === "idle";
-  let cursor = start;
+  const cursor = start;
   for (const ms of OBSERVE_DELAYS) {
-    if (!watchStatus && cursor === undefined) break;
+    if (cursor === undefined) break;
     if (ms > 0) await deps.clock.sleep(ms);
-    if (watchStatus) {
-      try {
-        const now = await rt.probe(ref);
-        if (now.status === "working" && now.pid === before.pid && now.sessionId === before.sessionId)
-          return confirmed(id, "the same lead session went from idle to working");
-      } catch {
-        // A failed probe is no evidence either way; the next observation decides.
-      }
-    }
-    if (cursor !== undefined) {
-      const seen = readNew(cursor, id);
-      if (seen === "seen") return confirmed(id, "its user record is in the lead session");
-      if (seen === "lost") cursor = undefined;
-    }
+    const seen = readNew(cursor, id);
+    if (seen === "lost") break;
+    if (seen !== "seen") continue;
+    const now = await rt.probe(ref);
+    if (now.pid !== before.pid || now.sessionId !== before.sessionId)
+      return unconfirmed(id, "the lead process or session changed");
+    return confirmed(id, "its user record is in the same lead session");
   }
-  return unconfirmed(id, "no new user record or idle-to-working change was observed");
+  return unconfirmed(id, "no new user record carrying this request's id was observed");
 };
 
 export const forwardToLead = async (deps: FlowDeps, request: LeadRequest): Promise<ToolResult> => {

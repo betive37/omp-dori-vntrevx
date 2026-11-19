@@ -1,5 +1,5 @@
 import { expect, test } from "bun:test";
-import { existsSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { parseLiveEvent } from "../src/voice/provider.ts";
 import { Replies } from "../src/voice/replies.ts";
@@ -79,6 +79,92 @@ test("barge-in discards acknowledged reply audio without advancing its durable o
     restored.scan();
     expect(restored.first()?.text).toBe(text);
     await f.engine.stop();
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a partially played reply stays pending until its final padded frame is pulled", async () => {
+  const f = fixture();
+  try {
+    const text = "The last part of this reply has to reach the local player.";
+    const cursor = join(f.directory, "lead-replies.state.json");
+    writeFileSync(join(f.directory, "lead-replies.jsonl"), `${JSON.stringify({ re: "request", text })}\n`);
+    const current = await f.start();
+    f.time(5000);
+    f.engine.tick();
+    const offered = current.wires.find((wire) => String(wire["event_id"]).startsWith("reply_"))!;
+    current.handlers.event({ type: "session.commentary.appended", client_event_id: String(offered["event_id"]) });
+    current.handlers.event({ type: "session.output_transcript.delta", delta: text });
+    current.handlers.event({ type: "session.output_audio.delta", delta: Buffer.alloc(1008, 12).toString("base64") });
+    expect(f.playback.read()).not.toBeNull();
+    expect(f.playback.queuedMs()).toBe(1);
+    expect(f.playback.read()).toBeNull();
+    f.time(7000);
+    f.engine.tick();
+    expect(existsSync(cursor)).toBe(false);
+    const tail = f.playback.read()!;
+    expect(tail.readInt16LE(0)).toBe(3084);
+    expect(tail.readInt16LE(192)).toBe(0);
+    f.time(8000);
+    f.engine.tick();
+    expect(existsSync(cursor)).toBe(true);
+    const restored = new Replies(f.directory, () => {});
+    restored.scan();
+    expect(restored.first()).toBeUndefined();
+    current.handlers.closed();
+    await f.engine.stop();
+  } finally {
+    f.cleanup();
+  }
+});
+
+test("a failed reply write cannot keep a local close live", async () => {
+  const f = fixture();
+  try {
+    const text = "The completed reply must stay pending if its offset cannot be written.";
+    writeFileSync(join(f.directory, "lead-replies.jsonl"), `${JSON.stringify({ re: "request", text })}\n`);
+    const current = await f.start();
+    f.time(5000);
+    f.engine.tick();
+    const offered = current.wires.find((wire) => String(wire["event_id"]).startsWith("reply_"))!;
+    f.time(5001);
+    current.handlers.event({ type: "session.commentary.appended", client_event_id: String(offered["event_id"]) });
+    f.time(5002);
+    current.handlers.event({ type: "session.output_transcript.delta", delta: text });
+    current.handlers.event({ type: "session.output_audio.delta", delta: Buffer.alloc(960, 12).toString("base64") });
+    expect(f.playback.read()).not.toBeNull();
+    mkdirSync(join(f.directory, "lead-replies.state.json.tmp"));
+    f.time(7000);
+    f.engine.ownerPresence(false);
+    expect(count(current.wires, "session.close")).toBe(1);
+    current.handlers.closed();
+    await f.engine.stop();
+    expect(f.failedSummaries).toEqual([true]);
+    expect(f.logs).toContain("VOICE_CLOSE_PERSIST_FAILED");
+    expect(existsSync(join(f.directory, "lead-replies.state.json"))).toBe(false);
+  } finally {
+    f.cleanup();
+  }
+});
+
+test.each(["input", "output"])("a sustained %s burst holds voice without using truncated audio", async (side) => {
+  const f = fixture();
+  try {
+    const current = await f.start();
+    if (side === "input") {
+      for (let i = 0; i < 151; i++) f.engine.pcm(voiced());
+    } else {
+      const delta = Buffer.alloc(48_000, 12).toString("base64");
+      for (let i = 0; i < 6; i++) current.handlers.event({ type: "session.output_audio.delta", delta });
+    }
+    expect(count(current.wires, "session.close")).toBe(1);
+    f.engine.tick();
+    expect(count(current.wires, "session.input_audio.append")).toBe(0);
+    expect(f.playback.queuedMs()).toBe(0);
+    current.handlers.closed();
+    await f.engine.stop();
+    expect(f.failedSummaries).toEqual([true]);
   } finally {
     f.cleanup();
   }
