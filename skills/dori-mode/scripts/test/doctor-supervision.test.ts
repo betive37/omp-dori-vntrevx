@@ -1,5 +1,6 @@
 import { expect, test } from "bun:test";
 import { join } from "node:path";
+import { doctorCommand } from "./doctor-fixture.ts";
 import { bootCheck } from "../src/boot.ts";
 import type { BootLane } from "../src/boot-monitors.ts";
 import { doctorCheck, doctorLocal } from "../src/doctor.ts";
@@ -108,6 +109,7 @@ test.each([true, false])(
         leadPane: "",
         sessionsDir: join(state.dir, "sessions"),
         doctor: { ignore: ["runtime"] },
+        agentCommand: doctorCommand(state.dir),
       });
       const config = {
         ...deps.config,

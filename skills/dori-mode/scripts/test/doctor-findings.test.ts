@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { doctorCommand } from "./doctor-fixture.ts";
 import { bootCheck } from "../src/boot.ts";
 import type { Manifest } from "../src/boot-monitors.ts";
 import { doctorCheck } from "../src/doctor.ts";
@@ -40,6 +41,7 @@ test("old session filters stay advisory while the trusted current owner's filter
     laneState(state.dir, "w1:p1", { role: "dori", sessionId: "owner", agentStatus: "idle" });
     const deps = depsFor(world, fakeClock(Date.parse("2026-01-01T12:00:00Z")), state.dir, {
       leadPane: "w1:p1",
+      agentCommand: doctorCommand(state.dir),
       sessionsDir: join(state.dir, "sessions"),
     });
     const dir = join(state.dir, "monitors");
@@ -73,6 +75,7 @@ test("done journals do not imply missing adoption and boot names its ignored che
       leadPane: "",
       sessionsDir: join(state.dir, "sessions"),
       doctor: { ignore: ["runtime", "lessons"] },
+      agentCommand: doctorCommand(state.dir),
     });
     await deps.registry.write({
       key: "complete",

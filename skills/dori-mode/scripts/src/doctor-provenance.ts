@@ -1,5 +1,6 @@
 import { resolve } from "node:path";
 import { readSourceBundle } from "../../../../src/release/source-bundle.ts";
+import { NATIVE_CLI_FEATURES, probeNativeCli } from "../../../../src/runtime/omp-capabilities.ts";
 import { type BootLane, finished } from "./boot-monitors.ts";
 import type { DoctorFinding } from "./doctor.ts";
 import type { FlowDeps } from "./done-flow.ts";
@@ -164,6 +165,28 @@ export const doctorProvenance = async (
         provenance: `${name}.lock and patch digest in the loaded CLI checkout`,
         next: "Inspect the selected executable and live process before claiming runtime compatibility.",
       });
+      if (native && bundle.lock.nativeVersion) {
+        const probe = await probeNativeCli(
+          deps.config.agentCommand,
+          deps.config.defaultCwd,
+          deps.env ?? process.env,
+          bundle.lock.nativeVersion,
+          source,
+        );
+        findings.push({
+          check: "source",
+          severity: probe.reason && probe.kind !== "other" ? "WARN" : "INFO",
+          detail:
+            `configured native executable=${JSON.stringify(probe.executable)} realpath=${JSON.stringify(probe.realpath ?? null)} ` +
+            `probeExecutable=${JSON.stringify(probe.probeExecutable ?? null)} entry=${JSON.stringify(probe.entry ?? null)} nativeVersion=${probe.version ?? "unknown"} ` +
+            `expectedRevision=${bundle.lock.commit} observedRevision=${probe.revision ?? "unknown"} ` +
+            `publicCLI=${probe.reason ? "unavailable" : "PASS"}; ${probe.reason ?? NATIVE_CLI_FEATURES.join(", ")}; ` +
+            "not live messenger compatibility",
+          provenance:
+            "native-cli --version/--help; private HOME and cwd, no configured prompt or credential environment",
+          next: "Resolve this executable or capability failure; a version number is not a live runtime attestation.",
+        });
+      }
     } catch {
       findings.push({
         check: "source",

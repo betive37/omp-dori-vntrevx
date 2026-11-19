@@ -1,6 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { doctorCommand } from "./doctor-fixture.ts";
 import { bootCheck } from "../src/boot.ts";
 import type { Manifest } from "../src/boot-monitors.ts";
 import { loadConfig } from "../src/config.ts";
@@ -84,7 +85,11 @@ test("trusted live lead is distinguished from stale metadata and lane roles", as
   const pane = "w1:p1";
   world.panes = [{ pane_id: pane, workspace_id: "w1", agent: "omp", agent_status: "idle", cwd: "/repo" }];
   agentIn(world, pane);
-  const deps = depsFor(world, fakeClock(now), state.dir, { leadPane: pane, sessionsDir: join(state.dir, "sessions") });
+  const deps = depsFor(world, fakeClock(now), state.dir, {
+    leadPane: pane,
+    sessionsDir: join(state.dir, "sessions"),
+    agentCommand: doctorCommand(state.dir),
+  });
   laneState(state.dir, pane, { role: "dori", agentStatus: "idle" });
   const result = await doctorCheck(deps);
   expect(result.exitCode).toBe(0);

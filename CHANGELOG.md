@@ -188,3 +188,5 @@ The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, pu
 - Unreleased: Distinguish source-lock declarations, configured models, trusted native model readbacks, historical opaque-launch receipts and credential presence in read-only doctor diagnostics.
 
 - Unreleased: Report current managed source and native runtime identities separately from historical updater deployment receipts.
+
+- Unreleased: Diagnose the selected native executable, source revision and public CLI/API capabilities without falling back to another binary or adding an extension peer to the test gate.

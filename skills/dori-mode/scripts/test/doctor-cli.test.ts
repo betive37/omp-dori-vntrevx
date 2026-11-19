@@ -1,6 +1,7 @@
 import { expect, test } from "bun:test";
 import { mkdirSync, readdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
+import { doctorCommand } from "./doctor-fixture.ts";
 import { withState } from "./fakes.ts";
 
 const cli = join(import.meta.dir, "../src/cli.ts");
@@ -11,9 +12,16 @@ test("real CLI emits JSON diagnostics and presets with isolated state and no sid
     const stateDir = join(state.dir, "state");
     mkdirSync(stateDir);
     const config = join(state.dir, "config.json");
+    const agentCommand = doctorCommand(state.dir);
     writeFileSync(
       config,
-      JSON.stringify({ stateDir, sessionsDir: join(state.dir, "sessions"), leadPane: "", runtime: "herdr" }),
+      JSON.stringify({
+        stateDir,
+        agentCommand,
+        sessionsDir: join(state.dir, "sessions"),
+        leadPane: "",
+        runtime: "herdr",
+      }),
     );
     const before = readFileSync(config, "utf8");
     const run = async (...args: string[]) => {
@@ -61,6 +69,7 @@ test("real CLI emits JSON diagnostics and presets with isolated state and no sid
       config,
       JSON.stringify({
         stateDir,
+        agentCommand,
         sessionsDir: join(state.dir, "sessions"),
         doctor: { ignore: ["runtime"] },
       }),
