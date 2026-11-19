@@ -7,7 +7,10 @@ type Binding = {
   source: number;
   session: string;
   accepts(content: string): boolean;
-  deliver(content: string, details: { ompDoriAdmission: { identity: string; fingerprint: string } }): void;
+  deliver(
+    content: string,
+    details: { ompDoriAdmission: { identity: string; fingerprint: string } },
+  ): void | Promise<void>;
 };
 type Pending = {
   source: number;
@@ -100,10 +103,13 @@ export class HeadAdmissions {
     this.#pending.set(request.identity, pending);
     try {
       this.changed(this.#pending.size);
-      binding.deliver(request.content, {
-        ompDoriAdmission: { identity: request.identity, fingerprint: request.fingerprint },
-      });
-      return await pending.promise;
+      const delivered = Promise.resolve(
+        binding.deliver(request.content, {
+          ompDoriAdmission: { identity: request.identity, fingerprint: request.fingerprint },
+        }),
+      ).then(() => pending.promise);
+      // Stop releases the receipt wait even during async delivery; its later rejection remains observed.
+      return await Promise.race([pending.promise, delivered]);
     } finally {
       this.#pending.delete(request.identity);
       this.changed(this.#pending.size);

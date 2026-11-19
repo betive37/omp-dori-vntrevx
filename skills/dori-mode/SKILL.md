@@ -62,6 +62,8 @@ Goals follow requests, not the session. When the owner asks for something, set o
 - On Slack, message events are not enough: also watch the threads view and unread counts (`dori inbound slack`), and treat every thread you have posted in as watched, so an untagged reply there still reaches you.
 - React to each new message with an "eyes" reaction (a read receipt, the one emoji you use), then handle it. If it is a reply, read the message it replies to first.
 - Answer every owner message within a minute, in its thread: the answer, or one line on what you are doing and when you will be back. While work runs, its thread gets a short progress reply every 15 minutes and at each milestone. Otherwise stay quiet: no FYIs, no confirmations.
+- On Discord, `dori react discord --to <channel> --message <owner-message>` adds the default eyes reaction and records its exact-message mark; a complete successful `dori send discord` records the channel-send receipt. Edits, reaction removals and incomplete split sends do not supply those receipts. Direct SDK/API sends bypass this CLI ledger.
+- Dori MAIN can request up to three continuations for a recent owner obligation missing either receipt; lanes and subagents are exempt. This bounded reminder is not answer-relevance or human-read detection. Inspect which action is still missing, and do not repeat an accepted answer merely because a local receipt is absent. Storage, retention and lock-wait limits: `references/scripts.md#discord-owner-obligation-reminders`.
 - When the owner asks you to remember something or to tell them when something happens, write it down, set a watch, and tell them at that moment.
 
 ## Writing to the owner

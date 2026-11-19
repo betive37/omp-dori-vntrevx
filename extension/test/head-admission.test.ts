@@ -9,6 +9,9 @@ import {
   type DiscordInboundQueue,
 } from "../../skills/dori-mode/scripts/src/messenger/discord-inbound-queue.ts";
 import { headReceipt } from "../head-receipt.ts";
+import { takeLock } from "../../skills/dori-mode/scripts/src/checkpoint-lock.ts";
+import { openOwes } from "../../skills/dori-mode/scripts/src/owes.ts";
+import { until } from "./fake-pi.ts";
 
 type Event = {
   event: string;
@@ -374,4 +377,113 @@ test("message_end during a native atomic batch publishes the deferred entry befo
   expect(batches).toHaveLength(2);
   pending(dir, null, "102");
   await stop(head);
+}, 15000);
+
+const holdOwes = (dir: string) => {
+  const folder = join(dir, "queue", "owes");
+  mkdirSync(folder, { mode: 0o700 });
+  const release = takeLock(join(folder, "inbound.jsonl.lock"), Date.now(), (message) => new Error(message));
+  if (typeof release === "string") throw new Error(release);
+  return release;
+};
+
+test("native receipt delivery waits behind an ordinary owe admission and preserves FIFO", async () => {
+  const dir = root();
+  const release = holdOwes(dir);
+  const head = start(dir, "owes-serial");
+  let held = true;
+  try {
+    await event(head, "ready");
+    expect((await event(head, "admission-status")).pending).toBe(1);
+    const waiting = head.events.filter((item) => item.event === "before-owe");
+    expect(waiting).toHaveLength(1);
+    expect(waiting[0]?.content).toContain("[prior] INBOUND discord 20 90");
+    expect(sources(head)).toEqual([]);
+    expect(openOwes(join(dir, "queue"), Date.now())).toEqual([]);
+    release();
+    held = false;
+    await sourceExited(head, 0);
+    const admitted = head.events.filter((item) => item.event === "owe-admitted");
+    expect(admitted.map((item) => item.details?.ompDoriAdmission.identity ?? "prior")).toEqual([
+      "prior",
+      "99:10:20:101",
+      "99:10:20:102",
+    ]);
+    expect(openOwes(join(dir, "queue"), Date.now()).map((owe) => owe.message)).toEqual(["90", "101", "102"]);
+    const handoffs = head.events.filter((item) => item.event === "handoff");
+    expect(handoffs.map((item) => item.details?.ompDoriAdmission.identity)).toEqual(["99:10:20:101", "99:10:20:102"]);
+    for (const item of handoffs) {
+      const source = item.details!.ompDoriAdmission;
+      expect(
+        (
+          await headReceipt(
+            head.events.find((item) => item.event === "ready")!.file!,
+            source.identity,
+            source.fingerprint,
+          )
+        )?.receipt,
+      ).toBe(item.entry);
+    }
+    pending(dir, null, "102");
+    await stop(head);
+  } finally {
+    if (held) release();
+  }
+}, 15000);
+
+test("source cancellation releases receipt status while asynchronous owe delivery is still blocked", async () => {
+  const dir = root();
+  const release = holdOwes(dir);
+  const head = start(dir, "owes-locked");
+  try {
+    await event(head, "ready");
+    await event(head, "before-owe");
+    head.proc.send({ op: "cancel-admission" });
+    await until(() => head.events.filter((item) => item.event === "admission-status").at(-1)?.pending === 0);
+    await sourceExited(head, 1);
+    expect(head.events.filter((item) => item.event === "handoff")).toEqual([]);
+    expect(openOwes(join(dir, "queue"), Date.now())).toEqual([]);
+    pending(dir, "101", "100");
+    queued(dir, (queue) => expect(queue.unresolved()?.identity).toBe("99:10:20:101"));
+    await stop(head);
+  } finally {
+    release();
+  }
+}, 15000);
+
+test("session cancellation during native owe admission leaves no publication and retains the original fence", async () => {
+  const dir = root();
+  const release = holdOwes(dir);
+  const head = start(dir, "owes-locked");
+  let held = true;
+  try {
+    const ready = await event(head, "ready");
+    expect((await event(head, "before-owe")).details?.ompDoriAdmission.identity).toBe("99:10:20:101");
+    head.proc.send({ op: "stop-monitors" });
+    await event(head, "monitors-stopped");
+    await until(() => {
+      try {
+        process.kill(ready.sourcePid!, 0);
+        return false;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") return true;
+        throw error;
+      }
+    });
+    await until(() => head.events.filter((item) => item.event === "admission-status").at(-1)?.pending === 0);
+    release();
+    held = false;
+    expect(head.events.filter((item) => item.event === "owe-admitted" || item.event === "handoff")).toEqual([]);
+    expect(openOwes(join(dir, "queue"), Date.now())).toEqual([]);
+    queued(dir, (queue) => expect(queue.unresolved()?.identity).toBe("99:10:20:101"));
+    pending(dir, "101", "100");
+    await stop(head);
+    const resumed = start(dir, "accepted");
+    await sourceExited(resumed, 1);
+    expect(sources(resumed)).toEqual([]);
+    pending(dir, "101", "100");
+    await stop(resumed);
+  } finally {
+    if (held) release();
+  }
 }, 15000);

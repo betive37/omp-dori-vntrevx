@@ -5,6 +5,7 @@ import { FileSessionStorage } from "@oh-my-pi/pi-coding-agent/session/session-st
 import { HeadAdmissions } from "../../../extension/head-admission.ts";
 import { Monitors } from "../../../extension/monitor.ts";
 import { assertNativeHost } from "./host.ts";
+import { recordOwes } from "../../../skills/dori-mode/scripts/src/owes.ts";
 
 const [root, mode, exitFile] = process.argv.slice(2);
 if (!root || !isAbsolute(root) || !exitFile || !process.send ||
@@ -36,7 +37,17 @@ const admissions = new HeadAdmissions(
 const nativeHead = mode === "agent"
   ? await (await import("./native-message-head.ts")).nativeMessageHead(root, session, admissions) : undefined;
 if (nativeHead) contextManager = nativeHead.manager;
-const monitors = new Monitors((content, details) => {
+const oweStarted = Promise.withResolvers<void>();
+const monitors = new Monitors(async (content, delivery) => {
+  const { details } = delivery;
+  if (mode?.startsWith("owes-") && content.includes("INBOUND discord")) {
+    process.send?.({ event: "before-owe", content, details });
+    oweStarted.resolve();
+    await recordOwes(join(root, "queue"), content, Date.now(), delivery.signal);
+    if (!delivery.isCurrent()) return;
+    process.send?.({ event: "owe-admitted", content, details });
+  }
+  if (!delivery.isCurrent()) return;
   if (details === undefined) {
     const exited = content.split("\n").some((line) => line.startsWith("[source] monitor exited ("));
     process.send?.({ event: exited ? "source-exited" : "diagnostic", content });
@@ -84,8 +95,14 @@ if (cli) {
     DORI_DISCORD_TOKEN: "synthetic-inbound-token", DORI_DISCORD_OWNER_ID: "10", DORI_DISCORD_CHANNEL_ID: "20",
     DORI_TEST_DISCORD_CASE: "context" });
 }
+if (mode === "owes-serial") {
+  monitors.start("prior", [process.execPath, "--eval",
+    'console.log(' + JSON.stringify('INBOUND discord 20 90 from=owner ref=- "prior"') + ');setInterval(()=>{},1000)'],
+    "^INBOUND", root, identity);
+  await oweStarted.promise;
+}
 monitors.start("source", argv, mode === "filtered" ? "NO_SOURCE_RECORD_MATCHES" : "^INBOUND", root, identity);
-process.send({ event: "ready", file, sourcePid: monitors.list()[0]?.pid });
+process.send({ event: "ready", file, sourcePid: monitors.list().find((entry) => entry.name === "source")?.pid });
 const stop = async () => {
   monitors.stopAll();
   await nativeHead?.close();
@@ -99,6 +116,9 @@ process.on("message", (message: unknown) => {
     const source = monitors.list().find((entry) => entry.name === "source");
     if (!source) throw new Error("fixture source is not live");
     admissions.stop(source.pid);
+  } else if (message.op === "stop-monitors") {
+    monitors.stopAll();
+    process.send?.({ event: "monitors-stopped" });
   } else if (message.op === "restart-source") {
     const resumed = [...argv];
     resumed[3] = join(root, "restart-exit");

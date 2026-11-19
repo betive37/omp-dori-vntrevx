@@ -10,6 +10,7 @@ import { discordInboundQueue } from "./messenger/discord-inbound-queue.ts";
 import { discordInboundEnv } from "./messenger/discord-inbound-state.ts";
 import { fetchHttp } from "./messenger/http.ts";
 import { headEmitter, reconcileHead } from "./messenger/head-admission.ts";
+import { recordOwes } from "./owes.ts";
 import { realClock } from "./run.ts";
 
 export const openDiscordSocket = (url: string): GatewaySocket => {
@@ -89,19 +90,15 @@ export const discordInboundCommand = async (
     });
     const watching = all ? "all" : intake.channels().join(",");
     const where = context ? inboundContext(discord, new DiscordChannels(stateDir), realClock.now) : undefined;
-    // The whole group, context included, finishes delivery before its cursor moves.
-    const emit: Emit = headEmitter(
-      queue,
-      intake.botId,
-      ownerId,
-      where
-        ? async (message) => {
-            const context = await where(message.channel);
-            return `${formatDiscordInbound(message)}
-${formatInboundContext(message, context)}`;
-          }
-        : formatDiscordInbound,
-    );
+    // The owe and complete context group precede native receipt, cursor and exact-ID ACK.
+    const emit: Emit = headEmitter(queue, intake.botId, ownerId, async (message, signal) => {
+      const text = where
+        ? `${formatDiscordInbound(message)}\n${formatInboundContext(message, await where(message.channel))}`
+        : formatDiscordInbound(message);
+      await recordOwes(stateDir, text, Date.now(), signal);
+      signal?.throwIfAborted();
+      return text;
+    });
     console.log(
       `INBOUND_READY discord owner=${ownerId} channel=${watching} bot=${intake.botId}${gateway ? " mode=gateway" : ""}`,
     );
