@@ -14,6 +14,13 @@ const { STRING_VALUE_FLAGS, VALUELESS_FLAGS }: typeof NativeFlags = await import
   Bun.resolveSync("@oh-my-pi/pi-coding-agent/cli/flag-tables", host)
 );
 
+// CI has no extension peer: exercise the frozen host module boundary instead of an ambient package import.
+const host = resolve(import.meta.dir, "../../test/fixtures/omp-native-host");
+const { parseArgs }: typeof NativeArgs = await import(Bun.resolveSync("@oh-my-pi/pi-coding-agent/cli/args", host));
+const { STRING_VALUE_FLAGS, VALUELESS_FLAGS }: typeof NativeFlags = await import(
+  Bun.resolveSync("@oh-my-pi/pi-coding-agent/cli/flag-tables", host)
+);
+
 const source = "/fixture/packages/coding-agent/";
 const prefixes = [
   ["omp"],
