@@ -6,7 +6,12 @@ import { DiscordChannels, inboundContext } from "./messenger/discord-channels.ts
 import type { GatewayClock, GatewaySocket } from "./messenger/discord-gateway.ts";
 import { routeDiscordAskReply } from "./messenger/discord-ask-mailbox.ts";
 import { type DiscordAskReceiverPublication, openDiscordAskReceiver } from "./messenger/discord-ask-receiver.ts";
-import { discordInbound, formatDiscordInbound, formatInboundContext } from "./messenger/discord-inbound.ts";
+import {
+  discordInbound,
+  formatDiscordInbound,
+  formatInboundContext,
+  markDiscordInboundSeen,
+} from "./messenger/discord-inbound.ts";
 import type { Emit } from "./messenger/discord-inbound-api.ts";
 import { discordInboundLive } from "./messenger/discord-inbound-live.ts";
 import { discordInboundQueue } from "./messenger/discord-inbound-queue.ts";
@@ -107,7 +112,10 @@ export const discordInboundCommand = async (
     // Context and the owner line remain one stdout group, after the owe is published.
     const emit: Emit = async (message, signal) => {
       signal?.throwIfAborted();
-      if (routeDiscordAskReply(stateDir, message, ownerId)) return;
+      if (routeDiscordAskReply(stateDir, message, ownerId)) {
+        await markDiscordInboundSeen(discord, message);
+        return;
+      }
       const route = await discordLaneRoute(stateDir, message.channel);
       if (route) {
         const held = await withDeliveryLock(delivery, route.key, async () => {
@@ -123,7 +131,10 @@ export const discordInboundCommand = async (
           return true;
         });
         if (!held.ok) throw new Error("Discord lane delivery is locked; cursor not advanced");
-        if (held.value) return;
+        if (held.value) {
+          await markDiscordInboundSeen(discord, message);
+          return;
+        }
       }
       const text = where
         ? `${formatDiscordInbound(message)}\n${formatInboundContext(message, await where(message.channel))}`
