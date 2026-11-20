@@ -1,4 +1,4 @@
-import { expect, test } from "bun:test";
+import { afterAll, beforeAll, describe, expect, test } from "bun:test";
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { requiredSourceRequest } from "../../test/fixtures/omp-native-host/required-source.ts";
@@ -18,28 +18,33 @@ const removeHome = (home: string): void => {
 };
 
 for (const boundary of ["session", "provider"] as const) {
-  test(`missing required overlays block real ${boundary} transport only for role sessions`, async () => {
+  describe(`missing required overlays block real ${boundary} transport only for role sessions`, () => {
     const keys = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
-    const before = keys.map((key) => process.env[key]);
-    const home = dirname(useConfig(""));
-    process.env["HOME"] = home;
-    process.env["DORI_OMP_ULW_PATH"] = join(home, ".cache/omp-dori", `omp-ulw-${"0".repeat(64)}`, "index.ts");
-    delete process.env["HERDR_PANE_ID"];
-    delete process.env["HC_TERMINAL_ID"];
-    try {
-      for (const role of ["lane", "dori", undefined] as const) {
-        const cwd = join(home, role ?? "ordinary");
-        mkdirSync(cwd);
-        const result = await requiredSourceRequest(join(import.meta.dir, "../index.ts"), cwd, role, boundary);
-        expect(result.errors.filter((error) => error.event === "session_start")).toEqual([]);
-        expect(result.requests).toBe(role ? 0 : 1);
-      }
-    } finally {
+    let before: (string | undefined)[];
+    let home: string;
+    beforeAll(() => {
+      before = keys.map((key) => process.env[key]);
+      home = dirname(useConfig(""));
+      process.env["HOME"] = home;
+      process.env["DORI_OMP_ULW_PATH"] = join(home, ".cache/omp-dori", `omp-ulw-${"0".repeat(64)}`, "index.ts");
+      delete process.env["HERDR_PANE_ID"];
+      delete process.env["HC_TERMINAL_ID"];
+    });
+    afterAll(() => {
       keys.forEach((key, index) => {
         if (before[index] === undefined) delete process.env[key];
         else process.env[key] = before[index];
       });
       removeHome(home);
+    });
+    for (const role of ["lane", "dori", undefined] as const) {
+      test(role ?? "ordinary", async () => {
+        const cwd = join(home, role ?? "ordinary");
+        mkdirSync(cwd);
+        const result = await requiredSourceRequest(join(import.meta.dir, "../index.ts"), cwd, role, boundary);
+        expect(result.errors.filter((error) => error.event === "session_start")).toEqual([]);
+        expect(result.requests).toBe(role ? 0 : 1);
+      });
     }
   });
 }
@@ -53,16 +58,18 @@ for (const input of [
   { name: "successful consumer directory", indexed: false, managed: true, failure: "none" },
 ]) {
   for (const boundary of ["session", "provider"] as const) {
-    test(`${input.name} load preserves required ${boundary} cancellation and ordinary sessions`, async () => {
+    describe(`${input.name} load preserves required ${boundary} cancellation and ordinary sessions`, () => {
       const keys = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
-      const before = keys.map((key) => process.env[key]);
-      const stateDir = useConfig("");
-      const home = dirname(stateDir);
-      process.env["HOME"] = home;
-      delete process.env["DORI_OMP_ULW_PATH"];
-      delete process.env["HERDR_PANE_ID"];
-      delete process.env["HC_TERMINAL_ID"];
-      try {
+      let before: (string | undefined)[];
+      let home: string;
+      beforeAll(() => {
+        before = keys.map((key) => process.env[key]);
+        const stateDir = useConfig("");
+        home = dirname(stateDir);
+        process.env["HOME"] = home;
+        delete process.env["DORI_OMP_ULW_PATH"];
+        delete process.env["HERDR_PANE_ID"];
+        delete process.env["HC_TERMINAL_ID"];
         const dependency = input.managed
           ? join(home, ".dori/releases/consumer-dependencies", `omp-ulw-${"a".repeat(40)}-${"b".repeat(64)}`)
           : join(home, "external-overlay");
@@ -78,7 +85,16 @@ for (const input of [
           join(home, "config.json"),
           JSON.stringify({ stateDir, ompUlwPath: input.indexed ? join(dependency, "index.ts") : dependency }),
         );
-        for (const role of ["lane", "dori", undefined] as const) {
+      });
+      afterAll(() => {
+        keys.forEach((key, index) => {
+          if (before[index] === undefined) delete process.env[key];
+          else process.env[key] = before[index];
+        });
+        removeHome(home);
+      });
+      for (const role of ["lane", "dori", undefined] as const) {
+        test(role ?? "ordinary", async () => {
           const cwd = join(home, role ?? "ordinary");
           mkdirSync(cwd);
           const result = await requiredSourceRequest(join(import.meta.dir, "../index.ts"), cwd, role, boundary);
@@ -86,13 +102,7 @@ for (const input of [
           expect(result.requests).toBe(role && input.managed && input.failure !== "none" ? 0 : 1);
           if (role && input.managed && input.failure !== "none")
             expect(result.errors.some((error) => error.error.includes("intentional dependency failure"))).toBe(true);
-        }
-      } finally {
-        keys.forEach((key, index) => {
-          if (before[index] === undefined) delete process.env[key];
-          else process.env[key] = before[index];
         });
-        removeHome(home);
       }
     });
   }
