@@ -1,24 +1,7 @@
 import type { Clock } from "../run.ts";
+import { discordErrorCode, retryAfter } from "./discord-response.ts";
 import { DEFAULT_RETRY, guardText, type Http, MessengerError, withBackoff } from "./http.ts";
 import { DISCORD_LIMIT, splitForDiscord } from "./split.ts";
-
-const retryAfter = (body: string): number | undefined => {
-  try {
-    const n = (JSON.parse(body) as { retry_after?: number }).retry_after;
-    return typeof n === "number" ? n : undefined;
-  } catch {
-    return undefined;
-  }
-};
-
-const discordErrorCode = (body: string): string | undefined => {
-  try {
-    const parsed = JSON.parse(body) as { code?: unknown } | null;
-    return typeof parsed?.code === "number" ? String(parsed.code) : undefined;
-  } catch {
-    return undefined;
-  }
-};
 
 export type DcChannel = {
   readonly id: string;
@@ -27,6 +10,13 @@ export type DcChannel = {
   readonly topic?: string | null;
   readonly parent_id?: string | null;
   readonly available_tags?: readonly { readonly id: string; readonly name: string }[];
+};
+
+type Delivery = { readonly ids: string[]; readonly replyConfirmed: boolean };
+type PostedMessage = {
+  readonly id: string;
+  readonly type?: number;
+  readonly message_reference?: { readonly message_id?: string; readonly channel_id?: string };
 };
 
 /** Forum and media channels contain posts, each represented by a thread. */
@@ -102,6 +92,11 @@ export class Discord {
    * part stops the rest; its error names the parts already posted, which stay.
    */
   async send(channelId: string, content: string, opts: { readonly replyTo?: string } = {}): Promise<string[]> {
+    return (await this.sendDelivery(channelId, content, opts)).ids;
+  }
+
+  /** Preserve first-message reply evidence instead of inferring it from the request. */
+  async sendDelivery(channelId: string, content: string, opts: { readonly replyTo?: string } = {}): Promise<Delivery> {
     return await this.post(channelId, splitForDiscord(guardText(content)), opts.replyTo);
   }
 
@@ -111,20 +106,28 @@ export class Discord {
     parts: readonly string[],
     replyTo?: string,
     before: readonly string[] = [],
-  ): Promise<string[]> {
+  ): Promise<Delivery> {
     const ids: string[] = [...before];
     const total = before.length + parts.length;
+    let replyConfirmed = false;
     for (const part of parts) {
       const reference =
         ids.length === 0 && replyTo !== undefined
           ? { message_reference: { message_id: replyTo, fail_if_not_exists: false } }
           : {};
       try {
-        const sent = await this.call<{ id: string }>("POST", `/channels/${channelId}/messages`, {
+        const sent = await this.call<PostedMessage>("POST", `/channels/${channelId}/messages`, {
           content: part,
           allowed_mentions: { parse: [] },
           ...reference,
         });
+        if (ids.length === 0 && replyTo !== undefined) {
+          const ref = sent.message_reference;
+          replyConfirmed =
+            sent.type === 19 &&
+            ref?.message_id === replyTo &&
+            (ref.channel_id === undefined || ref.channel_id === channelId);
+        }
         ids.push(sent.id);
       } catch (e) {
         if (ids.length === 0) throw e;
@@ -137,7 +140,7 @@ export class Discord {
         );
       }
     }
-    return ids;
+    return { ids, replyConfirmed };
   }
 
   /** One message is edited in place: text over the limit is refused before any request, never split. */

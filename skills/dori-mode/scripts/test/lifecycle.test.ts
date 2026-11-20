@@ -1,5 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { createHash } from "node:crypto";
 import { existsSync, writeFileSync } from "node:fs";
+import { withDeliveryLock } from "../src/delivery-lock.ts";
 import { closeLane, watchTick } from "../src/done-flow.ts";
 import { holdLines } from "../src/holds.ts";
 import { readPaneState } from "../src/lane-state.ts";
@@ -7,7 +9,7 @@ import { openDiscordLaneInbox } from "../src/messenger/discord-lane-inbox.ts";
 import { parkLane } from "../src/park.ts";
 import { reopenLane } from "../src/reopen.ts";
 import { statusOf } from "../src/registry.ts";
-import { laneState, sent } from "./fakes.ts";
+import { fakeClock, laneState, sent } from "./fakes.ts";
 import { lifecycleFixture, type LifecycleFixture } from "./lifecycle-fixture.ts";
 
 let f: LifecycleFixture;
@@ -149,3 +151,45 @@ test("wrong resumed session stays paused and receives no goal command", async ()
   expect(sent(f.world)).toEqual(["/goal pause"]);
   expect(f.creates()).toBe(1);
 });
+
+test.each(["parked", "abandoned", "reopen"] as const)(
+  "%s cannot change existing membership or touch the pane while a sibling election holds the thread lock",
+  async (operation) => {
+    const lane = { ...f.lane, thread: "discord:40" };
+    await f.deps.registry.write(lane);
+    const seen = operation === "reopen" ? (await parkLane(f.deps, lane, "prepare reopen")).lane : lane;
+    const before = await f.deps.registry.read(lane.key);
+    const panes = f.world.panes.map((pane) => pane.pane_id);
+    f.world.calls.length = 0;
+    const deps = { ...f.deps, config: { ...f.deps.config, threadDonePolicy: "last-lane" as const } };
+    const clock = fakeClock(deps.clock.now());
+    const waiting = {
+      ...deps,
+      clock: {
+        ...clock,
+        sleep: async (ms: number) => {
+          clock.at += ms;
+        },
+      },
+    };
+    const key = `@thread-${createHash("sha256").update(lane.thread).digest("hex")}`;
+    const held = await withDeliveryLock(waiting, key, () =>
+      operation === "reopen" ? reopenLane(waiting, seen) : parkLane(waiting, seen, "operator reason", operation),
+    );
+    expect(held.ok && held.value.code).toBe(3);
+    expect(held.ok && held.value.lines[0]).toStartWith(`HELD ${lane.key} thread close in flight`);
+    expect(await deps.registry.read(lane.key)).toEqual(before);
+    expect(f.world.panes.map((pane) => pane.pane_id)).toEqual(panes);
+    expect(sent(f.world)).toEqual([]);
+    expect(f.world.calls.some(([cmd, scope, verb]) => cmd === "herdr" && scope === "pane" && verb === "close")).toBe(
+      false,
+    );
+    expect(f.creates()).toBe(0);
+
+    const retried =
+      operation === "reopen" ? await reopenLane(deps, seen) : await parkLane(deps, seen, "operator reason", operation);
+    expect(retried.code).toBe(0);
+    expect(statusOf(retried.lane)).toBe(operation === "reopen" ? "working" : "closed");
+    expect(retried.lane).toMatchObject({ session: f.session, sessionFile: f.file, thread: lane.thread });
+  },
+);

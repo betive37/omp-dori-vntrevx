@@ -11,16 +11,16 @@ import { runtimesOf } from "./run.ts";
 import { readScreen } from "./sessions.ts";
 import { Supervision, type SupervisionResult } from "./supervision.ts";
 
-export { anchoredReportLine, lastReportLine, scrubForThread } from "./freshness-notify.ts";
-
 export type SweepAct = {
   readonly kind:
     | "nudged"
+    | "nudge-failed"
     | "posted"
     | "no-report"
     | "post-failed"
     | "pending-report"
     | "stale-report"
+    | "unrelayed"
     | "working-while-paused"
     | "stalled"
     | "journal-error"
@@ -72,7 +72,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
     // Only launched lanes report through the journal; an adopted lane keeps the screen path even if a record exists.
     let previous: Progress | null = null;
     let screen: string | null = null;
-    let legacyReport: string | null = null;
+    let legacyReport: string | null | undefined;
     let supervised: SupervisionResult | null = null;
     let supervisionError: string | undefined;
     const scope = { generation: lane.lifecycleEpoch };

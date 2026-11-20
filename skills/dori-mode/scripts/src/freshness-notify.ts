@@ -1,77 +1,13 @@
+import type { Runtimes } from "../../../../src/runtime/registry.ts";
 import type { SessionRef } from "../../../../src/runtime/types.ts";
 import { fill } from "./config.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { anchoredReportLine, scrubForThread } from "./freshness-report.ts";
 import type { SweepAct } from "./freshness.ts";
 import { type Lane, sameLaneGeneration, sessionOf } from "./registry.ts";
-import { type Progress, reportLine } from "./reports.ts";
+import { isReportKind, type Progress, reportId, reportLine } from "./reports.ts";
 import { runtimesOf } from "./run.ts";
 import { readScreen, sendVerified } from "./sessions.ts";
-
-export const lastReportLine = (screen: string, key: string): string | null => {
-  const grammar = new RegExp(
-    `\\[REPORT\\] ${key.replace(/[.]/g, "\\.")} \\| (milestone|blocker|question|halted|done) \\| (?!<what)\\S`,
-  );
-  const template = (l: string) => /["'`]\[REPORT\]/.test(l) && /\$?\{[A-Za-z_][\w.]*\}/.test(l);
-  const hits = screen
-    .split("\n")
-    .flatMap((l) => (grammar.test(l) && !template(l) ? [l.slice(l.indexOf("[REPORT]"))] : []));
-  return hits.at(-1)?.replace(/["'\])\s,]+$/, "") ?? null;
-};
-
-export const scrubForThread = (line: string, home: string): string =>
-  line
-    .replace(/^\[REPORT\]\s*[^|]*\|\s*[^|]*\|\s*/, "")
-    .split(home)
-    .join("~")
-    .replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)")
-    .replace(/\bw\w+:p\w+\b/g, "(pane)")
-    .replace(/`/g, "'")
-    .trim();
-
-// A report is a line that starts with [REPORT], or the last quoted element of an argv row, the shape lanes are told
-// to send it in: an argv array ending in "lead:p1", "[REPORT] key | kind | text". Instructions
-// and prompts that quote the grammar mid-sentence are dropped before parsing, so an example is never posted as the
-// lane's progress. A report whose whole text is one unfilled placeholder ($name, ${name}, {name}, %s, <what>) is a
-// template, quoted or not (#29). The match is anchored to the [REPORT] key | kind | text structure, so
-// 'deployed api | %s' stays a real report.
-const placeholderOnly =
-  /^\s*\[REPORT\][^|]*\|[^|]*\|\s*["'`]?(\$\{?[A-Za-z_]\w*\}?|\{[A-Za-z_][\w.]*\}|%[sdif]|<[^>]+>)["'`)\s]*$/;
-// An argv row is the whole line (optionally inside one spawn call): [ then quoted strings separated by commas, then ]. Only its last element can be the
-// report, which is how lanes are told to send it. Prose that happens to contain a quoted report is not an argv row.
-const argvElements = (line: string): string[] | null => {
-  // A spawn call around the row, such as Bun.spawn([...]) or subprocess.run([...]), is the same row.
-  const call = /^\s*[\w.$]+\(\s*(\[.*\])\s*\)\s*;?\s*$/.exec(line);
-  const row = (call?.[1] ?? line).trim();
-  if (!row.startsWith("[") || !row.endsWith("]")) return null;
-  const element = /\s*(?:"((?:[^"\\]|\\.)*)"|'((?:[^'\\]|\\.)*)')\s*(,|$)/y;
-  const inner = row.slice(1, -1);
-  const elements: string[] = [];
-  element.lastIndex = 0;
-  while (element.lastIndex < inner.length) {
-    const m = element.exec(inner);
-    if (!m) return null;
-    elements.push(m[1] ?? m[2] ?? "");
-    if (m[3] === "") break;
-  }
-  return element.lastIndex === inner.length && elements.length > 0 ? elements : null;
-};
-const argvReport = (line: string): string | null => {
-  const last = argvElements(line)?.at(-1);
-  return last?.startsWith("[REPORT]") ? last : null;
-};
-const reportCandidate = (l: string): string | null => {
-  if (!l.includes("[REPORT]")) return l;
-  const report = /^\s*\[REPORT\]/.test(l) ? l : argvReport(l);
-  return report !== null && !placeholderOnly.test(report) ? report : null;
-};
-export const anchoredReportLine = (screen: string, key: string): string | null =>
-  lastReportLine(
-    screen
-      .split("\n")
-      .flatMap((l) => reportCandidate(l) ?? [])
-      .join("\n"),
-    key,
-  );
 
 const lastHeard = (lane: Lane): number => lane.lastReplyAt ?? Date.parse(lane.openedAt);
 
@@ -79,20 +15,41 @@ const lastHeard = (lane: Lane): number => lane.lastReplyAt ?? Date.parse(lane.op
 export const rememberFreshness = (deps: FlowDeps, lane: Lane, patch: Partial<Lane>) =>
   deps.registry.transition(lane, (current) => ({ ...current, ...patch }));
 
-const threadReplyHook = (deps: FlowDeps, lane: Lane, now: number, heard: number) => {
-  // The post waits for the thread to be quiet, not the lane: a report resets only the nudge clock.
-  const threadQuietMin = Math.round((now - Math.max(lastHeard(lane), lane.lastAutoReplyAt ?? 0)) / 60_000);
-  // A report stamped in the same millisecond as the last post still counts; lastPostedReport stops a repeat.
-  if (threadQuietMin >= deps.config.postAfterMin && lane.thread !== "none" && (lane.lastAutoReplyAt ?? 0) <= heard) {
-    return deps.config.hooks.threadReply;
-  }
-  return undefined;
+// Equality admits a new report written in the same millisecond as the previous auto-post.
+const mayAutoPost = (lane: Lane, heard: number): boolean => (lane.lastAutoReplyAt ?? 0) <= heard;
+
+const mayInspectReport = (deps: FlowDeps, lane: Lane, now: number, heard: number): boolean => {
+  const policy = deps.config.freshness;
+  const hasPostingPolicy = policy?.postRaw === false || policy?.autoPostKinds !== undefined;
+  if (!deps.config.hooks.threadReply && !hasPostingPolicy) return false;
+  const threadActivity = Math.max(lastHeard(lane), lane.lastAutoReplyAt ?? 0, lane.lastRelayedAt ?? 0);
+  const threadQuietMin = Math.round((now - threadActivity) / 60_000);
+  // Opt-in policies can notice held reports even while the legacy auto-post gate is closed.
+  return (
+    threadQuietMin >= deps.config.postAfterMin &&
+    lane.thread !== "none" &&
+    (hasPostingPolicy || mayAutoPost(lane, heard))
+  );
 };
 
 export const sampleLegacyReport = async (deps: FlowDeps, lane: Lane, ref: SessionRef, now: number) => {
-  if (!threadReplyHook(deps, lane, now, lastHeard(lane))) return null;
+  if (!mayInspectReport(deps, lane, now, lastHeard(lane))) return undefined;
   return anchoredReportLine(await readScreen(runtimesOf(deps), ref, 200), lane.key);
 };
+
+const trustedIdle = async (runtimes: Runtimes, ref: SessionRef): Promise<boolean> => {
+  const observed = await runtimes
+    .for(ref)
+    .probe(ref)
+    .catch(() => undefined);
+  return observed?.status === "idle" && !observed.shellInFront && !observed.approvalPending;
+};
+
+const sameReceipt = (a: Lane, b: Lane): boolean =>
+  a.lastPostedReportId === b.lastPostedReportId &&
+  a.lastPostedReport === b.lastPostedReport &&
+  a.lastPostedReportOwner === b.lastPostedReportOwner &&
+  a.lastRelayedAt === b.lastRelayedAt;
 
 /** Called under the delivery lock, after the observed lane has been revalidated. */
 export const notifyFreshness = async (
@@ -100,7 +57,7 @@ export const notifyFreshness = async (
   lane: Lane,
   ref: SessionRef,
   progress: Progress | null,
-  legacyReport: string | null,
+  legacyReport: string | null | undefined,
   now: number,
   home: string,
   acts: SweepAct[],
@@ -110,34 +67,64 @@ export const notifyFreshness = async (
   const heard = Math.max(lastHeard(lane), progress?.lastReport ? Date.parse(progress.lastReport.at) : 0);
   const silentMin = Math.round((now - heard) / 60_000);
   let current = lane;
-  if (running && silentMin >= deps.config.nudgeAfterMin && (current.lastNudgeAt ?? 0) < heard) {
+  const policy = deps.config.freshness;
+  const idleOnly = policy?.nudge === "idle-only";
+  const runtimes = runtimesOf(deps);
+  if (
+    running &&
+    silentMin >= deps.config.nudgeAfterMin &&
+    (current.lastNudgeAt ?? 0) < heard &&
+    (!idleOnly || (await trustedIdle(runtimes, ref)))
+  ) {
     const delivery = await sendVerified(
-      runtimesOf(deps),
+      runtimes,
       deps.clock,
       ref,
       `[LEAD] your work thread has had no update for ${silentMin} min. Post a 1-2 sentence progress line (done since last, next) and keep its status true.`,
-      undefined,
+      idleOnly ? "idle" : undefined,
       lane.lifecycleEpoch ? lane.session : undefined,
+      idleOnly,
     );
+    const failure = idleOnly && delivery === "failed" ? `nudge-failed|${heard}` : undefined;
     // Record the completed attempt on its own pane even if a claim arrived during delivery.
     const nudged = await deps.registry.update(lane.key, (stored) => {
       if (!stored || stored.openedAt !== lane.openedAt || stored.lifecycleEpoch !== lane.lifecycleEpoch) return null;
       const actual = sessionOf(stored);
       if (actual?.id !== ref.id || actual.runtime !== ref.runtime || stored.session !== lane.session) return null;
-      return { ...stored, lastNudgeAt: now };
+      return failure
+        ? { ...stored, lastNudgeFailure: failure }
+        : { ...stored, lastNudgeAt: now, lastNudgeFailure: undefined };
     });
     if (!nudged) return;
     current = nudged;
-    acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+    if (!failure)
+      acts.push({ kind: "nudged", lane: lane.key, detail: `${silentMin} min silent, delivery ${delivery}` });
+    else if (failure !== lane.lastNudgeFailure)
+      acts.push({ kind: "nudge-failed", lane: lane.key, detail: "idle-only delivery failed; left unnudged" });
     if (!sameLaneGeneration(lane, current)) return;
   }
-  const hook = threadReplyHook(deps, current, now, heard);
-  if (hook) {
+  const hook = deps.config.hooks.threadReply;
+  if (mayInspectReport(deps, current, now, heard)) {
     // A journal report is durable, so it skips the two-tick hold; a screen-scraped line counts only once it is still
     // there on the next tick (the two reads are a full loop interval apart).
-    const fromJournal = progress?.lastReport ? reportLine(progress.lastReport) : null;
+    const entry = progress?.lastReport;
+    const fromJournal = entry ? reportLine(entry) : null;
+    const id = entry ? reportId(entry) : undefined;
+    const owner = entry?.owner;
+    const ownerLine =
+      entry && owner
+        ? reportLine({ type: "report", key: entry.key, kind: entry.kind, at: entry.at, text: owner })
+        : null;
     const report = fromJournal ?? legacyReport;
     const lastSeenReport = report ?? undefined;
+    const kind = entry?.kind ?? report?.split("|")[1]?.trim();
+    const allowAutomatic = mayAutoPost(current, heard);
+    if (!allowAutomatic && !report) {
+      if (legacyReport === null && current.lastSeenReport !== undefined) {
+        await rememberFreshness(deps, lane, { lastSeenReport: undefined, lastFreshnessNote: undefined });
+      }
+      return;
+    }
     let hold: { kind: SweepAct["kind"]; detail: string } | null = null;
     if (!report)
       hold = {
@@ -146,19 +133,30 @@ export const notifyFreshness = async (
       };
     else if (!fromJournal && report !== current.lastSeenReport)
       hold = { kind: "pending-report", detail: "a new [REPORT] line; posting once it holds on the next tick" };
-    else if (report === current.lastPostedReport)
-      hold = { kind: "stale-report", detail: "the last [REPORT] line was already posted" };
+    else if (
+      (id !== undefined && id === current.lastPostedReportId) ||
+      (report === current.lastPostedReport && owner === current.lastPostedReportOwner)
+    ) {
+      if (!allowAutomatic) return;
+      hold = { kind: "stale-report", detail: "the last [REPORT] line was already posted or relayed" };
+    } else if (policy?.autoPostKinds && (!isReportKind(kind) || !policy.autoPostKinds.includes(kind)))
+      hold = { kind: "unrelayed", detail: "report kind requires the lead to relay it" };
+    else if (policy?.postRaw === false && (!ownerLine || !scrubForThread(ownerLine, home)))
+      hold = { kind: "unrelayed", detail: "report needs an owner summary or the lead to relay it" };
+    else if (!hook) hold = { kind: "unrelayed", detail: "no threadReply hook; the lead must relay this report" };
     if (hold) {
-      const note = `${hold.kind}|${hold.detail}|${report ?? ""}`;
+      const witness = hold.kind === "unrelayed" ? (id ?? report) : report;
+      const note = `${hold.kind}|${hold.detail}|${witness ?? ""}`;
       const recorded = await rememberFreshness(deps, lane, { lastSeenReport, lastFreshnessNote: note });
       if (recorded && note !== current.lastFreshnessNote) {
         acts.push({ kind: hold.kind, lane: lane.key, detail: hold.detail });
       }
       return;
     }
-    const text = `Progress (from the lane's last report): ${scrubForThread(report ?? "", home)}`;
+    if (!hook || !allowAutomatic) return;
+    const text = `Progress (from the lane's last report): ${scrubForThread(ownerLine ?? report ?? "", home)}`;
     const latest = await deps.registry.read(lane.key);
-    if (!latest || !sameLaneGeneration(lane, latest)) return;
+    if (!latest || !sameLaneGeneration(lane, latest) || !sameReceipt(current, latest)) return;
     const sent = await deps.run(fill(hook, { thread: lane.thread, text, key: lane.key }));
     // Only a delivered report counts as posted: a failed hook leaves it unposted, so the next tick sends it again. Like
     // a held-back report, the same failure is printed once, not on every retry.
@@ -169,12 +167,19 @@ export const notifyFreshness = async (
       if (recorded && note !== current.lastFreshnessNote) acts.push({ kind: "post-failed", lane: lane.key, detail });
       return;
     }
-    const posted = await rememberFreshness(deps, lane, {
-      lastSeenReport,
-      lastAutoReplyAt: now,
-      lastPostedReport: report ?? undefined,
-      lastFreshnessNote: undefined,
-    });
-    if (posted) acts.push({ kind: "posted", lane: lane.key, detail: text });
+    await deps.registry.transition(lane, (live) =>
+      sameReceipt(live, latest)
+        ? {
+            ...live,
+            lastSeenReport,
+            lastAutoReplyAt: now,
+            lastPostedReport: report ?? undefined,
+            lastPostedReportId: id,
+            lastPostedReportOwner: owner,
+            lastFreshnessNote: undefined,
+          }
+        : null,
+    );
+    acts.push({ kind: "posted", lane: lane.key, detail: text });
   }
 };

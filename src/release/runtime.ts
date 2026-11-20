@@ -147,6 +147,9 @@ export function resolveProcessOmpUlwPath(configured: string, home: string): stri
   return selected;
 }
 
+/** Empty assignments override tokens retained by the terminal server; lanes do not host messenger bots. */
+export const laneMessengerOverrides = { DORI_DISCORD_TOKEN: "", DORI_TELEGRAM_TOKEN: "" } as const;
+
 /** Only launch context crosses a terminal server boundary; paths retain the caller's OS resolution. */
 export function doriLaunchEnv(
   env: Readonly<Record<string, string | undefined>>,

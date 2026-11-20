@@ -27,7 +27,7 @@ export const doctorLocal = (
   repo?: string,
   liveSession?: string,
 ): DoctorFinding[] => {
-  const findings = monitorFilterFindings(manifests, liveSession);
+  const findings = monitorFilterFindings(manifests, liveSession, config.freshness);
   const active = lanes.filter((lane) => !finished(lane));
   const launched = active.filter((lane) => lane.reportProtocol === "jsonl-v1");
   const adopted = active.filter((lane) => lane.reportProtocol !== "jsonl-v1");

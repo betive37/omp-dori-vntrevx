@@ -1,4 +1,4 @@
-import { scrubForThread } from "./freshness.ts";
+import { scrubForThread } from "./freshness-report.ts";
 import type { StatusSnapshot } from "./status.ts";
 
 const line = (text: string) => Bun.stripANSI(text).replace(/[\p{Cc}\p{Cf}\p{Zl}\p{Zp}]/gu, " ");

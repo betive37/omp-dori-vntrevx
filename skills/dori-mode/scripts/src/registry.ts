@@ -10,9 +10,8 @@ import type { BudgetLimits } from "./supervision-observe.ts";
 const LOCK_WAIT_MS = 5_000;
 const LOCK_RETRY_MS = 10;
 export const LANE_KEY = /^[a-z0-9][a-z0-9._-]{1,60}$/;
-// `lead` names the lead, never a lane: records the lead writes (lessons with `lane: "lead"`) and lead-only checks tell
-// the two apart by this key, so launch and adopt refuse it. LANE_KEY stays as it is because those records still carry
-// it, and keys are lowercase-only, so the exact match is the whole check.
+// `lead` belongs to the lead (including lessons and lead-only checks), so launch and adopt reject it.
+// LANE_KEY stays unchanged for those records; keys are lowercase, so an exact match suffices.
 export const RESERVED_LANE_KEY = "lead";
 
 export type LaneStatus = "working" | "paused" | "done-claimed" | "verified-done" | "not-done" | "closed";
@@ -46,12 +45,16 @@ export type Lane = {
   readonly openedAt: string;
   readonly lifecycleEpoch?: string;
   readonly nativeCloseIntent?: NativeCloseIntent;
+  readonly threadClosePending?: true;
   readonly closedAt?: string;
   readonly lastReplyAt?: number;
   readonly lastNudgeAt?: number;
   readonly lastAutoReplyAt?: number;
-  /** The [REPORT] line the freshness sweep last posted, so a stale screen is never posted twice. */
   readonly lastPostedReport?: string | undefined;
+  readonly lastPostedReportId?: string | undefined;
+  readonly lastPostedReportOwner?: string | undefined;
+  readonly lastRelayedAt?: number;
+  readonly lastNudgeFailure?: string | undefined;
   /** The [REPORT] line seen on the previous freshness tick (a line is posted only once it holds across two ticks). */
   readonly lastSeenReport?: string | undefined;
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
@@ -77,7 +80,6 @@ export const upgradeLane = (lane: Lane): Lane =>
   lane.sessionRef || !lane.pane
     ? lane
     : { ...lane, sessionRef: { runtime: LEGACY_RUNTIME, id: lane.pane, ...(lane.tab ? { container: lane.tab } : {}) } };
-
 /** The lane's session, whichever way the record was written (or built in memory). */
 export const sessionOf = (lane: Lane): SessionRef | undefined => upgradeLane(lane).sessionRef;
 
@@ -218,15 +220,15 @@ export class Registry {
       .filter((lane) => lane !== null);
   }
 
-  /** Like list(), but unreadable records and keys not matching their filename are isolated in `unreadable`. */
-  async scan(): Promise<{ lanes: Lane[]; unreadable: string[] }> {
+  /** Isolate unreadable and miskeyed rows; strict scans also flag a row that vanishes during the read. */
+  async scan(strict = false): Promise<{ lanes: Lane[]; unreadable: string[] }> {
     const lanes: Lane[] = [];
     const unreadable: string[] = [];
     for (const f of this.files()) {
       try {
         const lane: unknown = this.readNow(basename(f, ".json"));
-        if (lane === null) continue;
-        if (typeof lane !== "object" || !("key" in lane) || lane.key !== basename(f, ".json"))
+        if (lane === null && !strict) continue;
+        if (lane === null || typeof lane !== "object" || !("key" in lane) || lane.key !== basename(f, ".json"))
           throw new Error("not a lane record");
         lanes.push(lane as Lane);
       } catch {
@@ -240,9 +242,7 @@ export class Registry {
     return (await this.list()).filter((l) => statusOf(l) !== "closed");
   }
 
-  /**
-   * Finds an open lane in `ref`, excluding `lead`; legacy lead records remain readable by key, listable and closable.
-   */
+  /** The open lane in ref, excluding the legacy reserved lead record (still readable, listable and closable). */
   async bySession(ref: SessionRef | undefined): Promise<Lane | null> {
     if (!ref) return null;
     return (await this.open()).find((l) => sameSession(l.sessionRef, ref) && l.key !== RESERVED_LANE_KEY) ?? null;

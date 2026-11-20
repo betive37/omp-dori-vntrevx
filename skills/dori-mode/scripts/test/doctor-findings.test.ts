@@ -3,6 +3,7 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { bootCheck } from "../src/boot.ts";
 import type { Manifest } from "../src/boot-monitors.ts";
+import type { DoriConfig } from "../src/config.ts";
 import { doctorCheck } from "../src/doctor.ts";
 import { monitorFilterFindings } from "../src/doctor-monitors.ts";
 import { Reports } from "../src/reports.ts";
@@ -31,6 +32,19 @@ test("guard and watch diagnostics probe actual state-change events", () => {
   expect(monitorFilterFindings([manifest("watch", "^LANE_")], "owner")).toEqual([]);
 });
 
+const watchFilterBeforeQueue = "^LANE_(?:WATCH_READY$|(?:WATCH_WARN|DONE_CLAIMED|CHANGED|NOT_DONE|CLOSED|HELD) \\S)";
+
+test("doctor warns when a previously complete watch filter drops all three queue events", () => {
+  expect(monitorFilterFindings([manifest("watch", watchFilterBeforeQueue)], "owner")).toEqual([
+    {
+      check: "monitor-filter",
+      severity: "WARN",
+      detail:
+        '"custom-name" misses probes: LANE_QUEUE_READY LANE_QUEUE_HELD LANE_QUEUE_WARN; inspect dori monitor-presets watch in the owner session',
+    },
+  ]);
+});
+
 test("doctor accepts bare readiness lines and payload-bearing monitor events", async () => {
   const state = withState();
   try {
@@ -46,7 +60,7 @@ test("doctor accepts bare readiness lines and payload-bearing monitor events", a
     });
     const watch = manifest(
       "watch",
-      "^LANE_(?:WATCH_READY$|(?:WATCH_WARN|DONE_CLAIMED|CHANGED|NOT_DONE|CLOSED|HELD) \\S)",
+      `${watchFilterBeforeQueue}|^LANE_QUEUE_(?:READY \\S+; live checks |HELD \\S+ \\S+\\(working\\)$|WARN \\S+\\.json: invalid queue record: \\S+$)`,
     );
     const guard = manifest(
       "guard",
@@ -71,12 +85,73 @@ test("doctor accepts bare readiness lines and payload-bearing monitor events", a
   }
 });
 
+const defaultFreshnessFilter =
+  "^(?:(?:BLOCKED|WARNING) \\S+ (?:wallMinutes|tokens|costUsd) ceiling (?:reached \\(\\d+\\)|cannot be checked: usage unavailable)$|(?:NUDGED|POSTED|POST-FAILED|NO-REPORT|PENDING-REPORT|STALE-REPORT|STALLED|JOURNAL-ERROR|WORKING-WHILE-PAUSED|WAIT-ENDED|SUPERVISION-ERROR|WARN)\\b)";
+
+const freshnessFilterCases: ReadonlyArray<{
+  readonly name: string;
+  readonly config: Pick<DoriConfig, "freshness">;
+  readonly missing: readonly string[];
+}> = [
+  { name: "default config", config: {}, missing: [] },
+  { name: "explicit unrestricted settings", config: { freshness: { nudge: "all", postRaw: true } }, missing: [] },
+  { name: "idle-only nudge", config: { freshness: { nudge: "idle-only" } }, missing: ["NUDGE-FAILED"] },
+  { name: "raw posting disabled", config: { freshness: { postRaw: false } }, missing: ["UNRELAYED"] },
+  { name: "empty auto-post allowlist", config: { freshness: { autoPostKinds: [] } }, missing: ["UNRELAYED"] },
+  {
+    name: "both restrictions",
+    config: { freshness: { nudge: "idle-only", postRaw: false } },
+    missing: ["NUDGE-FAILED", "UNRELAYED"],
+  },
+];
+
+test.each(freshnessFilterCases)(
+  "doctor checks the default freshness filter with $name",
+  async ({ config, missing }) => {
+    const state = withState();
+    try {
+      const pane = "w1:p1";
+      const world = newWorld();
+      world.panes = [{ pane_id: pane, workspace_id: "w1", agent: "omp", agent_status: "idle", cwd: "/repo" }];
+      agentIn(world, pane);
+      laneState(state.dir, pane, { role: "dori", sessionId: "owner", agentStatus: "idle" });
+      const deps = depsFor(world, fakeClock(Date.parse("2026-01-01T12:00:00Z")), state.dir, {
+        leadPane: pane,
+        sessionsDir: join(state.dir, "sessions"),
+        doctor: { ignore: ["monitor-runtime"] },
+        ...config,
+      });
+      const dir = join(state.dir, "monitors");
+      mkdirSync(dir);
+      writeFileSync(
+        join(dir, "owner.json"),
+        JSON.stringify(manifest("freshness", defaultFreshnessFilter, "freshness").data),
+      );
+
+      const result = await doctorCheck(deps);
+      expect(result.findings.filter((finding) => finding.check === "monitor-filter")).toEqual(
+        missing.length
+          ? [
+              {
+                check: "monitor-filter",
+                severity: "WARN",
+                detail: `"freshness" misses probes: ${missing.join(" ")}; inspect dori monitor-presets freshness in the owner session`,
+              },
+            ]
+          : [],
+      );
+      expect(result.exitCode).toBe(missing.length ? 1 : 0);
+    } finally {
+      state.done();
+    }
+  },
+);
+
 test.each([
   {
     name: "freshness",
     argv: ["dori", "freshness"],
-    filter:
-      "^(?:(?:BLOCKED|WARNING) \\S+ (?:wallMinutes|tokens|costUsd) ceiling (?:reached \\(\\d+\\)|cannot be checked: usage unavailable)$|(?:NUDGED|POSTED|POST-FAILED|NO-REPORT|PENDING-REPORT|STALE-REPORT|STALLED|JOURNAL-ERROR|WORKING-WHILE-PAUSED|WAIT-ENDED|SUPERVISION-ERROR|WARN)\\b)",
+    filter: defaultFreshnessFilter,
     omitted: "BLOCKED",
   },
   {

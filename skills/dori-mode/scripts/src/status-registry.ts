@@ -9,6 +9,9 @@ const STATUSES: Readonly<Record<LaneStatus, true>> = {
   closed: true,
 };
 
+export const isStoredLaneStatus = (status: unknown): boolean =>
+  status === undefined || (typeof status === "string" && Object.hasOwn(STATUSES, status));
+
 /** scan isolates unreadable files; these are the fields consumed by the status and ETA projections. */
 const readable = (lane: Lane): boolean => {
   if (typeof lane !== "object" || lane === null || Array.isArray(lane)) return false;
@@ -24,8 +27,7 @@ const readable = (lane: Lane): boolean => {
   }
   for (const field of ["lastNudgeAt", "lastAutoReplyAt"] as const)
     if (lane[field] !== undefined && (typeof lane[field] !== "number" || !Number.isFinite(lane[field]))) return false;
-  if (lane.status !== undefined && (typeof lane.status !== "string" || !Object.hasOwn(STATUSES, lane.status)))
-    return false;
+  if (!isStoredLaneStatus(lane.status)) return false;
   const ref = lane.sessionRef;
   return (
     ref === undefined ||

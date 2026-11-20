@@ -5,7 +5,11 @@ export const USAGE = `dori <command> [options]
   upstream <command> --config FILE     maintainer staging: check, stage, watch, status, snapshot, restore, recover, restart
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
          [--wall-minutes N|none] [--token-limit N|none] [--cost-limit N|none] [--activity-path FILE ...] [--dry-run]
+         --template NAME [--set name=value]... replaces --brief; [--after a,b --expires-hours N] queues without starting
+  queue list | start <key> | cancel <key>
+                                       start only on explicit command after verified predecessors, host capacity and expiry checks
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF]
+  lanes [--thread REF] [--open]        list registered lanes, optionally for one exact thread
   status [<key>] [--json]              read-only lane, runtime, journal, decision and monitor observations
   board discord|telegram [--to ID] [--thread ID] [--lane KEY] [--loop MIN] [--message ID]
                                        opt-in single status message; reuse its ID, edit only changed content
@@ -14,9 +18,10 @@ export const USAGE = `dori <command> [options]
   boot                                 read-only check after a restart: Slack auth, vanished panes, journals, open worklog items and decisions, stale watches
   doctor [--json] [--repo owner/repo]   read-only configuration, adoption and monitor diagnostics; exit 1 on warnings
   monitor-presets [name] [--json]      recommended argv and filters; starts nothing
-  report <key> --kind milestone|blocker|question|halted|done --text TEXT
+  report <key> --kind milestone|blocker|question|halted|done --text TEXT [--owner SUMMARY] [--json]
          [--for job:ID|approval:ID|ci:owner/repo#N[@CHECK_RUN]] (blocker only)
                                        append a durable progress report; ordinary --for prose is unverified
+  relayed <key> --report ID            acknowledge the exact journal report already sent by the lead (--json supplies ID)
   checkpoint <key> --step ID --result TEXT --evidence PATH [--remote-effect RECEIPT]...
                                        record a completed step once; a conflicting rewrite is refused
   checkpoints <key>                    read completed steps before resuming remote work
@@ -32,7 +37,8 @@ export const USAGE = `dori <command> [options]
                                        the lead's lesson for every lane, whatever its repo
   lesson list [--cwd DIR]             show current lessons (global ones included), newest first
   lesson mark <id> --outcome pending|helped|no-effect|harmful|encoded
-  worklog add <title> --source REF     record an owner request when it arrives
+  worklog add <title> --source REF [--thread REF]
+                                       record an owner request when it arrives
   worklog next|note <id> <text>        set the item's next step, or add a note (a decision, an owner)
   worklog close <id> --result TEXT     close the item with what came of it
   worklog list [--open]                items as JSON; <stateDir>/worklog.md holds the same for reading
@@ -69,6 +75,8 @@ export const USAGE = `dori <command> [options]
                                        --message opens the thread on that message of a text channel
   thread discord set <thread> [--title T] [--tag NAME]... [--archive|--unarchive]
                                        open a forum post or text-channel thread; rename, replace tags, archive or reopen
+  thread discord status <thread> done|working
+                                       lead-owned: change the done prefix of the current title without archiving
   react discord --to CHANNEL [--thread ID] --message ID [--emoji E] [--remove]
                                        add or remove the bot's own reaction (eyes by default); --thread needs no --to
   voice discord                       opt-in owner-only voice assistant (voice.enabled in config; paid provider usage)

@@ -1,9 +1,11 @@
+import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 
 import { type Lane, LANE_KEY, Registry } from "./registry.ts";
 import { type WaitProof, waitRejection } from "./report-wait.ts";
-import { readWait, renderWait, type Wait } from "../../../../src/wait.ts";
+import { reportActivity } from "./report-observe.ts";
+import { readWait, renderWait, type Wait, waitKey } from "../../../../src/wait.ts";
 
 export type ReportKind = "milestone" | "blocker" | "question" | "halted" | "done";
 export type ProgressState = "running" | "blocked" | "halted" | "done" | "stalled";
@@ -17,6 +19,7 @@ export type Report = EventFields & {
   readonly type: "report";
   readonly kind: ReportKind;
   readonly wait?: Wait;
+  readonly owner?: string;
 };
 export type Activity = EventFields & {
   readonly type: "activity";
@@ -61,6 +64,21 @@ export const reportLine = (report: Report): string =>
     // biome-ignore lint/suspicious/noControlCharactersInRegex: the pattern deliberately matches control characters to reject or strip them
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")}`;
 
+export const reportId = ({ key, at, kind, text, owner, generation, wait }: Report): string =>
+  createHash("sha256")
+    .update(
+      JSON.stringify([
+        key,
+        at,
+        kind,
+        text,
+        owner ?? null,
+        generation ?? null,
+        ...(wait ? [[waitKey(wait.target), wait.startedAt, wait.observedAt, wait.lastObservedState]] : []),
+      ]),
+    )
+    .digest("hex");
+
 export const parseEvent = (line: string, key: string): LaneEvent => {
   const value: unknown = JSON.parse(line);
   if (
@@ -88,7 +106,15 @@ export const parseEvent = (line: string, key: string): LaneEvent => {
   if (value.type === "reopen") return { ...common, type: "reopen" };
   if (value.type === "report" && "kind" in value && isReportKind(value.kind)) {
     const wait = value.kind === "blocker" && "wait" in value ? readWait(value.wait) : undefined;
-    return { ...common, type: "report", kind: value.kind, ...(wait ? { wait } : {}) };
+    if ("owner" in value && (typeof value.owner !== "string" || !value.owner.trim()))
+      throw new ReportError(`invalid owner summary for ${key}`);
+    return {
+      ...common,
+      type: "report",
+      kind: value.kind,
+      ...("owner" in value ? { owner: value.owner as string } : {}),
+      ...(wait ? { wait } : {}),
+    };
   }
   if (value.type === "activity" && "state" in value && (value.state === "running" || value.state === "stalled")) {
     return { ...common, type: "activity", state: value.state };
@@ -155,6 +181,7 @@ export class Reports {
     text: string,
     now: number,
     generation?: string,
+    owner?: string,
     waiting?: WaitProof,
   ): Promise<Report>;
   report(
@@ -163,6 +190,7 @@ export class Reports {
     text: string,
     now: number,
     generation: string | undefined,
+    owner: string | undefined,
     waiting: WaitProof | undefined,
     shouldReport: (progress: Progress | null, current: Lane | null) => boolean,
   ): Promise<Report | null>;
@@ -172,6 +200,7 @@ export class Reports {
     text: string,
     now: number,
     generation?: string,
+    owner?: string,
     waiting?: WaitProof,
     shouldReport?: (progress: Progress | null, current: Lane | null) => boolean,
   ): Promise<Report | null> {
@@ -183,6 +212,7 @@ export class Reports {
       text: text.trim(),
       at: new Date(now).toISOString(),
       ...(generation === undefined ? {} : { generation }),
+      ...(owner === undefined ? {} : { owner: owner.trim() }),
       ...(waiting ? { wait: waiting.wait } : {}),
     };
     this.path(key);
@@ -211,38 +241,9 @@ export class Reports {
     scope?: EventScope,
   ): Progress | null {
     const progress = this.read(key, scope);
-    if (!progress || (progress.state !== "running" && progress.state !== "stalled")) return progress;
-    const visible = Bun.stripANSI(screen);
-    const lastAt = (pattern: RegExp): number => {
-      let at = -1;
-      for (const match of visible.matchAll(pattern)) at = match.index;
-      return at;
-    };
-    const workingAt = lastAt(/^\s*[^\w\n]*(?:Working|Running)\b/gim);
-    const working = workingAt >= 0;
-    // A failure counts only when no Working line follows it: an old error left on screen above a recovered lane is history.
-    const failed =
-      lastAt(
-        /compaction (?:failed|failure|error)|failed to compact|error (?:during|in) compaction|auto-?compaction failed/gi,
-      ) > workingAt;
-    const idle = /^\s*[❯>]\s*$/m.test(visible);
-    const stale = now - Date.parse(progress.lastReport?.at ?? progress.lastEvent.at) >= staleAfterMs;
-    const state =
-      failed || (idle && !working && stale) ? "stalled" : working && resumeOnWorking ? "running" : progress.state;
-    if (state === progress.state) return progress;
-    const { generation } = progress.lastEvent;
-    const event: Activity = {
-      type: "activity",
-      key,
-      at: new Date(now).toISOString(),
-      state,
-      ...(generation === undefined ? {} : { generation }),
-      text: failed
-        ? "compaction failed"
-        : state === "stalled"
-          ? "idle prompt without Working or a fresh report"
-          : "Working activity resumed",
-    };
+    if (!progress) return progress;
+    const event = reportActivity(key, progress, screen, now, staleAfterMs, resumeOnWorking);
+    if (!event) return progress;
     this.append(event);
     return this.read(key, scope);
   }

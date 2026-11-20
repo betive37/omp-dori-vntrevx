@@ -109,7 +109,8 @@ export type Delivery = "delivered" | "unconfirmed" | "failed";
  * status moving to "working" from something else. A session that was already working cannot show that change, so its
  * send comes back "unconfirmed" and the caller decides. `when` defaults to the status read before the send, so a
  * runtime can hold on a status change. If supplied, `expectedSessionId` must also match the live runtime probe before
- * delivery; the runtime command itself does not compare session IDs. Nothing is ever sent twice.
+ * delivery; the runtime command itself does not compare session IDs. `strictIdle` additionally requires idle at the
+ * runtime's delivery boundary. Nothing is ever sent twice.
  */
 export const sendVerified = async (
   rts: Runtimes,
@@ -118,6 +119,7 @@ export const sendVerified = async (
   text: string,
   when?: DeliverWhen,
   expectedSessionId?: string,
+  strictIdle?: boolean,
 ): Promise<Delivery> => {
   if (/`|\$\(/.test(text)) throw new UnsafeTextError("refusing to send text containing a backtick or $(");
   const before = await statusLookup(rts, ref);
@@ -127,6 +129,7 @@ export const sendVerified = async (
   const outcome = await rts.for(ref).deliver(ref, text, {
     when: when ?? (before.status === "working" ? "working" : "idle"),
     ...(expectedSessionId === undefined ? {} : { expectedSessionId }),
+    ...(strictIdle ? { strictIdle } : {}),
   });
   if (outcome.kind === "no-agent" || outcome.kind === "not-ready") return "failed";
   if (outcome.kind === "ambiguous") {

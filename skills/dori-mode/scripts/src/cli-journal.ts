@@ -3,7 +3,7 @@ import { CheckpointError, Checkpoints } from "./checkpoints.ts";
 import { type Cli, type Command, die } from "./cli-context.ts";
 import { autoTrackLinks } from "./cli-pr.ts";
 import { isLessonOutcome, LessonError, Lessons } from "./lessons.ts";
-import { isReportKind, ReportError, Reports, reportLine } from "./reports.ts";
+import { isReportKind, type Report, ReportError, Reports, reportLine, reportId } from "./reports.ts";
 import { sessionOf } from "./registry.ts";
 import { ghGet } from "./verify-pr.ts";
 import { Refusal } from "../../../../src/refusal.ts";
@@ -15,15 +15,17 @@ import { Worklog, WorklogError } from "./worklog.ts";
 /** Journal errors are the user's input refused: one line, never a stack. */
 export const journalErrors = [CheckpointError, LessonError, ReportError, WorklogError, Refusal] as const;
 
-const report: Command = async ({ key, need, opt, lane, config, deps }) => {
+const report: Command = async ({ key, need, opt, values, lane, config, deps }) => {
   const target = await lane(key ?? die("report needs a lane key"));
   const kind = need("kind");
   if (!isReportKind(kind)) return die("--kind must be milestone, blocker, question, halted or done");
   const text = need("text");
   const reports = new Reports(config.stateDir);
+  const print = (entry: Report) =>
+    console.log(values["json"] ? JSON.stringify({ ...entry, id: reportId(entry) }) : reportLine(entry));
   const selection = opt("for");
   if (selection === undefined) {
-    console.log(reportLine(await reports.report(target.key, kind, text, realClock.now(), target.lifecycleEpoch)));
+    print(await reports.report(target.key, kind, text, realClock.now(), target.lifecycleEpoch, opt("owner")));
     return;
   }
   if (kind !== "blocker") throw new ReportError("--for needs --kind blocker");
@@ -48,12 +50,33 @@ const report: Command = async ({ key, need, opt, lane, config, deps }) => {
   }
   const now = realClock.now();
   const wait = recordWait(bound.target, bound.lastObservedState, bound.observedAt, now, previous);
-  const written = await reports.report(target.key, kind, text, now, target.lifecycleEpoch, {
+  const written = await reports.report(target.key, kind, text, now, target.lifecycleEpoch, opt("owner"), {
     wait,
     lane: target,
     report: before,
   });
-  console.log(reportLine(written));
+  print(written);
+};
+
+const relayed: Command = async ({ key, need, lane, deps, config }) => {
+  const target = await lane(key ?? die("relayed needs a lane key"));
+  if (target.reportProtocol !== "jsonl-v1")
+    die("relayed requires a launched jsonl-v1 lane, not an adopted screen report");
+  const id = need("report");
+  const reports = new Reports(config.stateDir);
+  const updated = await deps.registry.transition(target, (current) => {
+    const entry = reports.read(target.key, { generation: current.lifecycleEpoch })?.lastReport;
+    if (current.reportProtocol !== "jsonl-v1" || !entry || reportId(entry) !== id) return null;
+    return {
+      ...current,
+      lastPostedReport: reportLine(entry),
+      lastPostedReportId: id,
+      lastPostedReportOwner: entry.owner,
+      lastRelayedAt: realClock.now(),
+    };
+  });
+  if (!updated) die("relayed: report is not the current journal report; read it again before acknowledging");
+  console.log(`RELAYED ${target.key} ${id}`);
 };
 
 const lessonAdd = async (
@@ -140,7 +163,12 @@ const worklog: Command = async ({ key, positionals, values, need, config }) => {
     case "add":
       console.log(
         JSON.stringify(
-          worklog.add(positionals.slice(1).join(" ").trim() || die("worklog add needs a title"), need("source"), now),
+          worklog.add(
+            positionals.slice(1).join(" ").trim() || die("worklog add needs a title"),
+            need("source"),
+            now,
+            values["thread"] === undefined ? undefined : need("thread"),
+          ),
         ),
       );
       break;
@@ -188,6 +216,7 @@ const checkpoint: Command = async (cli) => {
 
 export const journalCommands: Readonly<Record<string, Command>> = {
   report,
+  relayed,
   lesson,
   worklog,
   checkpoint,

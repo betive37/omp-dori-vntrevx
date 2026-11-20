@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { existsSync, mkdirSync, rmdirSync } from "node:fs";
 import { join } from "node:path";
-import { type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
+import { closeLane, type FlowDeps, objectDone, watchTick } from "../src/done-flow.ts";
 import { parkLane } from "../src/park.ts";
 import { type Lane, Registry, sessionOf, withStatus } from "../src/registry.ts";
 import { reopenLane } from "../src/reopen.ts";
@@ -183,6 +183,31 @@ test("a lost post-close list holds without cleanup, then a fresh watcher settles
   expect(list).toBeGreaterThanOrEqual(0);
   expect(threadDone).toBeGreaterThan(list);
   expectPendingClose(held);
+});
+
+test("a prepared reopened lane blocks sibling completion until native close recovery", async () => {
+  deps = { ...deps, config: { ...deps.config, threadDonePolicy: "last-lane" } };
+  const sibling: Lane = {
+    key: "shared-sibling",
+    title: "Sibling",
+    thread: claim.thread,
+    brief: claim.brief,
+    cwd: f.deps.config.defaultCwd,
+    done: claim.done,
+    openedAt: claim.openedAt,
+  };
+  await deps.registry.write(sibling);
+  const interrupted = withPostCloseList(async () => ({ code: 1, out: "", err: "interrupted readback" }));
+
+  expect(await watchTick(interrupted)).toEqual([expect.stringContaining("interrupted readback")]);
+  expectPendingClose(await deps.registry.read(claim.key));
+  expect((await closeLane(deps, sibling, "done")).closed).toBe(true);
+  expect(cleanupCalls()).toEqual([]);
+
+  f.world.prState = "OPEN";
+  f.world.dirty = " M tracked-after-prepare";
+  await expectClosed(await watchTick(deps));
+  expect(await watchTick(deps)).toEqual([]);
 });
 
 test("an absent reopened pane without close intent stays held rather than getting a close receipt", async () => {

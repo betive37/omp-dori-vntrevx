@@ -2,23 +2,47 @@
 
 ## Unreleased
 
+- Exercise native prompt rendering across role, ULW, workflow, profile, child-tool, and compaction boundaries in an isolated offline composition matrix.
+
+- Lane final reports separate the outcome, changes or findings, verified evidence, unrun checks and handoff. Done claims cite the saved report and live Done receipts without treating partial or blocked work as done.
+
+- Hide explicitly selected `monitor` tools from native child sessions while preserving inherited role behavior, ordinary main/child tools and the separate main-session execution guard.
+
 - Add opt-in `dori inbound discord --wake-lanes` for cleanly retired herdr tabs: queue owner messages for the exact registered OMP session and post lane replies back to the original Discord thread. Existing settings and monitor defaults are unchanged.
+
+- Bind Discord owed-answer receipts to the exact owner request and every accepted reply part; unrelated posts, legacy receipts and partial sends do not settle another request (omp-superagent comparison F22).
 
 - New lane registry records and brief footers retain requested launch text and its configuration origin without changing default ULW, raw message delivery or startup goal checks. Launch-selection provenance describes matching text rather than programmatic assignment history. Same-value reassignment retains the matching default or loaded-file origin, with regression coverage for both cases.
 
 - Add explicit lane parking, exact-session reopening, abandonment receipts and a read-only hold ledger. Keep worktrees, accepted pending Discord messages and ordinary Done verification.
 
+- Added opt-in last-lane thread completion, exact-thread lane and worklog links, and lead-owned idempotent Discord title status without automatic archiving.
+
+- Clarify that autonomous local work and successful review do not authorize merge, deployment, publication, spending or destructive cleanup; preserve read-only requests and all existing execution gates.
+
 - Add read-only lane status, historical ETA summaries and opt-in single-message Discord/Telegram boards. Boards validate options before delivery, omit URL credentials and parameters, and retain pending holds; Telegram recovery requires an existing message binding.
 
 - Add read-only `dori doctor` configuration, adoption and monitor diagnostics, canonical `monitor-presets`, and an advisory boot summary. Doctor checks external terminal metadata and verifies the native monitor's restart policy; documented filters include supervision and loop-error events.
 
+- Added opt-in idle-only freshness nudges, owner summaries and report-kind posting policy, with exact report relay receipts to prevent duplicate owner updates.
+
+- Add literal brief templates and durable prerequisite queues with explicit starts, live completion and host checks, expiry, cancellation and restart visibility.
+
 - Read-only `dori sync` shares one successful process-table snapshot and one herdr pane list within a pass. Later passes, failed reads, hc group queries and all `--write` observations stay fresh.
 
+- Align lead and skill routing: answer direct requests in place, honor explicitly main-scoped implementation, and isolate independent work without requiring a lane or supervisor solely because it has several steps or a PR.
+
 - Restore the Discord 👀 read receipt after accepting lane chat or an exact ASK reply. A failed reaction does not block message delivery.
+
+- Lane briefs and generated footers retain task sources, recorded locations, scoped acceptance, preserved resources and resume context without copying the lead transcript or inventing missing authority.
 
 - Route ordinary Discord messages for an unambiguously connected lane to its own OMP session. Existing connections need no new setting; exact ASK replies still resolve the open form instead of starting a turn.
 
 - Supported native OMP ASK forms are automatically available through an already connected Discord receiver with an unambiguous destination. Existing settings and explicit routes stay in place; only the configured owner's reply to the exact message answers that ASK.
+
+- Keep ambient Discord and Telegram tokens out of launched lane agents, reject empty tokens before network access, and preserve native authentication and the existing Slack token-file flow.
+
+- Dori and duty report observed progress at meaningful result boundaries without creating reporting-only model timers, while retaining code watches, inbound delivery and explicit long-silence alerts.
 
 - `dori voice discord` adds an opt-in, paid, owner-only Discord voice assistant configured by `voice` in the existing Dori config. It reads lanes and reports, searches the web, posts notes and forwards work to the lead once, claiming delivery only after receipt is observed; forwarded requests carry a written-approval policy, not an effect-point authorization gate. Daily, cumulative and backend spending caps apply, though in-flight usage can exceed them. Native codecs are optional dependencies loaded only by this command. See [the voice guide](docs/discord-voice.md).
 
@@ -50,6 +74,8 @@
 - Linux host sampling now reads load and memory directly from `/proc`, avoiding two `cat` children and three failed macOS command attempts per sample. Disk and session sampling, unknown-value behavior, and non-Linux probes are unchanged.
 
 - The skill CLI loads command implementations on demand, avoiding updater, messenger and lane graphs for successful journal commands and all configuration/command graphs for `--version`. Ordinary commands retain configuration and consumer-native admission before execution; usage, exit codes and original error classes remain unchanged.
+
+- Managed release preparation installs only production dependencies for the root and skill packages, leaving out development-only gate tools. The extension keeps its full frozen host install; private HOME/cache, lifecycle-script rejection, source admission and existing prepared releases are unchanged.
 
 - Automatic CI now runs only the Linux `check`, `e2e-herdr` and `e2e-hc` jobs; the automatic macOS job is removed. Exact-commit release validation and contributor requirements use the same three required jobs. Existing macOS tests and consumer verification scripts remain available for manual QA.
 

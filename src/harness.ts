@@ -3,7 +3,12 @@ import { cpus, loadavg } from "node:os";
 import { join, resolve } from "node:path";
 import { shq } from "./delivery.ts";
 import { memFreePct } from "./host.ts";
-import { doriLaunchEnv, processOmpCommand, resolveConsumerOmpCommand } from "./release/runtime.ts";
+import {
+  doriLaunchEnv,
+  laneMessengerOverrides,
+  processOmpCommand,
+  resolveConsumerOmpCommand,
+} from "./release/runtime.ts";
 import { type Exec, spawnExec } from "./runtime/exec.ts";
 import { HcRuntime } from "./runtime/hc/index.ts";
 import { HerdrRuntime } from "./runtime/herdr/index.ts";
@@ -98,6 +103,10 @@ export function harnessLaunchEnv(d: Deps): Record<string, string> {
     doriHome: d.store.root,
     stateDir: ompStateDir({ ...process.env, DORI_CONFIG: configFile }),
   });
+}
+
+export function harnessLaneEnv(d: Deps, key: string): Record<string, string> {
+  return { ...harnessLaunchEnv(d), ...laneMessengerOverrides, DORI_LANE: key };
 }
 
 /** `DORI_PROMPTS_DIR` when set, else the repo's `prompts/`. */

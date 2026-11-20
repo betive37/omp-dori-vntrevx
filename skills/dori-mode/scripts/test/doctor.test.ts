@@ -139,6 +139,9 @@ test("presets cover all diagnostic probes, match renamed direct commands, and ag
   }
   const freshness = monitorPresets.find((preset) => preset.name === "freshness")!;
   expect(monitorFilterFindings([desired(freshness.filter)])).toEqual([]);
+  expect(monitorFilterFindings([desired(freshness.filter)], "owner", { nudge: "idle-only", postRaw: false })).toEqual(
+    [],
+  );
   expect(monitorFilterFindings([desired("[")])[0]?.detail).toContain("invalid regular expression");
   expect(monitorPresetFor(["bun", "/checkout/skills/dori-mode/scripts/src/cli.ts", "freshness"])?.name).toBe(
     "freshness",

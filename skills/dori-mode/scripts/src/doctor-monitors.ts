@@ -3,6 +3,7 @@ import { processIdentity, underProcess } from "../../../../src/update/deployment
 import type { Manifest } from "./boot-monitors.ts";
 import type { DoctorFinding } from "./doctor.ts";
 import type { SweepAct } from "./freshness.ts";
+import type { FreshnessPolicy } from "./freshness-policy.ts";
 import type { PaneState } from "./lane-state.ts";
 import { monitorPresetFor, type monitorPresets } from "./monitor-presets.ts";
 
@@ -19,6 +20,9 @@ const probePayloads: Partial<Record<string, string>> = {
   LANE_NOT_DONE: "integration pending checks",
   LANE_CLOSED: 'integration {"checks":[],"note":"Done: checks passed","cleanup":[]}',
   LANE_HELD: "integration a message to the lane is in flight (delivery); retried next tick",
+  LANE_QUEUE_READY: "integration; live checks run on explicit dori queue start integration",
+  LANE_QUEUE_HELD: "integration predecessor(working)",
+  LANE_QUEUE_WARN: "integration.json: invalid queue record: integration",
   DEAD_PANE: "w1:p2",
   UNRECOGNISED_PANE: "w1:p2 dead-panes: no alive status and no dead marker for 3 ticks",
   HOST_GUARD_READY: "",
@@ -27,11 +31,13 @@ const probePayloads: Partial<Record<string, string>> = {
   "HOST_GUARD COMPUTE_READY": "load 2 < 8",
   "HOST_GUARD COMPUTE_BUSY": "load 10",
   NUDGED: "integration 15 min silent, delivery delivered",
+  "NUDGE-FAILED": "integration idle-only delivery failed; left unnudged",
   POSTED: "integration Progress (from the lane's last report): checks passed",
   "POST-FAILED": "integration thread hook failed (exit 1)",
   "NO-REPORT": "integration report journal has no report",
   "PENDING-REPORT": "integration a new [REPORT] line; posting once it holds on the next tick",
   "STALE-REPORT": "integration the last [REPORT] line was already posted",
+  UNRELAYED: "integration report kind requires the lead to relay it",
   STALLED: "integration no progress reported",
   "JOURNAL-ERROR": "integration malformed report journal",
   "WORKING-WHILE-PAUSED": "integration paused lane is working on two ticks; left paused (resume is dori resume only)",
@@ -50,7 +56,11 @@ const probePayloads: Partial<Record<string, string>> = {
   WARN: "pane list is unreadable",
 } satisfies Record<ProbeEvent, string>;
 
-export const monitorFilterFindings = (manifests: readonly Manifest[], liveSession?: string): DoctorFinding[] => {
+export const monitorFilterFindings = (
+  manifests: readonly Manifest[],
+  liveSession?: string,
+  freshness?: FreshnessPolicy,
+): DoctorFinding[] => {
   const findings: DoctorFinding[] = [];
   for (const manifest of manifests) {
     if (manifest.kind !== "omp") continue;
@@ -62,6 +72,11 @@ export const monitorFilterFindings = (manifests: readonly Manifest[], liveSessio
       try {
         const filter = new RegExp(monitor.filter ?? ".");
         const missing = preset.events.filter((event) => {
+          if (preset.name === "freshness") {
+            if (event === "NUDGE-FAILED" && freshness?.nudge !== "idle-only") return false;
+            if (event === "UNRELAYED" && freshness?.postRaw !== false && freshness?.autoPostKinds === undefined)
+              return false;
+          }
           const payload = probePayloads[event];
           return payload === undefined || !filter.test(payload ? `${event} ${payload}` : event);
         });

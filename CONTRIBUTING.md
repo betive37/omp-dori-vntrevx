@@ -159,6 +159,27 @@ one model preset and bookkeeping block, downstream context, and role/model gates
 The separate pinned compatibility factory establishes an opaque legacy baseline;
 it is not the current default overlay.
 
+`native-prompt-matrix.test.ts` runs 30 scenario/load-order cases, plus native
+parent setup and an orphan-role control, using the pinned `buildSystemPrompt`,
+canonical loader, and `ExtensionRunner` in an isolated Bun child. It covers
+ordinary, ULW, specialized, parent, child, Dori, non-Sol, profile-excluded, and
+user-profile behavior with embedded ULW and both standalone load orders. It
+compares the combined prompt across repeated turns and an ordinary follow-up
+after the native `SessionManager` compaction-entry and `session_compact` hook
+boundary. The child starts with an explicitly selected `monitor` and its
+parent's rendered ULW policy; both must be removed without losing its permitted
+tool or assignment. Dori's main session still advertises `monitor`. A profile
+opt-out preserves the native profile byte-for-byte; Dori's independent Sol lane
+bookkeeping remains applicable.
+
+The matrix verifies the local ULW checkout against the locked base and overlay
+before importing ULW. It blocks `fetch` and `fetch.preconnect` before native
+imports, rejects model-registry access through a fixture proxy, and attaches no
+provider transport. It checks prompt rendering and extension lifecycle
+composition, not an interactive OMP CLI, provider-generated compaction, model
+task completion, or messenger ingress/recovery. Those surfaces need separate
+evidence.
+
 Linux `check` also executes the bound ULW code-mode and task-host checks against
 the guarded bound native source. Keep the upstream assertions, including the
 documented 18.20.2 accounting behavior: a failure on the selected 18.20.0 host
@@ -169,6 +190,13 @@ synthetic loopback providers. Missing managed overlays must send no request for
 Dori or lane roles, including direct dispatch, while ordinary sessions still
 reach the local provider. These tests neither use real provider credentials nor
 establish live TUI, messenger, provider, or external-user behavior.
+
+Manager-only extension tools need both default-inactive presentation and an
+execution guard based on the selected role and native `ctx.agent.kind`. Inherited
+roles or copied role flags alone do not grant manager access. For each such tool,
+cover authorized main-session access, child/grandchild visibility with explicit
+tool selection, direct child-call rejection, and preservation of ordinary main
+and child tools. See the [manager-tool boundary](docs/runtime.md#manager-tool-boundary).
 
 ## Ready for review
 

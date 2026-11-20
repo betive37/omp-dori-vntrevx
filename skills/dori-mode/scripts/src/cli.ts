@@ -4,6 +4,7 @@ import { releaseVersion } from "../../../../src/release/version.ts";
 import type { Command } from "./cli-context.ts";
 import { USAGE } from "./cli-usage.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { QueueError, TemplateError } from "./launch-errors.ts";
 
 const [command = "", ...rest] = process.argv.slice(2);
 // Command-selected imports keep unrelated graphs out of short-lived CLI processes.
@@ -31,6 +32,10 @@ const flags = parseArgs({
   options: {
     title: { type: "string" },
     brief: { type: "string" },
+    template: { type: "string" },
+    set: { type: "string", multiple: true },
+    after: { type: "string" },
+    "expires-hours": { type: "string" },
     done: { type: "string" },
     thread: { type: "string" },
     model: { type: "string" },
@@ -62,6 +67,8 @@ const flags = parseArgs({
     emoji: { type: "string" },
     remove: { type: "boolean" },
     kind: { type: "string" },
+    owner: { type: "string" },
+    report: { type: "string" },
     step: { type: "string" },
     result: { type: "string" },
     "remote-effect": { type: "string", multiple: true },
@@ -88,13 +95,16 @@ const flags = parseArgs({
 let commands: Readonly<Record<string, Command>> = {};
 switch (command) {
   case "report":
+  case "relayed":
   case "lesson":
   case "worklog":
   case "checkpoint":
   case "checkpoints":
     commands = (await import("./cli-journal.ts")).journalCommands;
     break;
+  case "lanes":
   case "launch":
+  case "queue":
   case "adopt":
   case "claim-done":
   case "object-done":
@@ -164,6 +174,8 @@ try {
   const { statusErrors } = await import("./cli-status.ts");
   if (
     e instanceof LaunchError ||
+    e instanceof QueueError ||
+    e instanceof TemplateError ||
     [...messengerErrors, ...journalErrors, ...decisionErrors, ...prErrors, ...statusErrors].some(
       (type) => e instanceof type,
     )

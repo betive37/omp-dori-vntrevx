@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
-import { type DoriConfig, fill } from "./config.ts";
+import { discoverWorktrees, unpushedWork } from "./close-worktrees.ts";
+import type { DoriConfig } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import { Lessons } from "./lessons.ts";
 import { pendingDiscordLane } from "./messenger/discord-lane-inbox.ts";
@@ -7,9 +8,9 @@ import { type CloseLesson, commitClose, recordDoneDecision } from "./native-clos
 import { type Lane, type Registry, sameLaneGeneration, sessionOf, statusOf, withStatus } from "./registry.ts";
 import { type ChosenRuntimes, type Clock, iso, type Runner, runtimesOf } from "./run.ts";
 import { closeSession, sendVerified } from "./sessions.ts";
-import { checkDone, type SignalIo } from "./signals.ts";
+import { type Check, checkDone, type SignalIo } from "./signals.ts";
 import { Supervision } from "./supervision.ts";
-
+import { finishThread, recordThreadHold, ThreadElectionError, withThreadClose } from "./thread-groups.ts";
 export type FlowDeps = {
   readonly run: Runner;
   readonly clock: Clock;
@@ -75,52 +76,6 @@ export const objectDone = async (deps: FlowDeps, lane: Lane, reasons: readonly s
     );
   return `LANE_NOT_DONE ${lane.key} ${reasons.join("; ")}`;
 };
-
-export const discoverWorktrees = async (
-  lane: Lane,
-  run: Runner,
-  extraRoots: readonly string[] = [],
-): Promise<string[]> => {
-  const found = new Set<string>(lane.worktrees ?? []);
-  const ours = (name: string) => name === lane.key || name.startsWith(`${lane.key}-`);
-  for (const root of new Set([lane.cwd ?? "", ...extraRoots].filter(Boolean))) {
-    const r = await run(["git", "-C", root, "worktree", "list", "--porcelain"]);
-    if (r.code !== 0) continue;
-    let path = "";
-    for (const line of r.out.split("\n")) {
-      if (line.startsWith("worktree ")) path = line.slice(9);
-      else if (
-        line.startsWith("branch ") &&
-        path !== root &&
-        (ours(line.split("/").pop() ?? "") || ours(path.split("/").pop() ?? ""))
-      )
-        found.add(path);
-    }
-  }
-  return [...found];
-};
-
-export const unpushedWork = async (deps: FlowDeps, lane: Lane): Promise<string[]> => {
-  const exists = deps.exists ?? existsSync;
-  const reasons: string[] = [];
-  // Check owned worktrees instead of blocking on changes in the human's checkout.
-  // If the lane works directly in its cwd, that checkout must be checked instead.
-  const owned = await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
-  const roots = owned.length ? owned : [lane.cwd ?? deps.config.defaultCwd];
-  for (const wt of roots) {
-    if (!exists(wt)) continue;
-    // Only the fallback cwd may be skipped when it is not a checkout (#42).
-    if (!owned.length) {
-      const inside = await deps.run(["git", "-C", wt, "rev-parse", "--is-inside-work-tree"]);
-      if (inside.code !== 0 || inside.out.trim() !== "true") continue;
-    }
-    const dirty = await deps.run(["git", "-C", wt, "status", "--porcelain", "--untracked-files=no"]);
-    const ahead = await deps.run(["git", "-C", wt, "rev-list", "--count", "HEAD", "--not", "--remotes"]);
-    if (dirty.code !== 0 || ahead.code !== 0) reasons.push(`unpushed work in ${wt} (git state unreadable)`);
-    else if (dirty.out.trim() || Number(ahead.out.trim()) > 0) reasons.push(`unpushed work in ${wt}`);
-  }
-  return reasons;
-};
 type CloseResult = { readonly closed: boolean; readonly lines: string[] };
 const closeHeld = async (
   deps: FlowDeps,
@@ -130,31 +85,44 @@ const closeHeld = async (
   settlingClaim = false,
 ): Promise<CloseResult> => {
   const lane = await deps.registry.read(seen.key);
-  if (!lane || !sameLaneGeneration(seen, lane))
+  if (!lane || statusOf(lane) === "closed" || !sameLaneGeneration(seen, lane))
     return { closed: false, lines: [await movedOn(deps, seen, settlingClaim ? "verification" : "close")] };
   const saved = lane.nativeCloseIntent;
-  const checks =
-    saved?.checks ??
-    (await checkDone(lane.done, deps.run, { cwd: lane.cwd ?? deps.config.defaultCwd, ...deps.signalIo }));
-  const lines = checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`);
+  const note = saved?.note ?? requestedNote;
+  const lesson = saved ? saved.lesson : requestedLesson;
+  let checks: readonly Check[] = [];
+  let lines: string[] = [];
+  let refusal = "";
+  let blocked: readonly string[] = [];
   const fail = (text: string): CloseResult => ({ closed: false, lines: [...lines, text] });
-  if (checks.some((c) => !c.ok)) return fail(`REFUSED ${lane.key}: a Done signal is not live`);
-  const ref = sessionOf(lane);
-  if (!saved && pendingDiscordLane(deps.config.stateDir, lane))
-    return fail(`HELD ${lane.key}: Discord messages are still pending`);
-  const basis = saved ?? {
-    note: requestedNote,
-    checks,
-    settlingClaim,
-    ...(requestedLesson && { lesson: requestedLesson }),
+  const preflight = async (groupLocked: boolean) => {
+    if (groupLocked && settlingClaim && !saved) {
+      // The watcher checked Git before waiting for delivery and group locks; that result can now be stale.
+      blocked = await unpushedWork(deps, lane);
+      if (blocked.length) return false;
+    }
+    const io = { cwd: lane.cwd ?? deps.config.defaultCwd, ...deps.signalIo };
+    checks = saved?.checks ?? (await checkDone(lane.done, deps.run, io));
+    lines = checks.map((c) => `SIGNAL ${c.ok ? "OK " : "NOT"} ${c.signal} -> ${c.detail}`);
+    if (checks.some((c) => !c.ok)) refusal = `REFUSED ${lane.key}: a Done signal is not live`;
+    else if (!saved && pendingDiscordLane(deps.config.stateDir, lane))
+      refusal = `HELD ${lane.key}: Discord messages are still pending`;
+    return !refusal;
   };
-  const result = await commitClose(deps, lane, basis);
+  const thread = await withThreadClose(deps, lane, preflight, () =>
+    commitClose(deps, lane, saved ?? { note, checks, settlingClaim, ...(lesson && { lesson }) }),
+  );
+  if (!thread.ok) {
+    if (settlingClaim && !(await recordThreadHold(deps, lane))) return fail(await movedOn(deps, lane, "verification"));
+    return fail(`HELD ${lane.key} thread close in flight (${thread.holder})`);
+  }
+  if (!thread.value) return fail(blocked.length ? await objectDone(deps, lane, blocked) : refusal);
+  const { result, remaining } = thread.value;
   if (result.kind === "held") return fail(`HELD ${lane.key}: ${result.reason}`);
   const cleanup = result.pane ? [`pane ${result.pane} closed`] : [];
   if (result.kind === "changed")
     return fail(`${await movedOn(deps, lane, "close")}${cleanup[0] ? `; ${cleanup[0]}` : ""}`);
   const { lane: closed } = result;
-  const { note, lesson } = basis;
   // Cost is recorded on a best-effort basis: a failing hook is printed and never keeps a verified lane open.
   const supervisor = new Supervision({ ...deps, stateDir: deps.config.stateDir }, deps.config.supervision);
   try {
@@ -167,11 +135,8 @@ const closeHeld = async (
     const now = await deps.registry.read(lane.key);
     if (!now || !sameLaneGeneration(closed, now)) return fail(await movedOn(deps, closed, "cleanup (pane closed)"));
   }
-  const hook = deps.config.hooks.threadDone;
-  if (hook && lane.thread !== "none") {
-    const r = await deps.run(fill(hook, { thread: lane.thread, text: note, key: lane.key }));
-    cleanup.push(r.code === 0 ? "thread marked done" : `thread hook failed: ${r.err.slice(0, 160)}`);
-  }
+  cleanup.push(...(await finishThread(deps, lane, note, remaining)));
+  const ref = sessionOf(lane);
   if (ref && !result.pane) cleanup.push(await closeSession(deps, ref));
   const root = lane.cwd ?? deps.config.defaultCwd;
   const worktrees = await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
@@ -192,7 +157,6 @@ const closeHeld = async (
   }
   return { closed: true, lines: [...lines, `CLOSED ${lane.key} ${JSON.stringify(receipt)}`] };
 };
-
 export const closeLane = async (
   deps: FlowDeps,
   lane: Lane,
@@ -211,10 +175,13 @@ const settle = async (deps: FlowDeps, lane: Lane, note: string): Promise<string>
     if (blocked.length) return objectDone(deps, lane, blocked);
   }
   const held = await withDeliveryLock(deps, lane.key, async () => {
-    const result = await closeHeld(deps, lane, note, undefined, true);
+    const result = await closeHeld(deps, lane, note, undefined, true).catch((error: unknown) => {
+      if (!(error instanceof ThreadElectionError)) throw error;
+      return { closed: false, lines: [`HELD ${lane.key}: ${error.message}`] };
+    });
     if (result.closed) return `LANE_${result.lines.at(-1)}`;
     const line = result.lines.at(-1) ?? "";
-    if (line.startsWith("HELD ")) return `LANE_${line}`;
+    if (line.startsWith("HELD ")) return `LANE_${line}; retried next tick`;
     const prefix = "SIGNAL NOT ";
     const failures = result.lines.filter((l) => l.startsWith(prefix)).map((l) => l.slice(prefix.length));
     return failures.length ? objectDone(deps, lane, failures) : line;
@@ -231,7 +198,9 @@ export const watchTick = async (deps: FlowDeps): Promise<string[]> => {
       out.push(await settle(deps, listed, listed.nativeCloseIntent.note));
       continue;
     }
-    if (statusOf(listed) !== "done-claimed" || !listed.claim) continue;
+    const status = statusOf(listed);
+    const waiting = status === "verified-done" && listed.threadClosePending === true;
+    if (!listed.claim || (status !== "done-claimed" && !waiting)) continue;
     let lane = listed;
     const claim = listed.claim;
     if (!claim.emitted) {

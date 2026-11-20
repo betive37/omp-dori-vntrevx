@@ -145,6 +145,45 @@ test("a shared dori watch inside a loop, a condition, a subshell, a cd or an env
   expect(monitorCleanup(open, [manifest([{ command: "while true; do dori inbound slack; done # api" }])])).toEqual([]);
 });
 
+test("relayed is a command word, while its target still identifies a closed lane", () => {
+  const lanes = ["relayed", "api"].map((key) => lane(key, "closed"));
+  const receipt = "a".repeat(64);
+  const result = monitorCleanup(lanes, [
+    manifest([
+      { argv: ["dori", "relayed", "api", "--report", receipt], monitorId: "mon_ARGV" },
+      { command: `dori relayed api --report ${receipt}`, monitorId: "mon_COMMAND" },
+      { argv: ["dori", "relayed", "relayed", "--report", receipt], monitorId: "mon_TARGET" },
+    ]),
+  ]);
+  expect(result.map((m) => [m.monitorId, m.match])).toEqual([
+    ["mon_ARGV", ["api:argv:key"]],
+    ["mon_COMMAND", ["api:command:key"]],
+    ["mon_TARGET", ["relayed:argv:key"]],
+  ]);
+});
+
+test.each(["owner", "report"])("report option values do not hide a messenger platform: %s", (option) => {
+  const monitors: Monitor[] = [
+    { argv: ["dori", "inbound", `--${option}`, "slack", "discord"] },
+    { command: `dori inbound --${option} slack discord` },
+  ];
+  expect(monitorCleanup([lane("discord", "closed")], [manifest(monitors)])).toEqual([]);
+});
+
+test("lanes is a command word, but report can still target a lane named lanes", () => {
+  const result = monitorCleanup(
+    [lane("lanes", "closed")],
+    [
+      manifest([
+        { argv: ["dori", "lanes", "--thread", "discord:123", "--open"], monitorId: "mon_ARGV" },
+        { command: "dori lanes --open", monitorId: "mon_COMMAND" },
+        { argv: ["dori", "report", "lanes", "--kind", "done", "--text", "complete"], monitorId: "mon_TARGET" },
+      ]),
+    ],
+  );
+  expect(result.map((m) => [m.monitorId, m.match])).toEqual([["mon_TARGET", ["lanes:argv:key"]]]);
+});
+
 test("the dori command vocabulary is every command the CLI dispatches", async () => {
   const tables = [
     (await import("../src/cli-journal.ts")).journalCommands,

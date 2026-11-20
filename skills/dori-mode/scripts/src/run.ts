@@ -6,7 +6,7 @@ import { type RuntimeChoice, readRuntimeChoice } from "../../../../src/runtime/s
 import type { RuntimeKind, SessionRuntime } from "../../../../src/runtime/types.ts";
 import { configPath, type DoriConfig } from "./config.ts";
 
-export type Ran = { readonly code: number; readonly out: string; readonly err: string };
+export type Ran = { readonly code: number; readonly out: string; readonly err: string; readonly spawnFailed?: true };
 export type RunOptions = { readonly cwd?: string; readonly timeoutMs?: number; readonly preserveOutput?: boolean };
 export type Runner = (argv: readonly string[], opts?: RunOptions) => Promise<Ran>;
 
@@ -20,7 +20,7 @@ export const run: Runner = async (argv, opts = {}) => {
       ...(opts.timeoutMs ? { timeout: opts.timeoutMs, killSignal: "SIGKILL" } : {}),
     });
   } catch (e) {
-    return { code: 127, out: "", err: e instanceof Error ? e.message : String(e) };
+    return { code: 127, out: "", err: e instanceof Error ? e.message : String(e), spawnFailed: true as const };
   }
   const [out, err, code] = await Promise.all([
     new Response(p.stdout as ReadableStream).text(),
@@ -108,7 +108,7 @@ const runtimeFactory = (
 ): ((kind: RuntimeKind) => SessionRuntime) => {
   const exec: Exec = async (cmd, argv) => {
     const r = await runner([cmd, ...argv]);
-    return { code: r.code, stdout: r.out, stderr: r.err };
+    return { code: r.code, stdout: r.out, stderr: r.err, ...(r.spawnFailed ? { spawnFailed: true as const } : {}) };
   };
   const options = { env, sleep: clock.sleep, ...(config.stateDir === undefined ? {} : { stateDir: config.stateDir }) };
   const make: Record<RuntimeKind, () => SessionRuntime> = {

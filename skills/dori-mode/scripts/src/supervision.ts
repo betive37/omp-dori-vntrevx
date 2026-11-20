@@ -8,7 +8,7 @@ import { type Registry, sameLaneGeneration } from "./registry.ts";
 import { type Progress, Reports } from "./reports.ts";
 import type { Clock, Runner } from "./run.ts";
 import { laneActivity, observeBudget, workingTimer } from "./supervision-observe.ts";
-import type { SupervisedLane, SupervisionOptions, Usage, UsageSnapshot } from "./supervision-observe.ts";
+import type { Observation, SupervisedLane, SupervisionOptions, Usage, UsageSnapshot } from "./supervision-observe.ts";
 
 export type SupervisionDeps = {
   readonly stateDir: string;
@@ -27,17 +27,6 @@ export type SupervisionResult = {
   readonly hung: boolean;
 };
 const NOT_OBSERVED: SupervisionResult = { enabled: false, state: null, alerts: [], usage: null, hung: false };
-
-type Observation = {
-  readonly openedAt: string;
-  readonly generation?: string;
-  readonly at: number;
-  readonly timer: number | null;
-  readonly timerKind: string | null;
-  readonly activity: string;
-  readonly activeAt: number;
-  readonly alerts: readonly string[];
-};
 
 export class Supervision {
   readonly reports: Reports;
@@ -139,15 +128,24 @@ export class Supervision {
     const blocker = violations.join("; ");
     let discarded = false;
     if (!terminal && violations.length) {
-      await this.reports.report(lane.key, "blocker", blocker, now, scope.generation, undefined, (latest, current) => {
-        discarded =
-          this.deps.registry !== undefined &&
-          (!current || current.nativeCloseIntent !== undefined || !sameLaneGeneration(lane, current));
-        if (discarded) return false;
-        progress = latest;
-        terminal = latest?.state === "done" || latest?.state === "halted";
-        return !terminal && !(latest?.lastReport?.kind === "blocker" && latest.lastReport.text === blocker);
-      });
+      await this.reports.report(
+        lane.key,
+        "blocker",
+        blocker,
+        now,
+        scope.generation,
+        undefined,
+        undefined,
+        (latest, current) => {
+          discarded =
+            this.deps.registry !== undefined &&
+            (!current || current.nativeCloseIntent !== undefined || !sameLaneGeneration(lane, current));
+          if (discarded) return false;
+          progress = latest;
+          terminal = latest?.state === "done" || latest?.state === "halted";
+          return !terminal && !(latest?.lastReport?.kind === "blocker" && latest.lastReport.text === blocker);
+        },
+      );
     }
     if (discarded) return NOT_OBSERVED;
     // Without a usage hook each sweep would append the same unknown reading; close still records its final one.

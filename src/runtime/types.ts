@@ -67,6 +67,8 @@ export type DeliverWhen = "idle" | "working" | "any";
 export type DeliverOptions = {
   readonly when?: DeliverWhen;
   readonly force?: boolean;
+  /** Require idle at the runtime's last delivery check, overriding `when`. */
+  readonly strictIdle?: boolean;
   /** Require this process-bound native session in the probe immediately before delivery. */
   readonly expectedSessionId?: string;
 };

@@ -43,8 +43,15 @@ export type Cleanup = {
   readonly stop: string;
 };
 // The one definition of a finished lane, shared by the VANISHED filter and the cleanup check.
-export const finished = (lane: BootLane): boolean =>
-  ["closed", "verified-done"].includes(statusOf(lane)) || lane.reportState === "done";
+export const finished = (lane: BootLane): boolean => {
+  const status = statusOf(lane);
+  // A watcher or lead objection is authoritative, including before the lane journals its setback.
+  const rejected = status === "not-done" || (status === "paused" && lane.pausedFrom === "not-done");
+  return (
+    status === "closed" ||
+    (!lane.threadClosePending && (status === "verified-done" || (!rejected && lane.reportState === "done")))
+  );
+};
 
 // Loose: any mention of a name, prose and paths included. Used only to keep a watch that might belong to an open lane.
 // A colon or a period next to the name is punctuation ("lane:api-release", "api-release.") unless the period joins

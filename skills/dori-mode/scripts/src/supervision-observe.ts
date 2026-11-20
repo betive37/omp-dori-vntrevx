@@ -18,6 +18,17 @@ export type UsageSnapshot = Usage & {
   readonly openedAt?: string;
   readonly final?: true;
 };
+export type Observation = {
+  readonly openedAt: string;
+  readonly generation?: string;
+  readonly at: number;
+  readonly timer: number | null;
+  readonly timerKind: string | null;
+  readonly activity: string;
+  readonly activeAt: number;
+  readonly alerts: readonly string[];
+};
+
 export type SupervisedLane = Lane & { readonly activityPaths?: readonly string[]; readonly budget?: BudgetLimits };
 export type SupervisionOptions = {
   readonly hungAfterMinutes?: number;

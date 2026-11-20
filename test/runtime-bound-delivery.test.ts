@@ -24,3 +24,30 @@ test("Herdr checks the expected saved session again before fallback paste", asyn
   expect(s.pane.received).toEqual([]);
   expect(s.w.calls.some(({ argv }) => argv[1] === "send-keys")).toBe(false);
 });
+
+test.each([
+  ["paste", 2],
+  ["Enter", 3],
+] as const)("Herdr idle-only fallback stops before %s when OMP starts working", async (phase, getAt) => {
+  const { w, rt, ref, pane, record, save } = ompWorld();
+  w.promptFails.set(ref.id, "agent_not_ready");
+  w.getHook.set(ref.id, (observed) => {
+    if (observed !== getAt) return;
+    record.agentStatus = "working";
+    save();
+  });
+
+  const result = await rt.deliver(ref, "nudge", { expectedSessionId: record.sessionId, strictIdle: true });
+
+  expect(w.calls.filter(({ argv }) => argv[0] === "agent")).toEqual([
+    { cmd: "herdr", argv: ["agent", "prompt", ref.id, "nudge"] },
+  ]);
+  if (phase === "paste") {
+    expect(result).toEqual({ kind: "not-ready", status: "working" });
+    expect(pane.received).toEqual([]);
+  } else {
+    expect(result).toMatchObject({ kind: "typed", into: { pid: record.pid, sessionId: record.sessionId } });
+    expect(pane.received).toEqual(["nudge"]);
+  }
+  expect(w.calls.some(({ argv }) => argv[1] === "send-keys")).toBe(false);
+});

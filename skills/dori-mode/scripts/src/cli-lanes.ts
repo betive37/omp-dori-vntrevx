@@ -1,13 +1,18 @@
 /** dori launch, adopt, claim-done, object-done, close, pause, resume and tell. */
+import { resolve } from "node:path";
 import { type Command, die } from "./cli-context.ts";
+import { enqueueLaunch, startQueued, cancelQueued } from "./launch-queue.ts";
+import { LaunchQueue } from "./launch-queue-store.ts";
 import { autoTrackLinks } from "./cli-pr.ts";
 import { claimDone, closeLane, objectDone } from "./done-flow.ts";
-import { adoptLane, type LaunchInput, launchLane, prepareLaunch } from "./launch.ts";
+import { adoptLane, launchLane, prepareLaunch } from "./launch.ts";
+import type { LaunchInput } from "./launch-input.ts";
 import { pauseLane, resumeLane } from "./pause.ts";
 import { parkLane } from "./park.ts";
 import { reopenLane } from "./reopen.ts";
 import { holdLines } from "./holds.ts";
 import { tellLane } from "./tell.ts";
+import { statusOf } from "./registry.ts";
 
 const launch: Command = async ({ key, opt, need, ceiling, strings, values, deps }) => {
   const wallMinutes = ceiling("wall-minutes"),
@@ -16,10 +21,22 @@ const launch: Command = async ({ key, opt, need, ceiling, strings, values, deps 
   const thread = opt("thread"),
     model = opt("model"),
     cwd = opt("cwd");
+  const template = opt("template");
+  if (template && opt("brief")) die("choose --brief or --template, not both");
+  if (!template && strings("set").length) die("--set requires --template");
+  const variables = Object.fromEntries(
+    strings("set").map((setting) => {
+      const at = setting.indexOf("=");
+      const name = setting.slice(0, at);
+      if (at < 1 || !/^[a-zA-Z_][a-zA-Z0-9_.-]*$/.test(name)) return die("--set requires name=value");
+      return [name, setting.slice(at + 1)];
+    }),
+  );
   const input: LaunchInput = {
     key: key ?? "",
     title: need("title"),
-    brief: need("brief"),
+    brief: template ? resolve(deps.config.stateDir, "briefs", `${key}.md`) : need("brief"),
+    ...(template ? { template, variables } : {}),
     done: need("done"),
     ...(thread !== undefined ? { thread } : {}),
     ...(model !== undefined ? { model } : {}),
@@ -37,6 +54,20 @@ const launch: Command = async ({ key, opt, need, ceiling, strings, values, deps 
     console.log(prepared.preamble);
     return;
   }
+  const after = opt("after");
+  if (after !== undefined) {
+    const entry = await enqueueLaunch(
+      deps,
+      input,
+      after.split(",").map((s) => s.trim()),
+      Number(opt("expires-hours") ?? 24),
+    );
+    console.log(
+      `QUEUED ${entry.input.key} after=${entry.after.join(",")} expires=${entry.expiresAt}; explicit dori queue start required`,
+    );
+    return;
+  }
+  if (opt("expires-hours") !== undefined) die("--expires-hours requires --after");
   const r = await launchLane(deps, input);
   for (const warning of r.warnings) console.error(warning);
   console.log(`LAUNCHED ${r.lane.key} pane=${r.lane.pane} tab=${r.lane.tab ?? "?"}`);
@@ -107,7 +138,47 @@ const tell: Command = async ({ key, need, lane, deps }) => {
 
 export const laneCommands: Readonly<Record<string, Command>> = {
   launch,
+  queue: async ({ key: action, positionals, values, deps }) => {
+    if (action === "list") {
+      const scan = new LaunchQueue(deps.config.stateDir).scan();
+      console.log(JSON.stringify(scan.entries, null, 2));
+      for (const problem of scan.problems) console.error(`QUEUE_UNREADABLE ${problem}`);
+      process.exitCode = scan.problems.length ? 1 : 0;
+      return;
+    }
+    const key = positionals[1] ?? die("queue needs list, start <key>, or cancel <key>");
+    if (values["dry-run"] !== undefined && (action === "start" || action === "cancel"))
+      die("--dry-run is supported only by dori launch, not queue start or cancel");
+    if (action === "cancel") {
+      console.log(await cancelQueued(deps, key));
+      return;
+    }
+    if (action !== "start") die("queue needs list, start <key>, or cancel <key>");
+    const result = await startQueued(deps, key);
+    for (const line of result.lines) console.log(line);
+    process.exit(result.code);
+  },
   adopt,
+  lanes: async ({ values, need, deps }) => {
+    const thread = values["thread"] === undefined ? undefined : need("thread");
+    const lanes = (await deps.registry.list()).filter(
+      (lane) => (thread === undefined || lane.thread === thread) && (!values["open"] || statusOf(lane) !== "closed"),
+    );
+    console.log(
+      JSON.stringify(
+        lanes.map((lane) => ({
+          key: lane.key,
+          title: lane.title,
+          thread: lane.thread,
+          status: statusOf(lane),
+          openedAt: lane.openedAt,
+          closedAt: lane.closedAt,
+        })),
+        null,
+        2,
+      ),
+    );
+  },
   "claim-done": async (cli) => {
     const target = await cli.lane(cli.key);
     const evidence = cli.need("evidence");

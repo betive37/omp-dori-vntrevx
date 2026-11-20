@@ -19,6 +19,12 @@ const runtimeImports = (file: string): string[] =>
     ...readFileSync(join(ROOT, file), "utf8").matchAll(/^(?:import|export)\s+(?!type\b)[^;]*?\sfrom\s+"(\.[^"]+)"/gm),
   ].map((m) => relative(ROOT, resolve(dirname(join(ROOT, file)), m[1] ?? "")));
 
+test("launch validation does not import its coordinator", () => {
+  expect(runtimeImports("skills/dori-mode/scripts/src/launch-input.ts")).not.toContain(
+    "skills/dori-mode/scripts/src/launch.ts",
+  );
+});
+
 test("no module imports a module that imports it back", () => {
   const graph = new Map(modules().map((file) => [file, runtimeImports(file)]));
   const cycles: string[] = [];

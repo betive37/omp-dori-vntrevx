@@ -19,7 +19,7 @@ const race = async (stateDir: string, mode: "distinct" | "duplicate" | "receipts
       const root = ${JSON.stringify(stateDir)};
       ${
         mode === "receipts"
-          ? `await recordSent(root, "${3000 + index}", 1001); await recordMark(root, "${3000 + index}", "${id}", 1002); console.log(1);`
+          ? `await recordSent(root, "${3000 + index}", "${id}", ["${4000 + index}"], 1001); await recordMark(root, "${3000 + index}", "${id}", 1002); console.log(1);`
           : `console.log(await recordOwes(root, ${JSON.stringify(line(id))}, 1000));`
       }
     `;

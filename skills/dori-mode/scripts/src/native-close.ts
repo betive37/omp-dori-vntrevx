@@ -29,9 +29,9 @@ export const recordDoneDecision = async (
   let closing = false;
   const result = await deps.registry.update(seen.key, (current) => {
     closing = current?.nativeCloseIntent !== undefined;
-    return current && !closing && statusOf(current) !== "closed" && sameLaneGeneration(seen, current)
-      ? next(current)
-      : null;
+    if (!current || closing || statusOf(current) === "closed" || !sameLaneGeneration(seen, current)) return null;
+    const { threadClosePending: _waiting, ...active } = current;
+    return next(active);
   });
   return closing ? "closing" : result;
 };
@@ -58,7 +58,7 @@ const recordClosed = async (deps: FlowDeps, lane: Lane, basis: CloseBasis): Prom
   const intent = lane.nativeCloseIntent;
   const at = iso(deps.clock);
   const closed = await deps.registry.transition(lane, (current) => {
-    const { nativeCloseIntent: stored, ...cleared } = current;
+    const { nativeCloseIntent: stored, threadClosePending: _waiting, ...cleared } = current;
     if (intent ? !stored || !boundTo(current, stored) || !boundTo(current, intent) : stored) return null;
     const verified = basis.settlingClaim
       ? withStatus(cleared, "verified-done", "Done signals read back live", at)
