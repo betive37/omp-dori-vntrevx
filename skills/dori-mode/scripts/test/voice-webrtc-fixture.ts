@@ -5,6 +5,7 @@
 import { OpusEncoder } from "@discordjs/opus";
 import * as rtc from "werift";
 import { Playback } from "../src/voice/audio.ts";
+import type { OpusCodec } from "../src/voice/discord-link.ts";
 import { Replies } from "../src/voice/replies.ts";
 import { VoiceSession } from "../src/voice/session.ts";
 import type { VoiceSettings } from "../src/voice/settings.ts";
@@ -25,7 +26,19 @@ export const toneFrame = (): Buffer => {
 };
 
 /** The creation request as the client sends it. */
-type CreateBody = { session: Record<string, unknown>; transport: { type: string; sdp: string } };
+type CreateBody = { session: object; transport: { type: unknown; sdp: string } };
+const isCreateBody = (raw: unknown): raw is CreateBody =>
+  typeof raw === "object" &&
+  raw !== null &&
+  "session" in raw &&
+  typeof raw.session === "object" &&
+  raw.session !== null &&
+  "transport" in raw &&
+  typeof raw.transport === "object" &&
+  raw.transport !== null &&
+  "type" in raw.transport &&
+  "sdp" in raw.transport &&
+  typeof raw.transport.sdp === "string";
 
 export const fakeLiveWebrtc = (options: { status?: number } = {}) => {
   const requests: { authorization: string | null; body: CreateBody }[] = [];
@@ -42,7 +55,8 @@ export const fakeLiveWebrtc = (options: { status?: number } = {}) => {
     hostname: "127.0.0.1",
     port: 0,
     async fetch(request) {
-      const body: CreateBody = await request.json();
+      const body: unknown = await request.json();
+      if (!isCreateBody(body)) return Response.json({ error: { code: "bad_request" } }, { status: 400 });
       requests.push({ authorization: request.headers.get("authorization"), body });
       if (options.status) return Response.json({ error: { code: "fake" } }, { status: options.status });
       const pc = new rtc.RTCPeerConnection({ codecs, iceServers: [], iceUseDefaultStunServer: false });
@@ -101,9 +115,15 @@ export const fakeLiveWebrtc = (options: { status?: number } = {}) => {
 };
 
 /** A VoiceSession on the WebRTC transport against `url`, with a 40 ms tick like the CLI. */
-export const webrtcSession = (config: VoiceSettings, url: string, greet = false) => {
+export const webrtcSession = (
+  config: VoiceSettings,
+  url: string,
+  greet = false,
+  codec: () => OpusCodec = () => new OpusEncoder(48_000, 1),
+) => {
   const temp = temporaryVoice();
   const logs: string[] = [];
+  let finished = 0;
   const started = Promise.withResolvers<void>();
   const playback = new Playback();
   const usage = new VoiceUsage(temp.directory, config, Date.now);
@@ -112,14 +132,16 @@ export const webrtcSession = (config: VoiceSettings, url: string, greet = false)
     {
       now: Date.now,
       key: "synthetic-no-paid-key",
-      open: webrtcSocket(rtc, () => new OpusEncoder(48_000, 1), url),
+      open: webrtcSocket(rtc, codec, url),
       playback,
       replies: new Replies(temp.directory, () => {}),
       usage,
       tool: async () => ({ ok: true, result: "unused" }),
       log: (line) => logs.push(line),
       started: () => started.resolve(),
-      finished: async () => {},
+      finished: async () => {
+        finished++;
+      },
     },
     greet,
   );
@@ -132,6 +154,7 @@ export const webrtcSession = (config: VoiceSettings, url: string, greet = false)
     usage,
     session,
     started: started.promise,
+    finished: () => finished,
     cleanup: async () => {
       if (session.state !== "closed") session.close("shutdown");
       await session.done;

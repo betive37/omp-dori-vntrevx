@@ -19,6 +19,8 @@ type Request = (url: string, init: RequestInit) => Promise<Response>;
 
 const LIVE_SESSIONS_URL = "https://api.openai.com/v1/live/sessions";
 const PAYLOAD_TYPE = 111;
+/** Voice duration OpenAI bills when a WebRTC session is created (documented 2026-11-20). */
+const INIT_BILLED_SECONDS = 15;
 /** 20 ms of 48 kHz mono PCM16: one Opus frame. */
 const FRAME_BYTES = 1920;
 /** Owner audio waiting for the real-time track; more than this means the pacing upstream broke. */
@@ -179,9 +181,19 @@ export const webrtcSocket =
       const transport = body && typeof body === "object" && "transport" in body ? body.transport : undefined;
       const sdp = transport && typeof transport === "object" && "sdp" in transport ? transport.sdp : undefined;
       if (typeof sdp !== "string" || !sdp) throw new Error("Live session response has no SDP answer");
+      // Creation bills 15 s of initialization, credited against the running session's cumulative usage: record it
+      // now, so a session that ends before session.started still counts it and later usage does not add it again.
+      handlers.event({ type: "session.usage.updated", usage: { seconds: INIT_BILLED_SECONDS } });
       if (ended) return;
       await pc.setRemoteDescription({ type: "answer", sdp });
-      pump = setInterval(send, 20);
+      // A codec or track failure ends the transport as a provider failure instead of escaping the timer.
+      pump = setInterval(() => {
+        try {
+          send();
+        } catch {
+          end(true);
+        }
+      }, 20);
     };
 
     queueMicrotask(() => {

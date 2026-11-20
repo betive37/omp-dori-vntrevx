@@ -1,7 +1,7 @@
 import { expect, test } from "bun:test";
 import { writeFileSync } from "node:fs";
 import { join } from "node:path";
-import type { Discord } from "../src/messenger/discord.ts";
+import { Discord } from "../src/messenger/discord.ts";
 import { summarizeVoice } from "../src/voice/summary.ts";
 import { LiveMeter, VoiceUsage } from "../src/voice/usage.ts";
 import { flush, settings, temporaryVoice } from "./voice-fixture.ts";
@@ -78,11 +78,14 @@ test("with standby, minute caps count active seconds and standby seconds meet th
 test("the summary prices active and standby minutes only when Live rates are configured", async () => {
   const temp = temporaryVoice();
   const sent: string[] = [];
-  const discord = {
-    send: async (_channel: string, text: string) => {
-      sent.push(text);
+  const discord = new Discord(
+    async (request) => {
+      sent.push(String(request.body));
+      return { status: 200, headers: {}, body: '{"id":"summary-note"}' };
     },
-  } satisfies Pick<Discord, "send">;
+    { now: () => 0, sleep: async () => {} },
+    "synthetic-discord",
+  );
   try {
     const priced = settings({ livePrices: { active: 0.05, standby: 0.02 } });
     const usage = new VoiceUsage(temp.directory, priced, () => 0);
@@ -93,9 +96,9 @@ test("the summary prices active and standby minutes only when Live rates are con
       failed: true,
       meter: { seconds: 180, paused: 120 },
     });
-    await summarizeVoice(session(), priced, usage, "unused", discord as Discord);
+    await summarizeVoice(session(), priced, usage, "unused", discord);
     expect(sent[0]).toContain("Live time: 1.0 min active, 2.0 min standby; estimated $0.09 at configured rates");
-    await summarizeVoice(session(), settings(), usage, "unused", discord as Discord);
+    await summarizeVoice(session(), settings(), usage, "unused", discord);
     expect(sent[1]).not.toContain("Live time");
   } finally {
     temp.cleanup();

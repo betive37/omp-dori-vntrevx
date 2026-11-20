@@ -106,7 +106,22 @@ test("a rejected creation request closes the session once, with no retry", async
   }
 }, 20_000);
 
-test("losing the peer connection ends the session as a failure and records wall time", async () => {
+test("a created session that ends before session.started still records the 15 s initialization charge", async () => {
+  const live = fakeLiveWebrtc();
+  const w = webrtcSession(standby, live.url);
+  try {
+    await live.connected;
+    w.session.close("owner left");
+    await w.session.done;
+    expect(day(w.temp.directory).liveSeconds).toBe(15);
+    expect(live.requests).toHaveLength(1);
+  } finally {
+    await w.cleanup();
+    await live.stop();
+  }
+}, 20_000);
+
+test("losing the peer connection ends the session as a failure and keeps its billed time", async () => {
   const live = fakeLiveWebrtc();
   const w = webrtcSession(standby, live.url);
   try {
@@ -117,7 +132,31 @@ test("losing the peer connection ends the session as a failure and records wall 
     await w.session.done;
     expect(w.session.failed).toBe(true);
     expect(w.session.state).toBe("closed");
-    expect(day(w.temp.directory).liveSeconds).toBeGreaterThan(0);
+    expect(day(w.temp.directory).liveSeconds).toBeGreaterThanOrEqual(15);
+  } finally {
+    await w.cleanup();
+    await live.stop();
+  }
+}, 20_000);
+
+test("an Opus encoder failure on the paced track ends the session once instead of escaping the timer", async () => {
+  const live = fakeLiveWebrtc();
+  const broken = () => ({
+    encode: () => {
+      throw new Error("encoder broke");
+    },
+    decode: (packet: Buffer) => packet,
+  });
+  const w = webrtcSession(standby, live.url, false, broken);
+  try {
+    await live.connected;
+    live.send({ type: "session.started", session: { id: "live_fake" } });
+    await w.started;
+    w.session.inputAudio(owner(100), true);
+    await w.session.done;
+    expect(w.session.failed).toBe(true);
+    expect(w.logs.filter((line) => line === "VOICE_PROVIDER_ERROR")).toHaveLength(1);
+    expect(w.finished()).toBe(1);
   } finally {
     await w.cleanup();
     await live.stop();
