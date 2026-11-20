@@ -16,7 +16,8 @@ import {
 import type { FlowDeps } from "./done-flow.ts";
 import { sampleHost } from "./host-guard.ts";
 import { readPaneState } from "./lane-state.ts";
-import { quoteForPane } from "./launch-footer.ts";
+import { recordExecution } from "./lane-run.ts";
+import { quoteForPane, runCommandPrefix } from "./launch-footer.ts";
 import { isBareLaneShell, nativeGoalStatus } from "./lifecycle-session.ts";
 import {
   type Lane,
@@ -78,9 +79,13 @@ async function attestWake(deps: FlowDeps, lane: Lane, check: WakeLease): Promise
     return unconfirmed("waiting for exact live OMP pane, transcript and directory");
   if (!(await ownsWakeLease(deps, check, state.pid)))
     return unconfirmed("exact OMP lease ownership by the pane's native PID was not verified");
-  const completed = await deps.registry.transition(lane, (current) =>
-    sameWakeTarget(lane, current) ? { ...current, lifecycleEpoch: epoch } : null,
-  );
+  const completed = await deps.registry.transition(lane, (current) => {
+    if (!sameWakeTarget(lane, current)) return null;
+    const next = { ...current, lifecycleEpoch: epoch };
+    // The same run, now attested in its final generation, binds to the exact native session the lease proved.
+    recordExecution(deps.config.stateDir, next, deps.clock.now(), check.session);
+    return next;
+  });
   return completed ? { kind: "started", ref } : unconfirmed("the lane changed during startup attestation");
 }
 
@@ -162,13 +167,20 @@ async function startExactLane(deps: FlowDeps, seen: Lane): Promise<DiscordLaneWa
     // Last-tab close removes a workspace. `pane list` on this same Herdr adapter already
     // observes every surviving workspace through its root panes.
     const hasGroup = peers.some(({ ref }) => ref.runtime === "herdr" && ref.group === group);
-    const start = [...command.launch, "--config", wakeOverlay, `--resume=${file}`].map(quoteForPane).join(" ");
+    // A sourced wake is a new local run of the same original request; only its OMP process gets the run.
+    const run = lane.requestId === undefined ? {} : { runId: randomUUID() };
+    const argv = [...command.launch, "--config", wakeOverlay, `--resume=${file}`];
+    const start = `${runCommandPrefix(run)}${argv.map(quoteForPane).join(" ")}`;
     const epoch = randomUUID();
     // Commit before the first side effect. If the monitor dies during create, bind, or start, even a new
     // monitor must hold. Once bound, keep the new pane for inspection; a failed start receipt does not prove no start.
-    const intent = await deps.registry.transition(lane, (current) =>
-      sameWakeTarget(lane, current) ? { ...current, lifecycleEpoch: discordWakePendingEpoch(epoch) } : null,
-    );
+    const intent = await deps.registry.transition(lane, (current) => {
+      if (!sameWakeTarget(lane, current)) return null;
+      const next = { ...current, ...run, lifecycleEpoch: discordWakePendingEpoch(epoch) };
+      // The run starts in the final reporting generation; pending:/bound: only guard startup in the registry.
+      recordExecution(deps.config.stateDir, { ...next, lifecycleEpoch: epoch }, deps.clock.now());
+      return next;
+    });
     if (!intent) return held("lane changed before wake");
     reserved = true;
     const ref = await rt.create({

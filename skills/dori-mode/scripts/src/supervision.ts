@@ -5,11 +5,14 @@ import { Checkpoints } from "./checkpoints.ts";
 import { fill } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import { type Registry, sameLaneGeneration } from "./registry.ts";
-import { type Progress, Reports } from "./reports.ts";
+import { type Progress, Reports, reportScope } from "./reports.ts";
+import { runContext } from "./lane-run.ts";
+import { ReportError } from "./report-events.ts";
 import type { Clock, Runner } from "./run.ts";
 import {
   laneActivity,
   observeBudget,
+  type Observation,
   type SupervisedLane,
   type SupervisionOptions,
   type Usage,
@@ -34,17 +37,6 @@ export type SupervisionResult = {
   readonly hung: boolean;
 };
 const NOT_OBSERVED: SupervisionResult = { enabled: false, state: null, alerts: [], usage: null, hung: false };
-
-type Observation = {
-  readonly openedAt: string;
-  readonly generation?: string;
-  readonly at: number;
-  readonly timer: number | null;
-  readonly timerKind: string | null;
-  readonly activity: string;
-  readonly activeAt: number;
-  readonly alerts: readonly string[];
-};
 
 export class Supervision {
   readonly reports: Reports;
@@ -120,11 +112,17 @@ export class Supervision {
     usage: UsageSnapshot,
     signature: (progress: Progress | null) => string,
   ): Promise<SupervisionResult> {
-    const scope = { generation: lane.lifecycleEpoch };
-    const tag = scope.generation === undefined ? {} : { generation: scope.generation };
+    const scope = reportScope(lane);
+    const context = runContext(this.reports, lane, lane.runId);
+    if (!context) throw new ReportError(`supervision: execution identity unavailable for ${lane.key}`);
+    const tag = {
+      ...(scope.generation === undefined ? {} : { generation: scope.generation }),
+      ...(context.provenance ? { provenance: context.provenance } : {}),
+    };
     const path = join(dirname(this.reports.path(lane.key)), "supervision.json");
     const saved = existsSync(path) ? (JSON.parse(readFileSync(path, "utf8")) as Observation) : null;
-    const previous = saved?.openedAt === lane.openedAt && saved.generation === scope.generation ? saved : null;
+    const previous = saved?.openedAt === lane.openedAt && saved.generation === scope.generation &&
+      saved.provenance?.runId === context.provenance?.runId ? saved : null;
     const progress = this.reports.read(lane.key, scope);
     // Without a usage hook each sweep would append the same unknown reading; close still records its final one.
     if (this.options.usageArgv?.length) this.record(usage);
@@ -151,7 +149,7 @@ export class Supervision {
     const blocker = violations.join("; ");
     const reported = progress?.lastReport?.kind === "blocker" && progress.lastReport.text === blocker;
     if (!terminal && violations.length && !reported) {
-      this.reports.report(lane.key, "blocker", blocker, now, scope.generation);
+      this.reports.report(lane.key, "blocker", blocker, now, scope.generation, undefined, context.provenance);
     } else if (!terminal && hung && (!progress || progress.state === "running")) {
       this.reports.append({
         type: "activity",

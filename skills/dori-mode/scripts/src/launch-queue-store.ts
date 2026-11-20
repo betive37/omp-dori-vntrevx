@@ -3,6 +3,7 @@ import { join } from "node:path";
 import type { LaunchInput } from "./launch-input.ts";
 import { LANE_KEY } from "./registry.ts";
 import { QueueError } from "./launch-errors.ts";
+import { isRequestId } from "./request-identity.ts";
 
 export type QueueEntry = {
   readonly id: string;
@@ -48,6 +49,7 @@ export class LaunchQueue {
       typeof entry.input.brief !== "string" ||
       typeof entry.input.done !== "string" ||
       (entry.input.cwd !== undefined && typeof entry.input.cwd !== "string") ||
+      (entry.input.requestId !== undefined && !isRequestId(entry.input.requestId)) ||
       typeof entry.briefText !== "string" ||
       !Array.isArray(entry.after) ||
       entry.after.length === 0 ||

@@ -7,7 +7,7 @@ import type { FlowDeps } from "./done-flow.ts";
 import type { PaneState } from "./lane-state.ts";
 import { Lessons } from "./lessons.ts";
 import { LANE_KEY } from "./registry.ts";
-import { Reports } from "./reports.ts";
+import { Reports, reportScope } from "./reports.ts";
 import { runtimesOf } from "./run.ts";
 import { trustedPaneState } from "./session-id.ts";
 import { parseSignal, SignalSyntaxError, splitDone } from "./signals-parse.ts";
@@ -154,7 +154,7 @@ export const doctorCheck = async (
         continue;
       }
       try {
-        lanes.push({ ...lane, reportState: reports.read(lane.key, { generation: lane.lifecycleEpoch })?.state });
+        lanes.push({ ...lane, reportState: reports.read(lane.key, reportScope(lane))?.state });
       } catch {
         findings.push({
           check: "registry",

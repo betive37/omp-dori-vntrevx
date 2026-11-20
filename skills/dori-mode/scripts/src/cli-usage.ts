@@ -6,6 +6,8 @@ export const USAGE = `dori <command> [options]
   launch <key> --title T --brief FILE --done "merged o/r#N; closed o/r#M" [--thread REF] [--model M] [--cwd DIR]
          [--wall-minutes N|none] [--token-limit N|none] [--cost-limit N|none] [--activity-path FILE ...] [--dry-run]
          --template NAME [--set name=value]... replaces --brief; [--after a,b --expires-hours N] queues without starting
+         [--request discord:C:M|telegram:CHAT:MID|slack:CHANNEL:TS] the original input ID (metadata only); each launch,
+         reopen or wake gets a new local run, never an admission or completion receipt; adopt refuses it
   queue list | start <key> | cancel <key>
                                        start only on explicit command after verified predecessors, host capacity and expiry checks
   adopt  <key> --pane ID --title T --brief FILE --done "..." [--thread REF]
@@ -20,7 +22,8 @@ export const USAGE = `dori <command> [options]
   monitor-presets [name] [--json]      recommended argv and filters; starts nothing
   report <key> --kind milestone|blocker|question|halted|done --text TEXT [--owner SUMMARY] [--json]
                                        append a durable progress report and print its [REPORT] line
-  relayed <key> --report ID            acknowledge the exact journal report already sent by the lead (--json supplies ID)
+  relayed <key> --report ID [--delivery <Discord deliveryId>]
+                                       acknowledge the exact journal report already sent by the lead (--json supplies ID)
   checkpoint <key> --step ID --result TEXT --evidence PATH [--remote-effect RECEIPT]...
                                        record a completed step once; a conflicting rewrite is refused
   checkpoints <key>                    read completed steps before resuming remote work

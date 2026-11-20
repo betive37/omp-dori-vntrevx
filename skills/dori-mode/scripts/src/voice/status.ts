@@ -1,6 +1,6 @@
 // get_status: read-only lane and report lookups over the lead's own registry, sync and report journals.
 import type { FlowDeps } from "../done-flow.ts";
-import { type Progress, Reports, reportLine } from "../reports.ts";
+import { type Progress, Reports, reportLine, reportScope } from "../reports.ts";
 import { iso } from "../run.ts";
 import { syncRegistry } from "../sync.ts";
 import type { ToolResult } from "./types.ts";
@@ -40,7 +40,7 @@ const reports = async (deps: FlowDeps): Promise<Part> => {
     const unreadable: string[] = [];
     for (const lane of (await deps.registry.scan()).lanes) {
       try {
-        const progress = journal.read(lane.key, { generation: lane.lifecycleEpoch });
+        const progress = journal.read(lane.key, reportScope(lane));
         if (progress) found.push({ key: lane.key, progress });
       } catch {
         unreadable.push(lane.key);

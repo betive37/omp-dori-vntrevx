@@ -1,4 +1,5 @@
-import { isReportKind, type ReportKind } from "./reports.ts";
+import { isReportKind } from "./report-events.ts";
+import type { ReportKind } from "./reports.ts";
 
 export type FreshnessPolicy = {
   readonly nudge?: "all" | "idle-only";

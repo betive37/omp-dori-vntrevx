@@ -3,6 +3,7 @@ import {
   closeSync,
   fsyncSync,
   linkSync,
+  mkdirSync,
   openSync,
   readFileSync,
   renameSync,
@@ -142,4 +143,27 @@ export const takeLock = (
     rmSync(moved, { recursive: true, force: true });
   }
   return "the lock changed hands while taking it over; retry";
+};
+
+// Keep the registry writer wait and checkpoint immediate-refusal policies separate.
+export const withRegistryLock = async <T>(
+  target: { readonly directory: string; readonly path: string; readonly key: string },
+  fn: () => T,
+): Promise<T> => {
+  mkdirSync(target.directory, { recursive: true });
+  const lock = `${target.path}.lock`;
+  const fail = (m: string) => new Error(`lane registry lock of ${target.key} ${m}`);
+  const deadline = Date.now() + 5_000;
+  for (;;) {
+    const held = takeLock(lock, Date.now(), fail);
+    if (typeof held !== "string") {
+      try {
+        return fn();
+      } finally {
+        held();
+      }
+    }
+    if (Date.now() >= deadline) throw new Error(`lane registry locked: ${target.key} (${held})`);
+    await Bun.sleep(10);
+  }
 };

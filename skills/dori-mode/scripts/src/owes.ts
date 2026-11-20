@@ -1,10 +1,9 @@
 /**
  * A Discord owner request stays owed until its exact read mark and complete reply receipt exist.
- * Terminal output, reactions alone and unrelated channel sends are not answers. The CLI records every accepted
- * part only after the complete reply succeeds; legacy channel/time-only receipts cannot settle a request.
- * Inbound deliveries and CLI receipts share capped JSONL snapshots. Each file's writer lock covers deduplication
- * and atomic publication; corrupt old lines are skipped without swallowing the next admitted record.
- * The bounded ledgers retain the existing stale-owe and continuation limits.
+ * Terminal output, reactions alone and unrelated sends are not answers; legacy channel/time receipts cannot settle it.
+ * The CLI records all accepted parts only after the complete reply succeeds. Capped snapshots retain stale-owe limits.
+ * Writer locks protect deduplication and atomic publication; corrupt lines cannot swallow the next admitted record.
+ * Continuation limits are unchanged.
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -176,14 +175,17 @@ export const recordMark = async (stateDir: string, channel: string, message: str
   }));
 };
 
+export const sentReceipts = (stateDir: string): SentReceipt[] =>
+  readLines(sentPath(stateDir))
+    .map((line) => parse(line, isReceipt))
+    .filter((r): r is SentReceipt => r !== undefined);
+
 /**
  * Both the complete reply and read mark must name this exact request and follow its admission.
  * A successful send is evidence of API acceptance, not proof that the owner read the answer.
  */
 export const openOwes = (stateDir: string, now: number): InboundOwe[] => {
-  const receipts = readLines(sentPath(stateDir))
-    .map((line) => parse(line, isReceipt))
-    .filter((r): r is SentReceipt => r !== undefined);
+  const receipts = sentReceipts(stateDir);
   const marks = readLines(marksPath(stateDir))
     .map((line) => parse(line, isMark))
     .filter((m): m is MarkReceipt => m !== undefined);

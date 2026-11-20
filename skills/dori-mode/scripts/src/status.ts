@@ -6,8 +6,10 @@ import { type Decision, settled } from "./decisions-record.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { unfinishedOutcome } from "./holds.ts";
 import type { PaneState } from "./lane-state.ts";
+import { runContext } from "./lane-run.ts";
+import type { ReportDelivery, ReportProvenance } from "./request-identity.ts";
 import { type Lane, LANE_KEY, type LaneStatus, sessionOf, statusOf } from "./registry.ts";
-import { type Progress, Reports } from "./reports.ts";
+import { type Progress, Reports, reportScope } from "./reports.ts";
 import { runtimesOf } from "./run.ts";
 import { trustedPaneState } from "./session-id.ts";
 import { readStatusRegistry } from "./status-registry.ts";
@@ -59,6 +61,8 @@ export type StatusLane = {
   readonly runtime: RuntimeStatus | null;
   readonly progress: Progress | null;
   readonly checkpoint: Checkpoint | null;
+  readonly execution?: ReportProvenance;
+  readonly lastDelivery?: { readonly reportId: string; readonly receipt: ReportDelivery };
   readonly lastSweepNote: string | null;
   readonly lastNudgeAt: number | null;
   readonly lastPostedAt: number | null;
@@ -103,15 +107,20 @@ export const laneStatus = async (deps: FlowDeps, key?: string): Promise<StatusSn
   for (const lane of all.sort((a, b) => a.thread.localeCompare(b.thread) || a.key.localeCompare(b.key))) {
     const problems: string[] = [];
     let progress: Progress | null = null;
+    let execution: ReportProvenance | undefined;
     let checkpoint: Checkpoint | null = null;
     let runtime: RuntimeStatus | null = null;
     try {
-      progress = reports.read(lane.key, { generation: lane.lifecycleEpoch });
+      progress = reports.read(lane.key, reportScope(lane));
+      if (lane.requestId !== undefined) {
+        execution = runContext(reports, lane, lane.runId)?.provenance;
+        if (!execution) problems.push("launch invocation unverified");
+      }
     } catch {
       problems.push("report journal unreadable");
     }
     try {
-      checkpoint = checkpoints.read(lane.key).at(-1) ?? null;
+      checkpoint = checkpoints.latest(lane);
     } catch {
       problems.push("checkpoint journal unreadable");
     }
@@ -138,6 +147,9 @@ export const laneStatus = async (deps: FlowDeps, key?: string): Promise<StatusSn
       runtime,
       progress,
       checkpoint,
+      ...(execution ? { execution } : {}),
+      ...(lane.lastPostedReportId && lane.lastPostedReportDelivery
+        ? { lastDelivery: { reportId: lane.lastPostedReportId, receipt: lane.lastPostedReportDelivery } } : {}),
       lastSweepNote: lane.lastFreshnessNote ?? null,
       lastNudgeAt: lane.lastNudgeAt ?? null,
       lastPostedAt: lane.lastAutoReplyAt ?? null,

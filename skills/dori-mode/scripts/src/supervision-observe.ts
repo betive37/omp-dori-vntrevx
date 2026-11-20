@@ -4,10 +4,23 @@ import { isAbsolute, relative, resolve } from "node:path";
 import type { Checkpoints } from "./checkpoints.ts";
 import type { Lane } from "./registry.ts";
 import type { Progress } from "./reports.ts";
+import type { ReportProvenance } from "./request-identity.ts";
 import type { Runner } from "./run.ts";
 
 // path.relative() writes the platform's separators; a POSIX name may hold a literal backslash, so only Windows splits it.
 const PATH_SEPARATOR = process.platform === "win32" ? /[\\/]/ : "/";
+
+export type Observation = {
+  readonly openedAt: string;
+  readonly generation?: string;
+  readonly provenance?: ReportProvenance;
+  readonly at: number;
+  readonly timer: number | null;
+  readonly timerKind: string | null;
+  readonly activity: string;
+  readonly activeAt: number;
+  readonly alerts: readonly string[];
+};
 
 export type BudgetLimits = {
   readonly wallMinutes?: number | null | undefined;
@@ -101,7 +114,7 @@ export const laneActivity = async (
       return [path, null];
     }
   });
-  const checkpoint = checkpoints.read(lane.key).at(-1) ?? null;
+  const checkpoint = checkpoints.latest(lane);
   changes.sort();
   return (progress) => JSON.stringify({ report: progress?.lastReport ?? null, checkpoint, files, changes });
 };

@@ -1,14 +1,12 @@
-import { mkdirSync, readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { readdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { basename, join } from "node:path";
 
 import type { SessionRef } from "../../../../src/runtime/types.ts";
-import { takeLock } from "./checkpoint-lock.ts";
+import { withRegistryLock } from "./checkpoint-lock.ts";
 import type { NativeCloseIntent } from "./native-close.ts";
+import type { ReportDelivery } from "./request-identity.ts";
 import type { BudgetLimits } from "./supervision-observe.ts";
 
-// A writer holds a lane's lock for one synchronous read and write, so a short wait covers any live contention.
-const LOCK_WAIT_MS = 5_000;
-const LOCK_RETRY_MS = 10;
 export const LANE_KEY = /^[a-z0-9][a-z0-9._-]{1,60}$/;
 // `lead` names the lead, never a lane: records the lead writes (lessons with `lane: "lead"`) and lead-only checks tell
 // the two apart by this key, so launch and adopt refuse it. LANE_KEY stays as it is because those records still carry
@@ -24,6 +22,10 @@ export type Lane = {
   readonly key: string;
   readonly title: string;
   readonly thread: string;
+  /** Original physical input, immutable across reopen and wake; never a display title. */
+  readonly requestId?: string;
+  /** Local launch invocation, not a native admission or completion receipt. */
+  readonly runId?: string;
   /** The lane's session on its runtime. `pane`/`tab` mirror its id and container for older readers. */
   readonly sessionRef?: SessionRef;
   readonly pane?: string | undefined;
@@ -54,6 +56,7 @@ export type Lane = {
   readonly lastPostedReport?: string | undefined;
   readonly lastPostedReportId?: string | undefined;
   readonly lastPostedReportOwner?: string | undefined;
+  readonly lastPostedReportDelivery?: ReportDelivery | undefined;
   readonly lastRelayedAt?: number;
   readonly lastNudgeFailure?: string | undefined;
   /** The [REPORT] line seen on the previous freshness tick (a line is posted only once it holds across two ticks). */
@@ -133,23 +136,13 @@ export class Registry {
    * Runs `fn` under the lane's writer lock. `fn` is synchronous, so the lock is held for one read and one write and
    * never across pane, git or network I/O. Another writer's lock is waited out; a dead or stale one is taken over.
    */
-  private async locked<T>(key: string, fn: () => T): Promise<T> {
-    mkdirSync(this.dir, { recursive: true });
-    const lock = `${this.path(key)}.lock`;
-    const fail = (m: string) => new Error(`lane registry lock of ${key} ${m}`);
-    const deadline = Date.now() + LOCK_WAIT_MS;
-    for (;;) {
-      const held = takeLock(lock, Date.now(), fail);
-      if (typeof held !== "string") {
-        try {
-          return fn();
-        } finally {
-          held();
-        }
-      }
-      if (Date.now() >= deadline) throw new Error(`lane registry locked: ${key} (${held})`);
-      await Bun.sleep(LOCK_RETRY_MS);
-    }
+  private locked<T>(key: string, fn: () => T): Promise<T> {
+    return withRegistryLock({ directory: this.dir, path: this.path(key), key }, fn);
+  }
+
+  /** A synchronous journal operation on the current lane, without rewriting its registration. */
+  withCurrent<T>(key: string, fn: (current: Lane | null) => T): Promise<T> {
+    return this.locked(key, () => fn(this.readNow(key)));
   }
 
   private readNow(key: string): Lane | null {

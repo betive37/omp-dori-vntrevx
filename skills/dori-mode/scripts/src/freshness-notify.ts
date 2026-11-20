@@ -5,7 +5,9 @@ import type { FlowDeps } from "./done-flow.ts";
 import { anchoredReportLine, scrubForThread } from "./freshness-report.ts";
 import type { SweepAct } from "./freshness.ts";
 import { type Lane, sameLaneGeneration, sessionOf } from "./registry.ts";
-import { isReportKind, type Progress, reportId, reportLine } from "./reports.ts";
+import { isReportKind } from "./report-events.ts";
+import { reportDelivery } from "./report-delivery.ts";
+import { type Progress, reportId, reportLine } from "./reports.ts";
 import { runtimesOf } from "./run.ts";
 import { readScreen, sendVerified } from "./sessions.ts";
 
@@ -49,6 +51,7 @@ const sameReceipt = (a: Lane, b: Lane): boolean =>
   a.lastPostedReportId === b.lastPostedReportId &&
   a.lastPostedReport === b.lastPostedReport &&
   a.lastPostedReportOwner === b.lastPostedReportOwner &&
+  JSON.stringify(a.lastPostedReportDelivery) === JSON.stringify(b.lastPostedReportDelivery) &&
   a.lastRelayedAt === b.lastRelayedAt;
 
 /** Called under the delivery lock, after the observed lane has been revalidated. */
@@ -173,10 +176,11 @@ export const notifyFreshness = async (
             lastPostedReport: report ?? undefined,
             lastPostedReportId: id,
             lastPostedReportOwner: owner,
+            ...(entry?.provenance ? { lastPostedReportDelivery: reportDelivery(deps.config.stateDir, entry) } : {}),
             lastFreshnessNote: undefined,
           }
         : null,
     );
-    acts.push({ kind: "posted", lane: lane.key, detail: text });
+    acts.push({ kind: "posted", lane: lane.key, detail: entry?.provenance ? `${text} (delivery=unverified; hook returned no exact receipt)` : text });
   }
 };

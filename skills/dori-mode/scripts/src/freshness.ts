@@ -5,7 +5,8 @@ import type { FlowDeps } from "./done-flow.ts";
 import { notifyFreshness, rememberFreshness, sampleLegacyReport } from "./freshness-notify.ts";
 import { checkPausedLane } from "./pause.ts";
 import { type Lane, sameLaneGeneration, sessionOf, statusOf } from "./registry.ts";
-import { type Progress, ReportError, Reports } from "./reports.ts";
+import { ReportError } from "./report-events.ts";
+import { type Progress, Reports, reportScope } from "./reports.ts";
 import { runtimesOf } from "./run.ts";
 import { readScreen } from "./sessions.ts";
 import { Supervision, type SupervisionResult } from "./supervision.ts";
@@ -73,7 +74,7 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
     let legacyReport: string | null | undefined;
     let supervised: SupervisionResult | null = null;
     let supervisionError: string | undefined;
-    const scope = { generation: lane.lifecycleEpoch };
+    const scope = reportScope(lane);
     if (lane.reportProtocol === "jsonl-v1") {
       try {
         previous = reports.read(lane.key, scope);

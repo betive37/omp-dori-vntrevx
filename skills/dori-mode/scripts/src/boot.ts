@@ -15,7 +15,8 @@ import { type Lane, statusOf } from "./registry.ts";
 import { reconcilePanes } from "./reconcile.ts";
 import { runtimesOf } from "./run.ts";
 import { listSessions } from "./sessions.ts";
-import { ReportError, type Reports } from "./reports.ts";
+import { ReportError } from "./report-events.ts";
+import { type Reports, reportScope } from "./reports.ts";
 import { slackToken, TokenFileError, tokenFileNotice } from "./slack-token.ts";
 import type { Worklog } from "./worklog.ts";
 import { worklogLines } from "./worklog-render.ts";
@@ -109,7 +110,7 @@ export const bootCheck = async (deps: BootDeps): Promise<{ exitCode: number; lin
       continue;
     }
     try {
-      const progress = deps.reports.read(lane.key, { generation: lane.lifecycleEpoch });
+      const progress = deps.reports.read(lane.key, reportScope(lane));
       lanes.push({ ...lane, reportState: progress?.state });
       // The launch's activity record and screen-derived stalls are written by dori, not the lane: only a report is one.
       const report = progress?.lastReport;

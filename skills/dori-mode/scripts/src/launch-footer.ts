@@ -46,6 +46,11 @@ export const footer = (
     FOOTER_START,
     FOOTER_HEADING,
     `- Key: ${lane.key}. Work thread: ${lane.thread}.`,
+    ...(lane.requestId
+      ? [
+          `- Original request (metadata only): ${lane.requestId}. Each launch, reopen or wake runs under its own local DORI_LANE_RUN; neither ID proves native admission, delivery or completion. Run the report command in the environment Dori started; never set, copy or clear DORI_LANE_RUN.`,
+        ]
+      : []),
     ...(lane.launchSelection
       ? [
           `- Launch selection request (metadata only): ${JSON.stringify(lane.launchSelection)}. This is not proof of native activation, delivery or goal creation.`,
@@ -115,3 +120,7 @@ export const footer = (
 
 export const quoteForPane = (arg: string): string =>
   /^[\w./:@=-]+$/.test(arg) ? arg : `'${arg.replace(/'/g, `'\\''`)}'`;
+
+/** A sourced run reaches only the agent process it starts, never its pane shell or a later manual restart there. */
+export const runCommandPrefix = (lane: Pick<Lane, "runId">): string =>
+  lane.runId === undefined ? "" : `DORI_LANE_RUN=${quoteForPane(lane.runId)} `;

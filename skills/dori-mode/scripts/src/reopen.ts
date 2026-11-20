@@ -4,7 +4,8 @@ import type { SessionRef } from "../../../../src/runtime/types.ts";
 import { configPath, fill } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import { type FlowDeps, movedOn } from "./done-flow.ts";
-import { quoteForPane } from "./launch-footer.ts";
+import { recordExecution, runContext } from "./lane-run.ts";
+import { quoteForPane, runCommandPrefix } from "./launch-footer.ts";
 import { LaunchError } from "./launch.ts";
 import { confirmedLaneState, isBareLaneShell, nativeGoalStatus, resumeFile } from "./lifecycle-session.ts";
 import { resumeLane, type PauseResult } from "./pause.ts";
@@ -89,21 +90,27 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
           pane: _pane,
           ...rest
         } = current;
-        return withStatus(rest, "paused", `reopening: ${note ?? "explicit operator request"}`, at, {
+        const next = withStatus(rest, "paused", `reopening: ${note ?? "explicit operator request"}`, at, {
           ...sessionFields(ref),
           sessionFile: file,
           openedAt: at,
           lifecycleEpoch: epoch,
           pausedFrom: "working",
           lastReplyAt: deps.clock.now(),
+          // The original request stays; this reopen is a new local run of it.
+          ...(current.requestId === undefined ? {} : { runId: randomUUID() }),
           // A new generation starts with no report receipt or previously observed screen report.
           lastPostedReport: undefined,
           lastPostedReportId: undefined,
           lastPostedReportOwner: undefined,
+          lastPostedReportDelivery: undefined,
           lastSeenReport: undefined,
           lastFreshnessNote: undefined,
           pausedSeenWorking: undefined,
         });
+        // Under this same-generation lock, before any native process starts; an unsourced lane records nothing.
+        recordExecution(deps.config.stateDir, next, deps.clock.now());
+        return next;
       });
       return { ref, opened, at, epoch };
     });
@@ -115,19 +122,22 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
       return fail(await movedOn(deps, lane, "reopen"));
     }
     // The new paused generation exists even if startup/readback fails and the operator later uses resume.
-    new Reports(deps.config.stateDir).append({
+    const reports = new Reports(deps.config.stateDir);
+    const provenance = runContext(reports, opened, opened.runId)?.provenance;
+    reports.append({
       type: "reopen",
       key: lane.key,
       at,
       generation: epoch,
       text: `lane reopening in ${ref.id}`,
+      ...(provenance ? { provenance } : {}),
     });
     const argv = [
       ...fill(template.slice(0, -1), { model: lane.model ?? deps.config.defaultModel }),
       `--resume=${file}`,
     ];
     try {
-      await rts.for(ref).start(ref, argv.map(quoteForPane).join(" "));
+      await rts.for(ref).start(ref, `${runCommandPrefix(opened)}${argv.map(quoteForPane).join(" ")}`);
     } catch (error) {
       return fail(
         `REOPEN_UNVERIFIED ${lane.key}: start failed (${String(error)}); pane=${ref.id}, inspect before resume`,
@@ -136,20 +146,32 @@ export const reopenLane = async (deps: FlowDeps, seen: Lane, note?: string): Pro
     }
     // Never resume a foreign/new session or treat an unknown receipt as an idle agent.
     const attempts = Math.max(1, Math.ceil(deps.config.startupWaitSeconds));
-    let ready = false;
+    let confirmed: string | undefined;
     for (let n = 0; n < attempts; n++) {
-      const goal = nativeGoalStatus(await confirmedLaneState(deps, opened, ref));
+      const state = await confirmedLaneState(deps, opened, ref);
+      const goal = nativeGoalStatus(state);
       if (goal === "paused" || goal === "none" || goal === "complete" || goal === "dropped") {
-        ready = true;
+        confirmed = state?.sessionId;
         break;
       }
       await deps.clock.sleep(1000);
     }
-    if (!ready)
+    if (!confirmed)
       return fail(
         `REOPEN_UNVERIFIED ${lane.key}: same paused session not confirmed in ${ref.id}; inspect before resume`,
         opened,
       );
+    // The trusted readback named the recorded session in the new pane; bind this run only while it is still current.
+    const native = confirmed;
+    if (
+      opened.requestId !== undefined &&
+      !(await deps.registry.withCurrent(lane.key, (current) => {
+        if (!current || !sameLaneGeneration(opened, current) || current.runId !== opened.runId) return false;
+        recordExecution(deps.config.stateDir, current, deps.clock.now(), native);
+        return true;
+      }))
+    )
+      return fail(await movedOn(deps, opened, "reopen"), opened);
     const resumed = await resumeLane(deps, opened, note ?? "explicit reopen", true);
     if (resumed.code !== 0) return resumed;
     if (note) {

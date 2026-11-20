@@ -22,6 +22,9 @@ const launch: Command = async ({ key, opt, need, ceiling, strings, values, deps 
     model = opt("model"),
     cwd = opt("cwd");
   const template = opt("template");
+  // A bare or empty --request is refused, never read as an unsourced launch.
+  const requestId =
+    values["request"] === undefined ? undefined : opt("request") || die("--request needs the input ID");
   if (template && opt("brief")) die("choose --brief or --template, not both");
   if (!template && strings("set").length) die("--set requires --template");
   const variables = Object.fromEntries(
@@ -39,6 +42,7 @@ const launch: Command = async ({ key, opt, need, ceiling, strings, values, deps 
     ...(template ? { template, variables } : {}),
     done: need("done"),
     ...(thread !== undefined ? { thread } : {}),
+    ...(requestId !== undefined ? { requestId } : {}),
     ...(model !== undefined ? { model } : {}),
     ...(cwd !== undefined ? { cwd } : {}),
     budget: {
@@ -75,7 +79,8 @@ const launch: Command = async ({ key, opt, need, ceiling, strings, values, deps 
   process.exit(r.startup.startsWith("STARTUP_OK") || r.startup.startsWith("STARTUP_DONE") ? 0 : 3);
 };
 
-const adopt: Command = async ({ key, opt, need, deps }) => {
+const adopt: Command = async ({ key, opt, need, values, deps }) => {
+  if (values["request"] !== undefined) die("adopt cannot attach --request to an already running process");
   const thread = opt("thread");
   const l = await adoptLane(deps, {
     key: key ?? "",

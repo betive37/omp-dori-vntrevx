@@ -99,10 +99,14 @@ export const agentCommand = (d: Deps, role: "dori" | "lane"): string =>
 /** Native agents and loop controllers keep this home's selection across the terminal server. */
 export function harnessLaunchEnv(d: Deps): Record<string, string> {
   const configFile = process.env["DORI_CONFIG"] ?? join(d.store.root, "config.json");
-  return doriLaunchEnv(process.env, configFile, {
-    doriHome: d.store.root,
-    stateDir: ompStateDir({ ...process.env, DORI_CONFIG: configFile }),
-  });
+  return {
+    ...doriLaunchEnv(process.env, configFile, {
+      doriHome: d.store.root,
+      stateDir: ompStateDir({ ...process.env, DORI_CONFIG: configFile }),
+    }),
+    // A fresh controller/reviewer is not the registered invocation that launched this command.
+    DORI_LANE_RUN: "",
+  };
 }
 
 export function harnessLaneEnv(d: Deps, key: string): Record<string, string> {

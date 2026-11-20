@@ -2,7 +2,8 @@ import { afterEach, beforeEach, expect, test } from "bun:test";
 import { appendFileSync, chmodSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 import { freshnessTick } from "../src/freshness.ts";
-import { parseEvent, ReportError, Reports, reportLine } from "../src/reports.ts";
+import { parseEvent, ReportError } from "../src/report-events.ts";
+import { Reports, reportLine } from "../src/reports.ts";
 import { statusOf, type Lane } from "../src/registry.ts";
 import { depsFor, fakeClock, newWorld, withState } from "./fakes.ts";
 

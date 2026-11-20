@@ -3,48 +3,61 @@ import { CheckpointError, Checkpoints } from "./checkpoints.ts";
 import { type Cli, type Command, die } from "./cli-context.ts";
 import { autoTrackLinks } from "./cli-pr.ts";
 import { isLessonOutcome, LessonError, Lessons } from "./lessons.ts";
-import { isReportKind, ReportError, Reports, reportLine, reportId } from "./reports.ts";
+import { isReportKind, ReportError } from "./report-events.ts";
+import { Reports, reportLine, reportId, reportScope } from "./reports.ts";
+import { runContext } from "./lane-run.ts";
+import { reportDelivery } from "./report-delivery.ts";
 import { realClock, runtimesOf } from "./run.ts";
 import { Worklog, WorklogError } from "./worklog.ts";
 
 /** Journal errors are the user's input refused: one line, never a stack. */
 export const journalErrors = [CheckpointError, LessonError, ReportError, WorklogError] as const;
 
-const report: Command = async ({ key, need, opt, values, lane, config }) => {
+const report: Command = async ({ key, need, opt, values, lane, config, deps }) => {
   const target = await lane(key ?? die("report needs a lane key"));
   const kind = need("kind");
   if (isReportKind(kind)) {
-    const entry = new Reports(config.stateDir).report(
-      target.key,
-      kind,
-      need("text"),
-      realClock.now(),
-      target.lifecycleEpoch,
-      opt("owner"),
-    );
-    console.log(values["json"] ? JSON.stringify({ ...entry, id: reportId(entry) }) : reportLine(entry));
+    const text = need("text");
+    const owner = opt("owner");
+    const reports = new Reports(config.stateDir);
+    const entry = await deps.registry.withCurrent(target.key, (current) => {
+      if (!current) throw new ReportError(`no registered lane "${target.key}"`);
+      const context = runContext(reports, current, process.env.DORI_LANE_RUN);
+      if (!context) throw new ReportError("report: unknown or missing run (DORI_LANE_RUN); no matching execution recorded");
+      return reports.report(target.key, kind, text, realClock.now(), context.generation, owner, context.provenance);
+    });
+    const receipt = {
+      ...entry, id: reportId(entry),
+      ...(entry.provenance ? { delivery: reportDelivery(config.stateDir, entry) } : {}),
+    };
+    console.log(values["json"] ? JSON.stringify(receipt) : reportLine(entry));
   } else die("--kind must be milestone, blocker, question, halted or done");
 };
 
-const relayed: Command = async ({ key, need, lane, deps, config }) => {
+const relayed: Command = async ({ key, need, opt, values, lane, deps, config }) => {
   const target = await lane(key ?? die("relayed needs a lane key"));
   if (target.reportProtocol !== "jsonl-v1")
     die("relayed requires a launched jsonl-v1 lane, not an adopted screen report");
   const id = need("report");
+  const deliveryId = opt("delivery");
   const reports = new Reports(config.stateDir);
   const updated = await deps.registry.transition(target, (current) => {
-    const entry = reports.read(target.key, { generation: current.lifecycleEpoch })?.lastReport;
+    const entry = reports.read(target.key, reportScope(current))?.lastReport;
     if (current.reportProtocol !== "jsonl-v1" || !entry || reportId(entry) !== id) return null;
     return {
       ...current,
       lastPostedReport: reportLine(entry),
       lastPostedReportId: id,
       lastPostedReportOwner: entry.owner,
+      ...(entry.provenance || deliveryId !== undefined ? { lastPostedReportDelivery: reportDelivery(config.stateDir, entry, deliveryId) } : {}),
       lastRelayedAt: realClock.now(),
     };
   });
   if (!updated) die("relayed: report is not the current journal report; read it again before acknowledging");
-  console.log(`RELAYED ${target.key} ${id}`);
+  const delivery = updated.lastPostedReportDelivery;
+  console.log(delivery
+    ? values["json"] ? JSON.stringify({ key: target.key, reportId: id, delivery }) : `RELAYED ${target.key} ${id} delivery=${delivery.state}`
+    : `RELAYED ${target.key} ${id}`);
 };
 
 const lessonAdd = async (
@@ -168,6 +181,7 @@ const checkpoint: Command = async (cli) => {
   // parseArgs takes one value per flag; a second bare receipt would otherwise be dropped and its effect repeated later.
   const stray = positionals.slice(1);
   if (stray.length) die(`checkpoint: unexpected argument ${stray[0]}; give each receipt its own --remote-effect`);
+  const context = runContext(new Reports(config.stateDir), target, process.env.DORI_LANE_RUN);
   const result = new Checkpoints(config.stateDir).write(
     target.key,
     {
@@ -177,8 +191,12 @@ const checkpoint: Command = async (cli) => {
       remoteEffects: strings("remote-effect"),
     },
     realClock.now(),
+    context?.provenance,
   );
-  console.log(JSON.stringify(result));
+  const receipt = target.requestId !== undefined && !result.checkpoint.provenance
+    ? { ...result, attribution: { state: "unverified", reason: "No recorded launch invocation; remote effects retained without source attribution" } }
+    : result;
+  console.log(JSON.stringify(receipt));
   autoTrackLinks(cli, target, result.checkpoint.remoteEffects.join(" "), `checkpoint ${target.key}`);
 };
 

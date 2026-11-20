@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import { configPath, fill } from "./config.ts";
 import { renderTemplate } from "./launch-template.ts";
 import { type LaunchInput, validateLaunch } from "./launch-input.ts";
@@ -8,14 +9,14 @@ import { BRIEF_START, footer, originalBrief } from "./launch-footer.ts";
 import { mayRunOmpArgv } from "../../../../src/runtime/omp-argv.ts";
 import { parseRef } from "../../../../src/runtime/types.ts";
 import { selectionFor } from "./launch-selection.ts";
-import { laneStartCommand, openLaneSession, type OpenedLane } from "./launch-session.ts";
+import { bindLaunchRun, laneStartCommand, openLaneSession, type OpenedLane, startLaunchRun } from "./launch-session.ts";
 import { type Lane, sessionFields, upgradeLane } from "./registry.ts";
 import { type ChosenRuntimes, iso, runtimesOf } from "./run.ts";
 import { Reports } from "./reports.ts";
 import { Lessons, renderLessons } from "./lessons.ts";
 import { laneLaunchEnv, TokenFileError } from "./slack-token.ts";
 import { startupFailure } from "./startup-screen.ts";
-import { launchFinished, launchScreen, launchStatus } from "./launch-finished.ts";
+import { lastLines, launchFinished, launchScreen, launchStatus } from "./launch-finished.ts";
 
 export class LaunchError extends Error {}
 // The first check is 20 s after start, then the screen and status are re-read every 10 s until `startupWaitSeconds`.
@@ -38,6 +39,8 @@ export const adoptLane = async (
   input: LaunchInput & { readonly pane: string },
   locked = false,
 ): Promise<Lane> => {
+  // A running process cannot gain a run retroactively; a new request needs a new launch.
+  if (input.requestId !== undefined) throw new LaunchError("adopt cannot attach a request to a running process");
   await validateLaunch(deps, input, LaunchError);
   if (!locked) {
     const held = await withLaunchLock(deps, input.key, () => adoptLane(deps, input, true));
@@ -77,6 +80,8 @@ export const prepareLaunch = async (deps: FlowDeps, input: LaunchInput, queuedBr
     key: input.key,
     title: input.title,
     thread: input.thread?.trim() ? input.thread : "none",
+    // Only an explicit request opts in: each sourced launch draft is a new local run of that request.
+    ...(input.requestId === undefined ? {} : { requestId: input.requestId, runId: randomUUID() }),
     brief: input.brief,
     done: input.done,
     cwd,
@@ -154,6 +159,9 @@ const startLane = async (
   const cwd = input.cwd ?? deps.config.defaultCwd;
   const { lane, ref } = opened;
   const pane = ref.id;
+  // A sourced run is recorded as started (unverified) before its agent exists; a moved-on lane starts nothing.
+  const provenance = lane.requestId === undefined ? undefined : await startLaunchRun(deps, lane);
+  if (provenance === null) return { lane, startup: `STARTUP_ERROR ${input.key} ${pane}: lane changed before start` };
   // Launch starts the activity journal; it is not a lane report and is never posted to the thread.
   new Reports(deps.config.stateDir).append({
     type: "activity",
@@ -161,6 +169,7 @@ const startLane = async (
     at: iso(deps.clock),
     state: "running",
     text: `lane launched in ${pane}`,
+    ...(provenance ? { provenance } : {}),
   });
   const prompt = `${deps.config.launchKeywords}. Read and execute the lane brief at ${input.brief} in full. You are the ${input.key} lane; report as the brief's footer says.`;
   // The session can be written while start is still returning; its goal must belong to this invocation.
@@ -229,18 +238,9 @@ const startLane = async (
       const failed = current !== "working" && !(await hasGoal(shown)) ? startupFailure(shown, ompAgent) : null;
       if (failed) return { lane, startup: `STARTUP_ERROR ${input.key} ${pane}: ${failed}` };
     }
+    if (omp && lane.requestId !== undefined) await bindLaunchRun(deps, lane, omp, recordedGoal);
     return { lane, startup: `STARTUP_OK ${input.key} ${pane}` };
   }
   const why = error ? `status lookup failed: ${error}` : `no ready agent status (${status ?? "none"})`;
   return { lane, startup: `STARTUP_UNCONFIRMED ${input.key} ${pane}: ${why}; last lines: ${lastLines(screen)}` };
 };
-
-const lastLines = (screen: string): string =>
-  screen
-    .split("\n")
-    .map((s) => s.trim())
-    .filter(Boolean)
-    .slice(-3)
-    .join(" / ")
-    .replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)")
-    .slice(0, 240) || "(blank)";

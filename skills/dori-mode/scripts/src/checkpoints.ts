@@ -2,7 +2,8 @@ import { closeSync, existsSync, fsyncSync, mkdirSync, openSync, readFileSync, wr
 import { dirname, join } from "node:path";
 
 import { takeLock } from "./checkpoint-lock.ts";
-import { LANE_KEY } from "./registry.ts";
+import { type Lane, LANE_KEY } from "./registry.ts";
+import { type ReportProvenance, isProvenance } from "./request-identity.ts";
 
 export type CheckpointInput = {
   readonly step: string;
@@ -10,7 +11,9 @@ export type CheckpointInput = {
   readonly evidence: readonly string[];
   readonly remoteEffects: readonly string[];
 };
-export type Checkpoint = CheckpointInput & { readonly key: string; readonly at: string };
+export type Checkpoint = CheckpointInput & {
+  readonly key: string; readonly at: string; readonly provenance?: ReportProvenance;
+};
 export class CheckpointError extends Error {}
 
 const validate = (input: CheckpointInput): void => {
@@ -59,7 +62,8 @@ export class Checkpoints {
             value.key !== key ||
             typeof value.at !== "string" ||
             !Number.isFinite(Date.parse(value.at)) ||
-            steps.has(value.step)
+            steps.has(value.step) ||
+            ("provenance" in value && !isProvenance(value.provenance))
           ) {
             throw new CheckpointError("invalid key, timestamp, or duplicate step");
           }
@@ -71,6 +75,13 @@ export class Checkpoints {
       });
   }
 
+  latest(lane: Pick<Lane, "key" | "requestId" | "runId">): Checkpoint | null {
+    const entries = this.read(lane.key);
+    return (lane.requestId === undefined ? entries.at(-1) : entries.findLast((entry) =>
+      lane.runId !== undefined && entry.provenance?.requestId === lane.requestId && entry.provenance.runId === lane.runId
+    )) ?? null;
+  }
+
   /** Take the journal's writer lock (see takeLock) and return its release; a live writer's lock is refused. */
   lock(key: string, now: number): () => void {
     const path = this.path(key);
@@ -80,8 +91,9 @@ export class Checkpoints {
     return held;
   }
 
-  write(key: string, input: CheckpointInput, now: number): { checkpoint: Checkpoint; unchanged: boolean } {
+  write(key: string, input: CheckpointInput, now: number, provenance?: ReportProvenance): { checkpoint: Checkpoint; unchanged: boolean } {
     validate(input);
+    if (provenance !== undefined && !isProvenance(provenance)) throw new CheckpointError("invalid checkpoint provenance");
     const path = this.path(key);
     const at = new Date(now).toISOString();
     // Never replay a remote effect just because the process restarted: the step check runs under the lock.
@@ -100,7 +112,7 @@ export class Checkpoints {
         if (repeated !== undefined)
           throw new CheckpointError(`remote effect ${repeated} already recorded by step ${entry.step}`);
       }
-      const checkpoint: Checkpoint = { key, at, ...JSON.parse(payload(input)) };
+      const checkpoint: Checkpoint = { key, at, ...JSON.parse(payload(input)), ...(provenance ? { provenance } : {}) };
       const created = !existsSync(path);
       const fd = openSync(path, "a", 0o600);
       try {

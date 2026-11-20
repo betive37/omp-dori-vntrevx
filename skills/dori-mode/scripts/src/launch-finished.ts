@@ -4,17 +4,28 @@ import { reasonOf, ToolError } from "../../../../src/runtime/herdr/exec.ts";
 import type { SessionRef } from "../../../../src/runtime/types.ts";
 import { finished } from "./boot-monitors.ts";
 import type { FlowDeps } from "./done-flow.ts";
-import { Reports } from "./reports.ts";
+import { Reports, reportScope } from "./reports.ts";
 import { startupScreen } from "./startup-screen.ts";
 
 const missingSession = (ref: SessionRef, error: unknown): boolean =>
   isKind(error, "not_found") ||
   (ref.runtime === "herdr" && error instanceof ToolError && /not.?found/i.test(reasonOf(error)));
 
+/** The last three screen lines for a startup line, with local paths hidden. */
+export const lastLines = (screen: string): string =>
+  screen
+    .split("\n")
+    .map((s) => s.trim())
+    .filter(Boolean)
+    .slice(-3)
+    .join(" / ")
+    .replace(/\/(Users|home|Volumes|private)\/\S+/g, "(local path)")
+    .slice(0, 240) || "(blank)";
+
 export const launchFinished = async (deps: FlowDeps, key: string): Promise<boolean> => {
   const lane = await deps.registry.read(key);
   if (!lane) return false;
-  const report = new Reports(deps.config.stateDir).read(key, { generation: lane.lifecycleEpoch });
+  const report = new Reports(deps.config.stateDir).read(key, reportScope(lane));
   return finished({ ...lane, reportState: report?.state });
 };
 
