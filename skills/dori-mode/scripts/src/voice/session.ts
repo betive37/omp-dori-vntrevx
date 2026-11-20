@@ -5,6 +5,7 @@ import { Commentary } from "./commentary.ts";
 import { startEvent } from "./prompts.ts";
 import type { VoiceSettings } from "./settings.ts";
 import type { Action, LiveEvent, VoiceSessionPorts, VoiceSocket, Wire } from "./types.ts";
+import { LiveMeter } from "./usage.ts";
 export class VoiceSession {
   state: "connecting" | "live" | "capping" | "closing" | "closed" = "connecting";
   readonly openedAt: number;
@@ -23,7 +24,7 @@ export class VoiceSession {
   private capAt: number | undefined;
   private lastOwnerAt = 0;
   private lastOutputAt = 0;
-  private recordedSeconds = 0;
+  private readonly meter: LiveMeter;
   private lastRecordedAt = 0;
   private input: InputAudio | undefined;
   private tasks = new Set<Promise<void>>();
@@ -34,6 +35,7 @@ export class VoiceSession {
     private readonly greet: boolean,
   ) {
     this.openedAt = ports.now();
+    this.meter = new LiveMeter(ports.usage);
     this.backend = new Backend({
       now: ports.now,
       active: () => this.state === "live" && !ports.usage.capReason(),
@@ -82,11 +84,6 @@ export class VoiceSession {
     this.failed = true;
     this.ports.playback.clear();
     this.close("owner audio buffer overflow");
-  }
-  private record(seconds: number): void {
-    const delta = Math.max(0, seconds - this.recordedSeconds);
-    this.recordedSeconds += delta;
-    if (delta) this.ports.usage.live(delta);
   }
   private async event(event: LiveEvent): Promise<void> {
     if (this.finalized) return;
@@ -137,13 +134,13 @@ export class VoiceSession {
         if (this.state === "live") this.commentary.tick(this.timing());
         break;
       case "session.usage.updated":
-        this.record(event.usage?.seconds ?? 0);
+        this.meter.record(event.usage?.seconds ?? 0, event.usage?.paused_seconds);
         break;
       case "session.closed":
         this.failed ||= this.state !== "closing";
         this.state = "closing";
         this.closingAt ??= now;
-        this.persistClosing(event.usage?.seconds ?? this.recordedSeconds);
+        this.persistClosing(event.usage?.seconds ?? this.meter.seconds, event.usage?.paused_seconds);
         this.socket?.close();
         break;
       case "error":
@@ -170,7 +167,7 @@ export class VoiceSession {
     if (this.startedAt === undefined) return;
     if (now - this.lastRecordedAt >= 1000) {
       // Wall time is a conservative local cap when provider usage events are delayed or the socket is lost.
-      this.record((now - this.startedAt) / 1000);
+      this.meter.record((now - this.startedAt) / 1000);
       this.lastRecordedAt = now;
     }
     if (this.state === "live" && this.ports.usage.capReason()) {
@@ -208,10 +205,10 @@ export class VoiceSession {
       audible: this.ports.playback.audible,
     };
   }
-  private persistClosing(seconds?: number): void {
+  private persistClosing(seconds?: number, paused?: number): void {
     try {
       if (seconds === undefined) this.commentary.close(this.timing());
-      else this.record(seconds);
+      else this.meter.record(seconds, paused);
     } catch {
       this.failed = true;
       this.ports.log("VOICE_CLOSE_PERSIST_FAILED");

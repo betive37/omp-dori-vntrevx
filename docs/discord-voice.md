@@ -22,7 +22,7 @@ Voice has no separate configuration file, token or state root.
 | --- | --- |
 | `channelId` | Discord voice channel ID to join |
 | `textChannelId` | Discord text channel for notes, notices and summaries |
-| `liveModel` | Model supported by OpenAI Live |
+| `liveModel` | Model supported by OpenAI Live, such as `gpt-live-1.1` or `gpt-live-1` |
 | `backendModel` | Model that runs tools and web search |
 | `summaryModel` | Model that writes the end-of-session summary |
 | `voice` | Voice supported by the selected Live model |
@@ -49,6 +49,23 @@ A valid starting configuration keeps voice disabled while you enter your actual 
 {
   "voice": {
     "enabled": false,
+    "timeZone": "UTC",
+    "idleCloseSec": 120,
+    "dailyMinuteCap": 30,
+    "totalMinuteCap": 0,
+    "backendUsdCap": 3
+  }
+}
+```
+
+To use [GPT-Live-1.1](https://developers.openai.com/api/docs/models/gpt-live-1.1), set its model ID; it uses the same Live session protocol as `gpt-live-1`, and `marin` is the provider's default voice. Voice stays disabled until the remaining fields are filled in:
+
+```json
+{
+  "voice": {
+    "enabled": false,
+    "liveModel": "gpt-live-1.1",
+    "voice": "marin",
     "timeZone": "UTC",
     "idleCloseSec": 120,
     "dailyMinuteCap": 30,
@@ -98,6 +115,7 @@ It runs in the foreground until stopped. A service is optional; see [Running as 
 
 - When the owner joins the voice channel, a session opens and greets them. When the owner leaves, the session closes.
 - After `idleCloseSec` (2 minutes by default) of silence with no backend work pending, the session closes. Speaking above `wakeRmsDbfs` opens a new one; the last 2.5 seconds of audio before the wake are sent with it, so the first words are kept.
+- GPT-Live [standby](https://developers.openai.com/api/docs/guides/live-conversations#configure-standby) (`wake_policy`, `idle_timeout_s`, billed at a lower paused rate) is available only for WebRTC sessions. Dori connects over the Live WebSocket, so it does not use standby with any model; closing idle sessions and waking a new one, as above, takes its place.
 - Speaking over the assistant stops its playback. A discarded lead-reply chunk is not consumed; it is offered again at a later pause or session.
 - A short voice-link interruption mutes output and invalidates queued reply audio without closing the owner's Live session. A disconnect lasting 5 seconds ends that session and rejoins 3 seconds later; all initial and SDK-internal recovery paths have a 30-second readiness deadline. Moving the bot to a different channel stops the bridge rather than playing the owner's answer there.
 - Losing the Discord Gateway suspends voice and discards queued PCM and staged Opus packets. On resume, voice applies replayed channel changes before admitting speech again. After a fresh Gateway session, a guild voice-state snapshot can revalidate both the owner and the bot.
@@ -140,10 +158,11 @@ Recordings and transcripts are not written to disk. Audio and transcripts go to 
 
 ## Costs and limits
 
-- Live speech is billed for the whole open session, including silence. Joining the channel opens a session.
+- Live speech is billed per second for the whole open session, including silence. Joining the channel opens a session. On 2026-11-20 [OpenAI's pricing](https://developers.openai.com/api/docs/pricing#live-session-duration) listed $0.05 per active minute for both `gpt-live-1` and `gpt-live-1.1`; the $0.02 standby rate applies only to WebRTC standby, which Dori does not use. Check current rates; Dori does not estimate Live charges in dollars.
 - Web search and backend/summary calls are billed separately.
 - Daily Live time is capped at `dailyMinuteCap` (30 minutes by default) in `timeZone`; `totalMinuteCap` caps cumulative time and is off at `0`. Estimated backend and summary spending is capped at `backendUsdCap` ($3 by default), cumulatively.
-- At a limit, voice does not start and posts one notice per day. The ledger is `<stateDir>/voice/usage.json`; a corrupt ledger stops voice rather than resetting.
+- Minute limits count billed Live seconds (`liveSeconds` in the ledger): the provider's cumulative usage, or wall time since session start when that is higher. If the provider reports a paused breakdown (`paused_seconds`), its part of the billed time is also recorded as `pausedSeconds`; it is not added on top and still counts toward the minute limits. Over Dori's WebSocket transport it stays 0.
+- At a limit, voice does not start and posts one notice per day. The ledger is `<stateDir>/voice/usage.json`; a corrupt ledger stops voice rather than resetting. A provider usage breakdown that does not add up to its billed total ends the session as a provider failure.
 - Backend spending is estimated from your configured prices and per-search value, not from provider billing. Usage already in flight when a limit is reached is still billed, so actual charges can exceed a cap. Use provider-side spending limits as well.
 
 ## DAVE and audio limits

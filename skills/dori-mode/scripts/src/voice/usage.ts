@@ -3,7 +3,24 @@ import { join } from "node:path";
 import type { VoiceSettings } from "./settings.ts";
 import type { Usage } from "./types.ts";
 
-type Day = { liveSeconds: number; sessions: number; backendUsd: number };
+/** liveSeconds is all billed Live time and drives the minute caps; pausedSeconds is the part billed at the standby rate. */
+type Day = { liveSeconds: number; pausedSeconds: number; sessions: number; backendUsd: number };
+
+/** Turns one session's cumulative billed and paused seconds into ledger increments. */
+export class LiveMeter {
+  seconds = 0;
+  private paused = 0;
+  constructor(private readonly usage: VoiceUsage) {}
+  /** seconds is cumulative billed time; paused is the provider's cumulative paused part of it, when reported. */
+  record(seconds: number, paused = 0): void {
+    const delta = Math.max(0, seconds - this.seconds);
+    this.seconds += delta;
+    // Paused time is billed time too, so it never exceeds what has been recorded and never lowers the cap count.
+    const pausedDelta = Math.max(0, Math.min(paused, this.seconds) - this.paused);
+    this.paused += pausedDelta;
+    if (delta || pausedDelta) this.usage.live(delta, pausedDelta);
+  }
+}
 
 /** Operator prices are estimates; in-flight provider usage can arrive after a cap is reached. */
 export class VoiceUsage {
@@ -40,7 +57,16 @@ export class VoiceUsage {
         [day.liveSeconds, day.sessions, day.backendUsd].some((n) => !Number.isFinite(n) || n < 0)
       )
         throw new Error("Invalid voice usage ledger; refusing to reset spending history");
-      this.days[key] = { liveSeconds: day.liveSeconds, sessions: day.sessions, backendUsd: day.backendUsd };
+      // Ledgers written before the paused breakdown have no pausedSeconds.
+      const paused = "pausedSeconds" in day ? day.pausedSeconds : 0;
+      if (typeof paused !== "number" || !Number.isFinite(paused) || paused < 0)
+        throw new Error("Invalid voice usage ledger; refusing to reset spending history");
+      this.days[key] = {
+        liveSeconds: day.liveSeconds,
+        pausedSeconds: paused,
+        sessions: day.sessions,
+        backendUsd: day.backendUsd,
+      };
     }
   }
 
@@ -51,7 +77,7 @@ export class VoiceUsage {
       month: "2-digit",
       day: "2-digit",
     }).format(this.now());
-    this.days[key] ??= { liveSeconds: 0, sessions: 0, backendUsd: 0 };
+    this.days[key] ??= { liveSeconds: 0, pausedSeconds: 0, sessions: 0, backendUsd: 0 };
     return this.days[key];
   }
   private save(): void {
@@ -62,9 +88,12 @@ export class VoiceUsage {
     this.day().sessions++;
     this.save();
   }
-  live(seconds: number): void {
-    if (!Number.isFinite(seconds) || seconds < 0) throw new Error("Invalid Live usage");
-    this.day().liveSeconds += seconds;
+  /** Adds billed seconds and, separately, newly reported paused seconds already included in billed time. */
+  live(seconds: number, pausedSeconds = 0): void {
+    if ([seconds, pausedSeconds].some((n) => !Number.isFinite(n) || n < 0)) throw new Error("Invalid Live usage");
+    const day = this.day();
+    day.liveSeconds += seconds;
+    day.pausedSeconds += pausedSeconds;
     this.save();
   }
   backend(usage: Usage | undefined, model: string): number {
