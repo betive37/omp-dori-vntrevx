@@ -99,6 +99,8 @@ test("a rejected creation request closes the session once, with no retry", async
     expect(w.session.failed).toBe(true);
     expect(w.session.state).toBe("closed");
     expect(w.logs).toContain("VOICE_PROVIDER_ERROR");
+    expect(w.logs).toContain("VOICE_WEBRTC_CREATE_FAILED HTTP 500 fake");
+    expect(w.logs.join("\n")).not.toContain("synthetic-no-paid-key");
     expect(live.requests).toHaveLength(1);
   } finally {
     await w.cleanup();

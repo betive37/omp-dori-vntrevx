@@ -9,6 +9,7 @@
 import type * as Werift from "werift";
 import type { OpusCodec } from "./discord-link.ts";
 import { parseLiveEvent } from "./provider.ts";
+import { TrackPacer } from "./track-pacer.ts";
 import type { OpenVoiceSocket, Wire } from "./types.ts";
 
 type Rtc = Pick<
@@ -21,10 +22,6 @@ const LIVE_SESSIONS_URL = "https://api.openai.com/v1/live/sessions";
 const PAYLOAD_TYPE = 111;
 /** Voice duration OpenAI bills when a WebRTC session is created (documented 2026-11-20). */
 const INIT_BILLED_SECONDS = 15;
-/** 20 ms of 48 kHz mono PCM16: one Opus frame. */
-const FRAME_BYTES = 1920;
-/** Owner audio waiting for the real-time track; more than this means the pacing upstream broke. */
-const MAX_PENDING_BYTES = 5 * 50 * FRAME_BYTES;
 
 /** 24 kHz mono to 48 kHz mono, interpolating across chunk boundaries through `state.previous`. */
 const upsample = (pcm24: Buffer, state: { previous: number }): Buffer => {
@@ -55,6 +52,7 @@ export const webrtcSocket =
   (
     rtc: Rtc,
     codec: () => OpusCodec,
+    log: (line: string) => void,
     url = LIVE_SESSIONS_URL,
     request: Request = fetch,
     clock = performance,
@@ -81,10 +79,9 @@ export const webrtcSocket =
     const decoder = codec();
     const abort = new AbortController();
     const resample = { previous: 0 };
-    const rtp = { sequence: 0, timestamp: 0, ssrc: (Math.random() * 2 ** 32) >>> 0 };
-    let pending: Buffer[] = [];
-    let pendingBytes = 0;
-    let due = 0;
+    const pacer = new TrackPacer();
+    const ssrc = (Math.random() * 2 ** 32) >>> 0;
+    let sequence = 0;
     let started = false;
     let ended = false;
     let pump: NodeJS.Timeout | undefined;
@@ -94,7 +91,6 @@ export const webrtcSocket =
       ended = true;
       clearInterval(pump);
       abort.abort();
-      pending = [];
       try {
         channel.close();
         mic.stop();
@@ -103,40 +99,11 @@ export const webrtcSocket =
       if (failed) handlers.error();
       handlers.closed();
     };
-    const take = (): Buffer => {
-      const frame = Buffer.concat(pending, FRAME_BYTES);
-      let left = FRAME_BYTES;
-      while (left > 0) {
-        const head = pending[0]!;
-        if (head.length > left) {
-          pending[0] = head.subarray(left);
-          left = 0;
-        } else {
-          pending.shift();
-          left -= head.length;
-        }
-      }
-      pendingBytes -= FRAME_BYTES;
-      return frame;
-    };
-    // The track runs at real time: a burst of owner audio (the wake preroll) is spread out rather than sent at
-    // once, a late timer sends at most three frames together, and a starved track does not catch up afterwards.
     const send = () => {
-      const now = clock.now();
-      if (pendingBytes < FRAME_BYTES) due = Math.max(due, now);
-      else due = Math.max(due, now - 40);
-      while (due <= now && pendingBytes >= FRAME_BYTES) {
-        const header = new rtc.RtpHeader({
-          payloadType: PAYLOAD_TYPE,
-          sequenceNumber: rtp.sequence,
-          timestamp: rtp.timestamp,
-          ssrc: rtp.ssrc,
-          marker: false,
-        });
-        mic.writeRtp(new rtc.RtpPacket(header, encoder.encode(take())));
-        rtp.sequence = (rtp.sequence + 1) & 0xffff;
-        rtp.timestamp = (rtp.timestamp + 960) >>> 0;
-        due += 20;
+      for (const { frame, timestamp } of pacer.take(clock.now())) {
+        const header = new rtc.RtpHeader({ payloadType: PAYLOAD_TYPE, sequenceNumber: sequence, timestamp, ssrc });
+        mic.writeRtp(new rtc.RtpPacket(header, encoder.encode(frame)));
+        sequence = (sequence + 1) & 0xffff;
       }
     };
 
@@ -176,8 +143,12 @@ export const webrtcSocket =
         body: JSON.stringify({ session, transport: { type: "webrtc", sdp: pc.localDescription?.sdp } }),
         signal: abort.signal,
       });
-      if (!response.ok) throw new Error(`Live session HTTP ${response.status}`);
-      const body: unknown = await response.json();
+      const body: unknown = await response.json().catch(() => undefined);
+      if (!response.ok) {
+        const error = body && typeof body === "object" && "error" in body ? body.error : undefined;
+        const code = error && typeof error === "object" && "code" in error ? String(error.code) : "";
+        throw new Error(`HTTP ${response.status} ${code}`.trim());
+      }
       const transport = body && typeof body === "object" && "transport" in body ? body.transport : undefined;
       const sdp = transport && typeof transport === "object" && "sdp" in transport ? transport.sdp : undefined;
       if (typeof sdp !== "string" || !sdp) throw new Error("Live session response has no SDP answer");
@@ -186,6 +157,7 @@ export const webrtcSocket =
       handlers.event({ type: "session.usage.updated", usage: { seconds: INIT_BILLED_SECONDS } });
       if (ended) return;
       await pc.setRemoteDescription({ type: "answer", sdp });
+      if (ended) return;
       // A codec or track failure ends the transport as a provider failure instead of escaping the timer.
       pump = setInterval(() => {
         try {
@@ -205,12 +177,12 @@ export const webrtcSocket =
         if (event["type"] === "session.start") {
           if (started) throw new Error("Live WebRTC session already started");
           started = true;
-          create(event["session"]).catch(() => end(true));
+          create(event["session"]).catch((error: unknown) => {
+            if (!ended) log(`VOICE_WEBRTC_CREATE_FAILED ${error instanceof Error ? error.message : "unknown"}`);
+            end(true);
+          });
         } else if (event["type"] === "session.input_audio.append") {
-          const pcm = upsample(Buffer.from(String(event["audio"]), "base64"), resample);
-          if (pendingBytes + pcm.length > MAX_PENDING_BYTES) return void handlers.error();
-          pending.push(pcm);
-          pendingBytes += pcm.length;
+          if (!pacer.push(upsample(Buffer.from(String(event["audio"]), "base64"), resample))) handlers.error();
         } else if (channel.readyState === "open") channel.send(JSON.stringify(event));
         else throw new Error("Live WebRTC data channel is not open");
       },
@@ -220,9 +192,9 @@ export const webrtcSocket =
   };
 
 /** Loads the optional WebRTC and Opus packages; called only when voice.transport is "webrtc". */
-export const openWebrtcVoice = async (): Promise<OpenVoiceSocket> => {
+export const openWebrtcVoice = async (log: (line: string) => void): Promise<OpenVoiceSocket> => {
   // Dynamic on purpose: optional dependencies, absent or unloadable where this transport is not used.
   const rtc = await import("werift");
   const { OpusEncoder } = await import("@discordjs/opus");
-  return webrtcSocket(rtc, () => new OpusEncoder(48_000, 1));
+  return webrtcSocket(rtc, () => new OpusEncoder(48_000, 1), log);
 };

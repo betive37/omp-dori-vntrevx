@@ -41,7 +41,7 @@ export const voiceCommand: Command = async ({ key: target, config, deps }) => {
       const playback = new Playback();
       const usage = new VoiceUsage(directory, settings, Date.now);
       const replies = new Replies(directory, log);
-      const open = settings.transport === "webrtc" ? await openWebrtcVoice() : openVoiceSocket;
+      const open = settings.transport === "webrtc" ? await openWebrtcVoice(log) : openVoiceSocket;
       assistant = new VoiceAssistant(settings, {
         key,
         now: Date.now,

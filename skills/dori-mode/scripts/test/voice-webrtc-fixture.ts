@@ -132,7 +132,7 @@ export const webrtcSession = (
     {
       now: Date.now,
       key: "synthetic-no-paid-key",
-      open: webrtcSocket(rtc, codec, url),
+      open: webrtcSocket(rtc, codec, (line) => logs.push(line), url),
       playback,
       replies: new Replies(temp.directory, () => {}),
       usage,
