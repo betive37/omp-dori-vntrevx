@@ -58,6 +58,26 @@ test("track time keeps running through a gap, so the next RTP timestamp reflects
   expect(next!.timestamp).toBe(10 * 960);
 });
 
+test("speech fed in 40 ms batches with jitter keeps contiguous RTP timestamps", () => {
+  const pacer = new TrackPacer();
+  const stamps: number[] = [];
+  for (let tick = 0; tick < 500; tick++) {
+    const now = tick * 20 + (tick % 7);
+    if (tick % 2 === 0) pacer.push(voiced(2));
+    stamps.push(...pacer.take(now).map(({ timestamp }) => timestamp));
+  }
+  expect(stamps.length).toBeGreaterThan(490);
+  expect(stamps.every((stamp, i) => i === 0 || stamp - (stamps[i - 1] ?? 0) === 960)).toBe(true);
+});
+
+test("a late timer with audio still queued does not open a timestamp gap", () => {
+  const pacer = new TrackPacer();
+  pacer.push(voiced(20));
+  const stamps = [...pacer.take(0), ...pacer.take(150), ...pacer.take(170)].map(({ timestamp }) => timestamp);
+  // Three frames at once at each burst, numbered without a gap.
+  expect(stamps).toEqual([0, 1, 2, 3, 4, 5, 6].map((slot) => slot * 960));
+});
+
 test("more than five seconds of pending audio is refused", () => {
   const pacer = new TrackPacer();
   expect(pacer.push(voiced(250))).toBe(true);

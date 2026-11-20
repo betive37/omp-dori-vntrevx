@@ -2,7 +2,6 @@
  * A loopback stand-in for `POST /v1/live/sessions` with WebRTC transport: a local HTTP endpoint answers the SDP offer
  * with its own werift peer, then talks over the `oai-events` data channel and an Opus track. No OpenAI endpoint or key.
  */
-import { OpusEncoder } from "@discordjs/opus";
 import * as rtc from "werift";
 import { Playback } from "../src/voice/audio.ts";
 import type { OpusCodec } from "../src/voice/discord-link.ts";
@@ -17,6 +16,15 @@ import { temporaryVoice } from "./voice-fixture.ts";
 const codecs = {
   audio: [new rtc.RTCRtpCodecParameters({ mimeType: "audio/opus", clockRate: 48_000, channels: 2, payloadType: 111 })],
 };
+
+/**
+ * Stands in for the optional native Opus codec, which CI does not install: a "packet" is the first 5 ms of the frame,
+ * small enough for one datagram, and decodes to those samples. Level checks on the far side still hold.
+ */
+const fakeOpus = (): OpusCodec => ({
+  encode: (pcm) => Buffer.from(pcm.subarray(0, 480)),
+  decode: (packet) => Buffer.from(packet),
+});
 
 /** 20 ms of a loud 48 kHz mono tone. */
 export const toneFrame = (): Buffer => {
@@ -44,8 +52,8 @@ export const fakeLiveWebrtc = (options: { status?: number } = {}) => {
   const requests: { authorization: string | null; body: CreateBody }[] = [];
   const received: Wire[] = [];
   const inbound: Buffer[] = [];
-  const decoder = new OpusEncoder(48_000, 1);
-  const encoder = new OpusEncoder(48_000, 1);
+  const decoder = fakeOpus();
+  const encoder = fakeOpus();
   const connected = Promise.withResolvers<void>();
   const speaker = new rtc.MediaStreamTrack({ kind: "audio" });
   let peer: rtc.RTCPeerConnection | undefined;
@@ -115,12 +123,7 @@ export const fakeLiveWebrtc = (options: { status?: number } = {}) => {
 };
 
 /** A VoiceSession on the WebRTC transport against `url`, with a 40 ms tick like the CLI. */
-export const webrtcSession = (
-  config: VoiceSettings,
-  url: string,
-  greet = false,
-  codec: () => OpusCodec = () => new OpusEncoder(48_000, 1),
-) => {
+export const webrtcSession = (config: VoiceSettings, url: string, greet = false, codec: () => OpusCodec = fakeOpus) => {
   const temp = temporaryVoice();
   const logs: string[] = [];
   let finished = 0;

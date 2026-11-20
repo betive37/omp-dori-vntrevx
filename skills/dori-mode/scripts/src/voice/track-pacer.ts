@@ -5,7 +5,8 @@
  * - a late timer releases at most three overdue frames together;
  * - beyond 100 ms of backlog, padding frames are dropped from the stream and voiced frames go out 15% fast, so a
  *   backlog shrinks instead of accumulating stall after stall;
- * - after the queue ran empty, track time resumes from the wall clock, so the RTP timestamp after a gap reflects it.
+ * - after more than 40 ms without a frame, track time resumes from the last frame by the wall clock, so the RTP
+ *   timestamp after a gap reflects it while frames fed in 40 ms batches stay contiguous.
  */
 
 /** 20 ms of 48 kHz mono PCM16: one Opus frame. */
@@ -25,8 +26,8 @@ export class TrackPacer {
   private next = Number.NEGATIVE_INFINITY;
   /** Track time in frames since the first frame; drives the RTP timestamp. */
   private slot = 0;
-  /** When the first frame went out; after an empty queue, track time resumes from the wall clock. */
-  private start: number | undefined;
+  /** Wall time up to which the frames sent so far cover the track; a later restart after an empty queue is a gap. */
+  private coveredUntil = Number.NEGATIVE_INFINITY;
   private starved = false;
 
   /** False when the backlog would exceed 5 s. */
@@ -48,8 +49,10 @@ export class TrackPacer {
       this.starved = true;
       return out;
     }
-    if (this.start === undefined) this.start = now;
-    else if (this.starved) this.slot = Math.max(this.slot, Math.floor((now - this.start) / FRAME_MS));
+    // Only a real gap advances track time past the frames sent: the queue ran empty for longer than the session's
+    // feeding jitter. A late timer with audio still queued is not a gap.
+    if (this.starved && now - this.coveredUntil > MAX_BURST_MS)
+      this.slot += Math.floor((now - this.coveredUntil) / FRAME_MS);
     this.starved = false;
     this.next = Math.max(this.next, now - MAX_BURST_MS);
     while (this.next <= now && this.bytes >= FRAME_BYTES) {
@@ -57,9 +60,9 @@ export class TrackPacer {
       while (this.behind() && frame.every((byte) => byte === 0)) frame = this.shift();
       out.push({ frame, timestamp: (this.slot * SAMPLES_PER_FRAME) >>> 0 });
       this.slot++;
+      this.coveredUntil = Math.max(this.coveredUntil, now) + FRAME_MS;
       this.next += this.behind() ? FRAME_MS / CATCH_UP : FRAME_MS;
     }
-    this.starved = this.bytes < FRAME_BYTES;
     return out;
   }
 
