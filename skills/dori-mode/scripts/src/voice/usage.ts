@@ -10,15 +10,31 @@ type Day = { liveSeconds: number; pausedSeconds: number; sessions: number; backe
 export class LiveMeter {
   seconds = 0;
   private paused = 0;
+  /** Billed and paused seconds this session recorded per ledger day, in recording order. */
+  private readonly days = new Map<string, { seconds: number; paused: number }>();
   constructor(private readonly usage: VoiceUsage) {}
   /** seconds is cumulative billed time; paused is the provider's cumulative paused part of it, when reported. */
   record(seconds: number, paused = 0): void {
+    const today = this.usage.today();
     const delta = Math.max(0, seconds - this.seconds);
     this.seconds += delta;
-    // Paused time is billed time too, so it never exceeds what has been recorded and never lowers the cap count.
-    const pausedDelta = Math.max(0, Math.min(paused, this.seconds) - this.paused);
-    this.paused += pausedDelta;
-    if (delta || pausedDelta) this.usage.live(delta, pausedDelta);
+    const day = this.days.get(today) ?? { seconds: 0, paused: 0 };
+    day.seconds += delta;
+    if (delta) this.days.set(today, day);
+    // Paused time is billed time too: it never exceeds what was recorded and never lowers the cap count. A late
+    // paused report goes to the days that already hold this session's billed time, newest first, so each day's
+    // pausedSeconds stays within its liveSeconds across midnight.
+    let pending = Math.max(0, Math.min(paused, this.seconds) - this.paused);
+    const split = new Map<string, number>();
+    for (const [key, recorded] of [...this.days].reverse()) {
+      const part = Math.min(pending, recorded.seconds - recorded.paused);
+      if (part <= 0) continue;
+      recorded.paused += part;
+      this.paused += part;
+      pending -= part;
+      split.set(key, part);
+    }
+    if (delta || split.size) this.usage.live(today, delta, split);
   }
 }
 
@@ -70,13 +86,16 @@ export class VoiceUsage {
     }
   }
 
-  private day(): Day {
-    const key = new Intl.DateTimeFormat("en-CA", {
+  /** The ledger day key for now in the configured time zone. */
+  today(): string {
+    return new Intl.DateTimeFormat("en-CA", {
       timeZone: this.settings.timeZone,
       year: "numeric",
       month: "2-digit",
       day: "2-digit",
     }).format(this.now());
+  }
+  private day(key = this.today()): Day {
     this.days[key] ??= { liveSeconds: 0, pausedSeconds: 0, sessions: 0, backendUsd: 0 };
     return this.days[key];
   }
@@ -88,12 +107,11 @@ export class VoiceUsage {
     this.day().sessions++;
     this.save();
   }
-  /** Adds billed seconds and, separately, newly reported paused seconds already included in billed time. */
-  live(seconds: number, pausedSeconds = 0): void {
-    if ([seconds, pausedSeconds].some((n) => !Number.isFinite(n) || n < 0)) throw new Error("Invalid Live usage");
-    const day = this.day();
-    day.liveSeconds += seconds;
-    day.pausedSeconds += pausedSeconds;
+  /** Adds billed seconds to day `key` and newly classified paused seconds, already billed, to the days they belong to. */
+  live(key: string, seconds: number, paused: ReadonlyMap<string, number> = new Map()): void {
+    if ([seconds, ...paused.values()].some((n) => !Number.isFinite(n) || n < 0)) throw new Error("Invalid Live usage");
+    if (seconds) this.day(key).liveSeconds += seconds;
+    for (const [day, n] of paused) this.day(day).pausedSeconds += n;
     this.save();
   }
   backend(usage: Usage | undefined, model: string): number {

@@ -82,11 +82,14 @@ export const parseLiveEvent = (value: unknown): LiveEvent => {
     event.usage = {};
     for (const key of ["seconds", "active_seconds", "paused_seconds"] as const)
       if (usage[key] !== undefined) event.usage[key] = number(usage[key]);
-    // The documented breakdown adds up to the billed total; anything else cannot be accounted safely.
+    // Each breakdown field is optional and part of the billed total; when both are present they add up to it.
     const { seconds, active_seconds: active, paused_seconds: paused } = event.usage;
     if (
       (paused !== undefined || active !== undefined) &&
-      (seconds === undefined || (paused ?? 0) > seconds || (active !== undefined && active + (paused ?? 0) !== seconds))
+      (seconds === undefined ||
+        (paused ?? 0) > seconds ||
+        (active ?? 0) > seconds ||
+        (active !== undefined && paused !== undefined && active + paused !== seconds))
     )
       throw new Error("Invalid voice provider usage breakdown");
   }
