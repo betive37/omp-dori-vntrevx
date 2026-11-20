@@ -2,8 +2,8 @@ import { formatRef } from "../../../../src/runtime/types.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
 import type { FlowDeps } from "./done-flow.ts";
 import { statusOf } from "./registry.ts";
-import { type Ran, type Runner, runtimesOf } from "./run.ts";
-import { procTable, resolveSession } from "./session-id.ts";
+import { iso, type Ran, type Runner, runtimesOf } from "./run.ts";
+import { procTable, resolveSession, type SessionHit } from "./session-id.ts";
 import { listSessions, listWatched } from "./sessions.ts";
 
 export type SyncRow = {
@@ -12,8 +12,27 @@ export type SyncRow = {
   readonly pane: string;
   readonly session: string;
   readonly status: string;
+  readonly source: SessionHit["via"] | "registry";
+  /** A sampled ID relationship, never a native current-owner guarantee or permission to act. */
+  readonly relationship: "matched" | "changed" | "unbound" | "unknown";
+  readonly unknownReason: string | null;
 };
-export type SyncResult = { readonly rows: SyncRow[]; readonly drift: string[]; readonly unregistered: SyncRow[] };
+export type SyncResult = {
+  readonly rows: SyncRow[];
+  readonly drift: string[];
+  readonly unregistered: SyncRow[];
+  /** Start of this observation pass; the rows are not an atomic live snapshot. */
+  readonly observedAt: string;
+};
+
+const observation = (
+  hit: SessionHit,
+  registered?: string,
+): Pick<SyncRow, "source" | "relationship" | "unknownReason"> => ({
+  source: hit.id ? hit.via : registered ? "registry" : "none",
+  relationship: !hit.id ? "unknown" : !registered ? "unbound" : hit.id === registered ? "matched" : "changed",
+  unknownReason: hit.unknownReason ?? null,
+});
 
 // Share only successful read-only observations for this pass. hc group listings and all action checks stay fresh.
 const PASS_SHARED = /^(?:ps -A -o pid=,ppid=,command=|herdr (?:--session \S+ )?pane list)$/;
@@ -29,6 +48,7 @@ const passRunner = (run: Runner): Runner => {
 };
 
 export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<SyncResult> => {
+  const observedAt = iso(deps.clock);
   const scopedRun = write ? undefined : passRunner(deps.run);
   const lanes = await deps.registry.open();
   const rts = runtimesOf(deps, scopedRun);
@@ -38,13 +58,19 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
   const table = await procTable(run);
   const rows: SyncRow[] = [];
   const drift: string[] = [];
-  const resolveDeps = { run, sessionsDir: deps.config.sessionsDir, stateDir: deps.config.stateDir, rts };
+  const resolveDeps = {
+    run,
+    sessionsDir: deps.config.sessionsDir,
+    stateDir: deps.config.stateDir,
+    rts,
+    now: () => deps.clock.now(),
+  };
   for (const lane of lanes) {
     const session = lane.sessionRef ? live.get(formatRef(lane.sessionRef)) : undefined;
     if (!session) drift.push(`${lane.key}: pane ${lane.pane ?? "(none)"} is gone but the lane is ${statusOf(lane)}`);
-    const hit = session
+    const hit: SessionHit = session
       ? await resolveSession(session.ref, session.cwd ?? "", table, resolveDeps)
-      : { id: "", via: "none" };
+      : { id: "", via: "none", unknownReason: "pane not listed" };
     if (lane.session && hit.id && hit.id !== lane.session)
       drift.push(`${lane.key}: pane now runs session ${hit.id} (registry has ${lane.session})`);
     if (!lane.done) drift.push(`${lane.key}: empty Done line, so a done claim can never close it`);
@@ -73,6 +99,7 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
       pane: lane.pane ?? "-",
       session: hit.id ? `${hit.id} (${hit.via})` : (lane.session ?? "-"),
       status: statusOf(lane),
+      ...observation(hit, lane.session),
     });
   }
   const owned = new Set(lanes.flatMap((l) => (l.sessionRef ? [formatRef(l.sessionRef)] : [])));
@@ -90,7 +117,8 @@ export const syncRegistry = async (deps: FlowDeps, write: boolean): Promise<Sync
       pane: id,
       session: hit.id ? `${hit.id} (${hit.via})` : "-",
       status: "unregistered",
+      ...observation(hit),
     });
   }
-  return { rows, drift, unregistered };
+  return { rows, drift, unregistered, observedAt };
 };

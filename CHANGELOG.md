@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- `dori sync` and voice lane status label observation time, session source, unknown reasons and sampled registry/session relationships. Failed process reads and unverified live native records no longer supply session writes or start-time guesses. Existing result fields and successful legacy/custom discovery remain unchanged; a matched ID is not a current-owner guarantee or permission to act.
+
 - Slack thread positions are bound to the authenticated workspace/account rather than shared channel/root IDs. `dori inbound slack` keeps its existing readiness line and physical channel IDs; `--qualified-routes` opts into account-qualified readiness and destinations. Replies reject mismatched parents, qualified destinations reject another account before mutation, and nonempty legacy ledgers require explicit matching operator adoption with a durable receipt; existing non-self/non-bot intake and post-emit cursor semantics remain unchanged.
 
 - `dori park` and `dori reopen` accept saved OMP sessions whose first line is OMP's fixed-width title slot (v1) before the session header; any other leading record, a second title, a missing header, or a different session id or cwd is still refused.

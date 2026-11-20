@@ -22,11 +22,11 @@ const lanes = async (deps: FlowDeps): Promise<Part> => {
     const since = new Map((await deps.registry.open()).map((lane) => [lane.key, lane.history?.at(-1)?.at]));
     const rows = [...synced.rows, ...synced.unregistered].map((row) => {
       const at = since.get(row.key);
-      return `- ${row.key} ${row.status}${at ? ` since ${at}` : ""} pane=${row.pane} thread=${row.thread}`;
+      return `- ${row.key} ${row.status}${at ? ` since ${at}` : ""} pane=${row.pane} thread=${row.thread} source=${row.source} relationship=${row.relationship}${row.unknownReason ? ` unknown=${row.unknownReason}` : ""}`;
     });
     const drift = synced.drift.length ? `\ndrift: ${synced.drift.join("; ")}` : "";
     const body = rows.length ? rows.join("\n") : "no open lanes";
-    return { ok: true, result: clip(`read at ${iso(deps.clock)}\n${body}${drift}`, LANES_CHARS) };
+    return { ok: true, result: clip(`read at ${synced.observedAt}\n${body}${drift}`, LANES_CHARS) };
   } catch (e) {
     return { ok: false, result: `lanes unavailable at ${iso(deps.clock)}: ${reason(e)}` };
   }

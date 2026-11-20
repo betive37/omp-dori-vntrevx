@@ -101,7 +101,7 @@ test("an exited, foreign or non-agent writer never supplies the current session 
       sessionsDir: "/s",
       listDir,
     });
-    expect(hit).toEqual({ id: "01a10000-0000-7000-8000-000000000000", via: "start-time", pid: 4242 });
+    expect(hit).toEqual({ id: "", via: "none", pid: 4242, unknownReason: "native session record not attested" });
   }
   laneState(state.dir, ref.id, { paneId: "w:other" });
   expect(await trustedPaneState(deps.run, state.dir, ref, rts)).toBeNull();
@@ -130,7 +130,8 @@ test("OMP start-time fallback uses OMP encoding and ignores legacy --session and
     { pid: 4242, ppid: 4241, cmd: "bun /opt/node_modules/@oh-my-pi/pi-coding-agent/dist/cli.js --session old-id" },
     { pid: 4243, ppid: 4242, cmd: "bun mcp" },
   ];
-  laneState(state.dir, ref.id, { pid: 99 });
+  // Retired evidence permits legacy discovery; a live stale writer is explicitly unknown above.
+  laneState(state.dir, ref.id, { pid: 0 });
   const run = async (argv: readonly string[]) =>
     argv[0] === "ps" && argv.includes("lstart=")
       ? { code: 0, out: "Thu Jan  1 12:00:01 2026 GMT", err: "" }
@@ -160,7 +161,7 @@ test("OMP start-time fallback uses OMP encoding and ignores legacy --session and
         sessionsDir: "/s",
       },
     ),
-  ).toEqual({ id: "", via: "none" });
+  ).toEqual({ id: "", via: "none", unknownReason: "agent process not observed" });
 });
 
 test("OMP session folders canonicalize temp before home and keep absolute paths outside both", () => {

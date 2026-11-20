@@ -12,6 +12,7 @@ export type SessionHit = {
   readonly id: string;
   readonly via: "extension" | "argv" | "child-env" | "start-time" | "none";
   readonly pid?: number;
+  readonly unknownReason?: string;
 };
 
 // OMP's launch forms, the source launcher included, are classified once by the runtime; omo and senpi are custom agents.
@@ -20,11 +21,31 @@ const ENV_ID = /(?:^|\s)PI_SESSION_ID=([0-9a-f-]{36})(?:\s|$)/;
 const SESSION_FILE = /^(\d{4}-\d\d-\d\dT\d\d)-(\d\d)-(\d\d)-(\d{3})Z_([0-9a-f-]{36})\.jsonl$/;
 const START_WINDOW_MS = 180_000;
 
-export const procTable = async (run: Runner): Promise<Proc[]> =>
-  (await run(["ps", "-A", "-o", "pid=,ppid=,command="])).out.split("\n").flatMap((line) => {
-    const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
-    return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] ?? "" }] : [];
-  });
+// Failed process commands may still print plausible partial output. None of it is evidence.
+const processOutput = async (run: Runner, argv: readonly string[]): Promise<string | null> => {
+  try {
+    const result = await run(argv);
+    return result.code === 0 ? result.out : null;
+  } catch {
+    return null;
+  }
+};
+const unresolved = (unknownReason: string, pid?: number): SessionHit => ({
+  id: "",
+  via: "none",
+  unknownReason,
+  ...(pid === undefined ? {} : { pid }),
+});
+
+export const procTable = async (run: Runner): Promise<Proc[] | null> => {
+  const out = await processOutput(run, ["ps", "-A", "-o", "pid=,ppid=,command="]);
+  return out === null
+    ? null
+    : out.split("\n").flatMap((line) => {
+        const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+        return m ? [{ pid: Number(m[1]), ppid: Number(m[2]), cmd: m[3] ?? "" }] : [];
+      });
+};
 
 const descendants = (table: readonly Proc[], root: number): Proc[] => {
   const byParent = new Map<number, Proc[]>();
@@ -80,6 +101,8 @@ export type SessionDeps = {
   /** Where the OMP extension writes per-session runtime records. */
   readonly stateDir?: string;
   readonly listDir?: (dir: string) => readonly string[];
+  /** Optional observation clock, not an action-authorization policy. */
+  readonly now?: () => number;
 };
 
 // The runtime validates OMP's writer pid, foreground membership, process start and current session together.
@@ -88,7 +111,7 @@ const sessionProcs = async (
   table: readonly Proc[],
   deps: SessionDeps,
   requireForeground = false,
-): Promise<{ readonly candidates: readonly Proc[]; readonly probe?: Probe }> => {
+): Promise<{ readonly candidates: readonly Proc[]; readonly probe?: Probe; readonly unknownReason?: string }> => {
   const config = deps.stateDir === undefined ? {} : { stateDir: deps.stateDir };
   const rts = deps.rts ?? runtimesFor(config, process.env, deps.run);
   try {
@@ -96,9 +119,11 @@ const sessionProcs = async (
     const probe =
       requireForeground && ref.runtime === "hc" ? await rt.probe(ref, { foregroundOnly: true }) : await rt.probe(ref);
     const root = probe.rootPid;
-    return { probe, candidates: root ? [...table.filter((p) => p.pid === root), ...descendants(table, root)] : [] };
+    return root
+      ? { probe, candidates: [...table.filter((p) => p.pid === root), ...descendants(table, root)] }
+      : { probe, candidates: [], unknownReason: "process root unavailable" };
   } catch {
-    return { candidates: [] };
+    return { candidates: [], unknownReason: "runtime probe failed" };
   }
 };
 
@@ -136,7 +161,10 @@ export const trustedPaneState = async (
 ): Promise<PaneState | null> => {
   if (!readPaneState(stateDir, ref.id)) return null;
   const deps: SessionDeps = { run, stateDir, sessionsDir: "", ...(rts === undefined ? {} : { rts }) };
-  const { candidates, probe } = await sessionProcs(ref, await procTable(run), deps, requireForeground);
+  const table = await procTable(run);
+  // Unbound action callers distinguish a failed read from an absent native record.
+  if (table === null) throw new Error("process table unavailable");
+  const { candidates, probe } = await sessionProcs(ref, table, deps, requireForeground);
   // The runtime only returns non-shell OMP identity when its writer owns the foreground.
   if (requireForeground && (probe?.shellInFront !== false || probe.approvalPending !== false)) return null;
   return stateForAgent(stateDir, ref, candidates, probe);
@@ -145,48 +173,57 @@ export const trustedPaneState = async (
 export const resolveSession = async (
   ref: SessionRef,
   cwd: string,
-  table: readonly Proc[],
+  table: readonly Proc[] | null,
   deps: SessionDeps,
 ): Promise<SessionHit> => {
   // The root itself is a candidate when hc or herdr runs OMP directly, without an intervening shell.
-  const { candidates, probe } = await sessionProcs(ref, table, deps);
+  const { candidates, probe, unknownReason } = await sessionProcs(ref, table ?? [], deps);
+  if (table === null) return unresolved("process table unavailable");
+  if (unknownReason) return unresolved(unknownReason);
   const state = deps.stateDir === undefined ? null : stateForAgent(deps.stateDir, ref, candidates, probe);
-  if (state) return { id: state.sessionId, via: "extension", pid: state.pid };
+  if (state) {
+    if (deps.now && deps.now() < Date.parse(state.updatedAt))
+      return unresolved("clock behind native evidence", state.pid);
+    return { id: state.sessionId, via: "extension", pid: state.pid };
+  }
   // Without the extension's record only the start-time folder is read, so any line naming OMP is found, as before.
   const agent = candidates.find((p) => (namesOmpProcess(p.cmd) || CUSTOM_AGENT.test(p.cmd)) && !/\bmcp\b/.test(p.cmd));
-  if (!agent) return { id: "", via: "none" };
+  if (!agent) return unresolved("agent process not observed");
   // --session and PI_SESSION_ID belong to custom senpi/omo agents, never to OMP's current session.
   const omp = namesOmpProcess(agent.cmd);
+  if (omp && deps.stateDir && (readPaneState(deps.stateDir, ref.id)?.pid ?? 0) > 0)
+    return unresolved("native session record not attested", agent.pid);
   if (!omp) {
     const argv = agent.cmd.split(/\s+/);
     const flagAt = argv.indexOf("--session");
     const fromFlag = flagAt >= 0 ? (argv[flagAt + 1] ?? "") : "";
     if (fromFlag) return { id: fromFlag, via: "argv", pid: agent.pid };
     for (const child of descendants(table, agent.pid).slice(0, 40)) {
-      const env = await deps.run(["ps", "eww", "-o", "command=", "-p", String(child.pid)]);
-      const hit = ENV_ID.exec(env.out);
+      const env = await processOutput(deps.run, ["ps", "eww", "-o", "command=", "-p", String(child.pid)]);
+      if (env === null) return unresolved("child process environment unavailable", agent.pid);
+      const hit = ENV_ID.exec(env);
       if (hit?.[1]) return { id: hit[1], via: "child-env", pid: agent.pid };
     }
   }
-  const started = Date.parse((await deps.run(["ps", "-o", "lstart=", "-p", String(agent.pid)])).out);
-  if (Number.isNaN(started)) return { id: "", via: "none", pid: agent.pid };
-  const list =
-    deps.listDir ??
-    ((d: string) => {
-      try {
-        return readdirSync(d);
-      } catch {
-        return [];
-      }
-    });
+  const start = await processOutput(deps.run, ["ps", "-o", "lstart=", "-p", String(agent.pid)]);
+  const started = start === null ? Number.NaN : Date.parse(start);
+  if (Number.isNaN(started)) return unresolved("process start unavailable", agent.pid);
   const dir = omp
     ? sessionDirFor(deps.sessionsDir, cwd)
     : join(deps.sessionsDir, `--${cwd.replace(/^\//, "").replace(/\//g, "-")}--`);
-  const near = list(dir)
+  let names: readonly string[];
+  try {
+    names = (deps.listDir ?? readdirSync)(dir);
+  } catch {
+    return unresolved("session directory unavailable", agent.pid);
+  }
+  const near = names
     .flatMap((name) => {
       const hit = sessionFileStart(name);
       return hit && hit.at >= started - 5_000 && hit.at <= started + START_WINDOW_MS ? [hit] : [];
     })
     .sort((a, b) => a.at - b.at);
-  return near[0] ? { id: near[0].id, via: "start-time", pid: agent.pid } : { id: "", via: "none", pid: agent.pid };
+  return near[0]
+    ? { id: near[0].id, via: "start-time", pid: agent.pid }
+    : unresolved("no session file near process start", agent.pid);
 };

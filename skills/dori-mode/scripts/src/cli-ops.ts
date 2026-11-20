@@ -23,9 +23,21 @@ import { Worklog } from "./worklog.ts";
 
 const sync: Command = async ({ values, deps }) => {
   const r = await syncRegistry(deps, Boolean(values["write"]));
-  console.log("key | thread | pane | session | status");
+  console.log(`OBSERVED ${r.observedAt} (pass start; not action authorization)`);
+  console.log("key | thread | pane | session | status | source | relationship | unknownReason");
   for (const row of [...r.rows, ...r.unregistered])
-    console.log([row.key, row.thread, row.pane, row.session, row.status].join(" | "));
+    console.log(
+      [
+        row.key,
+        row.thread,
+        row.pane,
+        row.session,
+        row.status,
+        row.source,
+        row.relationship,
+        row.unknownReason ?? "-",
+      ].join(" | "),
+    );
   console.log(r.drift.length ? `DRIFT (${r.drift.length}):\n${r.drift.map((d) => `- ${d}`).join("\n")}` : "DRIFT none");
   console.log(values["write"] ? "WROTE session ids" : "READ_ONLY");
 };
