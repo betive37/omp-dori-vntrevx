@@ -2,7 +2,7 @@
 
 ## Unreleased
 
-- `dori sync` and voice lane status label observation time, session source, unknown reasons and sampled registry/session relationships. Failed process reads and unverified live native records no longer supply session writes or start-time guesses. Existing result fields and successful legacy/custom discovery remain unchanged; a matched ID is not a current-owner guarantee or permission to act.
+- Append compact role guidance once per root Dori/lane prompt, preserving existing host and ULW composition. Plain and child sessions are unchanged, and lane bookkeeping remains Sol-only.
 
 - Slack thread positions are bound to the authenticated workspace/account rather than shared channel/root IDs. `dori inbound slack` keeps its existing readiness line and physical channel IDs; `--qualified-routes` opts into account-qualified readiness and destinations. Replies reject mismatched parents, qualified destinations reject another account before mutation, and nonempty legacy ledgers require explicit matching operator adoption with a durable receipt; existing non-self/non-bot intake and post-emit cursor semantics remain unchanged.
 
@@ -284,4 +284,8 @@ The Sustainable Use License, OMP attribution in `LICENSE.omp-dori`, `NOTICE`, pu
 
 - Unreleased (source only): `dori send discord --render-tables` optionally aligns pipe tables in bounded code fences using Unicode display width. The default body, existing escapes/code, split-send replies and receipts remain intact; rendering over 80 columns or a 64 KiB message budget keeps the original text, and oversized edits still fail before any request. The adapted renderer retains its full upstream MIT notice in `NOTICE`.
 
+- Unreleased (source only): Reuse the existing native goal or durable workflow owner before creating an objective. Preserve paused ownership until the user explicitly directs resumption, and keep questions, external waits and availability monitoring from creating duplicate goals.
+
 Setup now offers configuration-only previews, preserves owner JSON/YAML values outside the existing managed keys, rejects observed concurrent edits, and atomically publishes owned configuration with permission/group preservation and redacted effective-reader readback. Shared-writable targets and linked configuration files now hold with repair guidance; source directory aliases retain physical-target checks; invalid UTF-8 source rewrites are refused, while unchanged configuration bytes are retained. Consumer reader unavailability is reported without blocking recovery. Source and consumer setup do not activate models, accounts or services; saved bytes are reported separately from inherited overrides and unstarted native settings (omp-superagent comparison F64).
+
+- `dori sync` and voice lane status label observation time, session source, unknown reasons and sampled registry/session relationships. Failed process reads and unverified live native records no longer supply session writes or start-time guesses. Existing result fields and successful legacy/custom discovery remain unchanged; a matched ID is not a current-owner guarantee or permission to act.
