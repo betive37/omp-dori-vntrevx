@@ -78,6 +78,14 @@ test("a late timer with audio still queued does not open a timestamp gap", () =>
   expect(stamps).toEqual([0, 1, 2, 3, 4, 5, 6].map((slot) => slot * 960));
 });
 
+test("a pump that runs before the first audio does not break the RTP timestamps", () => {
+  // The pump starts right after the SDP answer, usually before the session's first owner audio.
+  const pacer = new TrackPacer();
+  expect(pacer.take(0)).toHaveLength(0);
+  pacer.push(voiced(2));
+  expect(pacer.take(40).map(({ timestamp }) => timestamp)).toEqual([0, 960]);
+});
+
 test("more than five seconds of pending audio is refused", () => {
   const pacer = new TrackPacer();
   expect(pacer.push(voiced(250))).toBe(true);

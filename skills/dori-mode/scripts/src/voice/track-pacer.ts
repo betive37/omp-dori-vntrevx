@@ -51,7 +51,8 @@ export class TrackPacer {
     }
     // Only a real gap advances track time past the frames sent: the queue ran empty for longer than the session's
     // feeding jitter. A late timer with audio still queued is not a gap.
-    if (this.starved && now - this.coveredUntil > MAX_BURST_MS)
+    // Before the first frame there is no track time to resume from.
+    if (this.starved && Number.isFinite(this.coveredUntil) && now - this.coveredUntil > MAX_BURST_MS)
       this.slot += Math.floor((now - this.coveredUntil) / FRAME_MS);
     this.starved = false;
     this.next = Math.max(this.next, now - MAX_BURST_MS);
