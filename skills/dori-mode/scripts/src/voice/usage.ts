@@ -1,15 +1,19 @@
 import { existsSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { VoiceSettings } from "./settings.ts";
-import type { Usage } from "./types.ts";
+import type { LiveEvent, Usage } from "./types.ts";
 
-/** liveSeconds is all billed Live time and drives the minute caps; pausedSeconds is the part billed at the standby rate. */
+/**
+ * liveSeconds is all billed Live time; pausedSeconds is the part billed at the standby rate. With standby configured,
+ * the minute caps count the active rest and standby.dailyMinuteCap counts pausedSeconds.
+ */
 type Day = { liveSeconds: number; pausedSeconds: number; sessions: number; backendUsd: number };
 
 /** Turns one session's cumulative billed and paused seconds into ledger increments. */
 export class LiveMeter {
   seconds = 0;
-  private paused = 0;
+  /** Recorded billed seconds the provider reported as standby (paused inference). */
+  paused = 0;
   /** Billed and paused seconds this session recorded per ledger day, in recording order. */
   private readonly days = new Map<string, { seconds: number; paused: number }>();
   constructor(private readonly usage: VoiceUsage) {}
@@ -35,6 +39,12 @@ export class LiveMeter {
       split.set(key, part);
     }
     if (delta || split.size) this.usage.live(today, delta, split);
+  }
+  /** A provider usage snapshot; without paused_seconds, an active_seconds part implies the rest was paused. */
+  provider(usage: LiveEvent["usage"], fallback = this.seconds): void {
+    const seconds = usage?.seconds ?? fallback;
+    const active = usage?.active_seconds;
+    this.record(seconds, usage?.paused_seconds ?? (active === undefined ? undefined : seconds - active));
   }
 }
 
@@ -139,13 +149,18 @@ export class VoiceUsage {
   }
   capReason(): string | undefined {
     const day = this.day();
+    // With standby configured, minute caps count active seconds and standby seconds have their own daily cap;
+    // otherwise they count all billed seconds.
+    const standby = this.settings.standby;
+    const active = (d: Day) => d.liveSeconds - (standby ? d.pausedSeconds : 0);
     const totals = Object.values(this.days).reduce(
-      (sum, d) => ({ seconds: sum.seconds + d.liveSeconds, usd: sum.usd + d.backendUsd }),
+      (sum, d) => ({ seconds: sum.seconds + active(d), usd: sum.usd + d.backendUsd }),
       { seconds: 0, usd: 0 },
     );
-    if (day.liveSeconds >= this.settings.dailyMinuteCap * 60) return "Daily voice time limit reached";
+    if (active(day) >= this.settings.dailyMinuteCap * 60) return "Daily voice time limit reached";
     if (this.settings.totalMinuteCap > 0 && totals.seconds >= this.settings.totalMinuteCap * 60)
       return "Total voice time limit reached";
+    if (standby && day.pausedSeconds >= standby.dailyMinuteCap * 60) return "Daily voice standby limit reached";
     if (totals.usd >= this.settings.backendUsdCap) return "Backend spending limit reached";
     return undefined;
   }
