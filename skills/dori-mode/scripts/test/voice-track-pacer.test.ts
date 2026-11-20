@@ -70,6 +70,18 @@ test("speech fed in 40 ms batches with jitter keeps contiguous RTP timestamps", 
   expect(stamps.every((stamp, i) => i === 0 || stamp - (stamps[i - 1] ?? 0) === 960)).toBe(true);
 });
 
+test("a 40 ms batch that arrives 30 ms late, after empty pumps, does not skip a timestamp", () => {
+  // The pump runs every 20 ms; batches land 1 ms after a pump, one of them 30 ms late (feeding jitter, not a gap).
+  const pacer = new TrackPacer();
+  const batches = [1, 41, 111, 121, 161, 201, 241, 281];
+  const stamps: number[] = [];
+  for (let now = 0; now < 600; now += 20) {
+    stamps.push(...pacer.take(now).map(({ timestamp }) => timestamp / 960));
+    for (const at of batches) if (at > now && at <= now + 20) pacer.push(voiced(2));
+  }
+  expect(stamps).toEqual([...Array(16).keys()]);
+});
+
 test("a late timer with audio still queued does not open a timestamp gap", () => {
   const pacer = new TrackPacer();
   pacer.push(voiced(20));
