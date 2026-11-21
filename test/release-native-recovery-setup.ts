@@ -83,7 +83,7 @@ export async function activationFixture(legacy: boolean) {
   const one = await installBundle(f.paths, first.bundle, undefined);
   const second = boundRelease(f, "second", first.source);
   const before = await installBundle(f.paths, second.bundle, one);
-  const after = { version: 1 as const, current: one.current, previous: before.current };
+  const after = { version: 1 as const, current: one.current, ...(legacy ? {} : { previous: before.current }) };
   return { f, before, after, bundle: second.bundle };
 }
 

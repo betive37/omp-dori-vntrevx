@@ -46,6 +46,10 @@ runs:
         git -C "$compat" -c advice.detachedHead=false checkout --quiet "$pin"
         test "$(git -C "$compat" rev-parse HEAD)" = "$pin"
         printf 'DORI_TEST_COMPAT_ULW_ENTRY=%s/index.ts\n' "$compat" >> "$GITHUB_ENV"
+    - name: Fetch published consumer rollback baseline
+      if: ${{ inputs.fixtures == 'all' }}
+      shell: bash
+      run: git fetch --no-tags https://github.com/vntrevx/Cataly.git f5d34ab98ad040a500689fbeefe507e54281eff3
     - name: Install root dependencies
       shell: bash
       run: cd "$GITHUB_WORKSPACE" && bun install --frozen-lockfile

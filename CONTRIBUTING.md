@@ -118,6 +118,8 @@ git -C "$compat" fetch --quiet --no-tags https://github.com/dbc-hbin/omp-ulw.git
 git -C "$compat" -c advice.detachedHead=false checkout --quiet "$compat_pin"
 test "$(git -C "$compat" rev-parse HEAD)" = "$compat_pin"
 export DORI_TEST_COMPAT_ULW_ENTRY="$compat/index.ts"
+# Published v0.1.2 source for the restored-CLI rollback regression (also needed in shallow checkouts).
+git fetch --no-tags https://github.com/vntrevx/Cataly.git f5d34ab98ad040a500689fbeefe507e54281eff3
 bun run ci
 ```
 
