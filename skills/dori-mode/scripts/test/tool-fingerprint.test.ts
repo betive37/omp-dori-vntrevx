@@ -129,6 +129,11 @@ describe("native artifact locators", () => {
       expect(print(`tail\n\n${spillNotice("3")}`, truncated("3"))).not.toBe(
         print(`tail\n\n${notice("3")}`, truncated("3")),
       );
+      // A named local:// file is the read's own source, not a spill: distinct files stay distinct evidence.
+      const named = (file: string) => ({
+        meta: { limits: { columnTruncated: { maxColumn: 512, selectorBase: `local://${file}.log` } } },
+      });
+      expect(print("wide", named("build"), "read")).not.toBe(print("wide", named("deploy"), "read"));
     });
   });
 });

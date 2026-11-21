@@ -2,12 +2,12 @@
   "version": 1,
   "repository": "https://github.com/can1357/oh-my-pi.git",
   "commit": "f40f335845f0b136453d12fec8d6057011082766",
-  "patchSha256": "288f990e371387ccdf660c45082feeb8d772068f92b0f68cadcc11ac9872fd21",
-  "resultTree": "2fd08788c98b4ed9eccbfe93e5150b36f82dc69d",
+  "patchSha256": "30aa652b4a55a84a4f2f37963aa39861eb410aaddd23c2d8fefdb4738859227c",
+  "resultTree": "d005c868aedb3ee90fb8622a9c7d48b22a04ef74",
   "files": [
     {
       "path": "docs/context-files.md",
-      "sha256": "5d52fee3b6fb5f8c28f955887a3865c481225f5223da46d5b1a556f91384ae9d",
+      "sha256": "653054681b57d3a3e6f99f01cb0d6ae21e9ad949b98f18612293c308e1bb46ad",
       "executable": false
     },
     {
@@ -42,7 +42,7 @@
     },
     {
       "path": "packages/coding-agent/src/session/agent-session.ts",
-      "sha256": "ec6ee5da46160965f82b8abd27b9090394135dbfea65775fa463f7a054fcff93",
+      "sha256": "c0951b26b702cf1d72a478785191a512f95c749f7b64a981ba4923cbe9e28143",
       "executable": false
     },
     {
@@ -68,6 +68,16 @@
     {
       "path": "packages/coding-agent/test/agent-session-python-cleanup.test.ts",
       "sha256": "e9c3b4bd165aca18caff4579afb7cbd5aa89d7dc60eb0a9975ce5192535e66b4",
+      "executable": false
+    },
+    {
+      "path": "packages/coding-agent/test/eval/context-manager-startup.test.ts",
+      "sha256": "6606f2a022d4b77d4ec26b99fe02aaf9d6af132cce59c8f8dbfd3e7caf926530",
+      "executable": false
+    },
+    {
+      "path": "packages/coding-agent/test/eval/kernel-session-registry.test.ts",
+      "sha256": "a43b50be240ff5af1383922106b79ff1a64298968d93ebce020e4e3ebc8ee20b",
       "executable": false
     },
     {

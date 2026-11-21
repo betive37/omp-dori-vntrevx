@@ -1,14 +1,15 @@
 diff --git a/docs/context-files.md b/docs/context-files.md
-index 445e858ea56257b1f5af784724bc76f0646faa1d..17cea00c19a88aba15c6866b7b7d7350b925b01c 100644
+index 445e858ea56257b1f5af784724bc76f0646faa1d..ee025ec870f748aa95bd83d84120df058951b743 100644
 --- a/docs/context-files.md
 +++ b/docs/context-files.md
-@@ -186,6 +186,9 @@ When workspace-tree scanning is enabled (`includeWorkspaceTree`), deeper-directo
+@@ -186,6 +186,10 @@ When workspace-tree scanning is enabled (`includeWorkspaceTree`), deeper-directo
  
  The workspace scan behind `<workspace-tree>` and `<dir-context>` is a snapshot: it is taken at startup and retaken when the session's directory changes (`/move`, or resuming a session from another project) or a fresh conversation starts (`/clear`, `/new`). It does not follow file edits or branch checkouts within a conversation, and resuming a session in the same directory keeps it, so an existing conversation's prompt prefix stays cacheable.
  
 +Fresh-transcript invalidation stays with the affected conversation even while tree rendering is disabled. When rendering is re-enabled, retained conversations keep their own snapshots and fresh transcripts receive a new scan.
 +
 +A caller-supplied `workspaceTree` is kept as provided rather than rescanned. `includeWorkspaceTree` still controls whether the layout block renders, even for a supplied tree; its `AGENTS.md` index can still feed the separate `<dir-context>` block.
++
  ## `@` imports
  
  Inside any context file, an `@path` token expands inline to the referenced file's content before injection:
@@ -177,7 +178,7 @@ index 9b3f393f0f755e999cf01781961c0d17a97aa28c..3722aa552b6dbc6c0e4d09e15da2bd60
  					workspaceTreePromise = scan;
  					scan.then(
 diff --git a/packages/coding-agent/src/session/agent-session.ts b/packages/coding-agent/src/session/agent-session.ts
-index e4cfb6ab48a8cbbb31fc8ab11d542992ce886a8b..a26c2f34a7cabc5762b90461ad96bb8db7883ea7 100644
+index e4cfb6ab48a8cbbb31fc8ab11d542992ce886a8b..8af23fd73decc09012ac8da4f5cdcd05bfa93386 100644
 --- a/packages/coding-agent/src/session/agent-session.ts
 +++ b/packages/coding-agent/src/session/agent-session.ts
 @@ -652,6 +652,27 @@ export const MCP_DISCOVERY_TURN_WAIT_MS = 1500;
@@ -732,7 +733,7 @@ index e4cfb6ab48a8cbbb31fc8ab11d542992ce886a8b..a26c2f34a7cabc5762b90461ad96bb8d
  			return outcome.sessionClaimed;
  		}
  
-@@ -12883,6 +12974,13 @@ export class AgentSession implements SettingsScope, AgentViewSession {
+@@ -12883,6 +12974,14 @@ export class AgentSession implements SettingsScope, AgentViewSession {
  				this.#releaseQueuedTtsrReservations();
  				this.agent.reset();
  				this.#prunedTerminalFailure = undefined;
@@ -742,16 +743,17 @@ index e4cfb6ab48a8cbbb31fc8ab11d542992ce886a8b..a26c2f34a7cabc5762b90461ad96bb8d
 +				this.#sessionGeneration = ++this.#nextSessionGeneration;
 +				this.#customMessageOwner = {};
 +				this.#pendingNextTurnMessages = [];
++				this.#pendingExcludedRows = [];
 +				this.#scheduledHiddenNextTurnGeneration = undefined;
  				this.tokenRate.reset();
  				if (options?.drop && previousSessionFile) {
  					try {
-@@ -12925,17 +13023,7 @@ export class AgentSession implements SettingsScope, AgentViewSession {
+@@ -12925,17 +13024,6 @@ export class AgentSession implements SettingsScope, AgentViewSession {
  			this.agent.appendOnlyContext?.invalidateForModelChange();
  			this.#memory.rekeyForCurrentSessionId();
  			await this.#memory.resetContextForNewTranscript();
 -			this.#pendingNextTurnMessages = [];
- 			this.#pendingExcludedRows = [];
+-			this.#pendingExcludedRows = [];
 -			// The abort above may have skipped the loop's final aside poll (issue: stranded
 -			// asides survive an aborted turn by design so a resumed session can still see
 -			// them); discard here so they cannot leak into the new session's transcript via
@@ -2843,6 +2845,359 @@ index ba4a69f4e3f1f808d9ac4309fb58d10d91cc733b..ad63d800a98e62a985aaa3b7c7d6bf6f
 -	});
 +	}, 30_000);
  });
+diff --git a/packages/coding-agent/test/eval/context-manager-startup.test.ts b/packages/coding-agent/test/eval/context-manager-startup.test.ts
+index 3cd4a70dcc7fc62459cbb8eb62408897db304f6a..3e14618293dc6094d784c72f76380c4c16683ddb 100644
+--- a/packages/coding-agent/test/eval/context-manager-startup.test.ts
++++ b/packages/coding-agent/test/eval/context-manager-startup.test.ts
+@@ -2,6 +2,7 @@ import { afterEach, describe, expect, it, setDefaultTimeout } from "bun:test";
+ import { Settings } from "@oh-my-pi/pi-coding-agent/config/settings";
+ import {
+ 	disposeAllVmContexts,
++	disposeVmContextsByOwner,
+ 	executeInVmContext,
+ 	type JsEvalWorkerFactories,
+ 	type JsEvalWorkerHandle,
+@@ -91,6 +92,88 @@ async function captureStartupError(sessionKey: string): Promise<Error> {
+ 	}
+ }
+ 
++/** Hold a real isolated worker's init until the test releases the retained startup record. */
++function createInitGatedWorker(): {
++	handle: JsEvalWorkerHandle;
++	initialized: Promise<void>;
++	release(): void;
++	stop(): Promise<void>;
++} {
++	const worker = new Worker(new URL("../../src/eval/js/worker-entry.ts", import.meta.url).href, { type: "module" });
++	const initialized = Promise.withResolvers<void>();
++	const exited = Promise.withResolvers<void>();
++	const listeners = new Set<(message: WorkerOutbound) => void>();
++	let heldInit: Extract<WorkerInbound, { type: "init" }> | undefined;
++	let released = false;
++	let stopped = false;
++	worker.addEventListener("message", (event: MessageEvent<WorkerOutbound>) => {
++		for (const listener of listeners) listener(event.data);
++	});
++	worker.addEventListener("close", () => exited.resolve());
++	const stop = async (): Promise<void> => {
++		if (!stopped) {
++			stopped = true;
++			worker.terminate();
++		}
++		await exited.promise;
++	};
++	return {
++		initialized: initialized.promise,
++		release() {
++			released = true;
++			if (!heldInit) return;
++			worker.postMessage(heldInit);
++			heldInit = undefined;
++		},
++		stop,
++		handle: {
++			mode: "worker",
++			send(message) {
++				if (message.type === "init" && !released) {
++					heldInit = message;
++					initialized.resolve();
++					return;
++				}
++				worker.postMessage(message);
++			},
++			onMessage(handler) {
++				listeners.add(handler);
++				return () => listeners.delete(handler);
++			},
++			onError(handler) {
++				const onError = (event: ErrorEvent): void =>
++					handler(event.error instanceof Error ? event.error : new Error(event.message));
++				worker.addEventListener("error", onError);
++				return () => worker.removeEventListener("error", onError);
++			},
++			async close() {
++				await stop();
++				return true;
++			},
++			terminate: stop,
++		},
++	};
++}
++
++async function executeLifetimeCell(sessionKey: string, ownerId: string, code: string): Promise<string> {
++	const chunks: string[] = [];
++	await executeInVmContext({
++		sessionKey,
++		sessionId: sessionKey,
++		ownerId,
++		cwd: process.cwd(),
++		session: {
++			...createSession(),
++			getEvalSessionId: () => sessionKey,
++			getEvalKernelOwnerId: () => ownerId,
++		},
++		code,
++		filename: "[owner-lifetime].js",
++		runState: { onText: chunk => chunks.push(chunk) },
++	});
++	return chunks.join("").trim();
++}
++
+ describe("JS eval isolated startup failures", () => {
+ 	let restoreFactories: (() => void) | undefined;
+ 
+@@ -149,4 +232,57 @@ describe("JS eval isolated startup failures", () => {
+ 		expect(state).toEqual({ runMessages: 0, terminations: 4 });
+ 		expect(process.env[EXECUTION_MARKER]).toBeUndefined();
+ 	});
++
++	it("keeps a live or starting current namespace and its ownership until ordinary owner disposal", async () => {
++		const sessionKey = `js:owner-lifetime-${crypto.randomUUID()}`;
++		const ownerId = `${sessionKey}:owner`;
++		const peerId = `${sessionKey}:peer`;
++		const gated = createInitGatedWorker();
++		restoreFactories = setJsEvalWorkerFactoriesForTests({ spawnProcess: () => gated.handle });
++		const first = executeLifetimeCell(sessionKey, ownerId, "var sharedLifetime = 40; print(sharedLifetime);");
++		void first.catch(() => undefined);
++		let peer: Promise<string> | undefined;
++		const disposals: Promise<void>[] = [];
++		const finishesBeforeNextTurn = async (work: Promise<void>): Promise<boolean> => {
++			const nextTurn = Promise.withResolvers<void>();
++			setImmediate(nextTurn.resolve);
++			return await Promise.race([work.then(() => true), nextTurn.promise.then(() => false)]);
++		};
++		try {
++			await gated.initialized;
++			const keepSole = disposeVmContextsByOwner(ownerId, { keepSessionId: sessionKey });
++			disposals.push(keepSole);
++			expect(await finishesBeforeNextTurn(keepSole)).toBe(true);
++
++			peer = executeLifetimeCell(sessionKey, peerId, "print(6 * 7);");
++			void peer.catch(() => undefined);
++			const keepShared = disposeVmContextsByOwner(ownerId, { keepSessionId: sessionKey });
++			disposals.push(keepShared);
++			expect(await finishesBeforeNextTurn(keepShared)).toBe(true);
++			const detachPeer = disposeVmContextsByOwner(peerId);
++			disposals.push(detachPeer);
++			expect(await finishesBeforeNextTurn(detachPeer)).toBe(true);
++
++			gated.release();
++			expect(await first).toBe("40");
++			expect(await peer).toBe("42");
++			restoreFactories?.();
++			restoreFactories = undefined;
++			await disposeVmContextsByOwner(ownerId, { keepSessionId: sessionKey });
++			expect(await executeLifetimeCell(sessionKey, ownerId, "print(sharedLifetime + 2);")).toBe("42");
++
++			await disposeVmContextsByOwner(ownerId);
++			// 19.x announces the recreated JS runtime to the first cell after owner disposal.
++			const afterDispose = await executeLifetimeCell(sessionKey, ownerId, "print(typeof sharedLifetime);");
++			expect(afterDispose).toStartWith("Kernel restarted: the previous JS worker is dead");
++			expect(afterDispose.split("\n").at(-1)).toBe("undefined");
++		} finally {
++			gated.release();
++			restoreFactories?.();
++			restoreFactories = undefined;
++			await Promise.allSettled([first, ...(peer ? [peer] : []), ...disposals]);
++			await Promise.all([disposeVmContextsByOwner(ownerId), disposeVmContextsByOwner(peerId)]);
++			await gated.stop();
++		}
++	}, 30_000);
+ });
+diff --git a/packages/coding-agent/test/eval/kernel-session-registry.test.ts b/packages/coding-agent/test/eval/kernel-session-registry.test.ts
+index adaf67396883f6986b22b1e7db0191509ef46d55..8be834f306ccfdcd4b398d2d648f7bb7fcab256b 100644
+--- a/packages/coding-agent/test/eval/kernel-session-registry.test.ts
++++ b/packages/coding-agent/test/eval/kernel-session-registry.test.ts
+@@ -586,3 +586,189 @@ describe("kernel restart notice claim", () => {
+ 		}
+ 	});
+ });
++
++describe("owner-scoped session lifetime", () => {
++	async function finishesBeforeNextTurn(work: Promise<void>): Promise<boolean> {
++		const nextTurn = Promise.withResolvers<void>();
++		setImmediate(nextTurn.resolve);
++		return await Promise.race([work.then(() => true), nextTurn.promise.then(() => false)]);
++	}
++
++	it("keeps current live ownership while releasing departed and shared registrations", async () => {
++		const { registry } = createFakeRegistry(async kernel => ({
++			cancelled: false,
++			value: String(kernel.index),
++		}));
++		const current = { sessionId: "python:current", kernelOwnerId: "departing" };
++		const shared = { sessionId: "python:shared", kernelOwnerId: "departing" };
++		const stale = { sessionId: "python:stale", kernelOwnerId: "departing" };
++		const foreign = { sessionId: "python:foreign", kernelOwnerId: "remaining" };
++		try {
++			await registry.executeOnSession("current", "/tmp", current);
++			await registry.executeOnSession("join current", "/tmp", { ...current, kernelOwnerId: "remaining" });
++			await registry.executeOnSession("shared", "/tmp", shared);
++			await registry.executeOnSession("join shared", "/tmp", { ...shared, kernelOwnerId: "remaining" });
++			await registry.executeOnSession("stale", "/tmp", stale);
++			await registry.executeOnSession("foreign", "/tmp", foreign);
++			const kept = registry.peekLiveKernel("/tmp", current)!;
++			const sharedKernel = registry.peekLiveKernel("/tmp", shared)!;
++			const staleKernel = registry.peekLiveKernel("/tmp", stale)!;
++			const foreignKernel = registry.peekLiveKernel("/tmp", foreign)!;
++
++			await registry.disposeByOwner("departing", { keepSessionId: current.sessionId });
++			expect(registry.peekLiveKernel("/tmp", current)).toBe(kept);
++			expect(registry.peekLiveKernel("/tmp", shared)).toBe(sharedKernel);
++			expect(registry.peekLiveKernel("/tmp", stale)).toBeUndefined();
++			expect(staleKernel.alive).toBe(false);
++			expect(registry.peekLiveKernel("/tmp", foreign)).toBe(foreignKernel);
++
++			// Dropping the other owner must kill the departed shared kernel, not the kept current one.
++			await registry.disposeByOwner("remaining");
++			expect(sharedKernel.alive).toBe(false);
++			expect(foreignKernel.alive).toBe(false);
++			expect(kept.alive).toBe(true);
++			expect((await registry.executeOnSession("still current", "/tmp", current)).value).toBe(String(kept.index));
++			await registry.disposeByOwner("departing");
++			expect(kept.alive).toBe(false);
++			expect(registry.peekLiveKernel("/tmp", current)).toBeUndefined();
++		} finally {
++			await registry.disposeAll();
++		}
++	});
++
++	it("leaves a sole current startup registered without waiting for it", async () => {
++		const started = Promise.withResolvers<void>();
++		const release = Promise.withResolvers<void>();
++		const { kernels, registry } = createFakeRegistry(
++			async kernel => ({ cancelled: false, value: String(kernel.index) }),
++			async () => {
++				started.resolve();
++				await release.promise;
++			},
++		);
++		const current = { sessionId: "python:starting", kernelOwnerId: "owner" };
++		const execution = registry.executeOnSession("setup", "/tmp", current);
++		void execution.catch(() => undefined);
++		let disposal: Promise<void> | undefined;
++		try {
++			await started.promise;
++			disposal = registry.disposeByOwner("owner", { keepSessionId: current.sessionId });
++			expect(await finishesBeforeNextTurn(disposal)).toBe(true);
++			release.resolve();
++			expect(await execution).toEqual({ cancelled: false, value: "0" });
++			expect(registry.peekLiveKernel("/tmp", current)).toBe(kernels[0]);
++			await registry.disposeByOwner("owner");
++			expect(kernels[0]?.alive).toBe(false);
++			expect(registry.peekLiveKernel("/tmp", current)).toBeUndefined();
++		} finally {
++			release.resolve();
++			await Promise.allSettled([execution, ...(disposal ? [disposal] : [])]);
++			await registry.disposeAll();
++		}
++	});
++
++	it("keeps current startup ownership when another startup owner detaches", async () => {
++		const started = Promise.withResolvers<void>();
++		const release = Promise.withResolvers<void>();
++		const { kernels, registry } = createFakeRegistry(
++			async kernel => ({ cancelled: false, value: String(kernel.index) }),
++			async () => {
++				started.resolve();
++				await release.promise;
++			},
++		);
++		const current = { sessionId: "python:shared-starting", kernelOwnerId: "kept" };
++		const first = registry.executeOnSession("first", "/tmp", current);
++		void first.catch(() => undefined);
++		let second: Promise<TestResult> | undefined;
++		let disposal: Promise<void> | undefined;
++		try {
++			await started.promise;
++			second = registry.executeOnSession("second", "/tmp", { ...current, kernelOwnerId: "peer" });
++			void second.catch(() => undefined);
++			await registry.disposeByOwner("kept", { keepSessionId: current.sessionId });
++			disposal = registry.disposeByOwner("peer");
++			expect(await finishesBeforeNextTurn(disposal)).toBe(true);
++			release.resolve();
++			expect(await Promise.all([first, second])).toEqual([
++				{ cancelled: false, value: "0" },
++				{ cancelled: false, value: "0" },
++			]);
++			expect(registry.peekLiveKernel("/tmp", current)).toBe(kernels[0]);
++			await registry.disposeByOwner("kept");
++			expect(kernels[0]?.alive).toBe(false);
++		} finally {
++			release.resolve();
++			await Promise.allSettled([first, ...(second ? [second] : []), ...(disposal ? [disposal] : [])]);
++			await registry.disposeAll();
++		}
++	});
++
++	it("detaches only the departed startup owner and still fully disposes its last owner without options", async () => {
++		const started = Promise.withResolvers<void>();
++		const release = Promise.withResolvers<void>();
++		const { kernels, registry } = createFakeRegistry(
++			async kernel => ({ cancelled: false, value: String(kernel.index) }),
++			async () => {
++				started.resolve();
++				await release.promise;
++			},
++		);
++		const stale = { sessionId: "python:departed-starting", kernelOwnerId: "departing" };
++		const first = registry.executeOnSession("first", "/tmp", stale);
++		void first.catch(() => undefined);
++		let second: Promise<TestResult> | undefined;
++		let disposal: Promise<void> | undefined;
++		try {
++			await started.promise;
++			second = registry.executeOnSession("second", "/tmp", { ...stale, kernelOwnerId: "remaining" });
++			void second.catch(() => undefined);
++			await registry.disposeByOwner("departing", { keepSessionId: "python:current" });
++			disposal = registry.disposeByOwner("remaining");
++			expect(await finishesBeforeNextTurn(disposal)).toBe(false);
++			release.resolve();
++			await disposal;
++			expect(kernels[0]?.alive).toBe(false);
++			expect(registry.peekLiveKernel("/tmp", stale)).toBeUndefined();
++			const results = await Promise.allSettled([first, second]);
++			for (const result of results) {
++				expect(result.status).toBe("rejected");
++				if (result.status === "rejected") expect(result.reason).toBeInstanceOf(TestCancelledError);
++			}
++		} finally {
++			release.resolve();
++			await Promise.allSettled([first, ...(second ? [second] : []), ...(disposal ? [disposal] : [])]);
++			await registry.disposeAll();
++		}
++	});
++
++	it("disposes a departed sole startup while a different current session ID is kept", async () => {
++		const started = Promise.withResolvers<void>();
++		const release = Promise.withResolvers<void>();
++		const { kernels, registry } = createFakeRegistry(
++			async kernel => ({ cancelled: false, value: String(kernel.index) }),
++			async () => {
++				started.resolve();
++				await release.promise;
++			},
++		);
++		const stale = { sessionId: "python:departed-sole", kernelOwnerId: "owner" };
++		const execution = registry.executeOnSession("setup", "/tmp", stale);
++		void execution.catch(() => undefined);
++		let disposal: Promise<void> | undefined;
++		try {
++			await started.promise;
++			disposal = registry.disposeByOwner("owner", { keepSessionId: "python:current" });
++			expect(await finishesBeforeNextTurn(disposal)).toBe(false);
++			release.resolve();
++			await disposal;
++			expect(kernels[0]?.alive).toBe(false);
++			expect(registry.peekLiveKernel("/tmp", stale)).toBeUndefined();
++			await expect(execution).rejects.toBeInstanceOf(TestCancelledError);
++		} finally {
++			release.resolve();
++			await Promise.allSettled([execution, ...(disposal ? [disposal] : [])]);
++			await registry.disposeAll();
++		}
++	});
++});
 diff --git a/packages/coding-agent/test/tools/grep-pagination.test.ts b/packages/coding-agent/test/tools/grep-pagination.test.ts
 index fd85107b342c284c9f1e9644aaeb2899b99372b6..2a1b3e58c71fa69f1fef9b43fc53c08bef30d264 100644
 --- a/packages/coding-agent/test/tools/grep-pagination.test.ts

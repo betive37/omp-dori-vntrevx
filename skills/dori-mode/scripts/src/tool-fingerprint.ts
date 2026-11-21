@@ -58,7 +58,7 @@ const SPILLS = [
     url: (id: string) => `local://${id}.log`,
     blank: "local://.log",
     tail: "(?![\\w.-])",
-    base: /^local:\/\/(.+)\.log$/,
+    base: /^local:\/\/(\d+)\.log$/,
   },
 ] as const;
 const selectorId = (base: string): string | undefined =>
