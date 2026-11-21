@@ -124,8 +124,8 @@ export function assertNativeSource(
 
 async function probe(loader: string, cwd: string, home: string, bun: string, natives: string): Promise<string> {
   const code = `const m = await import(process.argv[1]); const b = m.loadNative();
-if (typeof b.__piNativesBuildVersion !== "function" || b.__piNativesBuildVersion() !== "18.20.0") throw new Error("official native addon version differs");
-const s = m.nativeAddonStatus(); if (!s || s.version !== "18.20.0" || s.stale) throw new Error("native addon identity unavailable"); console.log(s.path);`;
+if (typeof b.__piNativesBuildVersion !== "function" || b.__piNativesBuildVersion() !== "19.0.1") throw new Error("official native addon version differs");
+const s = m.nativeAddonStatus(); if (!s || s.version !== "19.0.1" || s.stale) throw new Error("native addon identity unavailable"); console.log(s.path);`;
   return command([bun, "-e", code, loader], cwd, { ...bundleEnv(home, bun), PI_NATIVES_DIR: natives }, 60_000);
 }
 

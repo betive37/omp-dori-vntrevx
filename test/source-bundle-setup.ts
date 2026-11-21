@@ -54,8 +54,8 @@ export function overlayFixture(source: string, checkout: string, native = false,
   put("index.ts", 'export const selected = "base";\n');
   put("presets.ts", "export {};\n");
   if (native) {
-    put("packages/coding-agent/scripts/omp", '#!/bin/sh\nprintf "18.20.0\\n"\n', true);
-    put("packages/coding-agent/src/cli.ts", 'export const version = "18.20.0";\n');
+    put("packages/coding-agent/scripts/omp", '#!/bin/sh\nprintf "19.0.1\\n"\n', true);
+    put("packages/coding-agent/src/cli.ts", 'export const version = "19.0.1";\n');
     put("packages/natives/native/loader-state.js", "export {};\n");
     const hash = digest(NATIVE_VIEWER_FIXTURE);
     put(
@@ -81,7 +81,7 @@ export function overlayFixture(source: string, checkout: string, native = false,
     patchSha256: digest(patch),
     resultTree: fixtureGit(checkout, "write-tree"),
     files: [{ path: "index.ts", sha256: digest(readFileSync(join(checkout, "index.ts"))), executable: false }],
-    ...(native ? { nativeVersion: "18.20.0" as const, launcher: "packages/coding-agent/scripts/omp" } : {}),
+    ...(native ? { nativeVersion: "19.0.1" as const, launcher: "packages/coding-agent/scripts/omp" } : {}),
   };
   const name = native ? "native-omp" : "omp-ulw.overlay";
   writeFileSync(join(source, `${name}.lock`), `${JSON.stringify(lock)}\n`, { mode: 0o600 });

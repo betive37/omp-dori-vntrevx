@@ -2,6 +2,8 @@
 
 ## Unreleased
 
+- The bound native OMP moves from 18.20.0 (`c308970`) to 19.0.1 (`f40f335`) with the frozen official `@oh-my-pi/pi-natives@19.0.1` addon. The Dori patch now carries only what upstream has not adopted: bounded grep range completeness, per-conversation workspace-tree invalidation while rendering is disabled, transition-aware stale eval release, custom-message ownership across reload, and array todo previews. Grep defaults, todo array targets, wait back-off/turn-ending guidance and the base eval release are upstream's. New source-bundle manifests, headless lanes and managed deployments require 19.0.1; published `v0.1.2` keeps its 18.18.8 contract. Tool fingerprints treat 19.x `local://N.log` spill locators like `artifact://N`, and the argv mirror admits 19.x `--no-judge`, `--no-spotlight` and `--offline`.
+
 - Add opt-in `dori update source check|status|apply`, `idle-check`, and `lead restart` on the existing managed deployment engine. The source supervisor checks CI and stops only at a verified idle and quiet boundary; service and upstream update defaults are unchanged.
 
 - Report the currently verified managed source and native runtime separately from historic deployment receipts.

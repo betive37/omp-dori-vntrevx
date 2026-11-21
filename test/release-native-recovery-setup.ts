@@ -41,7 +41,7 @@ export function boundRelease(f: ConsumerFixture, selected: string, nativeSource?
     validateReleaseManifest({
       ...original.bundle.manifest,
       source: publicSource,
-      requirements: { ...original.bundle.manifest.requirements, omp: "18.20.0" },
+      requirements: { ...original.bundle.manifest.requirements, omp: "19.0.1" },
       ompUlw: { repository: ulw.lock.repository, commit: ulw.commit },
     }),
     bytes,
@@ -96,7 +96,7 @@ const { home, before, after, phase } = JSON.parse(process.argv[1]);
 const paths = consumerPaths(home);
 const omp = join(paths.dori, "bin/omp");
 const target = releasePath(paths, after.current);
-const native = after.current.requirements.omp === "18.20.0" ? join(target, "scripts/consumer/omp") : undefined;
+const native = after.current.requirements.omp === "19.0.1" ? join(target, "scripts/consumer/omp") : undefined;
 activateRelease({
   ...paths,
   get dori() {
