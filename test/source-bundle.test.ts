@@ -35,6 +35,21 @@ posix("the same upstream version and launcher bytes cannot satisfy a bound patch
   expect(() => assertNativeSource(f.source, home)).toThrow("source checkout differs");
 });
 
+posix("a prior 18.20.0-bound receipt is still admitted by its exact identity; an unknown version is not", () => {
+  const root = realpathSync(mkdtempSync(join(tmpdir(), "dori-source-bundle-")));
+  roots.push(root);
+  const prior = overlayFixture(join(root, "bundle"), join(root, "upstream"), true, "reviewed-overlay", "18.20.0");
+  const home = join(root, "home");
+  const receipt = nativeCacheFixture(prior.source, home, prior.checkout);
+  expect(readSourceBundle(prior.source, true).lock.nativeVersion).toBe("18.20.0");
+  expect(assertNativeSource(prior.source, home)).toEqual(receipt);
+  writeFileSync(
+    join(prior.source, "native-omp.lock"),
+    `${JSON.stringify({ ...prior.lock, nativeVersion: "18.99.0" })}\n`,
+  );
+  expect(() => readSourceBundle(prior.source, true)).toThrow("Invalid source bundle lock");
+});
+
 posix("a version-only stock cache receipt cannot stand in for a source bundle", () => {
   const f = fixture(true);
   const home = join(f.root, "home");
