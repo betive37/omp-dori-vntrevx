@@ -15,7 +15,7 @@ import { fixtureGit } from "./source-bundle-setup.ts";
 // Published v0.1.2, not the later PR54 baseline used by the consumer smoke.
 const published = "f5d34ab98ad040a500689fbeefe507e54281eff3";
 
-posix("cross-generation rollback supports update status in the restored public v0.1.2 CLI", async () => {
+posix("cross-generation rollback remains readable by v0.1.2 and its Linux update status CLI", async () => {
   const f = fixture();
   const root = resolve(import.meta.dir, "..");
   const source = join(f.root, "published");
@@ -56,15 +56,35 @@ posix("cross-generation rollback supports update status in the restored public v
   expect(pointer(f.paths.live)).toBe(restored);
   const cli = join(f.paths.dori, "bin/dori");
   expect(realpathSync(cli)).toBe(join(restored, "skills/dori-mode/scripts/src/cli.ts"));
-  const status = Bun.spawnSync([process.execPath, cli, "update", "status"], {
-    env: { HOME: f.paths.home, PATH: process.env["PATH"], DORI_TELEMETRY: "0", DO_NOT_TRACK: "1" },
-    timeout: 10_000,
-  });
-  expect({ code: status.exitCode, stderr: status.stderr.toString() }).toEqual({ code: 0, stderr: "" });
-  expect(JSON.parse(status.stdout.toString())).toEqual({
-    installed: { tag: "v0.1.2", commit: published, sourceHash: files.hash, prerelease: manifest.prerelease },
-    previous: null,
-  });
+  const env = { HOME: f.paths.home, PATH: process.env["PATH"], DORI_TELEMETRY: "0", DO_NOT_TRACK: "1" };
+  // Run the unchanged historical reader on every POSIX host, independently of its Linux-only CLI lock.
+  const readState = `
+    const { consumerPaths } = await import(process.argv[1]);
+    const { recoverInstalled, verifyRelease } = await import(process.argv[2]);
+    const paths = consumerPaths();
+    const state = recoverInstalled(paths);
+    verifyRelease(paths, state.current);
+    console.log(JSON.stringify(state));
+  `;
+  const readback = Bun.spawnSync(
+    [process.execPath, "-e", readState, join(restored, "src/release/files.ts"), join(restored, "src/release/state.ts")],
+    { env, timeout: 10_000 },
+  );
+  expect({ code: readback.exitCode, stderr: readback.stderr.toString() }).toEqual({ code: 0, stderr: "" });
+  expect(JSON.parse(readback.stdout.toString())).toEqual({ version: 1, current: one.current });
+  const status = Bun.spawnSync([process.execPath, cli, "update", "status"], { env, timeout: 10_000 });
+  if (process.platform === "linux") {
+    expect({ code: status.exitCode, stderr: status.stderr.toString() }).toEqual({ code: 0, stderr: "" });
+    expect(JSON.parse(status.stdout.toString())).toEqual({
+      installed: { tag: "v0.1.2", commit: published, sourceHash: files.hash, prerelease: manifest.prerelease },
+      previous: null,
+    });
+  } else {
+    // v0.1.2 predates Darwin support and requires /proc for its consumer-lock process identity.
+    expect(status.exitCode).toBe(2);
+    expect(status.stderr.toString()).toBe("OMP-Dori release held: Consumer process identity is unavailable\n");
+    expect(status.stdout.toString()).toBe("");
+  }
   expect(rolled.previous).toBeUndefined();
   expect(JSON.parse(readFileSync(f.paths.state, "utf8"))).toEqual({ version: 1, current: one.current });
   expect(verifyRelease(f.paths, two.current)).toBe(releasePath(f.paths, two.current));
