@@ -69,6 +69,64 @@ test("real git cleanup preserves a clean committed artifact and final hook recei
   expect(w.artifacts.read(w.lane.key)[0]?.receipts).toEqual([]);
   expect(result.lines.join("\n")).toContain("kept: registered artifacts");
 });
+test.each([
+  ["recorded", false],
+  ["discovered", false],
+  ["recorded", true],
+  ["discovered", true],
+] as const)("shared root rejects another lane's %s real Git worktree (alias=%s)", async (ownership, alias) => {
+  const w = await worktree();
+  const otherTree = join(f.state.dir, "other-tree");
+  const other = {
+    ...f.lane,
+    key: "other-lane",
+    worktrees: ownership === "recorded" ? [otherTree] : [],
+  };
+  if (ownership === "recorded") other.cwd = w.repo;
+  else delete other.cwd;
+  git(w.repo, "worktree", "add", "-q", "-b", ownership === "recorded" ? "unrelated" : other.key, otherTree);
+  await f.registry.write(other);
+  const config = { ...w.deps.config, artifactRoots: [{ path: f.state.dir }] };
+  const artifacts = new Artifacts(config, f.registry);
+  const own = (await artifacts.add(w.lane.key, join(w.tree, "report.txt"), "Own", "private", now)).artifact;
+  const target = join(otherTree, "report.txt");
+  const path = alias ? join(f.root, "other-alias.txt") : target;
+  if (alias) symlinkSync(target, path);
+  await expect(artifacts.add(w.lane.key, path, "Other", "private", now)).rejects.toThrow(
+    'worktree owned by lane "other-lane"',
+  );
+  expect(artifacts.read(w.lane.key)).toEqual([own]);
+  expect(artifacts.read(other.key)).toEqual([]);
+  expect((await closeLane({ ...w.deps, config }, other, "Complete")).closed).toBe(true);
+  expect(existsSync(otherTree)).toBe(false);
+  expect((await artifacts.views(w.lane.key))[0]?.state).toBe("current");
+  expect((await closeLane({ ...w.deps, config }, w.lane, "Complete")).closed).toBe(true);
+  expect(existsSync(join(w.tree, "report.txt"))).toBe(true);
+});
+
+test.each([false, true])(
+  "overlapping lane prefixes refuse ambiguous worktree ownership (other closed=%s)",
+  async (closed) => {
+    const w = await worktree();
+    const other = {
+      ...f.lane,
+      key: "artifact",
+      cwd: w.repo,
+      status: closed ? ("closed" as const) : ("working" as const),
+    };
+    await f.registry.write(other);
+    await expect(w.artifacts.add(w.lane.key, join(w.tree, "report.txt"), "Own", "private", now)).rejects.toThrow(
+      'worktree owned by lane "artifact"',
+    );
+    expect(w.artifacts.read(w.lane.key)).toEqual([]);
+    if (!closed) {
+      // The prefix owner can remove this tree too, so preferring the selected lane would admit unsafe registrations.
+      expect((await closeLane(w.deps, other, "Complete")).closed).toBe(true);
+      expect(existsSync(w.tree)).toBe(false);
+    }
+  },
+);
+
 test("a clean worktree without registered artifacts is still removed by real git", async () => {
   const w = await worktree();
   expect((await closeLane(w.deps, w.lane, "Complete")).closed).toBe(true);
