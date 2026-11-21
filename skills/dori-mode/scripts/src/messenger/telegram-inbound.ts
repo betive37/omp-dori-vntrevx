@@ -1,8 +1,9 @@
-import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
-import { dirname } from "node:path";
 import { InboundActivityError } from "../../../../../src/update/source-activity.ts";
-import { inboundPollRetryDelay } from "./http.ts";
+import { inboundPollRetryDelay, MessengerError } from "./http.ts";
+import { TelegramCursorError } from "./telegram-cursor-error.ts";
+import type { TgInboundStore } from "./telegram-inbound-state.ts";
 import type { Telegram } from "./telegram.ts";
+import { mediaOf, replyOf, telegramUpdateReceipt, threadOf, type TgUpdate } from "./telegram-inbound-update.ts";
 
 /** `message` for a new message, `edit` when the owner edited an earlier one. */
 export type TgInboundKind = "message" | "edit";
@@ -50,11 +51,17 @@ export const envInt = (name: string, raw: string | undefined): number => {
   return n;
 };
 
-export type TgInboundStore = { load(): number; save(offset: number): void };
-
+/**
+ * The inbound watch loop. Without `--loop` (loopMin <= 0) it is one-shot: a single
+ * bounded poll, then it returns — scripts rely on that. With `--loop`, it re-polls
+ * immediately after any poll that returned updates — kept or gate-dropped alike, since
+ * more may be waiting behind that batch — and only sleeps after a truly empty poll
+ * (the 25s long-poll already returns on arrival, so bursts deliver without waiting
+ * out the interval).
+ */
 export const telegramInboundLoop = async (
   tg: Telegram,
-  store: TgInboundStore,
+  openStore: () => Promise<TgInboundStore>,
   opts: TgInboundOptions,
   loopMin: number,
   emit: (inbound: TgInbound) => void = () => {},
@@ -62,13 +69,15 @@ export const telegramInboundLoop = async (
   sleep: (ms: number) => Promise<void> = (ms) => Bun.sleep(ms),
   observe?: (available: boolean) => void,
 ): Promise<void> => {
+  let store: TgInboundStore | undefined;
   for (;;) {
     let wait = loopMin * 60_000;
     let updates: number | undefined;
     try {
+      store ??= await openStore();
       ({ updates } = await pollTelegramInbound(tg, store, opts, emit));
     } catch (error) {
-      if (error instanceof InboundActivityError) throw error;
+      if (error instanceof InboundActivityError || error instanceof TelegramCursorError) throw error;
       observe?.(false);
       wait = inboundPollRetryDelay(error, wait);
       warn(error instanceof Error ? error.message : String(error));
@@ -80,98 +89,14 @@ export const telegramInboundLoop = async (
   }
 };
 
-export const fileTgInboundStore = (path: string): TgInboundStore => {
-  // load() runs on every poll; a corrupt file must warn once, not once per poll.
-  let warned = false;
-  return {
-    load(): number {
-      try {
-        const n = Number(readFileSync(path, "utf8").trim());
-        if (!Number.isSafeInteger(n) || n < 0) {
-          // A corrupt offset must not silently replay the whole history.
-          if (!warned) {
-            warned = true;
-            // stdout like every other inbound WARN, so a monitor filtering stdout sees it.
-            console.log(`WARN telegram-offset at ${path} is unparseable (${n}); restarting from 0 (warned once)`);
-          }
-          return 0;
-        }
-        return n;
-      } catch {
-        return 0; // no file yet: a fresh start, not a warning
-      }
-    },
-    save(offset: number): void {
-      // The state dir may not exist yet on a fresh install; without this the first save
-      // fails with ENOENT and the same update is re-printed every tick.
-      mkdirSync(dirname(path), { recursive: true });
-      writeFileSync(path, String(offset));
-    },
-  };
-};
-
-type TgFile = { readonly file_id?: string };
-type TgUser = {
-  readonly id: number;
-  readonly is_bot?: boolean;
-  readonly username?: string;
-  readonly first_name?: string;
-};
-type TgMessage = {
-  readonly message_id?: number;
-  readonly from?: TgUser;
-  readonly chat?: { readonly id: number; readonly type?: string };
-  readonly is_topic_message?: boolean;
-  readonly message_thread_id?: number;
-  readonly reply_to_message?: { readonly message_id?: number };
-  readonly text?: string;
-  readonly caption?: string;
-  /** Unix seconds Telegram recorded the message; absent on some old or edited payloads. */
-  readonly date?: number;
-  readonly location?: unknown;
-  readonly voice?: TgFile;
-  readonly audio?: TgFile;
-  readonly video?: TgFile;
-  readonly video_note?: TgFile;
-  readonly animation?: TgFile;
-  readonly document?: TgFile;
-  readonly photo?: readonly TgFile[];
-};
-type TgUpdate = { readonly update_id: number; readonly message?: TgMessage; readonly edited_message?: TgMessage };
-
-/**
- * The topic a message belongs to, when it is a topic message. `message_thread_id` alone
- * is not it: for a reply in a forum's General topic Telegram puts the reply root's id
- * there, not the topic id (telegram-bot-api#447), and in a private chat run with topics
- * it only marks topic messages. `is_topic_message` is the reliable signal, so General
- * (replies included) resolves to no thread — callers treat it as topic 1 — and a
- * private-chat topic message keeps its thread.
- */
-const threadOf = (m: TgMessage): number | undefined =>
-  m.is_topic_message === true ? (m.message_thread_id ?? 1) : undefined;
-
-/** The message replied to. A topic message that replies to nothing names the topic's root (id = topic id): no reply. */
-const replyOf = (m: TgMessage): number | undefined => {
-  const id = m.reply_to_message?.message_id;
-  return m.is_topic_message === true && id === m.message_thread_id ? undefined : id;
-};
-
-/** The largest photo variant is the last array element; file ids are unique per size. */
-const mediaOf = (m: TgMessage): TgMedia | undefined => {
-  const kinds: readonly (readonly [string, TgFile | undefined])[] = [
-    ["voice", m.voice],
-    ["audio", m.audio],
-    ["video", m.video],
-    ["video_note", m.video_note],
-    ["animation", m.animation],
-    ["document", m.document],
-    ["photo", m.photo?.[m.photo.length - 1]],
-  ];
-  for (const [kind, f] of kinds)
-    if (f?.file_id !== undefined)
-      return { kind, fileId: f.file_id, ...(m.message_id === undefined ? {} : { messageId: m.message_id }) };
-  return undefined;
-};
+function cursorOperation<T>(run: () => T): T {
+  try {
+    return run();
+  } catch (cause) {
+    if (cause instanceof TelegramCursorError) throw cause;
+    throw new TelegramCursorError("Telegram inbound cursor could not be read or saved; intake stopped", { cause });
+  }
+}
 
 /**
  * Poll `getUpdates` once (new messages and edits) and hand every kept update to `emit`
@@ -188,14 +113,43 @@ export const pollTelegramInbound = async (
   store: TgInboundStore,
   opts: TgInboundOptions,
   emit: (inbound: TgInbound) => void = () => {},
+  now: () => number = Date.now,
 ): Promise<{ inbound: readonly TgInbound[]; updates: number }> => {
+  const previous = cursorOperation(() => store.load());
+  const observed = previous?.observedAt;
+  const age = observed === undefined ? undefined : now() - observed;
+  const fresh = age !== undefined && age >= 0 && age < 86_400_000;
   const updates = await tg.call<readonly TgUpdate[]>("getUpdates", {
-    offset: store.load(),
+    ...(fresh && previous !== undefined ? { offset: previous.offset } : {}),
+    limit: 100,
     timeout: 25,
     allowed_updates: ["message", "edited_message"],
   });
+  if (
+    !Array.isArray(updates) ||
+    updates.length > 100 ||
+    updates.some(
+      (update) =>
+        !update ||
+        !Number.isSafeInteger(update.update_id) ||
+        update.update_id < 0 ||
+        update.update_id >= Number.MAX_SAFE_INTEGER,
+    )
+  )
+    throw new MessengerError("Telegram getUpdates returned invalid update IDs or batch size", 0);
+  if (updates.length === 0) {
+    if (previous?.seen.length) cursorOperation(() => store.save({ ...previous, seen: [] }));
+    return { inbound: [], updates: 0 };
+  }
+  const observedAt = now();
+  const keys = updates.map(telegramUpdateReceipt);
+  // getUpdates returns the oldest unconfirmed batch (at most 100). A receipt
+  // absent from this batch is acknowledged/expired, not waiting behind it.
+  // Preserve all matching receipts before any emit, including later batch items.
+  const seen = new Set(previous?.seen.filter((key) => keys.includes(key)));
   const out: TgInbound[] = [];
-  for (const u of updates) {
+  for (const [index, u] of updates.entries()) {
+    const key = keys[index];
     const kind: TgInboundKind = u.edited_message === undefined ? "message" : "edit";
     const m = u.message ?? u.edited_message;
     let keep = false;
@@ -213,14 +167,14 @@ export const pollTelegramInbound = async (
         keep = opts.topicId === undefined || topic === opts.topicId;
       }
     }
-    if (!keep) {
-      store.save(u.update_id + 1);
+    if (!keep || (key !== undefined && seen.has(key))) {
+      cursorOperation(() => store.save({ offset: u.update_id + 1, observedAt, seen: [...seen] }));
       continue;
     }
     // A live location arrives as a stream of edited_message updates carrying no new
     // text; emitting one line per refresh would flood the consumer. Drop them.
     if (kind === "edit" && m!.location !== undefined && m!.text === undefined && m!.caption === undefined) {
-      store.save(u.update_id + 1);
+      cursorOperation(() => store.save({ offset: u.update_id + 1, observedAt, seen: [...seen] }));
       continue;
     }
     const source = m!.chat!.type === "private" ? "dm" : "topic";
@@ -243,7 +197,8 @@ export const pollTelegramInbound = async (
     };
     emit(inbound); // may throw: offset stays before this update, so it is polled again
     out.push(inbound);
-    store.save(u.update_id + 1);
+    if (key !== undefined) seen.add(key);
+    cursorOperation(() => store.save({ offset: u.update_id + 1, observedAt, seen: [...seen] }));
   }
   return { inbound: out, updates: updates.length };
 };

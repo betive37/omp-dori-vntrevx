@@ -2,6 +2,7 @@ import { expect, test } from "bun:test";
 import { existsSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { withState } from "./fakes.ts";
+import { telegramTestDirectory, telegramTestStore } from "./telegram-win32-fixtures.ts";
 
 const token = "test-startup-token-not-for-network";
 type Request = { method: string; params: Record<string, unknown> };
@@ -12,13 +13,14 @@ const startup = async (
   environment: Record<string, string | undefined> = {},
 ) => {
   const state = withState();
-  const journal = join(state.dir, "requests.jsonl");
-  const offset = join(state.dir, "telegram-offset");
+  const stateDir = telegramTestDirectory(state.dir);
+  const journal = join(stateDir, "requests.jsonl");
+  const store = telegramTestStore(stateDir, 222);
   const config = join(state.dir, "config.json");
-  writeFileSync(offset, "17");
+  store.save({ offset: 17, observedAt: Date.now(), seen: [] });
   writeFileSync(join(state.dir, "telegram-lag.jsonl"), '{"lagMs":12}\n');
   const recall = scenario["recall"] === true;
-  writeFileSync(config, JSON.stringify({ stateDir: state.dir, defaultCwd: state.dir, recall: { enabled: recall } }));
+  writeFileSync(config, JSON.stringify({ stateDir, defaultCwd: stateDir, recall: { enabled: recall } }));
   const child = Bun.spawn(
     [
       process.execPath,
@@ -33,7 +35,7 @@ const startup = async (
         HOME: state.dir,
         PATH: "/usr/bin:/bin",
         DORI_CONFIG: config,
-        DORI_STATE_DIR: state.dir,
+        DORI_STATE_DIR: stateDir,
         DORI_TELEGRAM_TOKEN: token,
         DORI_TELEGRAM_OWNER_ID: "7",
         DORI_TEST_TELEGRAM_REQUESTS: journal,
@@ -81,7 +83,7 @@ const startup = async (
       held,
       requests,
       methods: requests.map((r) => r.method),
-      offset: readFileSync(offset, "utf8"),
+      offset: String(store.load()?.offset),
       recallStored: existsSync(join(state.dir, "recall-scoped-v1.sqlite")),
     };
   } finally {

@@ -1,9 +1,10 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync } from "node:fs";
 import { join } from "node:path";
-import { fileTgInboundStore, pollTelegramInbound, type TgInbound } from "../src/messenger/telegram-inbound.ts";
+import { pollTelegramInbound, type TgInbound } from "../src/messenger/telegram-inbound.ts";
 import { withState } from "./fakes.ts";
 import { GROUP, mk, msg, OTHER, OWNER, telegramFake, TOPIC } from "./telegram-inbound-fakes.ts";
+import { telegramTestStore } from "./telegram-win32-fixtures.ts";
 
 const state = withState();
 beforeEach(() => mkdirSync(state.dir, { recursive: true }));
@@ -33,7 +34,7 @@ test.each([
         { update_id: 101, [kind]: msg(OWNER, OWNER, "private", "allowed") },
       ],
     ]);
-    const store = fileTgInboundStore(join(state.dir, `route-${kind}`));
+    const store = telegramTestStore(join(state.dir, `route-${kind}`), 900);
     const seen: TgInbound[] = [];
     const { inbound } = await pollTelegramInbound(
       mk(http),
@@ -47,8 +48,8 @@ test.each([
       [101, kind === "message" ? "message" : "edit", "dm", "allowed"],
     ]);
     expect(inbound).toEqual(seen);
-    expect(store.load()).toBe(102);
-    expect(bodies[0]?.["offset"]).toBe(0);
+    expect(store.load()?.offset).toBe(102);
+    expect(bodies[0]).not.toHaveProperty("offset");
   }
 });
 
@@ -66,13 +67,13 @@ test("message IDs may decrease across chats and repeat for edits without reorder
     [],
   ]);
   const path = join(state.dir, "identity-offset");
-  const store = fileTgInboundStore(path);
-  store.save(200);
+  const store = telegramTestStore(path, 900);
+  store.save({ offset: 200, observedAt: Date.now(), seen: [] });
   const seen: TgInbound[] = [];
   const offsetsAtEmit: number[] = [];
   const opts = { ownerId: OWNER, groupChatId: GROUP, topicId: TOPIC };
   const { inbound } = await pollTelegramInbound(mk(http), store, opts, (message) => {
-    offsetsAtEmit.push(store.load());
+    offsetsAtEmit.push(store.load()!.offset);
     seen.push(message);
   });
   expect(
@@ -86,8 +87,8 @@ test("message IDs may decrease across chats and repeat for edits without reorder
   ]);
   expect(inbound).toEqual(seen);
   expect(offsetsAtEmit).toEqual([200, 201, 202, 203, 204]);
-  expect(store.load()).toBe(205);
-  const resumed = await pollTelegramInbound(mk(http), fileTgInboundStore(path), opts, (message) => {
+  expect(store.load()?.offset).toBe(205);
+  const resumed = await pollTelegramInbound(mk(http), telegramTestStore(path, 900), opts, (message) => {
     seen.push(message);
   });
   expect(resumed.inbound).toEqual([]);

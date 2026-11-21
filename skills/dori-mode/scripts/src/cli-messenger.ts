@@ -13,6 +13,7 @@ import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.
 import { Slack } from "./messenger/slack.ts";
 import { slackPresence } from "./messenger/slack-presence.ts";
 import { Telegram } from "./messenger/telegram.ts";
+import { TelegramCursorError } from "./messenger/telegram-cursor-error.ts";
 import { lagOfLine, readLagTail, summarizeLag } from "./messenger/telegram-lag.ts";
 import { ThreadLedger } from "./messenger/thread-ledger.ts";
 import { transcribe, TranscriptionError, withLocalAudio } from "./messenger/voice.ts";
@@ -25,6 +26,7 @@ export const messengerErrors = [
   TranscriptionError,
   ChannelPurposeError,
   InboundActivityError,
+  TelegramCursorError,
 ] as const;
 
 const NO_SLACK_TOKEN = "DORI_SLACK_TOKEN is not set (nor DORI_SLACK_TOKEN_FILE)";

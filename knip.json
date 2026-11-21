@@ -30,7 +30,8 @@
         "test/record-inbound-activity-failure.ts",
         "test/record-slack-activity-backlog.ts",
         "test/record-discord.ts",
-        "test/record-telegram-startup.ts"
+        "test/record-telegram-startup.ts",
+        "test/record-telegram-epoch.ts"
       ],
       "project": ["src/**/*.ts", "test/**/*.ts"]
     },

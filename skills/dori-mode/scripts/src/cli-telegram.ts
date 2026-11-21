@@ -3,7 +3,8 @@ import { die } from "./cli-context.ts";
 import type { DoriConfig } from "./config.ts";
 import { fetchHttp, MessengerError } from "./messenger/http.ts";
 import { Telegram } from "./messenger/telegram.ts";
-import { envInt, fileTgInboundStore, telegramInboundLoop } from "./messenger/telegram-inbound.ts";
+import { fileTgInboundStore } from "./messenger/telegram-inbound-state.ts";
+import { envInt, telegramInboundLoop } from "./messenger/telegram-inbound.ts";
 import { inboundLagLog } from "./messenger/telegram-lag.ts";
 import { formatTelegramInbound } from "./messenger/telegram-line.ts";
 import { realClock } from "./run.ts";
@@ -15,7 +16,6 @@ export const telegramInbound = async (config: DoriConfig, minutes: number, activ
     realClock,
     process.env["DORI_TELEGRAM_TOKEN"] || die("DORI_TELEGRAM_TOKEN is not set"),
   );
-  const store = fileTgInboundStore(`${stateDir}/telegram-offset`);
   const num = (name: string): number => {
     try {
       return envInt(name, process.env[name]);
@@ -47,6 +47,9 @@ export const telegramInbound = async (config: DoriConfig, minutes: number, activ
     throw new MessengerError("Telegram getWebhookInfo returned an invalid webhook status", 0);
   if (webhook.url !== "")
     throw new MessengerError("Telegram inbound refused an active webhook; use a polling bot (webhook unchanged)", 409);
+  using store = fileTgInboundStore(stateDir, identity.id);
+  store.checkWritable();
+  store.load();
   // The INBOUND line stays exactly as monitors parse it; receive lag goes to its own jsonl.
   const recall = config.recall?.enabled
     ? (await import("./messenger/recall-telegram.ts")).telegramOwnerRecall(config, identity.id, ownerId)
@@ -57,7 +60,7 @@ export const telegramInbound = async (config: DoriConfig, minutes: number, activ
     console.log(`INBOUND_READY telegram owner=${ownerId} group=${groupChatId ?? "-"} topic=${topicId ?? "-"}`);
     await telegramInboundLoop(
       tg,
-      store,
+      async () => store,
       {
         ownerId,
         ...(groupChatId !== undefined ? { groupChatId } : {}),
