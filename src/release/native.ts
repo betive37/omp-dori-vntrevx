@@ -122,15 +122,7 @@ export function assertNativeSource(
   return receipt;
 }
 
-/** Load the addon through `loader` and require the exact native version the bound lock names. */
-async function probe(
-  loader: string,
-  cwd: string,
-  home: string,
-  bun: string,
-  natives: string,
-  version: string,
-): Promise<string> {
+async function probe(loader: string, cwd: string, home: string, bun: string, natives: string, version: string) {
   const code = `const m = await import(process.argv[1]); const b = m.loadNative(); const v = process.argv[2];
 if (typeof b.__piNativesBuildVersion !== "function" || b.__piNativesBuildVersion() !== v) throw new Error("official native addon version differs");
 const s = m.nativeAddonStatus(); if (!s || s.version !== v || s.stale) throw new Error("native addon identity unavailable"); console.log(s.path);`;
