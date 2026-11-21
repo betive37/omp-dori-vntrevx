@@ -1,24 +1,28 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join, resolve } from "node:path";
+import { artifactCommands } from "../src/cli-artifacts.ts";
 import { decisionCommands } from "../src/cli-decisions.ts";
 import { journalCommands } from "../src/cli-journal.ts";
 import { laneCommands } from "../src/cli-lanes.ts";
 import { messengerCommands } from "../src/cli-messenger.ts";
 import { opsCommands } from "../src/cli-ops.ts";
 import { prCommands } from "../src/cli-pr.ts";
+import { scheduleCommands } from "../src/cli-schedule.ts";
 import { statusCommands } from "../src/cli-status.ts";
 import { voiceCommand } from "../src/cli-voice.ts";
 import { type TestState, withState } from "./fakes.ts";
 
 const cli = resolve(import.meta.dir, "../src/cli.ts");
 const groups = {
+  "cli-artifacts.ts": artifactCommands,
   "cli-journal.ts": journalCommands,
   "cli-lanes.ts": laneCommands,
   "cli-ops.ts": opsCommands,
   "cli-messenger.ts": messengerCommands,
   "cli-decisions.ts": decisionCommands,
   "cli-pr.ts": prCommands,
+  "cli-schedule.ts": scheduleCommands,
   "cli-status.ts": statusCommands,
   "cli-voice.ts": { voice: voiceCommand },
 };

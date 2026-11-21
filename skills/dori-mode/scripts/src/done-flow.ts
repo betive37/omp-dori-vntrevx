@@ -1,5 +1,7 @@
 import { existsSync } from "node:fs";
 import type { PlatformAdapter } from "../../../../src/platform/adapter.ts";
+import { artifactClose, artifactKeepsWorktree } from "./artifact-report.ts";
+import { Artifacts } from "./artifacts.ts";
 import { discoverWorktrees, unpushedWork } from "./close-worktrees.ts";
 import type { DoriConfig } from "./config.ts";
 import { withDeliveryLock } from "./delivery-lock.ts";
@@ -144,15 +146,21 @@ const closeHeld = async (
     const now = await deps.registry.read(lane.key);
     if (!now || !sameLaneGeneration(closed, now)) return fail(await movedOn(deps, closed, "cleanup (pane closed)"));
   }
-  cleanup.push(...(await finishThread(deps, lane, note, remaining)));
+  const artifacts = await artifactClose(new Artifacts(deps.config, deps.registry), lane.key, deps.clock.now());
+  const finalNote = artifacts.note ? `${note}\n${artifacts.note}` : note;
+  cleanup.push(...(await finishThread(deps, lane, finalNote, remaining)));
   if (ref && !result.pane) cleanup.push(await closeSession(deps, ref));
   const root = lane.cwd ?? deps.config.defaultCwd;
   const worktrees = await discoverWorktrees(lane, deps.run, [deps.config.defaultCwd]);
   for (const wt of worktrees.filter(deps.exists ?? existsSync)) {
+    if (artifactKeepsWorktree(artifacts.entries, wt)) {
+      cleanup.push(`worktree ${wt} kept: registered artifacts or unreadable artifact index`);
+      continue;
+    }
     const r = await repoGit(deps.run, root, ["worktree", "remove", wt]);
     cleanup.push(r.code === 0 ? `worktree ${wt} removed` : `worktree ${wt} kept: ${r.err.slice(0, 120)}`);
   }
-  const receipt = { outcome: "done", checks, note, cleanup };
+  const receipt = { outcome: "done", checks, note: finalNote, cleanup };
   if (!(await deps.registry.transition(closed, (current) => ({ ...current, receipt }))))
     return { closed: false, lines: [...lines, await movedOn(deps, closed, "close receipt (cleanup finished)")] };
   if (lesson) {

@@ -8,7 +8,7 @@ The CLI loads only the selected command graph, including its existing dependenci
 
 ```sh
 cd skills/dori-mode/scripts
-bun install          # dev dependencies only (types, tsc)
+bun install --frozen-lockfile # pinned runtime and development dependencies
 bun link             # puts `dori` on your PATH
 bun test             # behavior tests with fake herdr/hc/git/gh; nothing real is touched
 bunx tsc --noEmit    # typecheck
@@ -49,6 +49,7 @@ Before a send/edit, a durable pending record is written. An ambiguous create or 
 |---|---|---|
 | `runtime` | detected | every command that opens or reads a session: `"herdr"` or `"hc"`. Unset, the Dori picks hc inside an hc terminal (`HC_TERMINAL_ID`), herdr inside a herdr pane (`HERDR_PANE_ID`), else hc when it is on PATH, else herdr, and refuses only when neither is there. Lanes already open stay on the runtime that opened them |
 | `stateDir` | `~/.dori/state` | registry, heavy slots |
+| `artifactRoots` | `[]` (disabled) | explicit `{ "path": "/absolute/root", "baseUrl": "https://existing.example/prefix/" }` mappings for artifact registration; `~/` is expanded and a root without `baseUrl` is private-only |
 | `laneWorkspace` | current workspace | `launch`: the herdr workspace, or on hc the `dori.group` label (default `dori`) |
 | `workspaces` | all | `sync`, `dead-panes`: herdr workspaces, or `dori.group` labels on hc |
 | `ignorePanes`, `leadPane` | none | sessions the sweeps skip, by id (`w1:p3` on herdr, `t7` on hc); `leadPane` is also where lanes report |
@@ -225,6 +226,22 @@ Sourced checkpoints retain the original run provenance outside the step payload.
 
 A lane reads its checkpoints before resuming and never repeats a recorded remote effect. A crash between a remote action and its checkpoint is not covered by the journal: read the live remote state first, and use the service's idempotency key where it has one.
 
+### `dori artifact add <key> <path> [--title T] [--public]` / `dori artifacts <key> [--json]`
+Register a regular file under an explicit `artifactRoots` path. Nothing is published by default: registration is private unless `--public` is given, and public registration requires that root's explicit HTTP(S) `baseUrl`. The command never guesses a preview server, starts one, uploads a file, fetches its URL or sends a message. Configure a root already served by your own approved read-only publisher; a base URL is a mapping, not proof that the server exists or that a recipient can reach it. Public registration is the operator's publication decision, not secret scanning of file contents.
+
+The most specific containing lexical root wins; a narrower private-only root cannot fall through to a wider public mapping. Both lexical and resolved paths must stay inside that root. Internal symlinks are allowed, but outside-root targets, hidden path components, dependency directories, and names containing `secret`, `credential`, `token` or `private` are refused. Control/format characters and unsupported file types are refused too. Allowed extensions are html, css, js, json, png, jpg, jpeg, gif, webp, avif, svg, ico, woff, woff2, ttf, otf, md, txt, csv, pdf, wav, mp3, ogg, m4a, flac, mp4, webm and mov. Path components in URLs are percent-encoded. Use the configured root's path spelling when it is a symlink alias.
+
+Registration refuses files whose lexical or canonical path is inside another registered lane's worktree, even under a shared artifact root. Ownership uses the same recorded worktrees and Git discovery as close, including discovery from `defaultCwd`; closed lane records still count while their worktrees remain. The error names another owning lane; move the file outside that worktree before registering it to the selected lane. If recorded ownership or lane-key prefixes associate the same worktree with multiple lanes, registration is refused even when the selected lane also owns it: either close could remove it. Files outside lane-owned worktrees may still use a shared root. This keeps each lane's artifact index responsible for the worktrees its close can remove.
+
+The private, fsynced `<stateDir>/lanes/<key>/artifacts.json` index holds a stable id per file path and immutable registrations: title, actual streamed SHA-256, size, visibility, explicit URL, canonical path and registration time (not filesystem birth time). Identical registration is idempotent; changed bytes, title, visibility or mapping append a version. Damaged indexes are reported, never replaced with an empty one. A live writer keeps its lock through hashing even beyond the usual stale-lock age. File changes, replacement or symlink retargeting during hashing are refused. Hashing is memory-bounded and reads at most the original file length.
+
+`artifacts` shows the current and registered hashes, every version and receipt, and checkpoint references. A changed/unreadable file or changed root mapping is not a newly verified version: register it again. Repeat the `--artifact ID` flag on `checkpoint` to append `artifact:<id>@sha256:<hash>` to the existing `--evidence`; only a current registered version can be bound. Each invocation resolves the current registration. An unchanged payload remains idempotent, but a changed/missing file or a new version cannot rewrite a completed checkpoint. On resume, read `checkpoints`; new verification needs a new version and step. The checkpoint does not itself run tests or make the file immutable.
+
+### `dori artifact delivered <key> <id> --sha256 HASH --receipt REF`
+After an authorized delivery, record its actual message reference against a known content hash. This is explicitly **operator-reported** evidence, not a transport-verified receipt. Repeating the same hash/reference is idempotent. A receipt remains attached to its old hash when the file changes; no HTTP success, hook exit code or model inference creates a receipt. HTTP is `not-checked` and human viewing is `unknown`. Delivery recording and inventory remain available after close; new registration requires an open lane. A crash between sending and recording does not authorize a resend: inspect the transport first.
+
+`report --kind done` and the close hook/close receipt append the same public summary: current URL, content hash, registration time and matching checkpoint/receipt counts. They omit private names/paths and withhold changed or unavailable public links. A successful `threadDone` hook is not automatically counted as delivery; it may only rename a thread. Close preserves its lane-owned worktrees containing that lane's registered files or their recorded canonical targets, including private and older versions. An active writer, damaged index or unresolved worktree path conservatively keeps the worktree with an explicit warning. There is no automatic artifact copy, deletion or external upload.
+
 ### `dori verify-pr <owner/repo> <num> [--loop N] [--cwd DIR]`
 Run before a lane claims PR work done. It reads the PR through `gh api` (the PR, every commit with all of its files, the PR's files, then the PR again) and checks:
 - every commit's author and committer email is the one in `repoIdentities` for that repo, ignoring case. The name may differ. `noreply@github.com` is accepted only as the committer of a merge commit, even if it is the configured email. A repo with no configured identity fails before anything is read; `loadConfig` drops an entry whose `name` or `email` is not a nonempty string, so such a repo counts as unconfigured;
@@ -400,6 +417,43 @@ Prints `HOST_GUARD ALERT <reasons>` when load, free memory, free disk or the pan
 
 ### `dori can-launch`
 Prints `CAN_LAUNCH` and exits 0 when the host has room for another lane. Otherwise it prints `HOLD <reasons>` and exits 4. The reasons come from the guard's memory, disk and pane-count thresholds. CPU load alone never holds a launch, because it moves too fast to plan around.
+
+### `dori schedule` / `dori scheduler`
+
+Schedules are opt-in and live in the selected configuration's `<stateDir>/schedule.json`. Adding one never starts a runner or installs an OS service.
+
+```sh
+dori schedule add usage-board --cron "*/15 * * * *" --tz Asia/Seoul --deliver log -- bun usage-board.mjs
+dori schedule list
+dori scheduler
+dori schedule pause usage-board
+dori schedule resume usage-board
+dori schedule remove usage-board
+```
+
+`add NAME --cron EXPR --tz IANA [--cwd DIR] [--deliver wake|log|post:PLATFORM:TARGET] -- COMMAND ARG...` saves the exact argv, not a shell command, and the absolute working directory (default: the caller's directory). Croner 11 parses five-field expressions; seconds and time-dependent `?` substitution are refused. IANA timezone rules apply, with conventional day-of-month/day-of-week OR matching. Fixed-time jobs in a spring-forward gap run after the jump that day and run only once in a fall-back fold. Interval expressions skip the gap and include both repeated intervals. `next` is a stored UTC cursor, not a promise that a runner is alive.
+
+One `scheduler` owns each state directory. It checks every second by default; `--loop MIN` accepts a positive polling ceiling below one minute, with sleep shortened to the earliest unpaused occurrence and `--loop 0` does one due-work pass, waits for its claimed foreground commands and delivery, then exits. Every occurrence is durably claimed and its cursor advanced before spawning. An occurrence at least a minute late is counted as missed, never burst-replayed; a recovery tick advances at most 1000 missed occurrences per job. A job never overlaps its own unfinished run or delivery. Other jobs can run concurrently. Busy occurrences also increment `missed`.
+
+`list` prints the next occurrence, pause state, missed count, and last run's claimed time, start/finish, PID, exit/signal, delivery status and private output path. Recorded PIDs are explicitly unverified, not live-process proof. `pause` affects future runs, not a current command. `resume` starts from the next future occurrence without replaying the paused interval. `remove` refuses a running command or pending delivery and preserves its existing logs.
+
+A restart never re-executes a claimed occurrence. An unfinished claim becomes `interrupted`, pauses that job and requires inspection of its recorded PID/output and any orphan before `schedule resume NAME --ack-interrupted`. Recorded PIDs are never signalled during recovery. An interrupted completed delivery becomes `unknown` and is not posted again. These are conservative at-most-once attempts, not exactly-once execution or delivery.
+
+Use an owner-controlled local state directory (owner-only ACLs on Windows). A crash can leave `scheduler.lock` or `schedule.json.lock`; neither is automatically taken over, even if old. To recover, first stop all launchers and verify no scheduler, job or schedule writer still owns the directory; preserve the marker and inspect `schedule.json` and its run logs. Only after confirming quiescence, move the orphaned marker out of the state directory, then restart and inspect interrupted runs before acknowledging them. Do not run mixed scheduler versions against the same state directory.
+
+SIGINT/SIGTERM stops the runner's own current children, allowing five seconds before SIGKILL. Commands must stay in the foreground; detached descendants are not supervised, and delivery snapshots the log when the direct child exits.
+
+Output and delivery:
+
+- Raw stdout/stderr share a private `0600` run log under `schedule-runs/`; state updates use a private file, atomic rename and fsync. Logs are retained, including after removal, so the owner controls retention.
+- `wake` (default) emits one `SCHEDULE_WAKE` JSON line with the result. `wake-emitted` means stdout accepted it, not native monitor admission or owner acknowledgement.
+- `log` emits no routine wake or post.
+- `post:discord:CHANNEL_OR_THREAD_ID`, `post:telegram:CHAT_ID[/TOPIC_ID]`, and `post:slack:WORKSPACE:ACCOUNT:CHANNEL[/THREAD_TS]` use the existing messenger clients and credentials, including protected `DORI_SLACK_TOKEN_FILE`. Discord thread IDs are channel targets, without a slash suffix. Other credentials are `DORI_DISCORD_TOKEN` and `DORI_TELEGRAM_TOKEN`. The existing message text safety guard still applies.
+- Wake delivery reads at most 64 KiB into the message; larger output sends the exit/byte count and complete private log path rather than silently truncating the raw file. Every message includes the log path. External posts have a conservative 2000 UTF-16-code-unit budget across all platforms: larger output becomes one summary with that path, not a message burst or provider-side truncation. Metadata that cannot fit is rejected before posting. The single post has a 30-second cancellation deadline. Posting never retries an uncertain request, including 429/5xx: the request may have landed, the run records `unknown`, and one `SCHEDULE_ERROR` warning is emitted. A new cron occurrence is separate work, not a retry.
+
+To attach the runner to an owning native session, explicitly start an ordinary persistent monitor with `argv: ["dori", "scheduler"]` and `filter: "^SCHEDULE_(WAKE|ERROR)"`. Bind its selected configuration and child-only credentials as for the other messenger monitors. Routine `log`/`post` results do not wake the owner; operational delivery failures do. No daemon-mode feature is required, and no monitor is installed automatically.
+
+`dori schedule adopt [NAME] --systemd UNIT [--system]` registers an existing `.timer` or `.service` for visibility only (`--user` by default; name defaults to the unit). `list` and `boot` use bounded `systemctl show` calls, including a timer's service when it triggers one, to show its next trigger, last observed service result and active state. Never-started services have no invented exit code; missed occurrences remain `systemd-managed`, not a fabricated count. Missing/inaccessible units are explicit errors. Adoption, pause refusal and removal never start, stop, enable, disable or edit a unit. `boot` also reports cron state read-only; it neither claims work nor recovers interrupted jobs.
 
 ### Discord REST test endpoint
 With `DORI_DISCORD_API_BASE` unset or empty, Discord REST requests use `https://discord.com/api/v10`. For an isolated test server, set it to an HTTP URL on `127.0.0.1`, `localhost` or `[::1]`, optionally with a path prefix; trailing slashes are removed. Credentials, query strings and fragments are refused without echoing the configured value. The local server receives the normal Bot authorization header, so use a synthetic token for tests. This overrides REST only, not Gateway or attachment/CDN URLs.

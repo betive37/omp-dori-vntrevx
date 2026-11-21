@@ -4,6 +4,10 @@
 
 - The bound native OMP moves from 18.20.0 (`c308970`) to 19.0.1 (`f40f335`) with the frozen official `@oh-my-pi/pi-natives@19.0.1` addon. The Dori patch now carries only what upstream has not adopted: bounded grep range completeness, per-conversation workspace-tree invalidation while rendering is disabled, transition-aware stale eval release, custom-message ownership across reload, and array todo previews. Grep defaults, todo array targets, wait back-off/turn-ending guidance and the base eval release are upstream's. New source-bundle manifests and headless lanes require 19.0.1, and a managed release's observed native version must match the one its own lock binds; existing 18.20.0-bound receipts and prior releases are still admitted by their exact identity. Earlier controllers reject 19.0.1 locks, so a managed source update from one fails during preparation without changes; re-run `scripts/install-source.sh` from the new checkout once in the installation's existing mode ([source bundle](docs/releases.md#current-source-bundle)). Published `v0.1.2` keeps its 18.18.8 contract. Tool fingerprints treat 19.x `local://N.log` spill locators like `artifact://N`, and the argv mirror admits 19.x `--no-judge`, `--no-spotlight` and `--offline`.
 
+- Add opt-in cron schedules with durable claims, explicit delivery, and read-only systemd observation. Stale ownership markers hold scheduled work for operator reconciliation.
+
+- Register lane artifacts by content hash, bind checkpoints and operator-reported delivery receipts to versions, and preserve worktrees that contain registered evidence.
+
 - Add opt-in `dori update source check|status|apply`, `idle-check`, and `lead restart` on the existing managed deployment engine. The source supervisor checks CI and stops only at a verified idle and quiet boundary; service and upstream update defaults are unchanged.
 
 - Report the currently verified managed source and native runtime separately from historic deployment receipts.

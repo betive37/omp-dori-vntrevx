@@ -45,6 +45,9 @@ export class Slack {
   }
 
   async call(method: string, params: Record<string, unknown>): Promise<Record<string, unknown>> {
+    const targetChannel = params["channel"];
+    const qualifiedPost =
+      method === "chat.postMessage" && typeof targetChannel === "string" && targetChannel.includes(":");
     for (const key of ["channel", "channel_id"]) {
       const target = params[key];
       if (typeof target === "string" && target.includes(":"))
@@ -97,6 +100,8 @@ export class Slack {
       const ts = body["ts"];
       if (typeof channel !== "string" || !channel || typeof ts !== "string" || !ts)
         throw new DeliveryUncertainError("slack chat.postMessage: missing channel/message ID", 200);
+      if (qualifiedPost && (channel !== params["channel"] || !/^\d+\.\d+$/.test(ts)))
+        throw new DeliveryUncertainError("slack chat.postMessage: no matching acknowledgement", 200);
       try {
         if (this.ledger && scope)
           await this.ledger.record(

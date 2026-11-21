@@ -53,10 +53,7 @@ export const slackAuthCheck =
     return { userId: auth["user_id"], teamId: auth["team_id"] };
   };
 
-/**
- * The boot Slack step from the environment: the token is read inside the step, so a bad token file throws
- * TokenFileError there and boot reports it as a failed check instead of exiting before the other checks.
- */
+/** Read the Slack token during its check, so a token-file error cannot interrupt the other boot checks. */
 export const envSlackCheck =
   (
     client: (token: string) => Pick<Slack, "call">,
@@ -218,6 +215,9 @@ export const bootCheck = async (deps: BootDeps): Promise<{ exitCode: number; lin
       `EXPIRED ${item.lanes.join(",")} match=${item.match.join(",")} ownerSession=${item.sessionId} metadata=${shellQuote(item.metadata)} expiresAt=${new Date(item.expiresAt ?? 0).toISOString()}; nothing to stop`,
     );
   }
+  const scheduled = await (await import("./schedule-view.ts")).scheduleBoot(deps.config.stateDir, deps.run, now);
+  lines.push(...scheduled.lines);
+  if (scheduled.failed) failed = true;
   // The network step runs last, after every local check, and gives up at a short deadline.
   const deadlineMs = deps.slackDeadlineMs ?? 10_000;
   let timer: ReturnType<typeof setTimeout> | undefined;

@@ -5,6 +5,8 @@
 /** Every `dori` command: cli.ts's own and its command tables. */
 export const DORI_COMMANDS: Record<string, true> = {
   adopt: true,
+  artifact: true,
+  artifacts: true,
   board: true,
   boot: true,
   "can-launch": true,
@@ -47,6 +49,8 @@ export const DORI_COMMANDS: Record<string, true> = {
   reopen: true,
   report: true,
   resume: true,
+  schedule: true,
+  scheduler: true,
   send: true,
   status: true,
   sync: true,
@@ -101,6 +105,9 @@ export const DORI_VALUE_OPTIONS: Record<string, true> = {
   result: true,
   "remote-effect": true,
   "evidence-file": true,
+  artifact: true,
+  sha256: true,
+  receipt: true,
   "wall-minutes": true,
   "token-limit": true,
   "cost-limit": true,
@@ -117,6 +124,10 @@ export const DORI_VALUE_OPTIONS: Record<string, true> = {
   "ignore-author": true,
   "adopt-legacy-threads": true,
   self: true,
+  cron: true,
+  tz: true,
+  deliver: true,
+  systemd: true,
 };
 const MESSENGER_COMMANDS: Record<string, true> = {
   send: true,

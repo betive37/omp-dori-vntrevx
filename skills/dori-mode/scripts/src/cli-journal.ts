@@ -1,10 +1,13 @@
 /** dori report, lesson, worklog, checkpoint and checkpoints: the durable journals. */
+import { ArtifactError } from "./artifact-files.ts";
+import { Artifacts } from "./artifacts.ts";
 import { CheckpointError, Checkpoints } from "./checkpoints.ts";
 import { type Cli, type Command, die } from "./cli-context.ts";
 import { autoTrackLinks } from "./cli-pr.ts";
+import { report } from "./cli-report.ts";
 import { EvidenceError, type EvidenceRef, fileEvidence } from "./evidence.ts";
 import { isLessonOutcome, LessonError, Lessons } from "./lessons.ts";
-import { isReportKind, ReportError } from "./report-events.ts";
+import { ReportError } from "./report-events.ts";
 import { Reports, reportLine, reportId, reportScope } from "./reports.ts";
 import { runContext } from "./lane-run.ts";
 import type { ReportProvenance } from "./request-identity.ts";
@@ -13,35 +16,18 @@ import { realClock, runtimesOf } from "./run.ts";
 import { Worklog, WorklogError } from "./worklog.ts";
 
 /** Journal errors are the user's input refused: one line, never a stack. */
-export const journalErrors = [CheckpointError, EvidenceError, LessonError, ReportError, WorklogError] as const;
+export const journalErrors = [
+  ArtifactError,
+  CheckpointError,
+  EvidenceError,
+  LessonError,
+  ReportError,
+  WorklogError,
+] as const;
 
 /** `--evidence-file PATH` fingerprints the selected bytes rather than the report text. */
 const evidenceFiles = (strings: Cli["strings"]): EvidenceRef[] =>
   strings("evidence-file").map((path) => fileEvidence(path, process.cwd()));
-
-const report: Command = async ({ key, need, opt, strings, values, lane, config, deps }) => {
-  const target = await lane(key ?? die("report needs a lane key"));
-  const kind = need("kind");
-  if (!isReportKind(kind)) return die("--kind must be milestone, blocker, question, halted or done");
-  const text = need("text");
-  const owner = opt("owner");
-  const reports = new Reports(config.stateDir);
-  const evidence = evidenceFiles(strings);
-  const entry = await deps.registry.withCurrent(target.key, (current) => {
-    if (!current) throw new ReportError(`no registered lane "${target.key}"`);
-    const context = runContext(reports, current, process.env["DORI_LANE_RUN"]);
-    if (!context)
-      throw new ReportError("report: unknown or missing run (DORI_LANE_RUN); no matching execution recorded");
-    const { generation, provenance } = context;
-    return reports.report(target.key, kind, text, realClock.now(), generation, owner, provenance, evidence);
-  });
-  const receipt = {
-    ...entry,
-    id: reportId(entry),
-    ...(entry.provenance ? { delivery: reportDelivery(config.stateDir, entry) } : {}),
-  };
-  console.log(values["json"] ? JSON.stringify(receipt) : reportLine(entry));
-};
 
 const relayed: Command = async ({ key, need, values, lane, deps, config }) => {
   const target = await lane(key ?? die("relayed needs a lane key"));
@@ -193,7 +179,7 @@ const worklog: Command = async ({ key, positionals, values, need, config }) => {
 };
 
 const checkpoint: Command = async (cli) => {
-  const { key, positionals, need, strings, lane, config } = cli;
+  const { key, positionals, need, strings, lane, config, deps } = cli;
   const target = await lane(key ?? die("checkpoint needs a lane key"));
   // parseArgs takes one value per flag; a second bare receipt would otherwise be dropped and its effect repeated later.
   const stray = positionals.slice(1);
@@ -211,7 +197,10 @@ const checkpoint: Command = async (cli) => {
     {
       step: need("step"),
       result: need("result"),
-      evidence: [need("evidence")],
+      evidence: [
+        need("evidence"),
+        ...(await new Artifacts(config, deps.registry).evidence(target.key, strings("artifact"))),
+      ],
       remoteEffects: strings("remote-effect"),
     },
     realClock.now(),

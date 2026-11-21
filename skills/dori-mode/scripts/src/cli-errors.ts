@@ -1,7 +1,11 @@
 import { die } from "./cli-context.ts";
 import { QueueError, TemplateError } from "./launch-errors.ts";
 
-export async function reportCommandError(error: unknown): Promise<never> {
+export async function reportCommandError(error: unknown, command: string): Promise<never> {
+  if (command === "schedule" || command === "scheduler") {
+    const { ScheduleError } = await import("./schedule-types.ts");
+    if (error instanceof ScheduleError) return die(error.message);
+  }
   const { LaunchError } = await import("./launch.ts");
   const { PolicyError } = await import("./lane-policy.ts");
   const { messengerErrors } = await import("./cli-messenger.ts");

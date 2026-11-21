@@ -2,12 +2,9 @@
 import { parseArgs } from "node:util";
 import { releaseVersion } from "../../../../src/release/version.ts";
 import type { Command } from "./cli-context.ts";
-import { USAGE } from "./cli-usage.ts";
 import type { FlowDeps } from "./done-flow.ts";
 const [command = "", ...rest] = process.argv.slice(2);
 const renderTablesUsage = "--render-tables requires dori send discord (with or without --edit)";
-// The harness grammar distinguishes a flag from message text and lock argv.
-// The sentinel lets it identify the unsupported flag even as the last token.
 if (
   rest.includes("--render-tables") &&
   (command === "--version" ||
@@ -59,6 +56,7 @@ if (command === "headless") process.exit(await (await import("./cli-headless.ts"
 if (command === "usage") process.exit(await (await import("./cli-usage-report.ts")).runUsageReport(command, rest));
 if (command === "quota") process.exit(await (await import("./cli-usage-report.ts")).runUsageReport(command, rest));
 const { die, makeCli } = await import("./cli-context.ts");
+const { invokeCommand, validateScheduleOptions } = await import("./cli-invoke.ts");
 const { ConfigError, loadConfig } = await import("./config.ts");
 const { Registry } = await import("./registry.ts");
 const { realClock, run } = await import("./run.ts");
@@ -86,6 +84,10 @@ const flags = parseArgs({
     cwd: { type: "string" },
     pane: { type: "string" },
     evidence: { type: "string" },
+    artifact: { type: "string", multiple: true },
+    sha256: { type: "string" },
+    receipt: { type: "string" },
+    public: { type: "boolean" },
     reason: { type: "string", multiple: true },
     note: { type: "string" },
     abandon: { type: "boolean" },
@@ -141,6 +143,12 @@ const flags = parseArgs({
     worklog: { type: "string" },
     "ignore-author": { type: "string", multiple: true },
     self: { type: "string" },
+    cron: { type: "string" },
+    tz: { type: "string" },
+    deliver: { type: "string" },
+    systemd: { type: "string" },
+    system: { type: "boolean" },
+    "ack-interrupted": { type: "boolean" },
   },
 });
 if (flags.values["activity-file"] !== undefined && command !== "inbound") die("--activity-file requires dori inbound");
@@ -214,6 +222,10 @@ switch (command) {
   case "transcribe":
     commands = (await import("./cli-messenger.ts")).messengerCommands;
     break;
+  case "artifact":
+  case "artifacts":
+    commands = (await import("./cli-artifacts.ts")).artifactCommands;
+    break;
   case "inbound-abandon":
     commands = { "inbound-abandon": (await import("./cli-discord-recovery.ts")).abandonDiscordInbound };
     break;
@@ -223,21 +235,16 @@ switch (command) {
   case "pr":
     commands = (await import("./cli-pr.ts")).prCommands;
     break;
+  case "schedule":
+  case "scheduler":
+    validateScheduleOptions(command, flags.tokens);
+    commands = (await import("./cli-schedule.ts")).scheduleCommands;
+    break;
   case "recall":
     commands = { recall: (await import("./cli-recall.ts")).recallCommand };
     break;
   case "voice":
     // Keep the opt-in voice graph out of unrelated command startup paths.
     commands = { voice: (await import("./cli-voice.ts")).voiceCommand };
-    break;
 }
-const handler = Object.hasOwn(commands, command) ? commands[command] : undefined;
-try {
-  if (!handler) {
-    console.log(USAGE);
-    process.exit(command ? 1 : 0);
-  }
-  await handler(makeCli(command, rest, flags, config, deps));
-} catch (e) {
-  await (await import("./cli-errors.ts")).reportCommandError(e);
-}
+await invokeCommand(makeCli(command, rest, flags, config, deps), commands);

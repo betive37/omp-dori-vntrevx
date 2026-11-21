@@ -8,6 +8,7 @@ import {
 } from "../../../../src/release/runtime.ts";
 import { freshnessError, type FreshnessPolicy } from "./freshness-policy.ts";
 import type { TerminalRuntimeKind } from "../../../../src/runtime/types.ts";
+import { type ArtifactRoot, parseArtifactRoots } from "./artifact-config.ts";
 import { repoIdentities } from "./config-identities.ts";
 import { type DoctorOptions, validDoctorOptions } from "./doctor-config.ts";
 import { type LaunchConfig, launchConfig } from "./launch-selection.ts";
@@ -41,6 +42,7 @@ export type DoriConfig = LaunchConfig & {
   readonly runtime?: TerminalRuntimeKind;
   readonly laneRuntime?: "headless" | "terminal"; // Opt in only for new lanes; lead and duty stay terminal.
   readonly stateDir: string;
+  readonly artifactRoots?: readonly ArtifactRoot[];
   readonly laneWorkspace: string;
   readonly workspaces: readonly string[];
   readonly ignorePanes: readonly string[];
@@ -204,6 +206,7 @@ export const loadConfig = async (path = configPath(), home = homedir(), env = pr
         ? resolveConsumerOmpCommand(command, { home })
         : command,
     stateDir: expandHome(env["DORI_STATE_DIR"] ?? merged.stateDir, home),
+    artifactRoots: parseArtifactRoots(raw.artifactRoots, (root) => expandHome(root, home), ConfigError),
     defaultCwd: expandHome(merged.defaultCwd, home),
     sessionsDir: expandHome(merged.sessionsDir, home),
     ompUlwPath: resolveConsumerOmpUlwPath(resolveProcessOmpUlwPath(expandHome(merged.ompUlwPath, home), home, env), {
