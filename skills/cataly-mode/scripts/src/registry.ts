@@ -76,7 +76,6 @@ export type Lane = {
   readonly reportProtocol?: "jsonl-v1" | undefined;
   readonly budget?: BudgetLimits;
   readonly activityPaths?: readonly string[];
-  /** The last supervision failure printed by `freshness`, so the same one is printed once. */
   readonly lastSupervisionError?: string | undefined;
   readonly receipt?: unknown;
   readonly modelSnapshot?: import("./lane-state.ts").ModelSnapshot;
@@ -84,10 +83,8 @@ export type Lane = {
   readonly modelSwitchRequest?: import("./model-switch-state.ts").ModelSwitchRequest;
 };
 
-/** Records written before runtimes existed name a herdr pane (and tab): the only runtime the skill spoke then. */
 const LEGACY_RUNTIME = "herdr" as const;
 
-/** A record as read: an older one gains `sessionRef` from its `pane`/`tab`; a newer one keeps what it stored. */
 export const upgradeLane = (lane: Lane): Lane =>
   lane.sessionRef || !lane.pane
     ? lane
