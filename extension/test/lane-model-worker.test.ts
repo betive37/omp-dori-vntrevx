@@ -1,3 +1,4 @@
+import type { AuthStorage } from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/session/auth-storage.d.ts";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
 import { rmSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -144,11 +145,13 @@ const workerRun = async (
   });
   const rootModel = thinking ? reasoningModel(ROOT_MODEL) : loopback.model(ROOT_MODEL);
   const childModel = thinking?.childEffort ? reasoningModel(CHILD_MODEL) : loopback.model(CHILD_MODEL);
+  let authStore: AuthStorage | undefined;
   let session: AgentSession | undefined;
   let holdFile: string | undefined;
   let controller: AbortController | undefined;
   try {
     const { auth, registry } = await loopbackRegistry(cwd, settings, [rootModel, childModel]);
+    authStore = auth;
     const manager = SessionManager.create(cwd, join(cwd, "sessions"));
     manager.appendCustomEntry("omp-cataly:role", "lane");
     if (pinned) {
@@ -296,6 +299,7 @@ const workerRun = async (
     controller?.abort();
     if (holdFile) rmSync(holdFile, { force: true });
     await session?.dispose();
+    authStore?.close();
     settings.stopWatching();
     await settings.flush();
   }

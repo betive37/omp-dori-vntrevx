@@ -1,3 +1,4 @@
+import type { AuthStorage } from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/session/auth-storage.d.ts";
 import { rm } from "node:fs/promises";
 import { expect, test } from "bun:test";
 import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
@@ -127,12 +128,14 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
       configFiles: [createModelProfileFile(stateDir)],
       overrides: { ...NATIVE_FIXTURE_OVERRIDES },
     });
+    const authStores: AuthStorage[] = [];
     let resumeSettings: NativeConfig.Settings | undefined;
     try {
       // 1. A fresh guarded lane launch on auto. Native writes no thinking entry (sdk.ts skips auto's initial record;
       //    model-controls records only a changed resolution, and the ultrathink turn keeps the provisional effort).
       //    Dori may record the selection itself; resume below must keep the snapshot either way.
       const { auth, registry } = await loopbackRegistry(cwd, launchSettings, models);
+      authStores.push(auth);
       const launchManager = SessionManager.create(cwd, join(cwd, "sessions"));
       ({ session: launched } = await createAgentSession({
         ...shared,
@@ -211,6 +214,7 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
       const resumeStore = join(home, "resume-process");
       mkdirSync(resumeStore, { recursive: true });
       const fresh = await loopbackRegistry(resumeStore, resumeSettings, models);
+      authStores.push(fresh.auth);
       const resumeManager = await SessionManager.open(sessionFile, undefined, undefined, { throwIfMissing: true });
       ({ session: resumed } = await createAgentSession({
         ...shared,
@@ -239,6 +243,7 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
     } finally {
       await launched?.dispose();
       await resumed?.dispose();
+      for (const auth of authStores) auth.close();
       launchSettings.stopWatching();
       await launchSettings.flush();
       resumeSettings?.stopWatching();

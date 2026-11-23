@@ -134,7 +134,7 @@ export async function requiredSourceRequest(
       cwd,
       agentDir: join(cwd, "agent"),
       sessionManager: manager,
-      agentId: `required-source-${manager.getSessionId()}`,
+      ...(profile ? {} : { agentId: `required-source-${manager.getSessionId()}` }),
       authStorage: auth,
       modelRegistry: registry,
       model,
