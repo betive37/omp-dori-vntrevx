@@ -1,12 +1,5 @@
 import { type Lane, type Registry, LANE_KEY, RESERVED_LANE_KEY } from "./registry.ts";
-import { exactModelIdentity, type ModelSnapshot, type PaneState } from "./lane-state.ts";
-
-/** A lane's pinned native model: its snapshot, process profile overlay and the head's one pending switch request. */
-export type LaneModelPin = {
-  readonly modelSnapshot?: ModelSnapshot;
-  readonly modelProfileFile?: string;
-  readonly modelSwitchRequest?: ModelSwitchRequest;
-};
+import { exactModelIdentity, type PaneState } from "./lane-state.ts";
 
 export type ModelSwitchResult = { readonly code: 0 | 2 | 3; readonly lines: readonly string[] };
 
