@@ -12,19 +12,15 @@ import { checkPriority } from "./lock-queue.ts";
 import { acquire, release } from "./loop-lock.ts";
 import { applyEvidence, blockerOf, waitingSinceOf, waitingTarget } from "./progress.ts";
 import { refText } from "./refs.ts";
+import { headSha } from "./gate.ts";
+import { bindCiWait } from "./wait-ci.ts";
+import { bindNativeWait, observeWait, parseWait, renderWait, type Wait } from "./wait.ts";
 import { groupId } from "./runtime/group.ts";
 import { HeadlessRuntime } from "./runtime/headless.ts";
 import { openSession } from "./runtime/types.ts";
 import { sameLaneRegistration } from "./store-lanes.ts";
 import { KEY_RE, reservedKey, type Lane } from "./store-types.ts";
-
-/**
- * The lead's `evidence:` line: each reference is the lane's own input, so a line break or escape in it stays out; the
- * spaces inside one stay, so it names the file the lane gave.
- */
 const evidenceLine = (evidence: readonly string[]): string => `evidence: ${evidence.map(oneName).join(" ")}`;
-
-/** Activation succeeded; only the lead's notification failed. */
 export class LaneStartNoticeFailure extends Refusal {
   constructor(
     readonly lane: Lane,
@@ -34,7 +30,6 @@ export class LaneStartNoticeFailure extends Refusal {
     super(`${lane.key} started in ${refText(lane.sessionRef)} but the lead was not told: ${why}`, { cause });
   }
 }
-
 export async function startLane(
   d: Deps,
   key: string,
@@ -54,7 +49,6 @@ export async function startLane(
     release(d, held.nonce, lock);
   }
 }
-
 async function startAdmitted(
   d: Deps,
   key: string,
@@ -73,10 +67,6 @@ async function startAdmitted(
   const briefPath = d.store.briefPath(key);
   const footer = prompt("lane-footer.md", { key, cataly: d.catalyCmd });
   await Bun.write(briefPath, `${readFileSync(briefFile, "utf8").trimEnd()}\n\n${footer}`);
-
-  // The group is the caller's own when it runs in a session of the selected runtime (a lane opened from the lead's
-  // workspace stays there); otherwise herdr gets a new "cataly" workspace, tern a session named "cataly", and hc and
-  // native lanes this home's group label.
   const self = d.runtimes.selfAny(process.env);
   const group =
     opts.group ??
@@ -89,7 +79,6 @@ async function startAdmitted(
     rt.kind === "headless"
       ? await rt.create(spec)
       : await openSession(rt, spec, `${agentCommand(d, "lane")} ${shq(kickoff)}`);
-
   const now = d.now();
   const reservation: Lane = {
     key,
@@ -121,14 +110,11 @@ async function startAdmitted(
   d.usage.record({ name: "cataly.lane_started", open_lanes: Math.min(open, 1000) });
   return lane;
 }
-
 function openLane(lane: Lane | undefined, key: string): Lane {
   if (!lane) throw new Refusal(`no lane ${key}`);
   if (lane.status === "done" || lane.status === "lost") throw new Refusal(`lane ${key} is ${lane.status}`);
   return lane;
 }
-
-/** Sets an open lane's priority (1 first, 9 last); the next lock it waits for queues it by that. */
 export function setPriority(d: Deps, key: string, priority: number): Lane {
   return d.store.updateLane(key, (current) => {
     const lane = openLane(current, key);
@@ -136,13 +122,6 @@ export function setPriority(d: Deps, key: string, priority: number): Lane {
     return lane;
   });
 }
-
-/**
- * Logs a lane's report and tells the lead. Only new evidence moves the progress clock and clears the nudge count; the
- * returned lines say whether it did. `sent` is the delivery to the lead. `--status waiting` records what the lane waits
- * on (`waitingFor`; else the target it already named; else the blocker in the text) and since when; `--status working`
- * clears both.
- */
 export async function report(
   d: Deps,
   key: string,
@@ -150,15 +129,46 @@ export async function report(
   opts: { status?: "working" | "waiting"; evidence?: readonly string[]; waitingFor?: string } = {},
 ): Promise<{ sent: SendResult | undefined; progress: string[] }> {
   if (opts.waitingFor !== undefined && opts.status !== "waiting") throw new Refusal("--for needs --status waiting");
+  const listed = openLane(d.store.lane(key), key);
+  const request = opts.waitingFor === undefined ? undefined : parseWait(opts.waitingFor);
+  const previous = listed.status === "waiting" ? listed.wait : undefined;
+  let wait: Wait | undefined;
+  if (request?.kind === "ci") {
+    wait = await bindCiWait(
+      request,
+      () => headSha(d, { repo: request.repo, number: request.number, id: `${request.repo}#${request.number}` }),
+      async (endpoint) => {
+        const result = await d.exec("gh", ["api", "--method", "GET", endpoint]);
+        if (result.code !== 0) throw new Refusal(`CI observation failed: ${(result.stderr || result.stdout).trim()}`);
+        return JSON.parse(result.stdout);
+      },
+      d.now,
+      previous,
+    );
+  } else if (request) {
+    const probe =
+      request.kind === "label" ? undefined : await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef);
+    wait = bindNativeWait(request, probe, d.now(), previous);
+  } else if (previous && opts.status !== "working") {
+    wait =
+      previous.target.kind === "job" || previous.target.kind === "approval"
+        ? observeWait(previous, await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef))
+        : previous;
+  }
   const now = d.now();
   const evidence = opts.evidence ?? [];
   let progress: string[] = [];
   const updated = d.store.updateLane(key, (current) => {
     const lane = openLane(current, key);
-    // A lane already waiting keeps its start and target. Read them before this report touches the record: a legacy
-    // record infers them from progress and the last report, and new evidence or text would otherwise move them.
+    if (
+      !sameLaneRegistration(listed, lane) ||
+      lane.status !== listed.status ||
+      lane.log.length !== listed.log.length ||
+      lane.progressEpoch !== listed.progressEpoch ||
+      JSON.stringify(lane.wait) !== JSON.stringify(listed.wait)
+    )
+      throw new Refusal("lane changed while observing its wait; report again");
     const still = lane.status === "waiting" ? { since: waitingSinceOf(lane), target: waitingTarget(lane) } : undefined;
-    // A legacy progress clock falls back to the last report; don't count the report being judged.
     progress = applyEvidence(lane, evidence, now);
     lane.log.push({
       at: now,
@@ -167,10 +177,13 @@ export async function report(
     });
     lane.lastActivityAt = now;
     if (opts.status === "waiting" || (still && opts.status === undefined)) {
-      // Waiting is not progress. Store the target on one line, with printable spaces inside its name.
       lane.waitingSince = still?.since ?? now;
       lane.waitingFor = oneName(opts.waitingFor ?? "").trim() || still?.target || blockerOf(text);
+      lane.wait =
+        wait ?? bindNativeWait({ kind: "label", text: lane.waitingFor }, undefined, now, still ? lane.wait : undefined);
+      if (lane.wait.target.kind !== "label") progress.push(`WAIT ${renderWait(lane.wait)}`);
     } else if (opts.status === "working") {
+      delete lane.wait;
       delete lane.waitingFor;
       delete lane.waitingSince;
     }
@@ -179,10 +192,13 @@ export async function report(
   });
   void runHook(d, "onReport", { key, text, evidence: evidence.join(" ") });
   const head = `[REPORT ${key}${updated.status === "waiting" ? " WAITING" : ""}]`;
-  const tail = evidence.length ? `\n${evidenceLine(evidence)}` : "";
+  const tail =
+    (evidence.length ? `\n${evidenceLine(evidence)}` : "") +
+    (updated.status === "waiting" && updated.wait && updated.wait.target.kind !== "label"
+      ? `\nWAIT ${renderWait(updated.wait)}`
+      : "");
   return { sent: await settled(tellLead(d, `${head} ${text}${tail}`, key)), progress };
 }
-
 export async function ready(
   d: Deps,
   key: string,
@@ -213,7 +229,6 @@ export async function ready(
   });
   return sent;
 }
-
 export async function done(d: Deps, key: string): Promise<void> {
   const lane = d.store.lane(key);
   if (!lane) throw new Refusal(`no lane ${key}`);

@@ -9,6 +9,7 @@ import { payLead } from "./inbox-forward.ts";
 import { underInboxLock } from "./duty-inbox.ts";
 import { Refusal } from "./refusal.ts";
 import { refText } from "./refs.ts";
+import { observeWait, renderWait, waitEnded, waitKey } from "./wait.ts";
 import { escalation, progressOf, stalled, waitingOn, waitingSinceOf, waitingTarget } from "./progress.ts";
 import type { SessionRef } from "./runtime/types.ts";
 import { sameLaneRegistration } from "./store-lanes.ts";
@@ -104,7 +105,6 @@ function payOwed(d: Deps): void {
 
 /** One proactive pass: flush inboxes of panes that became idle, nudge silent lanes, escalate, detect lost panes. */
 export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
-  // Kill switch: a stopped duty loop delivers, nudges and escalates nothing. Queued messages wait for the resume.
   const stop = d.store.stop("duty");
   if (stop) return [{ action: "stopped", detail: stop.reason }];
   const events: DutyEvent[] = [];
@@ -113,7 +113,6 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
     const paneId = refText(ref);
     try {
       const result = await flushInbox(d, ref);
-      // flushInbox follows the migration redirects; the counts are read where the entries live now.
       const at = d.store.destination(ref);
       if (result === "delivered") events.push({ pane: paneId, action: "flushed" });
       if (result === "no-agent") {
@@ -123,12 +122,10 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
           detail: `no agent in front; ${d.store.queued(at).length} message(s) kept`,
         });
       }
-      // Held after an ambiguous delivery (#89): shown on every pass, resent never; the lead was told once.
       const held = d.store.queued(at).filter((m) => m.attempt?.state === "ambiguous").length;
       if (held > 0)
         events.push({ pane: paneId, action: "delivery-ambiguous", detail: `${held} message(s) held, not resent` });
     } catch (e) {
-      // One pane's failed delivery must never kill the loop for every other pane and lane.
       if (e instanceof Refusal) events.push({ pane: paneId, action: "inbox-target-gone" });
       else if (e instanceof DeliveryUncertain && !e.typed)
         events.push({ pane: paneId, action: "delivery-ambiguous", detail: failureDetail(e) });
@@ -138,13 +135,30 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
   for (const listed of d.store.lanes()) {
     if (!watched(listed)) continue;
     try {
-      const { status: st } = await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef);
-      // Re-read under the writer lock: a report, READY or native transcript may have landed during the probe.
+      const probe = await d.runtimes.for(listed.sessionRef).probe(listed.sessionRef);
+      const st = probe.status;
       const notice = d.store.withCurrentLane<SessionRef | Nudge | undefined>(listed.key, (lane, save) => {
         if (!lane || !watched(lane) || !sameLaneRegistration(listed, lane)) return;
         const now = d.now();
+        if (
+          lane.wait &&
+          listed.wait &&
+          waitKey(lane.wait.target) === waitKey(listed.wait.target) &&
+          lane.wait.startedAt === listed.wait.startedAt
+        ) {
+          const observed = observeWait(lane.wait, probe);
+          if (JSON.stringify(observed) !== JSON.stringify(lane.wait)) {
+            if (waitEnded(observed) && !waitEnded(lane.wait))
+              events.push({
+                lane: lane.key,
+                action: "wait-ended",
+                detail: `${renderWait(observed)}; lane state and progress unchanged`,
+              });
+            lane.wait = observed;
+            save(lane);
+          }
+        }
         if (st === "gone") {
-          // The notice is queued first, under a fixed id, so a pass cut short before the save won't queue it twice.
           const leadRef = d.store.roles().lead;
           const queued = queueLost(d, lane, now, save);
           lane.status = "lost";
@@ -163,7 +177,6 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
           lane.lastActivityAt = now;
           save(lane);
         }
-        // Even a busy or waiting lane can stall. Queue its notice under the fixed id before recording escalation.
         if (stalled(lane, now)) {
           const lead = () => d.store.roles().lead;
           if (!lead()) {
@@ -185,10 +198,8 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
           events.push({ lane: lane.key, action: "escalated" });
           return told;
         }
-        // Older binaries could retain a prior epoch's marker; only this epoch's queued alert ends nudges.
         if (lane.escalatedAt !== undefined && lane.escalatedAt > progressOf(lane)) return;
         if (st === "working" || st === "blocked" || st === "error") return;
-        // Any report or a working pane restarts the quiet time, but only progress resets the nudge count.
         const quietMin = (now - Math.max(progressOf(lane), lane.lastActivityAt)) / 60_000;
         const due = NUDGE_MINUTES[lane.nudges];
         if (due === undefined || quietMin < due) return;
@@ -205,7 +216,6 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
             ? { target: "", wholeTarget: indented(whole).join("\n"), waitingSince: hhmm(waitingSinceOf(lane)) }
             : {}),
         };
-        // Fit the target beside the key, and keep the full target in the body even with an older template.
         const name = waiting ? "nudge-waiting.md" : "nudge.md";
         const template = readFileSync(promptFile(name), "utf8");
         const room = waiting ? WIDTH - Bun.stringWidth(fill(template, vars).split("\n")[0]!) : 0;
@@ -219,7 +229,6 @@ export async function dutyTick(d: Deps): Promise<DutyEvent[]> {
       const queued = notice && ("text" in notice ? queueNudge(d, notice, events) : notice);
       if (queued) await flushInbox(d, queued);
     } catch (e) {
-      // One lane's failed status read or delivery must not end the loop for the other lanes.
       events.push({ lane: listed.key, action: "lane-failed", detail: failureDetail(e) });
     }
   }

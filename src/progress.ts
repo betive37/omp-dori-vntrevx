@@ -5,6 +5,7 @@ import { statSync } from "node:fs";
 import { resolve } from "node:path";
 import { ageText, fitEnd, fitStart, hhmm, indented, oneName } from "./fit.ts";
 import type { Lane } from "./store-types.ts";
+import { renderWait } from "./wait.ts";
 
 /** Minutes without progress before the duty loop tells the lead, once per stall. */
 export const ESCALATE_MINUTES = 40;
@@ -94,7 +95,9 @@ export const blockerOf = (text: string): string =>
  * stored one-line, and one stored before that is made so here.
  */
 export const waitingTarget = (lane: Lane): string =>
-  oneName(lane.waitingFor ?? blockerOf(lane.log.findLast((e) => e.kind === "report")?.text ?? "?")).trim() || "?";
+  lane.wait && lane.wait.target.kind !== "label"
+    ? renderWait(lane.wait)
+    : oneName(lane.waitingFor ?? blockerOf(lane.log.findLast((e) => e.kind === "report")?.text ?? "?")).trim() || "?";
 
 /** What a waiting lane waits on, cut to 40 columns, or to `cols` when a line leaves it fewer. */
 export const waitingOn = (lane: Lane, cols = 40): string => fitEnd(waitingTarget(lane), Math.min(40, cols));

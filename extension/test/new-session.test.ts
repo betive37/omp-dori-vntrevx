@@ -59,15 +59,19 @@ afterEach(async () => {
     const beforeShutdown = readPaneState(stateDir, PANE);
     for (const pi of sessions.splice(0)) await pi.emit("session_shutdown");
     await until(() => [...pids].every((pid) => !alive(pid)));
-    if (beforeShutdown)
-      expect(readPaneState(stateDir, PANE)).toMatchObject({
-        ...beforeShutdown,
+    if (beforeShutdown) {
+      // The tombstone keeps the session's identity, never the live process's native observation.
+      const { native: _native, ...kept } = beforeShutdown;
+      const retired = readPaneState(stateDir, PANE);
+      expect(retired).toMatchObject({
+        ...kept,
         pid: 0,
         agentStatus: "idle",
         approvalPending: false,
         updatedAt: expect.any(String),
       });
-    else expect(readPaneState(stateDir, PANE)).toBeNull();
+      expect(retired).not.toHaveProperty("native");
+    } else expect(readPaneState(stateDir, PANE)).toBeNull();
   } finally {
     pids.clear();
     for (const [key, value] of previousEnv) {
@@ -86,7 +90,13 @@ test("a new lane carries only its role and resets goal, approvals and working st
   const pi = await load({ session: started, flags: { "cataly-role": "lane" } });
   sessions.push(pi);
   await pi.emit("session_start");
-  await pi.emit("tool_approval_requested", { toolCallId: "old-approval" });
+  await pi.emit("tool_approval_requested", {
+    type: "tool_approval_requested",
+    sessionId: started.id,
+    toolName: "bash",
+    approvalMode: "always-ask",
+    toolCallId: "old-approval",
+  });
   await pi.emit("agent_start");
   expect(readPaneState(stateDir, PANE)).toMatchObject({
     goal: { status: "active", objective: "old objective" },
@@ -111,7 +121,13 @@ test("a new lane carries only its role and resets goal, approvals and working st
     systemPrompt: ["base prompt", ROLE_INVARIANTS.lane, "<fake-ulw-policy>"],
   });
   await expect(run(pi, { op: "list" })).rejects.toThrow("monitor works only in the Cataly session");
-  await pi.emit("tool_approval_resolved", { toolCallId: "old-approval" });
+  await pi.emit("tool_approval_resolved", {
+    type: "tool_approval_resolved",
+    sessionId: started.id,
+    toolName: "bash",
+    toolCallId: "old-approval",
+    approved: false,
+  });
   expect(readPaneState(stateDir, PANE)?.approvalPending).toBe(false);
 });
 
@@ -137,7 +153,13 @@ test.each([
   expect(readPaneState(stateDir, PANE)).toBeNull();
   expect(await pi.emit("before_agent_start", agentStart)).toEqual([undefined]);
   await expect(run(pi, { op: "list" })).rejects.toThrow("monitor works only in the Cataly session");
-  await pi.emit("tool_approval_requested", { toolCallId: "plain-approval" });
+  await pi.emit("tool_approval_requested", {
+    type: "tool_approval_requested",
+    sessionId: plain.id,
+    toolName: "bash",
+    approvalMode: "always-ask",
+    toolCallId: "plain-approval",
+  });
   expect(readPaneState(stateDir, PANE)).toBeNull();
 
   // The original process flag cannot reactivate a role after an ordinary resume, fork or tree move cleared it.
@@ -244,7 +266,13 @@ posix.each([false, true])("rejected bootstrap cannot seed a new session (recorde
   await pi.emit("session_tree");
   await pi.emit("session_branch");
   await pi.emit("agent_start");
-  await pi.emit("tool_approval_requested", { toolCallId: "rejected-approval" });
+  await pi.emit("tool_approval_requested", {
+    type: "tool_approval_requested",
+    sessionId: started.id,
+    toolName: "bash",
+    approvalMode: "always-ask",
+    toolCallId: "rejected-approval",
+  });
   expect(readPaneState(stateDir, PANE)).toBeNull();
   await expect(run(pi, { op: "list" })).rejects.toThrow("monitor works only in the Cataly session");
 

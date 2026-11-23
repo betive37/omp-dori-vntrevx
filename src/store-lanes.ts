@@ -3,6 +3,7 @@ import { homedir } from "node:os";
 import { join } from "node:path";
 import { alive } from "../skills/cataly-mode/scripts/src/checkpoint-lock.ts";
 import { takeFile } from "./lock-claim.ts";
+import { readWait } from "./wait.ts";
 import { Refusal } from "./refusal.ts";
 import { sameSession } from "./refs.ts";
 import type { SessionRef } from "./runtime/types.ts";
@@ -11,10 +12,15 @@ import type { Lane } from "./store-types.ts";
 /** A lane file as any binary wrote it: one from before runtimes existed has no `sessionRef`. */
 type StoredLane = Omit<Lane, "sessionRef"> & { sessionRef?: SessionRef };
 
-const upgrade = (raw: StoredLane): Lane =>
-  raw.sessionRef !== undefined
-    ? (raw as Lane)
-    : { ...raw, sessionRef: { runtime: "herdr", id: raw.paneId, ...(raw.tabId ? { container: raw.tabId } : {}) } };
+const upgrade = (raw: StoredLane): Lane => {
+  const { wait: saved, ...rest } = raw;
+  const wait = readWait(saved);
+  return {
+    ...rest,
+    sessionRef: raw.sessionRef ?? { runtime: "herdr", id: raw.paneId, ...(raw.tabId ? { container: raw.tabId } : {}) },
+    ...(wait ? { wait } : {}),
+  };
+};
 
 export const rootStoreHome = (): string => process.env["CATALY_HOME"] ?? join(homedir(), ".cataly");
 

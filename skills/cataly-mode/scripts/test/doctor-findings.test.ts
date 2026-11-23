@@ -86,9 +86,8 @@ test("doctor accepts bare readiness lines and payload-bearing monitor events", a
     state.done();
   }
 });
-
 const defaultFreshnessFilter =
-  "^(?:(?:BLOCKED|WARNING) \\S+ (?:wallMinutes|tokens|costUsd) ceiling (?:reached \\(\\d+\\)|cannot be checked: usage unavailable)$|(?:NUDGED|HELD|DELIVERY-ERROR|POSTED|POST-FAILED|NO-REPORT|PENDING-REPORT|STALE-REPORT|STALLED|JOURNAL-ERROR|WORKING-WHILE-PAUSED|SUPERVISION-ERROR|WARN)\\b)";
+  "^(?:(?:BLOCKED|WARNING) \\S+ (?:wallMinutes|tokens|costUsd) ceiling (?:reached \\(\\d+\\)|cannot be checked: usage unavailable)$|(?:NUDGED|HELD|DELIVERY-ERROR|POSTED|POST-FAILED|NO-REPORT|PENDING-REPORT|STALE-REPORT|STALLED|WAIT-ENDED|JOURNAL-ERROR|WORKING-WHILE-PAUSED|SUPERVISION-ERROR|WARN)\\b)";
 
 const freshnessFilterCases: ReadonlyArray<{
   readonly name: string;

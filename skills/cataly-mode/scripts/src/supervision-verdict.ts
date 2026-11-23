@@ -174,70 +174,77 @@ export const judgeSweep = async (
     journal = journals(deps, lane, tag, sampled);
     if (journal.progress?.state === "blocked" && (sampled || !previousHung)) heldHung = false;
   };
-  const freshAlerts = alerts().filter(
-    ({ kind, detail }) =>
-      !previous?.alerts.includes(detail) && (kind !== "stalled" || journal.progress?.state !== "blocked"),
-  );
-  reconcile();
-  const settle = (undelivered: ReadonlyMap<string, string>) => {
+  const locked = async <T>(action: () => T): Promise<T> =>
+    deps.registry ? deps.registry.withCurrent(lane.key, action) : action();
+  const freshAlerts = await locked(() => {
     journal = journals(deps, lane, tag, sampled);
-    if (sampled && journal.evidence.signature !== initialEvidence.signature) {
-      advanced = true;
-      activeAt = deps.clock.now();
-      heldHung = false;
-    }
+    const fresh = alerts().filter(
+      ({ kind, detail }) =>
+        !previous?.alerts.includes(detail) && (kind !== "stalled" || journal.progress?.state !== "blocked"),
+    );
     reconcile();
-    evidenceUncommitted &&= novelEvidence(journal.records, refs).length > 0;
-    const lastReportAt = journal.progress?.lastReport?.at ?? null;
-    const lastEvidenceAt = journal.evidence.lastEvidenceAt;
-    const evidenceError = read.evidenceError ?? (!sampled ? previous?.evidenceError : undefined);
-    const uncertainty = evidenceError === undefined ? {} : { evidenceError };
-    const timer = sampled
-      ? { at: now, timer: read.timer?.seconds ?? null, timerKind: read.timer?.kind ?? null }
-      : { at: previous?.at ?? now, timer: previous?.timer ?? null, timerKind: previous?.timerKind ?? null };
-    const incidental = { ...previous?.incidental };
-    for (const { ref, fingerprint } of read.observed) if (incidental[ref] !== fingerprint) delete incidental[ref];
-    const alertsSent = alerts()
-      .filter(({ detail }) => !undelivered.has(detail))
-      .map(({ detail }) => detail);
-    const observation: Observation =
-      !sampled && previous
-        ? {
-            ...previous,
-            ...(coverage === undefined ? {} : { coverage }),
-            ...uncertainty,
-            alerts: alertsSent,
-          }
-        : {
-            openedAt: lane.openedAt,
-            ...tag,
-            ...timer,
-            activity: sampled ? journal.evidence.signature : null,
-            ...(sampled ? { files: read.files } : {}),
-            ...(coverage === undefined ? {} : { coverage: { ...coverage, changed: coverage.changed || advanced } }),
-            ...(Object.keys(incidental).length ? { incidental } : {}),
-            activeAt,
-            hung: heldHung,
-            lastReportAt,
-            lastEvidenceAt,
-            ...uncertainty,
-            alerts: alertsSent,
-          };
-    const result: SupervisionResult = {
-      enabled: true,
-      state: journal.progress?.state ?? "running",
-      alerts: freshAlerts.map(({ detail }) => detail),
-      alertEvents: freshAlerts,
-      usage,
-      hung: provedHung && heldHung,
-      heldHung: heldHung && journal.progress?.state === "stalled",
-      coverageComplete: complete && !evidenceUncommitted,
-      lastReportAt,
-      lastEvidenceAt,
-      ...uncertainty,
-      ...(!sampled || evidenceError !== undefined || evidenceUncommitted ? { observationIncomplete: true } : {}),
-    };
-    return { observation, result };
-  };
+    return fresh;
+  });
+  const settle = async (undelivered: ReadonlyMap<string, string>) =>
+    locked(() => {
+      journal = journals(deps, lane, tag, sampled);
+      if (sampled && journal.evidence.signature !== initialEvidence.signature) {
+        advanced = true;
+        activeAt = deps.clock.now();
+        heldHung = false;
+      }
+      reconcile();
+      evidenceUncommitted &&= novelEvidence(journal.records, refs).length > 0;
+      const lastReportAt = journal.progress?.lastReport?.at ?? null;
+      const lastEvidenceAt = journal.evidence.lastEvidenceAt;
+      const evidenceError = read.evidenceError ?? (!sampled ? previous?.evidenceError : undefined);
+      const uncertainty = evidenceError === undefined ? {} : { evidenceError };
+      const timer = sampled
+        ? { at: now, timer: read.timer?.seconds ?? null, timerKind: read.timer?.kind ?? null }
+        : { at: previous?.at ?? now, timer: previous?.timer ?? null, timerKind: previous?.timerKind ?? null };
+      const incidental = { ...previous?.incidental };
+      for (const { ref, fingerprint } of read.observed) if (incidental[ref] !== fingerprint) delete incidental[ref];
+      const alertsSent = alerts()
+        .filter(({ detail }) => !undelivered.has(detail))
+        .map(({ detail }) => detail);
+      const observation: Observation =
+        !sampled && previous
+          ? {
+              ...previous,
+              ...(coverage === undefined ? {} : { coverage }),
+              ...uncertainty,
+              alerts: alertsSent,
+            }
+          : {
+              openedAt: lane.openedAt,
+              ...tag,
+              ...timer,
+              activity: sampled ? journal.evidence.signature : null,
+              ...(sampled ? { files: read.files } : {}),
+              ...(coverage === undefined ? {} : { coverage: { ...coverage, changed: coverage.changed || advanced } }),
+              ...(Object.keys(incidental).length ? { incidental } : {}),
+              activeAt,
+              hung: heldHung,
+              lastReportAt,
+              lastEvidenceAt,
+              ...uncertainty,
+              alerts: alertsSent,
+            };
+      const result: SupervisionResult = {
+        enabled: true,
+        state: journal.progress?.state ?? "running",
+        alerts: freshAlerts.map(({ detail }) => detail),
+        alertEvents: freshAlerts,
+        usage,
+        hung: provedHung && heldHung,
+        heldHung: heldHung && journal.progress?.state === "stalled",
+        coverageComplete: complete && !evidenceUncommitted,
+        lastReportAt,
+        lastEvidenceAt,
+        ...uncertainty,
+        ...(!sampled || evidenceError !== undefined || evidenceUncommitted ? { observationIncomplete: true } : {}),
+      };
+      return { observation, result };
+    });
   return { freshAlerts, settle };
 };

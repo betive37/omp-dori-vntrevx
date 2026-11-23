@@ -3,6 +3,7 @@ import { type HeadlessObservation, HeadlessRuntime } from "../../../../src/runti
 
 import { withDeliveryLock } from "./delivery-lock.ts";
 import type { FlowDeps } from "./done-flow.ts";
+import { checkWaiting } from "./freshness-wait.ts";
 import { notifyFreshness, rememberFreshness, sampleLegacyReport } from "./freshness-notify.ts";
 import { checkPausedLane } from "./pause.ts";
 import { type Lane, sameLaneGeneration, sessionOf, statusOf } from "./registry.ts";
@@ -29,6 +30,7 @@ export type SweepAct = {
     | "stalled"
     | "journal-error"
     | "blocked"
+    | "wait-ended"
     | "warning"
     | "supervision-error";
   readonly lane: string;
@@ -202,6 +204,8 @@ export const freshnessTick = async (deps: FlowDeps, home: string): Promise<Sweep
         await journalProblem(deps, current, acts, error);
         return;
       }
+      const waitAct = await checkWaiting(deps, lane, progress);
+      if (waitAct) acts.push(waitAct);
       if (progress?.state === "stalled") {
         // A held evidence stall keeps its own alert, but its durable report still reaches the thread.
         if (!incompleteSample && previous?.state !== "stalled" && !supervisedHung) {

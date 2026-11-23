@@ -1,6 +1,7 @@
+import { rm } from "node:fs/promises";
 import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type * as NativeConfig from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/config/settings.d.ts";
 import {
@@ -65,6 +66,7 @@ const world = async (runtime: "herdr" | "tern" = "herdr") => {
       model: A,
       catalog: [A, B],
       thinkingLevel: "low",
+      asyncJobs: { running: [], recent: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } },
       flags: { "cataly-role": "lane", "cataly-launch-model": "fixture/a" },
       ...patch,
     };
@@ -87,7 +89,7 @@ const world = async (runtime: "herdr" | "tern" = "herdr") => {
       if (before[i] === undefined) delete process.env[key];
       else process.env[key] = before[i];
     });
-    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   const request = async (selector: string, target = state()): Promise<ModelSwitchRequest> => {
     if (!target.sessionFile) throw new Error("fixture needs a session file");
@@ -548,11 +550,17 @@ for (const [name, patch] of [
   ["queued message", { pendingMessages: true }],
   [
     "running async job",
-    { asyncJobs: { running: [{}], delivery: { queued: 0, delivering: false, pendingJobIds: [] } } },
+    {
+      asyncJobs: {
+        running: [{ id: "busy", startTime: 1, status: "running" as const, type: "bash", label: "busy" }],
+        recent: [],
+        delivery: { queued: 0, delivering: false, pendingJobIds: [] },
+      },
+    },
   ],
   [
     "pending async delivery",
-    { asyncJobs: { running: [], delivery: { queued: 1, delivering: false, pendingJobIds: ["job"] } } },
+    { asyncJobs: { running: [], recent: [], delivery: { queued: 1, delivering: false, pendingJobIds: ["job"] } } },
   ],
   ["descendant work", { descendantJobs: [{}] }],
   ["unknown async state", { asyncJobs: null }],

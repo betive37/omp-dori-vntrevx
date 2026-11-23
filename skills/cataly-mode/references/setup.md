@@ -135,7 +135,7 @@ Set `CATALY_HOME` to the actual installation before starting its lead. The monit
 | done flow | `cataly watch` | `^LANE_` |
 | dead panes | `cataly dead-panes --loop 3` | `^(DEAD_PANE\|UNRECOGNISED_PANE\|WARN)` |
 | host guard | `cataly guard --loop 1` | `^(HOST_GUARD\|WARN)` |
-| freshness | `cataly freshness --loop 5` | `^(NUDGED\|HELD\|DELIVERY-ERROR\|NUDGE-FAILED\|POSTED\|POST-FAILED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT\|UNRELAYED\|STALLED\|JOURNAL-ERROR\|WORKING-WHILE-PAUSED\|BLOCKED\|WARNING\|SUPERVISION-ERROR\|WARN)` |
+| freshness | `cataly freshness --loop 5` | `^(NUDGED\|WAIT-ENDED\|HELD\|DELIVERY-ERROR\|NUDGE-FAILED\|POSTED\|POST-FAILED\|NO-REPORT\|PENDING-REPORT\|STALE-REPORT\|UNRELAYED\|STALLED\|JOURNAL-ERROR\|WORKING-WHILE-PAUSED\|BLOCKED\|WARNING\|SUPERVISION-ERROR\|WARN)` |
 | PR follow-up (opt-in, needs `gh` auth) | `cataly pr watch --loop 3` | `^(PR_(FEEDBACK\|CI_FAIL\|HEAD_MOVED\|MERGED\|CLOSED\|REOPENED\|WATCH_WARN)\|WARN)` |
 | Slack inbound (Slack only) | `cataly inbound slack --loop 1` | `^INBOUND` |
 | Telegram inbound (Telegram only) | `CATALY_TELEGRAM_TOKEN=… CATALY_TELEGRAM_OWNER_ID=… cataly inbound telegram --loop 1` | `^INBOUND` |

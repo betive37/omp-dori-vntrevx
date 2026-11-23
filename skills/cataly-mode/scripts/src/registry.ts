@@ -69,6 +69,7 @@ export type Lane = {
   /** The last held-back freshness outcome, so a quiet lane logs each state change once, not every tick. */
   readonly lastFreshnessNote?: string | undefined;
   readonly lastNativeHold?: string | undefined;
+  readonly lastWaitNotice?: string | undefined; // Advisory wait outcome, separate from thread posting notes.
   /** A paused lane whose pane read working on the previous freshness tick (two in a row is reported, never a resume). */
   readonly pausedSeenWorking?: boolean | undefined;
   /** The status a paused lane had before it was paused; `resume` restores it. */
@@ -109,6 +110,12 @@ export const sameLaneGeneration = (seen: Lane, current: Lane): boolean =>
   seen.lifecycleEpoch === current.lifecycleEpoch &&
   (seen.history?.length ?? 0) === (current.history?.length ?? 0) &&
   statusOf(seen) === statusOf(current);
+/**
+ * The lane's status generation: every status change (a claim, objection, verification, pause, resume or close) goes
+ * through `withStatus` and appends one history entry, even when the status stays the same, as a second objection does.
+ * Bookkeeping fields (freshness notes, `claim.emitted`, a receipt) leave it as it is.
+ */
+export const generation = (lane: Lane): string => `${lane.openedAt} ${lane.history?.length ?? 0} ${statusOf(lane)}`;
 
 export const withStatus = (
   lane: Lane,
@@ -158,23 +165,18 @@ export class Registry {
       throw error;
     }
   }
-
-  // temp file + rename so a concurrent reader never sees a half-written lane
   private writeNow(lane: Lane): void {
     const tmp = `${this.path(lane.key)}.${process.pid}.tmp`;
     writeFileSync(tmp, JSON.stringify(lane, null, 1));
     renameSync(tmp, this.path(lane.key));
   }
-
   async write(lane: Lane): Promise<void> {
     await this.locked(lane.key, () => this.writeNow(lane));
   }
-
   /** Registers a new lane only while its key has no record (false: another launch or adopt holds the key). */
   async create(lane: Lane): Promise<boolean> {
     return (await this.update(lane.key, (current) => (current ? null : lane))) !== null;
   }
-
   /** Removes `lane`'s record while it is still that registration: a launch undoing its own failed start. */
   discard(lane: Lane): Promise<void> {
     return this.locked(lane.key, () => {
@@ -182,7 +184,6 @@ export class Registry {
       if (current && sameLaneGeneration(lane, current)) rmSync(this.path(lane.key), { force: true });
     });
   }
-
   /**
    * Read-modify-write of one lane under its lock: `fn` gets the stored lane (or null) and returns the lane to store, or
    * null to leave it. A lane held across I/O is changed here, never written back whole, so a change meanwhile is kept.
@@ -194,13 +195,10 @@ export class Registry {
       return next;
     });
   }
-
   /** Apply a decision only while the lane still has the observed generation. */
   transition(seen: Lane, next: (current: Lane) => Lane | null): Promise<Lane | null> {
     return this.update(seen.key, (current) => (current && sameLaneGeneration(seen, current) ? next(current) : null));
   }
-
-  // Reading never creates the lanes directory (cataly boot is read-only); write() creates it.
   private files(): string[] {
     try {
       return readdirSync(this.dir)
@@ -211,7 +209,6 @@ export class Registry {
       throw e;
     }
   }
-
   async list(): Promise<Lane[]> {
     return this.files()
       .map((f) => this.readNow(basename(f, ".json")))
@@ -237,11 +234,9 @@ export class Registry {
     }
     return { lanes, unreadable };
   }
-
   async open(): Promise<Lane[]> {
     return (await this.list()).filter((l) => statusOf(l) !== "closed");
   }
-
   /** The open lane in ref, excluding the legacy reserved lead record (still readable, listable and closable). */
   async bySession(ref: SessionRef | undefined): Promise<Lane | null> {
     if (!ref) return null;

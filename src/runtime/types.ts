@@ -1,3 +1,5 @@
+import type { ProbedNativeObservation } from "../native-observation.ts";
+
 export type TerminalRuntimeKind = "herdr" | "hc" | "tern";
 export type RuntimeKind = TerminalRuntimeKind | "headless";
 /**
@@ -38,6 +40,7 @@ export type Probe = {
   readonly sessionId?: string;
   readonly sessionFile?: string;
   readonly approvalPending?: boolean;
+  readonly native?: ProbedNativeObservation;
   readonly shellInFront: boolean;
   readonly foreground?: readonly ForegroundProcess[];
 };

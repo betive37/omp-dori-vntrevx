@@ -1,4 +1,5 @@
 import type { SessionRef } from "./runtime/types.ts";
+import type { Wait } from "./wait.ts";
 
 export type LaneStatus = "working" | "waiting" | "ready" | "done" | "lost";
 
@@ -42,6 +43,8 @@ export type Lane = {
   escalatedAt?: number;
   waitingFor?: string;
   waitingSince?: number;
+  /** Observed dependency identity; never a progress receipt or authority to resume. */
+  wait?: Wait;
   priority?: number;
   nudges: number;
   final?: { text: string; evidence: string[]; at: number };

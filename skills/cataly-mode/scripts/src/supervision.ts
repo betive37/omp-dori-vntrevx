@@ -119,7 +119,7 @@ export class Supervision {
         JSON.stringify(supervisionTag(this.reports, lane)) !== JSON.stringify(prepared.tag)
       )
         return;
-      const { result, observation } = verdict.settle(undelivered);
+      const { result, observation } = await verdict.settle(undelivered);
       // Commit decisions and delivered receipts before advisory post-effect I/O.
       const basis =
         sampled ||

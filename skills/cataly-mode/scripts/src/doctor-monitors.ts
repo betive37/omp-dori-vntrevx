@@ -59,6 +59,7 @@ const probePayloads: Partial<Record<string, string>> = {
   PR_CLOSED: "example/project#12 lane=integration thread=- unmerged",
   PR_REOPENED: "example/project#12 lane=integration thread=-",
   PR_WATCH_WARN: "run GitHub request failed",
+  "WAIT-ENDED": "wait-ended",
   WARN: "pane list is unreadable",
 } satisfies Record<ProbeEvent, string>;
 

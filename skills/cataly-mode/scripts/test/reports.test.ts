@@ -213,12 +213,12 @@ test("a quiet freshness tick reads the lane journal once and runs git status onc
 // POSIX-only: permission bits (0700/0600) have no meaning on Windows.
 const posix = test.skipIf(process.platform === "win32");
 
-posix("the lane journal directory is private (0700), like the 0600 journal", () => {
+posix("the lane journal directory is private (0700), like the 0600 journal", async () => {
   const state = withState();
   const umask = process.umask(0o022);
   try {
     const reports = new Reports(state.dir);
-    reports.report("private-lane", "milestone", "first", T0);
+    await reports.report("private-lane", "milestone", "first", T0);
     expect(statSync(join(state.dir, "lanes", "private-lane")).mode & 0o777).toBe(0o700);
     expect(statSync(reports.path("private-lane")).mode & 0o777).toBe(0o600);
   } finally {
@@ -227,10 +227,10 @@ posix("the lane journal directory is private (0700), like the 0600 journal", () 
   }
 });
 
-posix("a lane directory created earlier with wider permissions is made 0700 on the next report", () => {
+posix("a lane directory created earlier with wider permissions is made 0700 on the next report", async () => {
   const dir = join(state.dir, "lanes", lane.key);
   mkdirSync(dir, { recursive: true, mode: 0o755 });
   chmodSync(dir, 0o755);
-  reports.report(lane.key, "milestone", "first", T0);
+  await reports.report(lane.key, "milestone", "first", T0);
   expect(statSync(dir).mode & 0o777).toBe(0o700);
 });

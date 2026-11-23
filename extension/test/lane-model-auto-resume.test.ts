@@ -1,5 +1,6 @@
+import { rm } from "node:fs/promises";
 import { expect, test } from "bun:test";
-import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import type * as NativeConfig from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/config/settings.d.ts";
 import type * as NativeInit from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/modes/runtime-init.d.ts";
@@ -247,7 +248,7 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
         if (previous[index] === undefined) delete process.env[key];
         else process.env[key] = previous[index];
       });
-      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+      await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   }, 30_000);
 }

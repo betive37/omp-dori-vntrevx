@@ -16,6 +16,8 @@ export const USAGE = `cataly harness - a proactive multi-session harness using n
                                                       only new evidence (a file changed since the last progress, a link
                                                       not reported before) resets the nudge and escalation clock; a
                                                       waiting lane stays on it, named with what it waits on
+                                                      TARGET: job:ID, approval:ID, ci:owner/repo#N[@CHECK_RUN_ID];
+                                                      other text is an unverified label, not a pending-operation proof
   cataly harness ready <key> --text T --evidence LINK [--evidence LINK ...]
   cataly harness send <lead|duty|key|pane> --text T     deliver now, or queue until the pane's agent is idle
                           [--to-shell]                operator only: type this one message into a pane with no agent

@@ -1,5 +1,6 @@
+import { rm } from "node:fs/promises";
 import { afterEach, expect, test } from "bun:test";
-import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
 import type * as NativeConfig from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/config/settings.d.ts";
@@ -31,10 +32,10 @@ const effort = (level: string): ReturnType<typeof cfgDefaultThinkingLevel.get> =
   return value;
 };
 const model = { provider: "p", id: "a" };
-const cleanups: (() => void)[] = [];
+const cleanups: (() => Promise<void>)[] = [];
 
-afterEach(() => {
-  for (const cleanup of cleanups.splice(0)) cleanup();
+afterEach(async () => {
+  for (const cleanup of cleanups.splice(0)) await cleanup();
 });
 
 const world = () => {
@@ -48,9 +49,9 @@ const world = () => {
   const globalFile = join(agentDir, "config.yml");
   const projectFile = join(projectDir, "config.yml");
   const instances: NativeConfig.Settings[] = [];
-  cleanups.push(() => {
+  cleanups.push(async () => {
     for (const settings of instances) settings.cancelPendingSaves();
-    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   /** One native process: its own fresh profile overlay last, like a Dori launch or reopen. */
   const lane = async (overrides?: Record<string, unknown>, after: string[] = []) => {

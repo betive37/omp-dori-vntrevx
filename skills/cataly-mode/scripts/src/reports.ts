@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { appendFileSync, chmodSync, existsSync, mkdirSync, readFileSync, statSync } from "node:fs";
 import { join } from "node:path";
 
+import { renderWait, type Wait } from "../../../../src/wait.ts";
 import { nextEvidenceSequence } from "./evidence-sequence.ts";
 import type { EvidenceRef } from "./evidence.ts";
 import { type Lane, LANE_KEY } from "./registry.ts";
@@ -24,6 +25,7 @@ export type Report = EventFields & {
   readonly type: "report";
   readonly kind: ReportKind;
   readonly owner?: string;
+  readonly wait?: Wait;
 };
 export type Activity = EventFields & {
   readonly type: "activity";
@@ -69,7 +71,9 @@ export const reportState = (kind: ReportKind): ProgressState => {
 // The printed line goes to terminals, so escape sequences and other control characters are dropped from it (a CR or
 // newline becomes one space); the journal keeps the raw text.
 export const reportLine = (report: Report): string =>
-  `[REPORT] ${report.key} | ${report.kind} | ${Bun.stripANSI(report.text)
+  `[REPORT] ${report.key} | ${report.kind} | ${Bun.stripANSI(
+    report.wait ? `${report.text} WAIT ${renderWait(report.wait)}` : report.text,
+  )
     .replace(/\s*[\r\n]+\s*/g, " ")
     // oxlint-disable-next-line no-control-regex -- the pattern deliberately matches control characters to reject or strip them
     .replace(/[\u0000-\u0008\u000b-\u001f\u007f-\u009f]/g, "")}`;
@@ -83,6 +87,7 @@ export const reportId = (report: Report): string =>
         report.kind,
         report.text,
         report.owner ?? null,
+        ...(report.wait ? [report.wait] : []),
         report.generation ?? null,
         ...(report.provenance ? [provenanceIdentity(report.provenance)] : []),
         ...(report.evidenceRefs?.length ? [[report.evidenceSequence, report.evidenceRefs]] : []),
@@ -96,9 +101,8 @@ type CachedJournal = {
   lastRead?: { readonly scopeKey: string; readonly progress: Progress | null };
 };
 
-// One O_APPEND write per event: concurrent lane/lead writers cannot overwrite
-// each other's state. The last event is the persisted progress state; no
-// second mutable snapshot can race with this journal or registry done claims.
+// Reports share the lane registry's writer lock; observation checks and their append are one synchronous section.
+// Activity events use one O_APPEND write and cannot supersede a blocked, halted or done report in read().
 export class Reports {
   private readonly memo: Map<string, CachedJournal> | undefined;
 
@@ -142,7 +146,6 @@ export class Reports {
     return [...(this.journal(key)?.events ?? [])];
   }
 
-  // Raw history is available without a scope; a scoped read selects only the exact generation, request and run.
   read(key: string, scope?: EventScope): Progress | null {
     const journal = this.journal(key);
     if (!journal) return null;
@@ -174,13 +177,11 @@ export class Reports {
     if (this.memo) journal.lastRead = { scopeKey, progress };
     return progress;
   }
-
   append<Event extends LaneEvent>(event: Event): Event {
     if ("evidenceRefs" in event || "evidenceSequence" in event)
       throw new ReportError("evidence append must hold the lane writer lock");
     return this.persist(event);
   }
-
   /** The caller owns Registry.withCurrent for this lane and has rechecked the generation and execution binding. */
   appendEvidenceLocked<Event extends ProgressEvent>(event: Event, refs: readonly EvidenceRef[]): Event {
     if (refs.length === 0) return this.append(event);
@@ -191,19 +192,16 @@ export class Reports {
       evidenceSequence: nextEvidenceSequence(this.stateDir, event.key),
     });
   }
-
   private persist<Event extends LaneEvent>(event: Event): Event {
     const path = this.path(event.key);
     const line = JSON.stringify(event);
     parseEvent(line, event.key);
     const dir = join(this.stateDir, "lanes", event.key);
     mkdirSync(dir, { recursive: true, mode: 0o700 });
-    // mkdir's mode applies only on creation; a directory made earlier with wider permissions is narrowed here.
     chmodSync(dir, 0o700);
     appendFileSync(path, `${line}\n`, { encoding: "utf8", mode: 0o600 });
     return event;
   }
-
   report(
     key: string,
     kind: ReportKind,
@@ -213,6 +211,7 @@ export class Reports {
     owner?: string,
     provenance?: ReportProvenance,
     evidenceLocked: readonly EvidenceRef[] = [],
+    wait?: Wait,
   ): Report {
     const report: Report = {
       type: "report",
@@ -221,12 +220,12 @@ export class Reports {
       text: text.trim(),
       at: new Date(now).toISOString(),
       ...(generation === undefined ? {} : { generation }),
+      ...(wait === undefined ? {} : { wait }),
       ...(owner === undefined ? {} : { owner: owner.trim() }),
       ...(provenance === undefined ? {} : { provenance }),
     };
     return this.appendEvidenceLocked(report, evidenceLocked);
   }
-
   observe(
     key: string,
     screen: string,

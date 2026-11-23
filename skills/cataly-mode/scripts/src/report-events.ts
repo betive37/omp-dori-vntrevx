@@ -1,3 +1,4 @@
+import { readWait } from "../../../../src/wait.ts";
 import { isEvidenceRefs, isEvidenceSequence } from "./evidence.ts";
 import type { LaneEvent, ReportKind } from "./reports.ts";
 import { isNativeReference, isProvenance, isRequestId, isRunId } from "./request-identity.ts";
@@ -69,6 +70,7 @@ export const parseEvent = (line: string, key: string): LaneEvent => {
       ...progress,
       type: "report",
       kind: value.kind,
+      ...(value.kind === "blocker" && "wait" in value && readWait(value.wait) ? { wait: readWait(value.wait)! } : {}),
       ...("owner" in value ? { owner: value.owner as string } : {}),
     };
   }

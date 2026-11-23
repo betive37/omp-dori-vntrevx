@@ -43,6 +43,7 @@ export const parseSkillFlags = (rest: string[]) =>
       "adopt-legacy-threads": { type: "string", multiple: true },
       purpose: { type: "string" },
       to: { type: "string" },
+      for: { type: "string" },
       text: { type: "string" },
       status: { type: "boolean" },
       resolve: { type: "string" },

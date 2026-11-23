@@ -174,7 +174,13 @@ posix("a rejected bootstrap leaves no half-initialized role session publishing p
   sessions.push(cataly);
   await expect(cataly.emit("session_start")).rejects.toThrow("session or version");
   await cataly.emit("agent_start");
-  await cataly.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "pending" });
+  await cataly.emit("tool_approval_requested", {
+    type: "tool_approval_requested",
+    sessionId: cataly.session.id,
+    toolName: "bash",
+    approvalMode: "always-ask",
+    toolCallId: "pending",
+  });
   await cataly.emit("goal_updated", { goal: { objective: "work", status: "active" } });
   expect(readPaneState(f.stateDir, "w1:p7")).toBeNull();
   // A tree or branch move in the rejected session finds no recorded role to restore.
@@ -203,7 +209,13 @@ posix(
     await cataly.emit("session_tree");
     await cataly.emit("session_branch");
     await cataly.emit("agent_start");
-    await cataly.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "pending" });
+    await cataly.emit("tool_approval_requested", {
+      type: "tool_approval_requested",
+      toolCallId: "pending",
+      sessionId: cataly.session.id,
+      toolName: "bash",
+      approvalMode: "always-ask",
+    });
     expect(readPaneState(f.stateDir, "w1:p7")).toBeNull();
   },
 );

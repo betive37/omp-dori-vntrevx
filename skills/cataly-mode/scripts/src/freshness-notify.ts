@@ -155,7 +155,10 @@ export const notifyFreshness = async (
     const fromJournal = entry ? reportLine(entry) : null;
     const id = entry ? reportId(entry) : undefined;
     const owner = entry?.owner;
-    const ownerLine = entry && owner ? reportLine({ ...entry, text: owner }) : null;
+    const ownerLine =
+      entry && owner
+        ? reportLine({ key: entry.key, at: entry.at, type: "report", kind: entry.kind, text: owner })
+        : null;
     const report = fromJournal ?? legacyReport;
     const lastSeenReport = report ?? undefined;
     const kind = entry?.kind ?? report?.split("|")[1]?.trim();

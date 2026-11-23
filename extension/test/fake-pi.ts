@@ -7,6 +7,7 @@ const host = resolve(import.meta.dir, "../../test/fixtures/omp-native-host");
 const { Settings, withActiveSettings }: typeof NativeConfig = await import(
   Bun.resolveSync("@oh-my-pi/pi-coding-agent/config/settings", host)
 );
+import type { AsyncJobSnapshot } from "@oh-my-pi/pi-coding-agent";
 
 import type { CommandOptions as Command, CatalyApi, CatalyContext, ToolDefinition as Tool } from "../index";
 
@@ -59,6 +60,10 @@ export type FakePi = {
   notes: string[];
   statuses: Map<string, string>;
   session: FakeSession;
+  /** The agent the next context names; a subagent's context reads its own jobs. */
+  agent: Agent;
+  /** What `getAsyncJobSnapshot` returns; null is OMP's "no job manager". */
+  jobs: AsyncJobSnapshot | null;
   ctx(): CatalyContext;
   /** Runs handlers in registration order, chaining before_agent_start prompt replacements as OMP does. */
   emit(event: string, payload?: unknown): Promise<unknown[]>;
@@ -83,18 +88,17 @@ export const fakePi = (options: FakeOptions): FakePi => {
     notes: [],
     statuses: new Map(),
     session: options.session,
+    agent: options.agent ?? { kind: "main", id: "Main" },
+    jobs: options.asyncJobs ?? null,
     ctx: () => ({
       cwd: tmpdir(),
       abort: () => void calls.push("abort"),
       isIdle: () => options.idle ?? true,
       hasPendingMessages: () => options.pendingMessages ?? false,
-      getAsyncJobSnapshot: () =>
-        options.asyncJobs === undefined
-          ? { running: [], delivery: { queued: 0, delivering: false, pendingJobIds: [] } }
-          : options.asyncJobs,
+      getAsyncJobSnapshot: () => fake.jobs,
       mode: options.mode ?? "print",
       ...(options.hasUI === undefined ? {} : { hasUI: options.hasUI }),
-      agent,
+      agent: fake.agent,
       get model() {
         return options.model;
       },

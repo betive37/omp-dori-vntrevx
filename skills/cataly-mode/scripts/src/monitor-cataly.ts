@@ -102,6 +102,7 @@ export const CATALY_VALUE_OPTIONS: Record<string, true> = {
   owner: true,
   report: true,
   delivery: true,
+  for: true,
   step: true,
   result: true,
   "remote-effect": true,

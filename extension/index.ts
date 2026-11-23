@@ -9,6 +9,7 @@
  *   only in role sessions; load-time registrations stay visible everywhere. Source installs leave it empty for OMP loading.
  * - Pane state (`{stateDir}/sessions/<pane>.json`, read by the `cataly` CLI): session id, goal status and open tool
  *   approvals of the Cataly/lane session running in HERDR_PANE_ID, HC_TERMINAL_ID or TERN_PANE.
+ *   Native jobs and approval observations use the existing process-bound record.
  * - Lanes without a goal get omp's `goal` tool so the agent can create its goal from the lane brief.
  * - The Cataly session gets the `monitor` tool (monitor.ts).
  * - Root Cataly/lane agents get compact role guidance on each turn; children do not.
@@ -38,6 +39,12 @@ import { Checkpoints } from "../skills/cataly-mode/scripts/src/checkpoints.ts";
 import { type CatalyConfig, loadConfig } from "../skills/cataly-mode/scripts/src/config";
 import { EvidenceError, fileEvidence, novelEvidence } from "../skills/cataly-mode/scripts/src/evidence.ts";
 import { runContext } from "../skills/cataly-mode/scripts/src/lane-run.ts";
+import type {
+  AsyncJobSnapshot,
+  ToolApprovalRequestedEvent,
+  ToolApprovalResolvedEvent,
+} from "@oh-my-pi/pi-coding-agent";
+import type { NativeApproval, NativeObservation } from "../src/native-observation.ts";
 import {
   type CatalyRole,
   type GoalStatus,
@@ -129,10 +136,6 @@ export interface CatalyContext {
   hasPendingMessages?(): boolean;
   shutdown?(): void;
   getPendingPlanReview?(): unknown;
-  getAsyncJobSnapshot?(): {
-    running: readonly unknown[];
-    delivery: { queued: number; delivering: boolean; pendingJobIds: readonly string[] };
-  } | null;
   agent: { kind: "main" | "sub"; id: string; parentId?: string };
   model?: PromptModel;
   models?: { resolve(selector: string): PromptModel | undefined; current(): PromptModel | undefined };
@@ -152,6 +155,7 @@ export interface CatalyContext {
     notify(message: string, type?: "info" | "warning" | "error"): void;
     setStatus?(key: string, text: string | undefined): void;
   };
+  getAsyncJobSnapshot?(): AsyncJobSnapshot | null;
 }
 /** A native registry ref's session on any thread: the AgentSession itself, or a worker's handle to one elsewhere. */
 interface NativeSessionHandle {
@@ -246,9 +250,10 @@ export interface CatalyApi {
     handler: (event: { goal: Goal | null; state?: { enabled?: boolean } }, ctx: CatalyContext) => unknown,
   ): void;
   on(
-    event: "tool_approval_requested" | "tool_approval_resolved",
-    handler: (event: { toolCallId: string; sessionId?: string }, ctx: CatalyContext) => unknown,
+    event: "tool_approval_requested",
+    handler: (event: ToolApprovalRequestedEvent, ctx: CatalyContext) => unknown,
   ): void;
+  on(event: "tool_approval_resolved", handler: (event: ToolApprovalResolvedEvent, ctx: CatalyContext) => unknown): void;
   on(event: string, handler: Handler): void;
   appendEntry(customType: string, data?: unknown): void;
   sendMessage(
@@ -546,7 +551,18 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
   let agentStatus: "idle" | "working" = "idle";
   let goalToolAdded = false;
   let paneWritten: string | undefined;
-  const approvals = new Set<string>();
+  /**
+   * Open tool approvals of this process (the session and its subagents), each under its event's session and tool call,
+   * so an event of one session never resolves another's approval that reuses the call id.
+   */
+  const approvals = new Map<string, NativeApproval>();
+  const approvalKey = (event: { sessionId: string; toolCallId: string }): string =>
+    JSON.stringify([event.sessionId, event.toolCallId]);
+  /**
+   * The main session's last async job snapshot and when it was read. `jobs` stays null, with the time it was cleared,
+   * until the current session's main context is read; a subagent's context reports only its own jobs.
+   */
+  let observed: Pick<NativeObservation, "jobs" | "observedAt"> = { jobs: null, observedAt: Date.now() };
   const discordApiOverride = installation.env["CATALY_DISCORD_API_BASE"] ?? "";
   const discordAsk = new DiscordAsk(undefined, discordApiOverride);
   const discordLane = new DiscordLane(undefined, discordApiOverride);
@@ -635,14 +651,15 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     paneWritten = undefined;
   };
 
-  // Preserve session identity for a later resume without attesting a live pane owner.
+  // Preserve session identity for a later resume without attesting a live pane owner or its last native observation.
   const retirePane = (): void => {
     runtimeHealth.stop();
     if (paneWritten === undefined || stateDir === undefined) return;
     const state = readPaneState(stateDir, paneWritten);
     if (state !== null && state.pid === process.pid) {
+      const { native: _native, ...kept } = state;
       writePaneState(stateDir, {
-        ...state,
+        ...kept,
         pid: 0,
         agentStatus: "idle",
         approvalPending: false,
@@ -683,7 +700,30 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     return !(ps.status === 0 && Number.isFinite(started) && started > Date.parse(existing.startedAt));
   };
 
-  const savePane = (ctx: CatalyContext): void => {
+  /**
+   * Reads the current session's job snapshot through its main context; returns whether its jobs differ from the last
+   * read. Any other context (a subagent, a session that is not the current one) is not read: its snapshot is not the
+   * main session's jobs.
+   */
+  const observeJobs = (ctx: CatalyContext): boolean => {
+    if (ctx.agent.kind !== "main" || session === undefined || ctx.sessionManager.getSessionId() !== session.id)
+      return false;
+    const snapshot = ctx.getAsyncJobSnapshot?.() ?? null;
+    const jobs = snapshot && {
+      running: snapshot.running.map((job) => ({ id: job.id, startTime: job.startTime })),
+      recent: snapshot.recent.map((job) => ({
+        id: job.id,
+        startTime: job.startTime,
+        status: job.status,
+        ...(job.endTime === undefined ? {} : { endTime: job.endTime }),
+      })),
+    };
+    const changed = JSON.stringify(jobs) !== JSON.stringify(observed.jobs);
+    observed = { jobs, observedAt: Date.now() };
+    return changed;
+  };
+
+  const savePane = (ctx: CatalyContext, read = true): void => {
     // Do not advertise a retired duty TUI to consumers of the lead/lane pane ABI.
     if (role === "cataly" && !isLead()) {
       removePane();
@@ -719,6 +759,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
       return;
     }
     if (paneHeldByAnother(paneId)) return;
+    if (read) observeJobs(ctx);
     const sessionFile = ctx.sessionManager.getSessionFile();
     let discordReceiver: PaneState["discordLaneReceiver"];
     if (role === "lane" && ownsDiscordReceiver) {
@@ -749,6 +790,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
         agentStatus,
         approvalPending: approvals.size > 0,
         modelReadback: modelReadback(ctx),
+        native: { observedAt: observed.observedAt, jobs: observed.jobs, approvals: [...approvals.values()] },
         modelSnapshot: modelProfile?.snapshot,
         modelProfileFile: modelProfile?.file,
         modelSnapshotError: modelProfileError,
@@ -1123,29 +1165,25 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
   const registerLifecycle = (): void => {
     lifecycleRegistered = true;
     pi.on("tool_approval_requested", (event, ctx) => {
+      if (!role) return;
       const id = ctx.sessionManager.getSessionId();
-      if (
-        !role ||
-        ctx.agent.kind !== "main" ||
-        id !== session?.id ||
-        (event.sessionId !== undefined && event.sessionId !== id)
-      )
-        return;
-      approvals.add(event.toolCallId);
-      nativeRemote.event("tool_approval_requested", event, ctx);
+      const receipt = { ...event, sessionId: event.sessionId ?? id };
+      approvals.set(approvalKey(receipt), {
+        sessionId: receipt.sessionId,
+        toolCallId: event.toolCallId,
+        toolName: event.toolName,
+      });
+      if (ctx.agent.kind === "main" && id === session?.id && receipt.sessionId === id)
+        nativeRemote.event("tool_approval_requested", event, ctx);
       savePane(ctx);
     });
     pi.on("tool_approval_resolved", (event, ctx) => {
+      if (!role) return;
       const id = ctx.sessionManager.getSessionId();
-      if (
-        !role ||
-        ctx.agent.kind !== "main" ||
-        id !== session?.id ||
-        (event.sessionId !== undefined && event.sessionId !== id) ||
-        !approvals.delete(event.toolCallId)
-      )
-        return;
-      nativeRemote.event("tool_approval_resolved", event, ctx);
+      const receipt = { ...event, sessionId: event.sessionId ?? id };
+      if (!approvals.delete(approvalKey(receipt))) return;
+      if (ctx.agent.kind === "main" && id === session?.id && receipt.sessionId === id)
+        nativeRemote.event("tool_approval_resolved", event, ctx);
       savePane(ctx);
     });
     for (const event of ["session_before_switch", "session_before_branch", "session_before_tree"] as const)
@@ -1172,6 +1210,8 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     });
     // The awaited preflight runs before the built-in opens its form; execution events can arrive later.
     pi.on("tool_call", (event, ctx) => {
+      // A changed job set is recorded before the call runs, so a command it starts reads the jobs as of this call.
+      if (role && observeJobs(ctx)) savePane(ctx, false);
       const id = ctx.sessionManager.getSessionId();
       const root = stateDir;
       const currentRole = role;
@@ -1327,6 +1367,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
       approvals.clear();
       backgroundCalls.clear();
       callDirs.clear();
+      observed = { jobs: null, observedAt: Date.now() };
       agentStatus = "idle";
     }
     if (role && !lifecycleRegistered) registerLifecycle();

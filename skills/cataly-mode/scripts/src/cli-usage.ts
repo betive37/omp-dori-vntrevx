@@ -32,7 +32,8 @@ export const USAGE = `cataly <command> [options]
   doctor [--json] [--repo owner/repo]   read-only configuration, adoption and monitor diagnostics; exit 1 on warnings
   monitor-presets [name] [--json]      recommended argv and filters; starts nothing
   report <key> --kind milestone|blocker|question|halted|done --text TEXT [--owner SUMMARY] [--json] [--evidence-file PATH]...
-                                       append a durable progress report and print its [REPORT] line
+         [--for job:ID|approval:ID|ci:owner/repo#N[@CHECK_RUN]] (blocker only)
+                                       append a durable progress report; plain --for text is an unverified label
   relayed <key> --report ID [--delivery <Discord deliveryId>] [--json]
                                        acknowledge the exact journal report already sent by the lead (--json supplies ID)
   checkpoint <key> --step ID --result TEXT --evidence PATH [--remote-effect RECEIPT]... [--evidence-file PATH]...

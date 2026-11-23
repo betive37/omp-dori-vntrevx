@@ -1,6 +1,7 @@
+import { rm } from "node:fs/promises";
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
-import { mkdirSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { isModelSnapshot, paneStatePath, readPaneState } from "../../skills/cataly-mode/scripts/src/lane-state.ts";
 import { identityOf, type ModelSwitchRequest } from "../../skills/cataly-mode/scripts/src/model-switch-state.ts";
@@ -95,7 +96,7 @@ test("real native idle command selects once, preserves defaults and dispatches t
       if (previous[index] === undefined) delete process.env[key];
       else process.env[key] = previous[index];
     });
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -165,7 +166,7 @@ test("real native refused idle switch keeps the unchanged pinned lane running", 
       if (previous[index] === undefined) delete process.env[key];
       else process.env[key] = previous[index];
     });
-    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+    await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -221,7 +222,7 @@ for (const boundary of ["session", "provider"] as const) {
           if (previous[index] === undefined) delete process.env[key];
           else process.env[key] = previous[index];
         });
-        rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });
   }
@@ -309,7 +310,7 @@ for (const boundary of ["session", "provider"] as const) {
           if (previous[index] === undefined) delete process.env[key];
           else process.env[key] = previous[index];
         });
-        rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
+        await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });
   }

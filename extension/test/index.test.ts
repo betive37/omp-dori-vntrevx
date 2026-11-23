@@ -617,12 +617,36 @@ describe("pane state", () => {
     await pi.emit("goal_updated", { type: "goal_updated", goal: { objective: "fix #12", status: "budget-limited" } });
     expect(readPaneState(stateDir, PANE)?.goal.status).toBe("blocked");
 
-    await pi.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "a" });
-    await pi.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "b" });
+    await pi.emit("tool_approval_requested", {
+      type: "tool_approval_requested",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      approvalMode: "always-ask",
+      toolCallId: "a",
+    });
+    await pi.emit("tool_approval_requested", {
+      type: "tool_approval_requested",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      approvalMode: "always-ask",
+      toolCallId: "b",
+    });
     expect(readPaneState(stateDir, PANE)?.approvalPending).toBe(true);
-    await pi.emit("tool_approval_resolved", { type: "tool_approval_resolved", toolCallId: "a", approved: true });
+    await pi.emit("tool_approval_resolved", {
+      type: "tool_approval_resolved",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      toolCallId: "a",
+      approved: true,
+    });
     expect(readPaneState(stateDir, PANE)?.approvalPending).toBe(true);
-    await pi.emit("tool_approval_resolved", { type: "tool_approval_resolved", toolCallId: "b", approved: false });
+    await pi.emit("tool_approval_resolved", {
+      type: "tool_approval_resolved",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      toolCallId: "b",
+      approved: false,
+    });
     expect(readPaneState(stateDir, PANE)).toMatchObject({ approvalPending: false, startedAt });
   });
 
@@ -719,7 +743,13 @@ describe("pane state", () => {
     await pi.emit("session_start");
     pi.session = session("plain-2");
     await pi.emit("session_switch", { type: "session_switch", reason: "resume" });
-    await pi.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "a" });
+    await pi.emit("tool_approval_requested", {
+      type: "tool_approval_requested",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      approvalMode: "always-ask",
+      toolCallId: "a",
+    });
     expect(existsSync(paneStatePath(stateDir, PANE))).toBe(false);
   });
 
@@ -733,7 +763,13 @@ describe("pane state", () => {
       approvalPending: false,
     });
     expect(readPaneState(stateDir, PANE)).toBeNull();
-    await pi.emit("tool_approval_requested", { type: "tool_approval_requested", toolCallId: "hc-approval" });
+    await pi.emit("tool_approval_requested", {
+      type: "tool_approval_requested",
+      sessionId: pi.session.id,
+      toolName: "bash",
+      approvalMode: "always-ask",
+      toolCallId: "hc-approval",
+    });
     expect(readPaneState(stateDir, "t1b")?.approvalPending).toBe(true);
     await pi.emit("goal_updated", { type: "goal_updated", goal: { objective: "hc port", status: "paused" } });
     expect(readPaneState(stateDir, "t1b")?.goal.status).toBe("paused");
