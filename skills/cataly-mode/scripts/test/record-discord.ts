@@ -17,8 +17,30 @@ class StreamOnlyResponse extends Response {
   };
 }
 
-globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) => {
+// Optional journal of fetch options; it records header presence only, never header values.
+const network = process.env["CATALY_TEST_NETWORK_LOG"] ?? "";
+
+const substitute = (response: Response, url: string, redirected: boolean): Response => {
+  Object.defineProperty(response, "url", { value: url, configurable: true });
+  Object.defineProperty(response, "redirected", { value: redirected, configurable: true });
+  return response;
+};
+
+const serve = async (input: string | URL | Request, init?: RequestInit): Promise<Response> => {
   const url = new URL(String(input));
+  if (network !== "") {
+    const headers = new Headers(init?.headers);
+    appendFileSync(
+      network,
+      `${JSON.stringify({
+        href: url.href,
+        redirect: init?.redirect ?? null,
+        credentials: init?.credentials ?? null,
+        authorization: headers.has("authorization"),
+        signal: init?.signal instanceof AbortSignal,
+      })}\n`,
+    );
+  }
   const key = `${init?.method ?? "GET"} ${url.pathname.replace(/^\/api\/v10/, "")}${url.search}`;
   appendFileSync(
     log,
@@ -41,6 +63,14 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     );
   }
   const status = route.status ?? 200;
+  if (route.location !== undefined) {
+    // A fake redirect honours the caller's explicit redirect mode exactly like fetch.
+    if (init?.redirect === "error") throw new TypeError("synthetic redirect refused");
+    const target = new URL(route.location, url).href;
+    if (init?.redirect === "manual") return new Response(null, { status, headers: { location: target } });
+    const followed = await serve(target, init);
+    return substitute(followed, followed.url || target, true);
+  }
   let body: BodyInit | null | undefined = status === 204 ? null : (route.raw ?? JSON.stringify(route.body));
   if (route.base64 !== undefined) body = Buffer.from(route.base64, "base64");
   if (route.chunks) {
@@ -69,5 +99,8 @@ globalThis.fetch = (async (input: string | URL | Request, init?: RequestInit) =>
     );
   }
   const ResponseType = route.base64 !== undefined || route.chunks ? StreamOnlyResponse : Response;
-  return new ResponseType(body, { status, ...(route.headers ? { headers: route.headers } : {}) });
-}) as typeof fetch;
+  const response = new ResponseType(body, { status, ...(route.headers ? { headers: route.headers } : {}) });
+  return substitute(response, route.url ?? url.href, route.redirected ?? false);
+};
+
+globalThis.fetch = serve as typeof fetch;

@@ -18,6 +18,7 @@ export const discordInboundCommand = async (
     readonly gateway: boolean;
     readonly pollMinutes: number;
     readonly context: boolean;
+    readonly attachmentRefs?: boolean;
     readonly wake: boolean;
     readonly activityFile?: string;
   },
@@ -33,7 +34,7 @@ export const discordInboundCommand = async (
   const supervised = admission !== undefined;
   // The monitor contract is one live IPC channel; anything else cannot settle a head admission.
   if (supervised && (admission !== "1" || !process.connected)) throw headUnresolved();
-  const standalone = !context && !wake && activityFile === undefined;
+  const standalone = !options.attachmentRefs && !context && !wake && activityFile === undefined;
   if (head && (supervised || process.connected || all || !standalone))
     die("Rust-owned Discord head requires an independent receiver with explicit scope");
   const workspace = env["CATALY_DISCORD_NATIVE_WORKSPACE"] || deps.config.laneWorkspace;
@@ -49,6 +50,7 @@ export const discordInboundCommand = async (
   }
   try {
     execDiscordMonitor(executable, deps, {
+      ...(options.attachmentRefs === undefined ? {} : { attachmentRefs: options.attachmentRefs }),
       supervised,
       channels: channelIds,
       threads,

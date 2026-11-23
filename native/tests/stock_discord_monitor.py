@@ -10,6 +10,7 @@ from threading import Thread
 from discord_wire import Discord, World, message
 from stock_discord_send import exercise_send
 from stock_discord_queue import exercise_queue
+from stock_discord_attachments import exercise_attachments
 
 
 README = "Cataly transport fixture — 네이티브 Discord"
@@ -29,6 +30,7 @@ def exercise_monitor(command, env, root, calls, results):
     }
     prefix = [*command[:7], "discord", "--channel", "20"]
     try:
+        exercise_attachments(command[0], wire_env, root, world)
         rest(prefix, wire_env, root, world, calls, command[2])
         gateway(prefix, wire_env, root, world, calls, results)
         memory_checkpoint(prefix, wire_env, root, world)

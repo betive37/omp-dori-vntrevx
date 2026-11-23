@@ -395,3 +395,9 @@ Unreleased (source only): Discord purpose commands optionally bind to an exact o
 - Unreleased (source only): Discord thread create/set optionally verify an original owner message and lane with `--source "discord CHANNEL MESSAGE" --lane KEY`. Exact parent/capability/tag checks and durable write-ahead receipts prevent repeated creates, retain known thread IDs before subsequent text, and hold uncertain operations against their original source/lane. Confirmed replay sends nothing; archive remains explicit, and unbound manual behavior is unchanged.
 
 - Waiting reports can bind an attested native job/approval identity or an explicitly read PR head/check run. Repeated identities preserve their waiting interval; later native observations can end that wait without declaring success, granting permission or clearing a blocker. Plain dependency text remains unverified, and existing progress, pause and escalation protections remain in force. CI observation occurs only on explicit reports, without a new polling service.
+
+The Sustainable Use License, OMP attribution in `LICENSE.omp-cataly`, `NOTICE`, public dependency pin and third-party notices remain unchanged.
+
+- Unreleased: Stream URL transcription within configurable `transcribeMaxBytes` (default 25 MiB), abort overflow immediately, and verify audio container signatures against MIME before invoking the hook. Compatibility change: raw PCM, unsupported URL formats and MIME mismatches are rejected with a one-line remedy; local file paths remain unchanged.
+
+- Unreleased (source only): Add original-route Discord attachment references and bounded `cataly download`, keep existing signed `url` fields by default, and make URL omission an explicit `inbound discord --attachment-refs` opt-in. Reference downloads verify bot/owner/scope/message/file identity and exact size, reject unsafe CDN paths and redirects, and never echo URL credentials.

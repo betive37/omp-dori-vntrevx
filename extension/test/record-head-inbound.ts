@@ -26,7 +26,7 @@ try {
         : [],
   );
   const intake = await discordInbound(world.discord, queue.storeFor, { ownerId: "10", channelIds: ["20"] });
-  const emit = headEmitter(queue, intake.botId, "10", formatDiscordInbound);
+  const emit = headEmitter(queue, intake.botId, "10", (message) => formatDiscordInbound(message));
   for (let next = queue.first(); next; next = queue.first()) {
     if (next.kind === "sync") await intake.poll(emit);
     else await intake.accept(JSON.parse(next.payload), emit);

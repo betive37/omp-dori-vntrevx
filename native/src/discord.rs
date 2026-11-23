@@ -57,6 +57,9 @@ pub struct Options {
     /// Append an `INBOUND_CONTEXT` line with channel metadata and purposes to each head message.
     #[arg(long, requires = "cataly_state")]
     context: bool,
+    /// Emit URL-free attachment references bound to the authenticated bot and owner.
+    #[arg(long, requires = "cataly_state")]
+    attachment_refs: bool,
     /// Start lane OMP sessions for messages routed to sleeping Discord lanes (continuous REST only).
     #[arg(long, requires = "cataly_state", conflicts_with = "gateway")]
     wake_lanes: bool,

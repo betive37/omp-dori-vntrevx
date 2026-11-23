@@ -119,7 +119,8 @@ export const USAGE = `cataly <command> [options]
                                        --source "discord CHANNEL MESSAGE" binds the command to its verified conversation
                                        the operator's purpose note per channel or thread, shown by inbound --context
   presence <slack|discord>             keep the account shown as online until stopped
-  transcribe <audio-file|url>           run hooks.transcribe and print the text; HTTP(S) downloads are private and temporary
+  download <discord-file:...> --out FILE [--max-bytes N]  private bounded attachment download
+  transcribe <audio-file|url|discord-file:...>           run hooks.transcribe and print the text; HTTP(S) downloads are private and temporary
   inbound slack|telegram|discord [--loop MIN] [--gateway] [--context] [--activity-file PATH]
                                        Slack defaults to INBOUND_READY slack and physical channel IDs;
                                        --qualified-routes opts into account-qualified readiness and destinations

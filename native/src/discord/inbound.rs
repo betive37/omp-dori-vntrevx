@@ -32,6 +32,7 @@ pub(super) struct InboundReply {
 /// One owner attachment, retaining Discord field names and the exact expiring signed CDN URL.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(super) struct InboundAttachment {
+    pub(super) id: Option<Snowflake>,
     pub(super) filename: String,
     pub(super) content_type: Option<String>,
     pub(super) size: i64,
@@ -182,6 +183,42 @@ impl Inbound {
         out
     }
 
+    /// URL-free records are built before any admission or cursor write.
+    pub(super) fn format_refs(&self, bot: Snowflake, owner: Snowflake) -> Result<String> {
+        let mut text = self.format();
+        if self.attachments.is_empty() {
+            return Ok(text);
+        }
+        text.truncate(text.find("\nINBOUND_ATTACHMENT ").unwrap_or(text.len()));
+        for attachment in &self.attachments {
+            let id = attachment.id.ok_or_else(|| protocol("Discord attachment has no unique file reference; use default URL records or repair its metadata"))?;
+            if attachment.size < 0 {
+                bail!("Discord attachment has invalid size");
+            }
+            let mut raw = String::new();
+            attachment.write(&mut raw, false);
+            let mut record: Value = serde_json::from_str(&raw)?;
+            let object = record.as_object_mut().expect("attachment object");
+            object.remove("url");
+            object.insert("id".to_owned(), Value::String(id.to_string()));
+            object.insert(
+                "ref".to_owned(),
+                Value::String(format!(
+                    "discord-file:{bot}:{owner}:{}:{}:{id}",
+                    self.channel, self.message
+                )),
+            );
+            let _ = write!(
+                text,
+                "\nINBOUND_ATTACHMENT discord {} {} {}",
+                self.channel,
+                self.message,
+                serde_json::to_string(&record)?
+            );
+        }
+        Ok(text)
+    }
+
     /// `{"channel":…,"message":…,"reference":…,"text":…` shared by both serializations.
     fn prefix(&self) -> String {
         let reference = self
@@ -315,7 +352,14 @@ fn attachments(raw: &Value) -> Result<Vec<InboundAttachment>> {
             ) else {
                 return Err(protocol("Discord inbound attachment is invalid"));
             };
+            let id = snowflake(item.get("id")).filter(|id| {
+                list.iter()
+                    .filter(|entry| snowflake(entry.get("id")) == Some(*id))
+                    .count()
+                    == 1
+            });
             Ok(InboundAttachment {
+                id,
                 filename: filename.clone(),
                 content_type: match item.get("content_type") {
                     Some(Value::String(kind)) => Some(kind.clone()),

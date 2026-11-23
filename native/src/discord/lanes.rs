@@ -47,6 +47,7 @@ pub(super) struct Lanes {
     state: PathBuf,
     bot: String,
     owner: String,
+    attachment_refs: bool,
     wake: Option<WakeMonitor>,
     inbox: Option<LaneInbox>,
 }
@@ -76,10 +77,10 @@ impl Lanes {
         cataly_state: &Path,
         bot: Snowflake,
         owner: Snowflake,
-        wake: bool,
+        options: &super::Options,
     ) -> Result<Self> {
         util::absolute(cataly_state, "--cataly-state")?;
-        let wake = if wake {
+        let wake = if options.wake_lanes {
             let launch = wake::Launch::from_env()?;
             let Ok(lock) = take_lock(&cataly_state.join("discord-lane-monitor.lock"), true)? else {
                 bail!("Another Discord lane wake monitor is running for this state directory");
@@ -101,6 +102,7 @@ impl Lanes {
             state: cataly_state.to_owned(),
             bot: bot.to_string(),
             owner: owner.to_string(),
+            attachment_refs: options.attachment_refs,
             wake,
             inbox,
         })
@@ -111,7 +113,14 @@ impl Lanes {
     pub(super) async fn route(&mut self, inbound: &Inbound) -> Result<bool> {
         let channel = inbound.channel.to_string();
         let message = inbound.message.to_string();
-        let text = inbound.format();
+        let text = if self.attachment_refs {
+            inbound.format_refs(
+                Snowflake::try_from(self.bot.clone()).map_err(anyhow::Error::msg)?,
+                Snowflake::try_from(self.owner.clone()).map_err(anyhow::Error::msg)?,
+            )?
+        } else {
+            inbound.format()
+        };
         let wake = self.wake.is_some();
         let identity = ReplyIdentity {
             bot: &self.bot,

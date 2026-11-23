@@ -146,6 +146,7 @@ switch (command) {
   case "react":
   case "channel":
   case "inbound-lag":
+  case "download":
   case "transcribe":
     commands = (await import("./cli-messenger.ts")).messengerCommands;
     break;

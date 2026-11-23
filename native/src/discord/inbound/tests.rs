@@ -1,3 +1,4 @@
+use crate::discord::Snowflake;
 use serde_json::json;
 
 use super::{Inbound, ReplyStatus, raw_fingerprint, stable_url};
@@ -171,5 +172,36 @@ fn source_json_matches_discord_inbound_shape() {
     assert_eq!(
         Inbound::from_raw(&raw).unwrap().source_json(),
         "{\"channel\":\"2001\",\"message\":\"1002\",\"reference\":null,\"text\":\"hi\",\"replyTo\":null,\"attachments\":[],\"unreferencedText\":true}"
+    );
+}
+
+#[test]
+fn attachment_refs_hide_urls_and_hold_missing_or_duplicate_ids() {
+    let mut raw = json!({"id":"1002", "channel_id":"2001", "content":"file", "type":0,
+        "author":{"id":"3"}, "attachments":[{"id":"7", "filename":"file.pdf", "size":1,
+        "url":"https://cdn.discordapp.com/attachments/2001/7/file.pdf?hm=secret"}]});
+    let bot = Snowflake::try_from("99".to_owned()).unwrap();
+    let owner = Snowflake::try_from("3".to_owned()).unwrap();
+    let inbound = Inbound::from_raw(&raw).unwrap();
+    let text = inbound.format_refs(bot, owner).unwrap();
+    assert!(text.contains("discord-file:99:3:2001:1002:7"));
+    assert!(!text.contains("secret"));
+    assert!(!text.contains("\"url\""));
+    assert!(inbound.format().contains("secret"));
+    raw["attachments"][0].as_object_mut().unwrap().remove("id");
+    assert!(
+        Inbound::from_raw(&raw)
+            .unwrap()
+            .format_refs(bot, owner)
+            .is_err()
+    );
+    raw["attachments"][0]["id"] = json!("7");
+    let duplicate = raw["attachments"][0].clone();
+    raw["attachments"].as_array_mut().unwrap().push(duplicate);
+    assert!(
+        Inbound::from_raw(&raw)
+            .unwrap()
+            .format_refs(bot, owner)
+            .is_err()
     );
 }

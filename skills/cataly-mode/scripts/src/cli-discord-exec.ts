@@ -17,6 +17,7 @@ type DiscordMonitor = {
   readonly gateway: boolean;
   readonly pollMinutes: number;
   readonly context: boolean;
+  readonly attachmentRefs?: boolean;
   readonly wake: boolean;
   readonly activityFile?: string;
 };
@@ -43,6 +44,7 @@ function discordMonitorArgv(
   for (const channel of new Set(monitor.channels)) argv.push("--channel", channel);
   if (monitor.all) argv.push("--scope-all");
   else if (monitor.threads) argv.push("--follow-threads");
+  if (monitor.attachmentRefs) argv.push("--attachment-refs");
   if (monitor.context) argv.push("--context");
   if (monitor.wake) argv.push("--wake-lanes");
   if (monitor.activityFile !== undefined) {

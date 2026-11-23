@@ -1,5 +1,5 @@
 /** cataly send, presence, inbound, thread, react and transcribe: the messengers. */
-import { existsSync } from "node:fs";
+import { constants, copyFileSync, existsSync } from "node:fs";
 import { InboundActivityError } from "../../../../src/update/source-activity.ts";
 
 import { type Command, die, envSlackToken, every, messageText, slackAuth } from "./cli-context.ts";
@@ -9,6 +9,7 @@ import { channelDiscord } from "./cli-discord-purpose.ts";
 import { discordClock, openDiscordSocket, untilStopped } from "./cli-discord-gateway.ts";
 import { inboundCommand } from "./cli-inbound.ts";
 import { configuredHookEnv } from "./config.ts";
+import { discordAttachment } from "./messenger/discord-attachment.ts";
 import { ChannelPurposeError } from "./messenger/discord-channels.ts";
 import { discordPresence } from "./messenger/discord-presence.ts";
 import { fetchHttp, MessengerError, UnsafeMessageError } from "./messenger/http.ts";
@@ -18,7 +19,7 @@ import { Telegram } from "./messenger/telegram.ts";
 import { TelegramCursorError } from "./messenger/telegram-cursor-error.ts";
 import { lagOfLine, readLagTail, summarizeLag } from "./messenger/telegram-lag.ts";
 import { ThreadLedger } from "./messenger/thread-ledger.ts";
-import { transcribe, TranscriptionError, withLocalAudio } from "./messenger/voice.ts";
+import { transcribe, TranscriptionError, withLocalAudio, withLocalFile } from "./messenger/voice.ts";
 import { realClock, run } from "./run.ts";
 
 /** Messenger errors are one line, never a stack. */
@@ -145,12 +146,34 @@ export const messengerCommands: Readonly<Record<string, Command>> = {
         (skipped === 0 ? "" : ` skipped=${skipped}`),
     );
   },
+  download: async ({ key, need, opt }) => {
+    const source = discordAttachment(key ?? die("download needs a Discord attachment reference"));
+    const out = need("out");
+    console.log(
+      await withLocalFile(
+        source,
+        Number(opt("max-bytes") ?? 26214400),
+        async (file) => {
+          try {
+            copyFileSync(file, out, constants.COPYFILE_EXCL);
+          } catch {
+            throw new TranscriptionError(
+              "download: could not create output; choose a writable, nonexistent --out path",
+            );
+          }
+          return `DOWNLOADED ${JSON.stringify(out)}`;
+        },
+        false,
+      ),
+    );
+  },
   transcribe: async ({ key, config }) => {
     const source = key ?? die("transcribe needs an audio file path");
+    const input = source.startsWith("discord-file:") ? discordAttachment(source) : source;
     const hook = config.hooks.transcribe;
     const env = hook && configuredHookEnv(config.hooks, hook);
     console.log(
-      await withLocalAudio(source, config.transcribeMaxBytes, (file) =>
+      await withLocalAudio(input, config.transcribeMaxBytes, (file) =>
         transcribe(env ? (argv) => run(argv, { env }) : run, hook, file),
       ),
     );

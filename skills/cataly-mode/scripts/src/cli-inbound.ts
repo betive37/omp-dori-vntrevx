@@ -9,6 +9,8 @@ import { realClock } from "./run.ts";
 
 export const inboundCommand: Command = async ({ key, loopMinutes, config, deps, values, strings, opt }) => {
   const minutes = loopMinutes();
+  const attachmentRefs = values["attachment-refs"] === true;
+  if (attachmentRefs && key !== "discord") die("--attachment-refs is supported for discord only");
   const context = values["context"] === true;
   if (context && key !== "discord") die("--context is supported for discord only");
   const wake = values["wake-lanes"] === true;
@@ -22,6 +24,7 @@ export const inboundCommand: Command = async ({ key, loopMinutes, config, deps, 
       gateway: values["gateway"] === true,
       pollMinutes: values["loop"] === undefined ? 3 / 60 : minutes,
       context,
+      attachmentRefs,
       wake,
       ...(activityFile ? { activityFile } : {}),
     });

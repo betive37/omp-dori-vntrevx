@@ -58,6 +58,7 @@ pub(super) struct Session<'a> {
     pub(super) relay: Relay,
     pub(super) lanes: Lanes,
     pub(super) context: Option<Context>,
+    pub(super) attachment_refs: bool,
     pub(super) recall: Option<Recall>,
     pub(super) activity: Option<Activity>,
     pub(super) scope: Scope<'a>,
@@ -166,6 +167,12 @@ impl Session<'_> {
 
     /// One owner message. Returning `Ok` lets the caller advance the cursor; any error retains it.
     pub(super) async fn emit(&mut self, inbound: &Inbound) -> Result<()> {
+        let mut text = if self.attachment_refs {
+            inbound.format_refs(self.bot, self.owner)?
+        } else {
+            inbound.format()
+        };
+
         if let Some(activity) = self.activity.as_mut() {
             activity.received().context(ActivityFailed)?;
         }
@@ -188,7 +195,6 @@ impl Session<'_> {
         if matches!(plan, Plan::Skip) {
             return Ok(());
         }
-        let mut text = inbound.format();
         if let Some(context) = self.context.as_mut() {
             text.push('\n');
             text.push_str(&context.line(self.api, inbound).await);

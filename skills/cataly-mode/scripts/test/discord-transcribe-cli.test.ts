@@ -46,7 +46,7 @@ test("local and URL transcription use the real hook and remove private downloads
       expect([r.code, r.out, r.audio, readdirSync(f.tmp)]).toEqual([1, "", [], []]);
       expect(r.err).toBe(
         route.status === 404
-          ? "transcribe: GET /audio/voice.ogg answered 404; check the URL or use a local file (config: transcribeMaxBytes=26214400)"
+          ? "transcribe: GET answered 404; check access or use a local file (config: transcribeMaxBytes=26214400)"
           : "transcribe: could not download audio; check the URL/network and temporary storage, or use a local file (config: transcribeMaxBytes=26214400)",
       );
       expect(r.err).not.toContain("token=private");

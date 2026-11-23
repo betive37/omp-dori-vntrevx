@@ -179,7 +179,8 @@ pub(super) async fn run(options: Options) -> Result<()> {
         inbox: &inbox,
         relay: relay(ipc.as_ref(), &cataly),
         head,
-        lanes: Lanes::open(&cataly, bot, owner, options.wake_lanes)?,
+        lanes: Lanes::open(&cataly, bot, owner, &options)?,
+        attachment_refs: options.attachment_refs,
         context: options.context.then(|| Context::new(&cataly)),
         recall: options
             .recall_retention_days

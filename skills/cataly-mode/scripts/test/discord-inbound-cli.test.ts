@@ -216,3 +216,13 @@ posix("Discord intake refuses to start without the native binary or with invalid
   expect({ code: foreign.code, out: foreign.out }).toEqual({ code: 1, out: "" });
   expect(foreign.err).toContain("HEAD_ADMISSION_UNRESOLVED");
 });
+
+posix("attachment references opt into native stateful intake without changing the default", async () => {
+  const refs = await monitor(["--loop", "0", "--attachment-refs"]);
+  expect({ code: refs.code, err: refs.err }).toEqual({ code: 0, err: "" });
+  expect(refs.argv).toContain("--attachment-refs");
+  expect(refs.argv).toContain("--cataly-state");
+  expect(refs.argv).not.toContain("--state-dir");
+  const ordinary = await monitor(["--loop", "0"]);
+  expect(ordinary.argv).not.toContain("--attachment-refs");
+});

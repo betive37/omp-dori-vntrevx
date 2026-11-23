@@ -41,12 +41,19 @@ export async function markDiscordInboundSeen(
   }
 }
 
-export const formatDiscordInbound = (message: DiscordInbound): string => {
+export const formatDiscordInbound = (message: DiscordInbound, attachmentRefs = false): string => {
   const id = `discord ${message.channel} ${message.message}`;
   return [
     `INBOUND ${id} from=owner ref=${message.reference ?? "-"} ${JSON.stringify(message.text)}`,
     ...(message.replyTo ? [`INBOUND_REPLY ${id} ${JSON.stringify(message.replyTo)}`] : []),
-    ...message.attachments.map((attachment) => `INBOUND_ATTACHMENT ${id} ${JSON.stringify(attachment)}`),
+    ...message.attachments.map((attachment) => {
+      if (attachmentRefs && !attachment.ref)
+        throw inboundProtocolError(
+          "Discord attachment has no unique file reference; use default URL records or repair its metadata",
+        );
+      const record = attachmentRefs ? { ...attachment, url: undefined } : attachment;
+      return `INBOUND_ATTACHMENT ${id} ${JSON.stringify(record)}`;
+    }),
   ].join("\n");
 };
 
@@ -130,7 +137,7 @@ export const discordInbound = async (
     return floor;
   };
   const deliver = async (message: Message, store: DiscordInboundStore, emit: Emit, cursor = message.id) => {
-    if (isOwnerMessage(message, ownerId, botId)) await emit(toInbound(message));
+    if (isOwnerMessage(message, ownerId, botId)) await emit(toInbound(message, botId));
     store.save(cursor);
   };
   const accept = async (
