@@ -318,6 +318,9 @@ test("a pinned Tern lane's worker-thread subagent passes against its verified ro
     const result = await workerRun(true);
     expect(result.childRequests).toBeGreaterThan(0);
     expect(result.probe).toMatchObject({ model: CHILD_MODEL });
+    const drifted = await workerRun(true, (root) => root.session.setModelTemporary(root.childModel));
+    expect(drifted.totalRequests).toBe(0);
+    expect(drifted.childRequests).toBe(0);
   } finally {
     delete process.env.TERN_PANE;
     process.env.HERDR_PANE_ID = PANE;

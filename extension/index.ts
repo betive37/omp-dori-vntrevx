@@ -367,6 +367,9 @@ type StartupGoalPause = {
   used?: boolean;
 };
 
+const nativePaneId = (): string | undefined =>
+  process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
+
 const errorText = (error: unknown): string => (error instanceof Error ? error.message : String(error));
 
 const CATALY_REPORT_DESCRIPTION = [
@@ -704,7 +707,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
       } else runtimeHealth.stop();
       return;
     }
-    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
+    const paneId = nativePaneId();
     if (!paneId || stateDir === undefined || !session) return;
     // Only an interactive session taking over the pane clears an inactive resume pointer. Print/RPC children
     // inherit pane ids too, but do not own the terminal. A record another live process owns stays untouched.
@@ -971,7 +974,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
         const requested = launchModelFlag();
         if (!freshLaunch || proof.status !== "matched" || typeof requested !== "string")
           throw new Error(
-            "native model snapshot is unknown; use an explicit idle /dori-lane-model selection from the Dori head",
+            "native model snapshot is unknown; use an explicit idle /cataly-lane-model selection from the Cataly head",
           );
         const captured = captureModelSnapshot(nativeProfileModules, owner.settings, {
           kind: "launch",
@@ -1029,7 +1032,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
    */
   const workerRootProblem = (ctx: CatalyContext): string | undefined => {
     if (isMainThread || stateDir === undefined) return undefined;
-    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
+    const paneId = nativePaneId();
     const modules = nativeProfileModules;
     if (!modules) {
       // Without native settings only this process's own pinned-lane publication can say a root is pinned.
@@ -1264,7 +1267,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     const root = stateDir;
     const owner = session;
     const ownerRole = role;
-    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
+    const paneId = nativePaneId();
     const headless = headlessRemoteId(ctx, ownerRole);
     if (
       !root ||
@@ -1542,7 +1545,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
         )
           appendRole(role);
         if (ctx.agent.kind === "main") {
-          const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
+          const pane = nativePaneId();
           const nativeId = nativeHeadlessId(ctx);
           const nativeRole = role === "cataly" && nativeId ? nativeHarnessRole() : undefined;
           const harness = nativeRole === "lead" && !isLead() ? undefined : nativeRole;
@@ -1741,194 +1744,197 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     });
   }
 
-  pi.registerCommand("dori-lane-model", {
-    description: "Explicitly change one idle lane's model from its native Cataly head",
-    async handler(args, ctx) {
-      if (ctx.agent.kind !== "main" || role !== "cataly" || !stateDir || !catalyConfig) {
-        ctx.ui.notify("/dori-lane-model works only in the native main Dori head", "warning");
-        return;
-      }
-      const parts = args.trim().split(/\s+/);
-      if (parts.length !== 2) {
-        ctx.ui.notify("Usage: /dori-lane-model <lane-key> <provider/id>. Pause the lane first.", "warning");
-        return;
-      }
-      savePane(ctx);
-      const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
-      const head = pane ? readPaneState(stateDir, pane) : null;
-      if (!head || head.pid !== process.pid || head.sessionId !== ctx.sessionManager.getSessionId()) {
-        ctx.ui.notify("MODEL_SWITCH_REFUSED: this head has no owned native pane record", "warning");
-        return;
-      }
-      const result = await requestLaneModelSwitch(
-        { config: catalyConfig, registry: new Registry(stateDir), run, clock: realClock, env: process.env },
-        parts[0]!,
-        parts[1]!,
-        head,
-      );
-      ctx.ui.notify(result.lines.join("\n"), result.code === 0 ? "info" : "warning");
-    },
-  });
-
-  pi.registerCommand("dori-model-apply", {
-    description: "Apply a single pending head-authorized idle lane model request",
-    async handler(args, ctx) {
-      const parts = args.trim().split(/\s+/);
-      if (
-        parts.length !== 2 ||
-        ctx.agent.kind !== "main" ||
-        role !== "lane" ||
-        !stateDir ||
-        modelChanging ||
-        modelSwitch?.nonce === parts[1]
-      )
-        return;
-      const binding = modelProfile;
-      if (!binding) {
-        ctx.ui.notify("MODEL_SWITCH_REFUSED: reopen this lane with a process-owned model profile first", "warning");
-        return;
-      }
-      const idleProblem = (): string | undefined => {
-        if (ctx.isIdle?.() !== true || agentStatus !== "idle") return "native lane is not idle";
-        if (approvals.size || ctx.hasPendingMessages?.()) return "native lane has an approval or queued input";
-        if (!["none", "paused", "complete", "dropped"].includes(goal.status)) return "pause the native goal first";
-        const jobs = ctx.getAsyncJobSnapshot?.();
-        if (
-          !jobs ||
-          jobs.running.length ||
-          jobs.delivery.queued ||
-          jobs.delivery.delivering ||
-          jobs.delivery.pendingJobIds.length ||
-          binding.owner.getAsyncJobTree()?.running.length !== 0
-        )
-          return "native asynchronous or descendant work is pending or unknown";
-        if (
-          binding.ownerApi.AgentRegistry.global().get(binding.agentId)?.session !== binding.owner ||
-          binding.sessionId !== ctx.sessionManager.getSessionId() ||
-          binding.sessionFile !== ctx.sessionManager.getSessionFile()
-        )
-          return "native owning session changed";
-        return undefined;
-      };
-      const busy = idleProblem();
-      if (busy) {
-        ctx.ui.notify(`MODEL_SWITCH_REFUSED: ${busy}`, "warning");
-        return;
-      }
-      const previousError = binding.error;
-      const previousProfileError = modelProfileError;
-      let accepted = false;
-      modelChanging = true;
-      binding.error = "explicit idle model change is in progress";
-      try {
+  for (const command of ["cataly-lane-model", "dori-lane-model"])
+    pi.registerCommand(command, {
+      description: "Explicitly change one idle lane's model from its native Cataly head",
+      async handler(args, ctx) {
+        if (ctx.agent.kind !== "main" || role !== "cataly" || !stateDir || !catalyConfig) {
+          ctx.ui.notify("/cataly-lane-model works only in the native main Cataly head", "warning");
+          return;
+        }
+        const parts = args.trim().split(/\s+/);
+        if (parts.length !== 2) {
+          ctx.ui.notify("Usage: /cataly-lane-model <lane-key> <provider/id>. Pause the lane first.", "warning");
+          return;
+        }
         savePane(ctx);
-        const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
-        const self = pane ? readPaneState(stateDir, pane) : null;
-        if (!self || self.pid !== process.pid) return;
-        const request = await claimModelSwitch(new Registry(stateDir), parts[0]!, parts[1]!, self, (receipt) => {
+        const pane = nativePaneId();
+        const head = pane ? readPaneState(stateDir, pane) : null;
+        if (!head || head.pid !== process.pid || head.sessionId !== ctx.sessionManager.getSessionId()) {
+          ctx.ui.notify("MODEL_SWITCH_REFUSED: this head has no owned native pane record", "warning");
+          return;
+        }
+        const result = await requestLaneModelSwitch(
+          { config: catalyConfig, registry: new Registry(stateDir), run, clock: realClock, env: process.env },
+          parts[0]!,
+          parts[1]!,
+          head,
+        );
+        ctx.ui.notify(result.lines.join("\n"), result.code === 0 ? "info" : "warning");
+      },
+    });
+
+  for (const command of ["cataly-model-apply", "dori-model-apply"])
+    pi.registerCommand(command, {
+      description: "Apply a single pending head-authorized idle lane model request",
+      async handler(args, ctx) {
+        const parts = args.trim().split(/\s+/);
+        if (
+          parts.length !== 2 ||
+          ctx.agent.kind !== "main" ||
+          role !== "lane" ||
+          !stateDir ||
+          modelChanging ||
+          modelSwitch?.nonce === parts[1]
+        )
+          return;
+        const binding = modelProfile;
+        if (!binding) {
+          ctx.ui.notify("MODEL_SWITCH_REFUSED: reopen this lane with a process-owned model profile first", "warning");
+          return;
+        }
+        const idleProblem = (): string | undefined => {
+          if (ctx.isIdle?.() !== true || agentStatus !== "idle") return "native lane is not idle";
+          if (approvals.size || ctx.hasPendingMessages?.()) return "native lane has an approval or queued input";
+          if (!["none", "paused", "complete", "dropped"].includes(goal.status)) return "pause the native goal first";
+          const jobs = ctx.getAsyncJobSnapshot?.();
+          if (
+            !jobs ||
+            jobs.running.length ||
+            jobs.delivery.queued ||
+            jobs.delivery.delivering ||
+            jobs.delivery.pendingJobIds.length ||
+            binding.owner.getAsyncJobTree()?.running.length !== 0
+          )
+            return "native asynchronous or descendant work is pending or unknown";
+          if (
+            binding.ownerApi.AgentRegistry.global().get(binding.agentId)?.session !== binding.owner ||
+            binding.sessionId !== ctx.sessionManager.getSessionId() ||
+            binding.sessionFile !== ctx.sessionManager.getSessionFile()
+          )
+            return "native owning session changed";
+          return undefined;
+        };
+        const busy = idleProblem();
+        if (busy) {
+          ctx.ui.notify(`MODEL_SWITCH_REFUSED: ${busy}`, "warning");
+          return;
+        }
+        const previousError = binding.error;
+        const previousProfileError = modelProfileError;
+        let accepted = false;
+        modelChanging = true;
+        binding.error = "explicit idle model change is in progress";
+        try {
+          savePane(ctx);
+          const pane = nativePaneId();
+          const self = pane ? readPaneState(stateDir, pane) : null;
+          if (!self || self.pid !== process.pid) return;
+          const request = await claimModelSwitch(new Registry(stateDir), parts[0]!, parts[1]!, self, (receipt) => {
+            const changed = idleProblem();
+            if (changed) throw new Error(changed);
+            accepted = true;
+            modelSwitch = receipt;
+            savePane(ctx);
+          });
+          if (!request) return;
+          if (request.priorSnapshotId !== (binding.snapshot?.id ?? null))
+            throw new Error("snapshot changed since the head request");
           const changed = idleProblem();
           if (changed) throw new Error(changed);
-          accepted = true;
-          modelSwitch = receipt;
-          savePane(ctx);
-        });
-        if (!request) return;
-        if (request.priorSnapshotId !== (binding.snapshot?.id ?? null))
-          throw new Error("snapshot changed since the head request");
-        const changed = idleProblem();
-        if (changed) throw new Error(changed);
-        const requested = exactModelIdentity(request.requested)!;
-        if (!ctx.modelRegistry) throw new Error("native model registry is unavailable");
-        const available = ctx.modelRegistry.getAvailableForProviders(new Set([requested.provider.toLowerCase()]));
-        const matches = available.filter(
-          (candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === request.requested.toLowerCase(),
-        );
-        const selected =
-          matches.find((candidate) => candidate.id === requested.id) ?? (matches.length === 1 ? matches[0] : undefined);
-        if (!selected?.provider) throw new Error("requested exact native model is unavailable or ambiguous");
-        if (!(await pi.setModel?.(selected))) throw new Error("native model setter refused the requested model");
-        if (
-          binding.owner.sessionManager.getSessionId() !== binding.sessionId ||
-          binding.owner.sessionManager.getSessionFile() !== binding.sessionFile
-        )
-          throw new Error("native session changed during model selection");
-        const actual = binding.owner.agent.state.model;
-        if (actual?.provider !== selected.provider || actual.id !== selected.id)
-          throw new Error("native model readback did not confirm the explicit selection");
-        const observed = { provider: selected.provider, id: selected.id };
-        let snapshot: ModelSnapshot;
-        if (binding.snapshot)
-          snapshot = {
-            ...binding.snapshot,
-            id: request.nonce,
-            model: observed,
-            configuredThinkingLevel: binding.owner.configuredThinkingLevel() ?? null,
-            thinkingLevel: pi.getThinkingLevel?.() ?? null,
-            capturedAt: new Date().toISOString(),
-            provenance: { ...binding.snapshot.provenance, kind: "idle-switch", requested: request.requested },
-          };
-        else {
-          const captured = captureModelSnapshot(binding.modules, binding.owner.settings, {
-            kind: "idle-switch",
-            requested: request.requested,
-            model: observed,
-            configuredThinkingLevel: binding.owner.configuredThinkingLevel(),
-            thinkingLevel: pi.getThinkingLevel?.(),
-          });
-          if (typeof captured === "string") throw new Error(captured);
-          snapshot = captured;
-        }
-        const failed =
-          (await bindModelProfile(binding.modules, binding.owner.settings, binding.file, snapshot)) ??
-          checkModelProfile(
-            binding.modules,
-            binding.owner.settings,
-            binding.file,
-            snapshot,
-            binding.owner.agent.state.model,
-          ) ??
-          thinkingSelectionDrift(snapshot, binding.owner.configuredThinkingLevel());
-        if (failed) throw new Error(failed);
-        recordModelSnapshot(binding, snapshot);
-        binding.snapshot = snapshot;
-        binding.error = modelProfileError = undefined;
-        modelSwitch = { nonce: request.nonce, status: "changed" };
-      } catch (error) {
-        const reason = errorText(error);
-        if (accepted) {
-          modelSwitch = { nonce: parts[1]!, status: "failed", reason };
-          // The earlier state stands only when native reads back the unchanged session, model and pinned profile;
-          // anything else holds as it is, without rollback or reselection.
-          const owner = binding.ownerApi.AgentRegistry.global().get(binding.agentId)?.session;
-          const unchanged =
-            binding.snapshot !== undefined &&
-            owner === binding.owner &&
-            binding.owner.sessionManager.getSessionId() === binding.sessionId &&
-            binding.owner.sessionManager.getSessionFile() === binding.sessionFile &&
+          const requested = exactModelIdentity(request.requested)!;
+          if (!ctx.modelRegistry) throw new Error("native model registry is unavailable");
+          const available = ctx.modelRegistry.getAvailableForProviders(new Set([requested.provider.toLowerCase()]));
+          const matches = available.filter(
+            (candidate) => `${candidate.provider}/${candidate.id}`.toLowerCase() === request.requested.toLowerCase(),
+          );
+          const selected =
+            matches.find((candidate) => candidate.id === requested.id) ??
+            (matches.length === 1 ? matches[0] : undefined);
+          if (!selected?.provider) throw new Error("requested exact native model is unavailable or ambiguous");
+          if (!(await pi.setModel?.(selected))) throw new Error("native model setter refused the requested model");
+          if (
+            binding.owner.sessionManager.getSessionId() !== binding.sessionId ||
+            binding.owner.sessionManager.getSessionFile() !== binding.sessionFile
+          )
+            throw new Error("native session changed during model selection");
+          const actual = binding.owner.agent.state.model;
+          if (actual?.provider !== selected.provider || actual.id !== selected.id)
+            throw new Error("native model readback did not confirm the explicit selection");
+          const observed = { provider: selected.provider, id: selected.id };
+          let snapshot: ModelSnapshot;
+          if (binding.snapshot)
+            snapshot = {
+              ...binding.snapshot,
+              id: request.nonce,
+              model: observed,
+              configuredThinkingLevel: binding.owner.configuredThinkingLevel() ?? null,
+              thinkingLevel: pi.getThinkingLevel?.() ?? null,
+              capturedAt: new Date().toISOString(),
+              provenance: { ...binding.snapshot.provenance, kind: "idle-switch", requested: request.requested },
+            };
+          else {
+            const captured = captureModelSnapshot(binding.modules, binding.owner.settings, {
+              kind: "idle-switch",
+              requested: request.requested,
+              model: observed,
+              configuredThinkingLevel: binding.owner.configuredThinkingLevel(),
+              thinkingLevel: pi.getThinkingLevel?.(),
+            });
+            if (typeof captured === "string") throw new Error(captured);
+            snapshot = captured;
+          }
+          const failed =
+            (await bindModelProfile(binding.modules, binding.owner.settings, binding.file, snapshot)) ??
             checkModelProfile(
               binding.modules,
               binding.owner.settings,
               binding.file,
-              binding.snapshot,
+              snapshot,
               binding.owner.agent.state.model,
-            ) === null &&
-            thinkingSelectionDrift(binding.snapshot, binding.owner.configuredThinkingLevel()) === null;
-          if (unchanged) {
+            ) ??
+            thinkingSelectionDrift(snapshot, binding.owner.configuredThinkingLevel());
+          if (failed) throw new Error(failed);
+          recordModelSnapshot(binding, snapshot);
+          binding.snapshot = snapshot;
+          binding.error = modelProfileError = undefined;
+          modelSwitch = { nonce: request.nonce, status: "changed" };
+        } catch (error) {
+          const reason = errorText(error);
+          if (accepted) {
+            modelSwitch = { nonce: parts[1]!, status: "failed", reason };
+            // The earlier state stands only when native reads back the unchanged session, model and pinned profile;
+            // anything else holds as it is, without rollback or reselection.
+            const owner = binding.ownerApi.AgentRegistry.global().get(binding.agentId)?.session;
+            const unchanged =
+              binding.snapshot !== undefined &&
+              owner === binding.owner &&
+              binding.owner.sessionManager.getSessionId() === binding.sessionId &&
+              binding.owner.sessionManager.getSessionFile() === binding.sessionFile &&
+              checkModelProfile(
+                binding.modules,
+                binding.owner.settings,
+                binding.file,
+                binding.snapshot,
+                binding.owner.agent.state.model,
+              ) === null &&
+              thinkingSelectionDrift(binding.snapshot, binding.owner.configuredThinkingLevel()) === null;
+            if (unchanged) {
+              binding.error = previousError;
+              modelProfileError = previousProfileError;
+            } else binding.error = modelProfileError = reason;
+          }
+          ctx.ui.notify(`MODEL_SWITCH_FAILED: ${reason}`, "warning");
+        } finally {
+          modelChanging = false;
+          if (!accepted) {
             binding.error = previousError;
             modelProfileError = previousProfileError;
-          } else binding.error = modelProfileError = reason;
+          }
+          savePane(ctx);
         }
-        ctx.ui.notify(`MODEL_SWITCH_FAILED: ${reason}`, "warning");
-      } finally {
-        modelChanging = false;
-        if (!accepted) {
-          binding.error = previousError;
-          modelProfileError = previousProfileError;
-        }
-        savePane(ctx);
-      }
-    },
-  });
+      },
+    });
 
   const z = pi.zod;
   pi.registerTool<{

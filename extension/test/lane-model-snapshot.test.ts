@@ -26,8 +26,8 @@ afterEach(async () => {
   for (const cleanup of cleanups.splice(0).reverse()) await cleanup();
 });
 
-const world = async () => {
-  const keys = ["DORI_CONFIG", "DORI_STATE_DIR", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
+const world = async (runtime: "herdr" | "tern" = "herdr") => {
+  const keys = ["DORI_CONFIG", "DORI_STATE_DIR", "HERDR_PANE_ID", "HC_TERMINAL_ID", "TERN_PANE"];
   const before = keys.map((key) => process.env[key]);
   const stateDir = useConfig(join(import.meta.dir, "fake-ulw.ts"));
   const root = dirname(stateDir);
@@ -45,7 +45,9 @@ const world = async () => {
       }),
     );
   global("fixture/a");
-  process.env.HERDR_PANE_ID = "profile:p1";
+  delete process.env.HERDR_PANE_ID;
+  delete process.env.TERN_PANE;
+  process.env[runtime === "tern" ? "TERN_PANE" : "HERDR_PANE_ID"] = "profile:p1";
   delete process.env.HC_TERMINAL_ID;
   const instances: Array<{ pi: FakePi; settings: NativeConfig.Settings }> = [];
   const lane = async (patch: Partial<FakeOptions> = {}) => {
@@ -304,7 +306,7 @@ test.each(["missing", "malformed"])(
     const before = readFileSync(w.globalFile, "utf8");
     const request = await w.request("fixture/b");
     expect(request.priorSnapshotId).toBeNull();
-    await lane.pi.command("dori-model-apply", `lane ${request.nonce}`);
+    await lane.pi.command("cataly-model-apply", `lane ${request.nonce}`);
     expect(w.state().modelSwitch).toEqual({ nonce: request.nonce, status: "changed" });
     expect(w.state().modelSnapshotError).toBeUndefined();
     expect(snapshot(w.state())).toMatchObject({
@@ -458,6 +460,36 @@ test("layer observers do not mistake an in-progress saved-snapshot bind for drif
   await lane.pi.emit("before_provider_request");
 });
 
+test("a Tern authorized idle switch creates one new snapshot and never mutates global defaults or resumes the goal", async () => {
+  const w = await world("tern");
+  let sets = 0;
+  const lane = await w.lane({
+    setModel: async () => {
+      sets++;
+      return true;
+    },
+  });
+  const previous = snapshot(w.state());
+  const globalBefore = readFileSync(w.globalFile, "utf8");
+  const request = await w.request("fixture/b");
+  await lane.pi.command("dori-model-apply", `lane ${request.nonce}`);
+  const current = w.state();
+  expect(current.modelSwitch).toEqual({ nonce: request.nonce, status: "changed" });
+  expect(snapshot(current)).toMatchObject({
+    model: B,
+    modelRoles: previous.modelRoles,
+    defaultThinkingLevel: previous.defaultThinkingLevel,
+    provenance: { ...previous.provenance, kind: "idle-switch", requested: "fixture/b" },
+  });
+  expect(current.modelSnapshot?.id).not.toBe(previous.id);
+  expect(current.goal.status).toBe("paused");
+  expect(readFileSync(w.globalFile, "utf8")).toBe(globalBefore);
+  await lane.pi.emit("before_provider_request");
+  await lane.pi.command("dori-model-apply", `lane ${request.nonce}`);
+  expect(sets).toBe(1);
+  expect(snapshot(w.state())).toEqual(snapshot(current));
+});
+
 test("an authorized idle switch creates one new snapshot and never mutates global defaults or resumes the goal", async () => {
   const w = await world();
   let sets = 0;
@@ -608,6 +640,6 @@ test("ordinary and lane sessions cannot invoke the native head workflow", async 
   const w = await world();
   const lane = await w.lane();
   await lane.pi.command("dori-lane-model", "lane fixture/b");
-  expect(lane.pi.notes.at(-1)).toContain("only in the native main Dori head");
+  expect(lane.pi.notes.at(-1)).toContain("only in the native main Cataly head");
   expect(await new Registry(w.stateDir).read("lane")).toBeNull();
 });
