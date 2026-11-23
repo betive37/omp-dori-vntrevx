@@ -185,7 +185,7 @@ test.each([
   "discord-file:99:10:20:101:99999999999999999999999",
 ])("malformed reserved ref %s is refused without URL or local fallback", async (bad) => {
   await withDiscordCli(async (f) => {
-    writeFileSync(join(dirname(f.tmp), bad), "would be a local fallback");
+    if (process.platform !== "win32") writeFileSync(join(dirname(f.tmp), bad), "would be a local fallback");
     for (const command of ["transcribe", "download"]) {
       const args = command === "download" ? [command, bad, "--out", join(dirname(f.tmp), "never")] : [command, bad];
       const r = await f.invoke(args, { environment, routes: discordRoutes("voice.ogg", Buffer.alloc(1)) });
@@ -194,7 +194,7 @@ test.each([
   });
 });
 
-test("a ./discord-file: path stays a local transcribe input", async () => {
+test.skipIf(process.platform === "win32")("a ./discord-file: path stays a local transcribe input", async () => {
   await withDiscordCli(async (f) => {
     writeFileSync(join(dirname(f.tmp), "discord-file:99:10:20:101:500"), "local reserved name");
     const r = await f.invoke(["transcribe", `./${ref}`], { environment });

@@ -1,5 +1,5 @@
-//! One owner message as the TypeScript monitor delivered it (`toInbound`, `formatDiscordInbound` and
-//! `discordSourceFingerprint` parity, byte for byte).
+//! One owner message in the retained native wire format. Source fingerprints retain TypeScript parity;
+//! URL-free attachment references are opt-in, while default native records keep their historical fields.
 
 use std::fmt::Write as _;
 

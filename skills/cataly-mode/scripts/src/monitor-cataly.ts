@@ -18,6 +18,7 @@ export const CATALY_COMMANDS: Record<string, true> = {
   "dead-panes": true,
   decision: true,
   doctor: true,
+  download: true,
   eta: true,
   "monitor-presets": true,
   freshness: true,
@@ -68,6 +69,8 @@ export const CATALY_COMMANDS: Record<string, true> = {
 /** cli.ts's options that take a value (`type: "string"`); the others are flags. */
 export const CATALY_VALUE_OPTIONS: Record<string, true> = {
   title: true,
+  out: true,
+  "max-bytes": true,
   brief: true,
   template: true,
   set: true,
