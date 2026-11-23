@@ -1,3 +1,4 @@
+import { snapshotFor } from "./model-snapshot-fixture.ts";
 import { afterEach, beforeEach, expect, test } from "bun:test";
 import { readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
@@ -177,6 +178,24 @@ test("launch persists requested metadata but keeps the exact prompt and refuses 
           out: JSON.stringify({ result: { root_pane: { pane_id: "w:p9" }, tab_id: "w:t9" } }),
           err: "",
         };
+      if (argv[0] === "herdr" && argv[2] === "run") {
+        const lane = await base.registry.read("selection-lane");
+        if (!lane?.modelProfileFile) throw new Error("selection fixture has no model profile");
+        laneState(state.dir, "w:p9", {
+          agentStatus: "idle",
+          goal,
+          modelReadback: {
+            requested: model,
+            observed: model,
+            status: "matched",
+            billing: "unknown",
+            checkedAt: new Date(T0).toISOString(),
+            source: "native-extension",
+          },
+          modelSnapshot: snapshotFor(`${provider}/${id}`),
+          modelProfileFile: lane.modelProfileFile,
+        });
+      }
       const response = await base.run(argv, options);
       if (argv[0] === "herdr" && argv[2] === "send-keys" && argv[4] === "enter" && response.code === 0)
         laneState(state.dir, "w:p9", { agentStatus: "working", goal });
