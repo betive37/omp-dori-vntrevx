@@ -95,7 +95,7 @@ test("real native idle command selects once, preserves defaults and dispatches t
       if (previous[index] === undefined) delete process.env[key];
       else process.env[key] = previous[index];
     });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -165,7 +165,7 @@ test("real native refused idle switch keeps the unchanged pinned lane running", 
       if (previous[index] === undefined) delete process.env[key];
       else process.env[key] = previous[index];
     });
-    rmSync(home, { recursive: true, force: true });
+    rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
@@ -221,7 +221,7 @@ for (const boundary of ["session", "provider"] as const) {
           if (previous[index] === undefined) delete process.env[key];
           else process.env[key] = previous[index];
         });
-        rmSync(home, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });
   }
@@ -309,7 +309,7 @@ for (const boundary of ["session", "provider"] as const) {
           if (previous[index] === undefined) delete process.env[key];
           else process.env[key] = previous[index];
         });
-        rmSync(home, { recursive: true, force: true });
+        rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });
   }

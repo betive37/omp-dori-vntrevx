@@ -50,7 +50,7 @@ const world = () => {
   const instances: NativeConfig.Settings[] = [];
   cleanups.push(() => {
     for (const settings of instances) settings.cancelPendingSaves();
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   /** One native process: its own fresh profile overlay last, like a Dori launch or reopen. */
   const lane = async (overrides?: Record<string, unknown>, after: string[] = []) => {

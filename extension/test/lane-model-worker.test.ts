@@ -88,7 +88,7 @@ afterAll(() => {
     if (previous[index] === undefined) delete process.env[key];
     else process.env[key] = previous[index];
   });
-  if (stateDir) rmSync(dirname(stateDir), { recursive: true, force: true });
+  if (stateDir) rmSync(dirname(stateDir), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
 /** The live root lane a disturbance acts on, with the pane state it published at startup. */

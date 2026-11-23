@@ -1,4 +1,5 @@
 import { afterEach, beforeEach, expect, test } from "bun:test";
+import { quoteForPane } from "../src/launch-footer.ts";
 import type { PaneState } from "../src/lane-state.ts";
 import { newWorld, withState, type TestState, type World } from "./fakes.ts";
 import { startOmpLane, type OmpLaunchOptions } from "./omp-launch-fixture.ts";
@@ -22,7 +23,7 @@ test("OMP startup reads its own live goal and session launch prompt even when th
   expect(active.startup).toBe("STARTUP_OK active-lane w:p9");
   const command = world.calls.find((argv) => argv[2] === "run")?.at(-1) ?? "";
   expect(command).toBe(
-    `omp --cataly-launch-model=anthropic/claude-opus-5-5 --cataly-role=lane --model=anthropic/claude-opus-5-5 --config=${active.lane.modelProfileFile}`,
+    `omp --cataly-launch-model=anthropic/claude-opus-5-5 --cataly-role=lane --model=anthropic/claude-opus-5-5 ${quoteForPane(`--config=${active.lane.modelProfileFile}`)}`,
   );
   expect(command).not.toContain("ulw set goal and work");
   expect(world.calls.filter((argv) => argv[2] === "send-text")).toHaveLength(1);

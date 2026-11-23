@@ -208,7 +208,7 @@ test("launch persists requested metadata but keeps the exact prompt and refuses 
     world.calls
       .find((argv) => argv[0] === "herdr" && argv[2] === "run")
       ?.at(-1)
-      ?.replace(/ --config=.+$/, ""),
+      ?.replace(/ ['"]?--config=.+$/, ""),
   ).toBe(
     [
       "omp",

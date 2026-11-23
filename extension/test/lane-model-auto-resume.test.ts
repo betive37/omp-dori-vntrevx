@@ -247,7 +247,7 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
         if (previous[index] === undefined) delete process.env[key];
         else process.env[key] = previous[index];
       });
-      rmSync(home, { recursive: true, force: true });
+      rmSync(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
-  });
+  }, 30_000);
 }

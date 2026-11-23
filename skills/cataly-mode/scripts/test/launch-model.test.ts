@@ -100,7 +100,7 @@ test("an exact live readback delivers once after starting without the brief", as
     model: matched.observed,
     provenance: { kind: "launch", requested: "subscription/exact" },
   });
-  expect(result.lane.modelProfileFile).toContain("model-profiles/");
+  expect(result.lane.modelProfileFile).toContain(join("model-profiles", ""));
   expect(sent(world)).toHaveLength(1);
   expect(sent(world)[0]).toContain("Read and execute");
   const command = world.calls.find((argv) => argv[2] === "run")?.at(-1);

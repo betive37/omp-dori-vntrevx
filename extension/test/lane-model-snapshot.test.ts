@@ -87,7 +87,7 @@ const world = async (runtime: "herdr" | "tern" = "herdr") => {
       if (before[i] === undefined) delete process.env[key];
       else process.env[key] = before[i];
     });
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   const request = async (selector: string, target = state()): Promise<ModelSwitchRequest> => {
     if (!target.sessionFile) throw new Error("fixture needs a session file");
