@@ -185,7 +185,12 @@ test("launch persists requested metadata but keeps the exact prompt and refuses 
   };
   const result = await launchLane(deps, input());
   const prompt = `${DEFAULT}. Read and execute the lane brief at ${input().brief} in full. You are the selection-lane lane; report as the brief's footer says.`;
-  expect(world.calls.find((argv) => argv[0] === "herdr" && argv[2] === "run")?.at(-1)).toBe(
+  expect(
+    world.calls
+      .find((argv) => argv[0] === "herdr" && argv[2] === "run")
+      ?.at(-1)
+      ?.replace(/ --config=.+$/, ""),
+  ).toBe(
     [
       "omp",
       `--cataly-launch-model=${deps.config.defaultModel}`,
@@ -195,6 +200,7 @@ test("launch persists requested metadata but keeps the exact prompt and refuses 
       .map(quoteForPane)
       .join(" "),
   );
+  expect(world.calls.find((argv) => argv[0] === "herdr" && argv[2] === "run")?.at(-1)).toContain("model-profiles");
   expect(sent(world)).toEqual([prompt]);
   expect(result.startup).toStartWith("STARTUP_NO_GOAL selection-lane w:p9:");
   expect(result.lane.launchSelection?.selectedBy).toBe("default");
