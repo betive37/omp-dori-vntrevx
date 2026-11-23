@@ -52,6 +52,7 @@ const KEYS = [
   "DORI_OMP_ULW_PATH",
   "HERDR_PANE_ID",
   "HC_TERMINAL_ID",
+  "TERN_PANE",
   WORKER_PROBE_ENV,
 ];
 const previous = KEYS.map((key) => process.env[key]);
@@ -73,6 +74,7 @@ beforeAll(async () => {
   process.env[WORKER_PROBE_ENV] = probes;
   delete process.env.DORI_OMP_ULW_PATH;
   delete process.env.HC_TERMINAL_ID;
+  delete process.env.TERN_PANE;
   // Test hook only: every subagent run goes to a worker thread, which starts with this environment.
   pool = new SubagentWorkerPool({ maxWorkers: () => 1, hostsOnMain: false });
   setSubagentWorkerPoolForTests(pool);
@@ -303,6 +305,26 @@ test("a pinned lane's worker-thread subagent passes against its verified root on
   const result = await workerRun(true);
   expect(result.probe).toEqual({ mainThread: false, mirror: true, model: CHILD_MODEL, thinkingLevel: null });
   expect(result.childRequests).toBeGreaterThan(0);
+}, 60_000);
+
+test("a pinned Tern lane's worker-thread subagent passes against its verified root", async () => {
+  delete process.env.HERDR_PANE_ID;
+  process.env.TERN_PANE = PANE;
+  // Workers inherit the runtime identity when their pool starts.
+  pool?.dispose();
+  pool = new SubagentWorkerPool({ maxWorkers: () => 1, hostsOnMain: false });
+  setSubagentWorkerPoolForTests(pool);
+  try {
+    const result = await workerRun(true);
+    expect(result.childRequests).toBeGreaterThan(0);
+    expect(result.probe).toMatchObject({ model: CHILD_MODEL });
+  } finally {
+    delete process.env.TERN_PANE;
+    process.env.HERDR_PANE_ID = PANE;
+    pool.dispose();
+    pool = new SubagentWorkerPool({ maxWorkers: () => 1, hostsOnMain: false });
+    setSubagentWorkerPoolForTests(pool);
+  }
 }, 60_000);
 
 test("a legacy lane without a Dori overlay keeps its worker-thread subagents running", async () => {

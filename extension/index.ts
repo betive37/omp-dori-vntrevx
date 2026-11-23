@@ -1029,7 +1029,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
    */
   const workerRootProblem = (ctx: CatalyContext): string | undefined => {
     if (isMainThread || stateDir === undefined) return undefined;
-    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID;
+    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
     const modules = nativeProfileModules;
     if (!modules) {
       // Without native settings only this process's own pinned-lane publication can say a root is pinned.
@@ -1264,7 +1264,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     const root = stateDir;
     const owner = session;
     const ownerRole = role;
-    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID;
+    const paneId = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
     const headless = headlessRemoteId(ctx, ownerRole);
     if (
       !root ||
@@ -1542,7 +1542,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
         )
           appendRole(role);
         if (ctx.agent.kind === "main") {
-          const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID;
+          const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
           const nativeId = nativeHeadlessId(ctx);
           const nativeRole = role === "cataly" && nativeId ? nativeHarnessRole() : undefined;
           const harness = nativeRole === "lead" && !isLead() ? undefined : nativeRole;
@@ -1754,7 +1754,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
         return;
       }
       savePane(ctx);
-      const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID;
+      const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
       const head = pane ? readPaneState(stateDir, pane) : null;
       if (!head || head.pid !== process.pid || head.sessionId !== ctx.sessionManager.getSessionId()) {
         ctx.ui.notify("MODEL_SWITCH_REFUSED: this head has no owned native pane record", "warning");
@@ -1822,7 +1822,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
       binding.error = "explicit idle model change is in progress";
       try {
         savePane(ctx);
-        const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID;
+        const pane = process.env.HC_TERMINAL_ID || process.env.HERDR_PANE_ID || process.env.TERN_PANE;
         const self = pane ? readPaneState(stateDir, pane) : null;
         if (!self || self.pid !== process.pid) return;
         const request = await claimModelSwitch(new Registry(stateDir), parts[0]!, parts[1]!, self, (receipt) => {
