@@ -1,3 +1,4 @@
+import { closeNativeStorage } from "./native-storage.ts";
 import assert from "node:assert/strict";
 import { join } from "node:path";
 import { ModelRegistry } from "@oh-my-pi/pi-coding-agent/config/model-registry";
@@ -183,6 +184,7 @@ export async function requiredSourceRequest(
     auth?.close();
     settings.stopWatching();
     await settings.flush();
+    closeNativeStorage();
     server.stop(true);
   }
 }

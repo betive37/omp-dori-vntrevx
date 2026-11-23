@@ -1,3 +1,4 @@
+import { closeNativeStorage } from "../../test/fixtures/omp-native-host/native-storage.ts";
 import { rm } from "node:fs/promises";
 import { afterEach, expect, test } from "bun:test";
 import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
@@ -51,6 +52,7 @@ const world = () => {
   const instances: NativeConfig.Settings[] = [];
   cleanups.push(async () => {
     for (const settings of instances) settings.cancelPendingSaves();
+    closeNativeStorage();
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   /** One native process: its own fresh profile overlay last, like a Dori launch or reopen. */

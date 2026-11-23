@@ -1,3 +1,4 @@
+import { closeNativeStorage } from "../../test/fixtures/omp-native-host/native-storage.ts";
 import { rm } from "node:fs/promises";
 import { expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -11,13 +12,13 @@ import { requiredSourceRequest } from "../../test/fixtures/omp-native-host/requi
 import { useConfig } from "./fake-pi.ts";
 
 test("real native idle command selects once, preserves defaults and dispatches through its new snapshot", async () => {
-  const keys = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
+  const keys = ["HOME", "CATALY_CONFIG", "CATALY_STATE_DIR", "CATALY_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
   const previous = keys.map((key) => process.env[key]);
   const stateDir = useConfig("");
   const home = dirname(stateDir);
   process.env.HOME = home;
   process.env.HERDR_PANE_ID = "native-model:p1";
-  delete process.env.DORI_OMP_ULW_PATH;
+  delete process.env.CATALY_OMP_ULW_PATH;
   delete process.env.HC_TERMINAL_ID;
   const cwd = join(home, "project");
   const agentDir = join(cwd, "agent");
@@ -96,18 +97,19 @@ test("real native idle command selects once, preserves defaults and dispatches t
       if (previous[index] === undefined) delete process.env[key];
       else process.env[key] = previous[index];
     });
+    closeNativeStorage();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
 
 test("real native refused idle switch keeps the unchanged pinned lane running", async () => {
-  const keys = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
+  const keys = ["HOME", "CATALY_CONFIG", "CATALY_STATE_DIR", "CATALY_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
   const previous = keys.map((key) => process.env[key]);
   const stateDir = useConfig("");
   const home = dirname(stateDir);
   process.env.HOME = home;
   process.env.HERDR_PANE_ID = "native-model:p2";
-  delete process.env.DORI_OMP_ULW_PATH;
+  delete process.env.CATALY_OMP_ULW_PATH;
   delete process.env.HC_TERMINAL_ID;
   const cwd = join(home, "project");
   mkdirSync(join(cwd, "agent"), { recursive: true });
@@ -166,6 +168,7 @@ test("real native refused idle switch keeps the unchanged pinned lane running", 
       if (previous[index] === undefined) delete process.env[key];
       else process.env[key] = previous[index];
     });
+    closeNativeStorage();
     await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   }
 });
@@ -173,12 +176,19 @@ test("real native refused idle switch keeps the unchanged pinned lane running", 
 for (const boundary of ["session", "provider"] as const) {
   for (const initial of ["low", "auto"] as const) {
     test(`real native ${boundary}: changed thinking ${initial} to high is held before dispatch`, async () => {
-      const keys = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
+      const keys = [
+        "HOME",
+        "CATALY_CONFIG",
+        "CATALY_STATE_DIR",
+        "CATALY_OMP_ULW_PATH",
+        "HERDR_PANE_ID",
+        "HC_TERMINAL_ID",
+      ];
       const previous = keys.map((key) => process.env[key]);
       const stateDir = useConfig("");
       const home = dirname(stateDir);
       process.env.HOME = home;
-      delete process.env.DORI_OMP_ULW_PATH;
+      delete process.env.CATALY_OMP_ULW_PATH;
       delete process.env.HERDR_PANE_ID;
       delete process.env.HC_TERMINAL_ID;
       const cwd = join(home, "project");
@@ -222,6 +232,8 @@ for (const boundary of ["session", "provider"] as const) {
           if (previous[index] === undefined) delete process.env[key];
           else process.env[key] = previous[index];
         });
+        closeNativeStorage();
+        closeNativeStorage();
         await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });
@@ -235,12 +247,19 @@ for (const boundary of ["session", "provider"] as const) {
     [true, true],
   ] as const) {
     test(`real native ${boundary}: ${publicationFails ? "pane publication failure still stops dispatch" : extraRole ? "unexpected role holds before dispatch" : "edited defaults do not retarget a pinned lane"}`, async () => {
-      const keys = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
+      const keys = [
+        "HOME",
+        "CATALY_CONFIG",
+        "CATALY_STATE_DIR",
+        "CATALY_OMP_ULW_PATH",
+        "HERDR_PANE_ID",
+        "HC_TERMINAL_ID",
+      ];
       const previous = keys.map((key) => process.env[key]);
       const stateDir = useConfig("");
       const home = dirname(stateDir);
       process.env.HOME = home;
-      delete process.env.DORI_OMP_ULW_PATH;
+      delete process.env.CATALY_OMP_ULW_PATH;
       if (publicationFails) process.env.HERDR_PANE_ID = "native-publish:p1";
       else delete process.env.HERDR_PANE_ID;
       delete process.env.HC_TERMINAL_ID;
@@ -310,6 +329,8 @@ for (const boundary of ["session", "provider"] as const) {
           if (previous[index] === undefined) delete process.env[key];
           else process.env[key] = previous[index];
         });
+        closeNativeStorage();
+        closeNativeStorage();
         await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
       }
     });

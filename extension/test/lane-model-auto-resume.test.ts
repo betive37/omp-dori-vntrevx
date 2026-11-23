@@ -1,3 +1,4 @@
+import { closeNativeStorage } from "../../test/fixtures/omp-native-host/native-storage.ts";
 import type { AuthStorage } from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/session/auth-storage.d.ts";
 import { rm } from "node:fs/promises";
 import { expect, test } from "bun:test";
@@ -37,7 +38,7 @@ const SNAPSHOT_ENTRY = "omp-cataly:model-snapshot";
 // `ultrathink` resolves auto to the ladder's top (`high` on the loopback ladder), which equals auto's provisional
 // level: native records no resolution, so native alone leaves the transcript without any `thinking_level_change`.
 const AUTO_TURN = "ultrathink Return OK.";
-const KEYS = ["HOME", "DORI_CONFIG", "DORI_STATE_DIR", "DORI_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
+const KEYS = ["HOME", "CATALY_CONFIG", "CATALY_STATE_DIR", "CATALY_OMP_ULW_PATH", "HERDR_PANE_ID", "HC_TERMINAL_ID"];
 
 /** Global settings saved after the lane stopped: another default model with its own concrete effort, another default. */
 const EDITED_GLOBAL = { modelRoles: { default: `openai/${OTHER_ID}:medium` }, defaultThinkingLevel: "medium" };
@@ -76,7 +77,7 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
     const stateDir = useConfig("");
     const home = dirname(stateDir);
     process.env.HOME = home;
-    delete process.env.DORI_OMP_ULW_PATH;
+    delete process.env.CATALY_OMP_ULW_PATH;
     delete process.env.HERDR_PANE_ID;
     delete process.env.HC_TERMINAL_ID;
     const cwd = join(home, "project");
@@ -253,6 +254,7 @@ for (const { name, launchGlobal, explicitAuto, freshSession } of CASES) {
         if (previous[index] === undefined) delete process.env[key];
         else process.env[key] = previous[index];
       });
+      closeNativeStorage();
       await rm(home, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
     }
   }, 30_000);

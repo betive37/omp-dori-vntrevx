@@ -1,3 +1,4 @@
+import { closeNativeStorage } from "../../test/fixtures/omp-native-host/native-storage.ts";
 import type { AuthStorage } from "../../test/fixtures/omp-native-host/node_modules/@oh-my-pi/pi-coding-agent/dist/types/session/auth-storage.d.ts";
 import { afterAll, beforeAll, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -48,9 +49,9 @@ const ROOT_MODEL = "required-source-local";
 const CHILD_MODEL = "required-source-child";
 const KEYS = [
   "HOME",
-  "DORI_CONFIG",
-  "DORI_STATE_DIR",
-  "DORI_OMP_ULW_PATH",
+  "CATALY_CONFIG",
+  "CATALY_STATE_DIR",
+  "CATALY_OMP_ULW_PATH",
   "HERDR_PANE_ID",
   "HC_TERMINAL_ID",
   "TERN_PANE",
@@ -73,7 +74,7 @@ beforeAll(async () => {
   process.env.HOME = dirname(stateDir);
   process.env.HERDR_PANE_ID = PANE;
   process.env[WORKER_PROBE_ENV] = probes;
-  delete process.env.DORI_OMP_ULW_PATH;
+  delete process.env.CATALY_OMP_ULW_PATH;
   delete process.env.HC_TERMINAL_ID;
   delete process.env.TERN_PANE;
   // Test hook only: every subagent run goes to a worker thread, which starts with this environment.
@@ -89,6 +90,7 @@ afterAll(() => {
     if (previous[index] === undefined) delete process.env[key];
     else process.env[key] = previous[index];
   });
+  closeNativeStorage();
   if (stateDir) rmSync(dirname(stateDir), { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
 });
 
@@ -302,6 +304,7 @@ const workerRun = async (
     authStore?.close();
     settings.stopWatching();
     await settings.flush();
+    closeNativeStorage();
   }
 };
 

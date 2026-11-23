@@ -1,3 +1,4 @@
+import { closeNativeStorage } from "../../test/fixtures/omp-native-host/native-storage.ts";
 import { rm } from "node:fs/promises";
 import { afterEach, expect, test } from "bun:test";
 import { randomUUID } from "node:crypto";
@@ -28,7 +29,7 @@ afterEach(async () => {
 });
 
 const world = async (runtime: "herdr" | "tern" = "herdr") => {
-  const keys = ["DORI_CONFIG", "DORI_STATE_DIR", "HERDR_PANE_ID", "HC_TERMINAL_ID", "TERN_PANE"];
+  const keys = ["CATALY_CONFIG", "CATALY_STATE_DIR", "HERDR_PANE_ID", "HC_TERMINAL_ID", "TERN_PANE"];
   const before = keys.map((key) => process.env[key]);
   const stateDir = useConfig(join(import.meta.dir, "fake-ulw.ts"));
   const root = dirname(stateDir);
@@ -89,6 +90,7 @@ const world = async (runtime: "herdr" | "tern" = "herdr") => {
       if (before[i] === undefined) delete process.env[key];
       else process.env[key] = before[i];
     });
+    closeNativeStorage();
     await rm(root, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 });
   });
   const request = async (selector: string, target = state()): Promise<ModelSwitchRequest> => {
