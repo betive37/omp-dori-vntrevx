@@ -118,19 +118,23 @@ export async function requiredSourceRequest(
     ? await Settings.loadIsolated({ cwd, agentDir: join(cwd, "agent"), configFiles: [profile.file], overrides })
     : Settings.isolated(overrides);
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
+  let auth: AuthStorage | undefined;
   const errors: Array<{ event: string; error: string }> = [];
   try {
-    const { auth, registry } = await loopbackRegistry(
+    const resources = await loopbackRegistry(
       cwd,
       settings,
       launchModel ? [model, ...(profile?.alternateModelId ? [loopbackModel(profile.alternateModelId)] : [])] : [],
     );
+    auth = resources.auth;
+    const registry = resources.registry;
     const manager = profile?.persistentSession ? SessionManager.create(cwd, join(cwd, "sessions")) : SessionManager.inMemory(cwd);
     if (role && !profile) manager.appendCustomEntry("omp-cataly:role", role);
     ({ session } = await createAgentSession({
       cwd,
       agentDir: join(cwd, "agent"),
       sessionManager: manager,
+      agentId: `required-source-${manager.getSessionId()}`,
       authStorage: auth,
       modelRegistry: registry,
       model,
@@ -176,6 +180,7 @@ export async function requiredSourceRequest(
     return { requests: requested.length, errors, modelSnapshot: saved?.type === "custom" ? saved.data : undefined };
   } finally {
     await session?.dispose();
+    auth?.close();
     settings.stopWatching();
     await settings.flush();
     server.stop(true);
