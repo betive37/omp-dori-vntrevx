@@ -18,15 +18,20 @@ export async function requiredSourceRequest(
   boundary: "session" | "provider",
   launchModel?: string,
   thinking?: "high" | "low",
-): Promise<{ requests: number; errors: Array<{ event: string; error: string }> }> {
+  /** Pair OMP's advisor on another local model and wait for its first request. */
+  advisor = false,
+): Promise<{ requests: number; models: string[]; errors: Array<{ event: string; error: string }> }> {
   const factory = await nativeExtensionFactory(entry);
   const thinkingLevel = THINKING_EFFORTS.find((effort) => String(effort) === thinking);
   let requests = 0;
+  const models: string[] = [];
   const server = Bun.serve({
     hostname: "127.0.0.1",
     port: 0,
-    fetch() {
+    async fetch(request) {
       requests++;
+      const body: unknown = await request.json();
+      models.push(String(body && typeof body === "object" && "model" in body ? body.model : undefined));
       return new Response(
         'data: {"id":"local","object":"chat.completion.chunk","choices":[{"index":0,"delta":{"role":"assistant","content":"OK"},"finish_reason":null}]}\n\n' +
           'data: {"id":"local","object":"chat.completion.chunk","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}\n\n' +
@@ -50,6 +55,7 @@ export async function requiredSourceRequest(
     identity: { class: "unknown" },
     compat: undefined,
   } satisfies NonNullable<ExtensionContext["model"]>;
+  const advisorModel = { ...model, id: "required-source-advisor", name: "Local advisor fixture" };
   const settings = Settings.isolated({
     "compaction.enabled": false,
     "async.widgets": false,
@@ -57,6 +63,9 @@ export async function requiredSourceRequest(
     "retry.modelFallback": false,
     "prewalk.auto": "off",
     "prewalk.enabled": false,
+    ...(advisor
+      ? { "advisor.enabled": true, modelRoles: { advisor: `${advisorModel.provider}/${advisorModel.id}` } }
+      : {}),
   });
   let session: Awaited<ReturnType<typeof createAgentSession>>["session"] | undefined;
   let auth: AuthStorage | undefined;
@@ -72,7 +81,7 @@ export async function requiredSourceRequest(
       },
     });
     if (launchModel)
-      registry.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: "local-fixture-only", models: [model] });
+      registry.registerProvider(model.provider, { api: model.api, baseUrl: model.baseUrl, apiKey: "local-fixture-only", models: advisor ? [model, advisorModel] : [model] });
     const manager = SessionManager.inMemory(cwd);
     if (role) manager.appendCustomEntry("omp-cataly:role", role);
     ({ session } = await createAgentSession({
@@ -118,9 +127,15 @@ export async function requiredSourceRequest(
         throw error;
       },
     });
+    if (advisor) session.setAdvisorEnabled(true);
     if (boundary === "session") await session.prompt("Return OK.");
     else await session.agent.prompt({ role: "user", content: "Return OK.", timestamp: Date.now() });
-    return { requests, errors };
+    // The advisor reviews the finished turn after the prompt settles.
+    for (const deadline = Date.now() + 10_000; advisor && !models.includes(advisorModel.id); ) {
+      if (Date.now() > deadline) throw new Error(`advisor sent no request; requests went to ${models.join(", ")}`);
+      await Bun.sleep(20);
+    }
+    return { requests, models, errors };
   } finally {
     await session?.dispose();
     auth?.close();

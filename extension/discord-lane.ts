@@ -67,7 +67,8 @@ export class DiscordLane {
   agentStart?: (session: string) => void;
   agentEnd?: (session: string, event: unknown) => void;
   beforeAgentStart?: (event: unknown, ctx: CatalyContext) => Promise<void>;
-  beforeProviderRequest?: (ctx: CatalyContext) => void;
+  /** `model` is the main agent's: OMP also reports advisor and compaction requests here, on their own models. */
+  beforeProviderRequest?: (ctx: CatalyContext, model: CatalyContext["model"]) => void;
 
   constructor(
     private readonly readyForHeadless = headlessDiscordLaneAvailable,
@@ -202,11 +203,11 @@ export class DiscordLane {
       attempt.prepared = true;
       replies.prepareNative(attempt.input);
     };
-    this.beforeProviderRequest = (liveCtx) => {
+    this.beforeProviderRequest = (liveCtx, model) => {
       const attempt = native;
       if (!attempt || liveCtx.sessionManager.getSessionId() !== session) return;
-      if (admission.approvalFree() && matchesModel(liveCtx.model)) return;
-      // Request middleware receives the actual provider model, unlike the launch or UI selection.
+      // The main agent's requests carry its live session model, not the launch or UI selection.
+      if (admission.approvalFree() && matchesModel(model)) return;
       if (!attempt.prepared && !nativeDiscordReceipt(liveCtx.sessionManager.getBranch(), attempt.input)) return;
       liveCtx.abort();
       attempt.hold();

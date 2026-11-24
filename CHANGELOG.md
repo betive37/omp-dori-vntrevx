@@ -30,6 +30,8 @@
   `CATALY_RUNTIME` can explicitly select a supported terminal; a historical
   `runtime` key alone does not.
 
+- A lane's exact launch-model lock checks the main agent's session model on every provider request. Advisor, compaction and auto-learn requests on their own models no longer raise `STARTUP_MODEL_HOLD`, abort the running main turn and pause its goal, and no longer hold a Discord wake lane's native turn; a switch of the main model is still held.
+
 - `cataly launch --model provider/id:<level>` accepts an OMP thinking-level suffix again: the native readback matches the base model and the live thinking level instead of holding every suffixed launch. A literal catalog id that ends in a level still wins, and other colon suffixes stay part of the id.
 
 - Telegram intake binds a private atomic cursor to the authenticated bot and omits offsets after 24 hours without observed updates, missing/invalid timestamps, or clock rollback. Bounded message/revision receipts prevent replay across epoch resets without treating a reused update ID as sufficient identity. Empty polls do not renew the epoch; legacy unscoped numeric cursors are preserved but not trusted. Windows uses a private owner ACL and an exclusive per-bot lease.

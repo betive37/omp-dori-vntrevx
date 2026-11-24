@@ -118,6 +118,9 @@ posix.each([false, true])(
         cataly.userMessages.push(content);
         await cataly.emit("before_agent_start", { reason: "prompt", prompt: content, systemPrompt: [] });
         await cataly.emit("agent_start");
+        // OMP reports an advisor's request, on the advisor's model, through the main agent's request hook.
+        await cataly.emit("before_provider_request", undefined, { provider: "advisor", id: "other" });
+        await cataly.emit("before_provider_request");
         const user = { role: "user", content: [{ type: "text", text: content }], timestamp: 10 };
         cataly.session.entries.push(
           { id: "discord-input", type: "message", message: user },

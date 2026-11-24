@@ -373,10 +373,15 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
     | undefined;
   const launchSessionIds = new Set<string>();
   let headlessKickoff: { readonly sessionId: string; providerChecked: boolean; complete: boolean } | undefined;
-  const modelReadback = (ctx: CatalyContext): ModelReadback => {
+  /**
+   * The main agent's session context. OMP gives `before_provider_request` the model of that one request, which for
+   * an advisor, compaction or auto-learn request is not the main agent's; a context created without a request model
+   * reads the session's current model live, and the main agent's own requests always use that model.
+   */
+  let mainContext: CatalyContext | undefined;
+  const modelReadback = (ctx: CatalyContext, model = ctx.model): ModelReadback => {
     const selector = launchSessionIds.has(ctx.sessionManager.getSessionId()) ? launchModelFlag() : undefined;
     const requested = typeof selector === "string" ? exactModelIdentity(selector) : null;
-    const model = ctx.model;
     const observed = model?.provider ? { provider: model.provider, id: model.id } : null;
     const base = { requested, observed, checkedAt: new Date().toISOString(), source: "native-extension" as const };
     if (!model || !observed || (selector !== undefined && !requested))
@@ -412,12 +417,12 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
       return { ...base, status: "unknown", billing: "unknown" };
     }
   };
-  const assertLaunchModel = (ctx: CatalyContext): void => {
+  const assertLaunchModel = (ctx: CatalyContext, model = ctx.model): void => {
     if (ctx.agent.kind !== "main" || launchModelFlag() === undefined) return;
     const id = ctx.sessionManager.getSessionId();
     if (launchSessionIds.size > 0 && !launchSessionIds.has(id)) return;
     if (headlessKickoff?.sessionId === id && headlessKickoff.complete) return;
-    const readback = modelReadback(ctx);
+    const readback = modelReadback(ctx, model);
     if (role === "lane" && readback.status === "matched") return;
     ctx.abort();
     throw new Error(`STARTUP_MODEL_HOLD: exact launch model ${readback.status}; no automatic substitution`);
@@ -1115,6 +1120,7 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
         role = inherited?.role;
         archivedLeadRestricted = false;
       } else {
+        mainContext = ctx;
         if (eventName === "session_start" && launchSessionIds.size === 0 && launchModelFlag() !== undefined)
           launchSessionIds.add(ctx.sessionManager.getSessionId());
         const recorded = recordedRole(branch);
@@ -1360,14 +1366,18 @@ export default async function ompCataly(pi: CatalyApi): Promise<void> {
       ctx.abort();
       throw requiredLoadError;
     }
-    assertLaunchModel(ctx);
+    // The lock is on the main agent's model, not on whichever request (advisor, compaction) this hook reports.
+    const model = mainContext ? mainContext.model : ctx.model;
+    assertLaunchModel(ctx, model);
     if (
       ctx.agent.kind === "main" &&
+      ctx.model?.provider === model?.provider &&
+      ctx.model?.id === model?.id &&
       headlessKickoff?.sessionId === ctx.sessionManager.getSessionId() &&
       goal.status === "active"
     )
       headlessKickoff.providerChecked = true;
-    if (role === "lane" && ctx.agent.kind === "main") discordLane.beforeProviderRequest?.(ctx);
+    if (role === "lane" && ctx.agent.kind === "main") discordLane.beforeProviderRequest?.(ctx, model);
   });
 
   const z = pi.zod;

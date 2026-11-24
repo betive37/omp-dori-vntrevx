@@ -45,9 +45,12 @@ export type FakePi = {
   agent: Agent;
   /** What `getAsyncJobSnapshot` returns; null is OMP's "no job manager". */
   jobs: AsyncJobSnapshot | null;
-  ctx(): CatalyContext;
-  /** Runs handlers in registration order, chaining before_agent_start prompt replacements as OMP does. */
-  emit(event: string, payload?: unknown): Promise<unknown[]>;
+  ctx(requestModel?: CatalyContext["model"]): CatalyContext;
+  /**
+   * Runs handlers in registration order, chaining before_agent_start prompt replacements as OMP does. `requestModel`
+   * is the model of the provider request a `before_provider_request` reports, when it is not the session's own.
+   */
+  emit(event: string, payload?: unknown, requestModel?: CatalyContext["model"]): Promise<unknown[]>;
   command(name: string, args?: string): Promise<void>;
 };
 
@@ -67,13 +70,16 @@ export const fakePi = (options: FakeOptions): FakePi => {
     session: options.session,
     agent: options.agent ?? { kind: "main", id: "Main" },
     jobs: null,
-    ctx: () => ({
+    ctx: (requestModel) => ({
       cwd: tmpdir(),
       abort: () => void calls.push("abort"),
       mode: options.mode ?? "print",
       ...(options.hasUI === undefined ? {} : { hasUI: options.hasUI }),
       agent: fake.agent,
-      model: options.model,
+      // As OMP's createContext: a request hook's context names that request's model, any other reads the session's.
+      get model() {
+        return requestModel ?? options.model;
+      },
       modelRegistry: {
         getAvailableForProviders: (providers) =>
           (options.catalog ?? (options.model ? [options.model] : [])).filter(
@@ -96,11 +102,11 @@ export const fakePi = (options: FakeOptions): FakePi => {
       },
       getAsyncJobSnapshot: () => fake.jobs,
     }),
-    emit: async (event, payload = { type: event }) => {
+    emit: async (event, payload = { type: event }, requestModel) => {
       const results: unknown[] = [];
       let current = payload;
       for (const handler of [...(fake.handlers.get(event) ?? [])]) {
-        const result = await handler(current, fake.ctx());
+        const result = await handler(current, fake.ctx(requestModel));
         results.push(result);
         if (
           event === "before_agent_start" &&

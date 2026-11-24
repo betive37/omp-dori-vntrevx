@@ -166,9 +166,13 @@ for (const [name, options, status, thinking] of [
 // Native host initialization on Windows can exceed the short subprocess deadline under CI load.
 const fixtureTimeoutMs = process.platform === "win32" ? 60_000 : 25_000;
 for (const boundary of ["session", "provider"] as const) {
-  for (const availability of ["available", "unavailable", "thinking", "thinking-mismatch"] as const) {
+  const cases = ["available", "unavailable", "thinking", "thinking-mismatch"] as const;
+  for (const availability of boundary === "session" ? [...cases, "advisor" as const] : cases) {
     const requests = availability === "available" || availability === "thinking" ? "one request" : "zero requests";
-    const title = `real native ${boundary} sends ${requests} for a launch model that is ${availability}`;
+    const title =
+      availability === "advisor"
+        ? "real native advisor on another model does not hold the lane's matched main agent"
+        : `real native ${boundary} sends ${requests} for a launch model that is ${availability}`;
     test(
       title,
       async () => {
@@ -254,6 +258,59 @@ test("the initial launch cannot escape its model guard through a missing lane ro
   });
   await pi.emit("session_start");
   await expect(pi.emit("before_provider_request")).rejects.toThrow("STARTUP_MODEL_HOLD");
+});
+
+test("a side request on another model leaves the lane's matched main agent running", async () => {
+  // OMP runs before_provider_request for every request the session sends — advisor, compaction, auto-learn — with
+  // the main agent's identity and that request's own model.
+  const settings: FakeOptions = {
+    session: { id: "advised-lane", entries: [] },
+    flags: { "cataly-role": "lane", "cataly-launch-model": "subscription/exact" },
+    model: exact,
+  };
+  const pi = await load(settings);
+  await pi.emit("session_start");
+  await pi.emit("before_agent_start");
+  const aborts = calls.filter((call) => call === "abort").length;
+  await pi.emit("before_provider_request", undefined, { provider: "advisor", id: "other" });
+  await pi.emit("before_provider_request");
+  expect(calls.filter((call) => call === "abort")).toHaveLength(aborts);
+  settings.model = { provider: "fixture", id: "other" };
+  await expect(pi.emit("before_provider_request", undefined, { provider: "advisor", id: "other" })).rejects.toThrow(
+    "STARTUP_MODEL_HOLD",
+  );
+  expect(calls.filter((call) => call === "abort")).toHaveLength(aborts + 1);
+});
+
+test("a side request does not stand in for the headless kickoff's checked main request", async () => {
+  const keys = ["CATALY_CONFIG", "CATALY_STATE_DIR", "CATALY_HEADLESS_ID"];
+  const previous = keys.map((key) => process.env[key]);
+  const stateDir = useConfig("");
+  process.env.CATALY_HEADLESS_ID = "00000000-0000-4000-8000-000000000003";
+  const settings: FakeOptions = {
+    session: { id: "headless-side-request", entries: [] },
+    flags: { "cataly-role": "lane", "cataly-launch-model": "subscription/exact" },
+    mode: "rpc",
+    hasUI: true,
+    model: exact,
+  };
+  const pi = await load(settings);
+  try {
+    await pi.emit("session_start");
+    await pi.emit("goal_updated", { goal: { status: "active", objective: "test kickoff" } });
+    await pi.emit("before_agent_start");
+    await pi.emit("before_provider_request", undefined, { provider: "advisor", id: "other" });
+    await pi.emit("agent_end");
+    settings.model = { provider: "fixture", id: "other" };
+    await expect(pi.emit("before_provider_request")).rejects.toThrow("STARTUP_MODEL_HOLD");
+  } finally {
+    await pi.emit("session_shutdown");
+    keys.forEach((key, index) => {
+      if (previous[index] === undefined) delete process.env[key];
+      else process.env[key] = previous[index];
+    });
+    rmSync(dirname(stateDir), { recursive: true, force: true });
+  }
 });
 
 test("native children keep their own models instead of inheriting the root launch lock", async () => {
