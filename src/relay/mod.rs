@@ -85,14 +85,17 @@ pub(crate) trait Relay: Send + Sync + 'static {
     fn normalise(&self, row: &crate::store::relay::QueueRow) -> Result<Inbound, String>;
 
     /// Another room bound to `source` that takes the whole answer to it instead of a reply in `room`
-    /// (Discord: the thread started from that message); asked once per answer, before its first
-    /// part. `None` keeps the reply in `room`; so does a failed lookup, which the relay logs.
+    /// (Discord: the thread started from that message); asked once per delivery. For a new answer
+    /// (`posted` is `None`) `Ok(None)` keeps the reply in `room`, and so does a failed lookup, which
+    /// the relay logs. For an answer whose first part `posted` is already out (a restart in the
+    /// middle of it), the room that part is in; `Err` when that cannot be read now.
     fn answer_room(
         &self,
         _room: &str,
         _source: &str,
-    ) -> impl Future<Output = Option<String>> + Send {
-        async { None }
+        _posted: Option<&str>,
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send {
+        async { Ok(None) }
     }
 
     /// Posts one part; the first part of an answer replies to `reply_to`.

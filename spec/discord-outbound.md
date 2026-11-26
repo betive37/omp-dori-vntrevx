@@ -125,16 +125,25 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 25. Parts are posted in order; the first is a reply to the source message (rule 15). Each confirmed
     part is acknowledged in the outbox with its remote ID before the next is posted.
     When the source message is in a text or announcement channel, thread following is on (intake
-    spec req. 6) and a thread was started from it (the message's `thread` names one under the same
-    channel that is not locked), the whole answer goes into that thread instead: every part is a
-    plain post there with its own nonce, none carries a message reference, and the confirmed first
-    part counts as the confirmed linked reply (rules 16, 33). The daemon reads the source message
-    once per delivery, just before the first part, within 5 s; a failed or late read is logged and
-    the answer is the reply in the channel. If the thread rejects the first part (rule 6) and no
-    earlier attempt there was uncertain, the first part goes as the reply in the channel with the
-    same nonce; once a part there was uncertain, the answer stays in the thread. The choice lives
-    in daemon memory for that delivery; after a restart it is read again. While the lead works,
-    typing shows in such a thread when the daemon already follows it.
+    spec req. 6) and a thread was started from it, by anyone (the owner, the lead through the bot,
+    or a lane), the whole answer goes into that thread instead. The message's `thread` must name
+    one under the same channel that is not locked. Every part is a plain post there with its own
+    nonce, none carries a message reference, and the confirmed first part counts as the confirmed
+    linked reply (rules 16, 33). When a lane owns that thread, the answer lands there all the same,
+    and the owner's later messages in the thread go to the lane as thread routing already does
+    (intake spec req. 41).
+    The daemon reads the source message once per delivery, just before the first part, within
+    5 s; a failed or late read is logged and the answer is the reply in the channel. If the thread
+    rejects the first part (rule 6) and no earlier attempt there was uncertain, the first part goes
+    as the reply in the channel with the same nonce; once a part there was uncertain, or a later
+    part is rejected, the answer stays in the thread and is retried there. The choice lives in
+    daemon memory for that delivery. After a restart with the first part already confirmed, the
+    rest follows that part: the daemon reads it back from the thread (it has the source message's
+    ID) and uses the channel when the thread does not have it; while that read fails, posting
+    waits. A first part still pending at a restart is decided again, so if it ended uncertain in
+    the thread and the new lookup fails or finds no thread, it may be posted a second time in the
+    channel. While the lead works, typing shows where the answer would go now: in a followed thread
+    with the source message's ID, after the same lookup (once per request), else in the channel.
 26. If Discord reports the source message unknown (error 10008, on the post or on a follow-up check
     after a 400/404), the remaining parts for that request are discarded and logged; nothing is
     posted unlinked.

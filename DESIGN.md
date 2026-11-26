@@ -310,7 +310,7 @@ event). Tern deliveries are confirmed by the delivery ID in a `custom_message` e
 
 **Answers.** The hub posts a session's final answer itself (DISC-OUT-07): the last assistant message of the
 turn the request started, read from the session file after `prompt_result`, table-rendered, split, stored in
-the outbox part by part, and posted as a linked reply, or into the thread the owner started from the request
+the outbox part by part, and posted as a linked reply, or into the thread started from the request
 (DISC-OUT req. 25). The stop gate (EXT-24) remains as the rare fallback.
 
 ### 5.2 Voice is a separate module

@@ -103,15 +103,39 @@ impl Relay for DiscordRelay {
         types::normalise(&raw, parent)
     }
 
-    /// The thread started from the request, looked up once within 5 s (DISC-OUT req. 25).
-    async fn answer_room(&self, room: &str, source: &str) -> Option<String> {
-        if !self.follow_threads {
-            return None;
+    /// The thread started from the request, looked up within 5 s; after a restart in the middle of
+    /// an answer, whether its first part is in that thread (it has the request's ID) (DISC-OUT req.
+    /// 25).
+    async fn answer_room(
+        &self,
+        room: &str,
+        source: &str,
+        posted: Option<&str>,
+    ) -> Result<Option<String>, String> {
+        let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
+            return Ok(None);
+        };
+        if let Some(posted) = posted {
+            let read = self.rest.message(message, id(posted)?);
+            return match tokio::time::timeout(LOOKUP_TIMEOUT, read).await {
+                Ok(Ok(_)) => Ok(Some(source.to_string())),
+                // No such thread or no such message in it: the part is in the channel.
+                Ok(Err(e))
+                    if e.status
+                        .is_some_and(|s| s != 429 && (400..500).contains(&s)) =>
+                {
+                    Ok(None)
+                }
+                Ok(Err(e)) => Err(e.why),
+                Err(_) => Err("no answer within 5 s".into()),
+            };
         }
-        let (channel, message) = (id(room).ok()?, id(source).ok()?);
+        if !self.follow_threads {
+            return Ok(None);
+        }
         let lookup = self.rest.started_thread(channel, message);
         let why = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
-            Ok(Ok(thread)) => return thread.map(|t| t.to_string()),
+            Ok(Ok(thread)) => return Ok(thread.map(|t| t.to_string())),
             Ok(Err(why)) => why,
             Err(_) => "no answer within 5 s".into(),
         };
@@ -119,7 +143,7 @@ impl Relay for DiscordRelay {
             "thread lookup failed; the answer is a reply in the channel",
             &[("message", &source), ("reason", &why)],
         );
-        None
+        Ok(None)
     }
 
     async fn post(
@@ -288,6 +312,8 @@ pub(crate) struct Intake<T: Runtime> {
     /// A turn ended (no continuation) since the last turn start.
     turn_ended: AtomicBool,
     typed: Mutex<Option<Instant>>,
+    /// The request typing was last looked up for and where it shows.
+    typing_room: Mutex<Option<(String, String)>>,
     pub(super) cards: Cards,
     pub(super) events: Events,
     /// Voice's tap and whether the config wanted it at start.
@@ -400,6 +426,7 @@ impl<T: Runtime> Intake<T> {
             turn_running: AtomicBool::new(false),
             turn_ended: AtomicBool::new(false),
             typed: Mutex::new(None),
+            typing_room: Mutex::new(None),
             cards: Cards::default(),
         });
         intake.close_left_open().await;
@@ -612,19 +639,44 @@ impl<T: Runtime> Intake<T> {
         let Some((room, message)) = self.pipeline.typing_room().await else {
             return;
         };
-        // Typing shows where the answer will go: a followed thread started from the request (it
-        // takes the request's ID) under the request's channel (DISC-OUT req. 25).
-        let started = Snowflake::parse(&message).filter(|m| {
-            self.scope()
-                .threads
-                .get(m)
-                .is_some_and(|p| Some(*p) == Snowflake::parse(&room))
-        });
-        let room = started.map_or(room, |thread| thread.to_string());
+        let room = self.typing_target(room, message).await;
         *self.typed.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         if let Err(e) = self.pipeline.relay.typing(&room).await {
             log::debug("typing not shown", &[("error", &e)]);
         }
+    }
+
+    /// Where typing shows for the request `message` in `room`: where its answer would go now
+    /// (DISC-OUT req. 25). Only a followed thread with the request's ID (a thread started from a
+    /// message takes its ID) costs the same lookup as the answer, once per request.
+    async fn typing_target(&self, room: String, message: String) -> String {
+        let followed = Snowflake::parse(&message).is_some_and(|m| {
+            self.scope()
+                .threads
+                .get(&m)
+                .is_some_and(|p| Some(*p) == Snowflake::parse(&room))
+        });
+        if !followed {
+            return room;
+        }
+        if let Some((m, target)) = self
+            .typing_room
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone()
+            && m == message
+        {
+            return target;
+        }
+        let target = match self.pipeline.relay.answer_room(&room, &message, None).await {
+            Ok(Some(thread)) => thread,
+            _ => room,
+        };
+        *self
+            .typing_room
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some((message, target.clone()));
+        target
     }
 
     /// Lists active threads and follows those under listed channels (DISC-IN req. 8).

@@ -159,7 +159,9 @@ impl FakeDiscord {
         self.state.lock().unwrap().scripted.extend(statuses);
     }
 
-    /// Statuses for the next message creates in one channel (the message is stored regardless).
+    /// Statuses for the next message creates in one channel: a 4xx refuses before anything is
+    /// stored; any other status is answered after the message is stored (the create may have
+    /// happened); `0` answers as usual.
     pub fn script_in(&self, channel: &str, statuses: &[u16]) {
         self.state
             .lock()
@@ -168,6 +170,31 @@ impl FakeDiscord {
             .entry(channel.to_string())
             .or_default()
             .extend(statuses);
+    }
+
+    /// Drops the statuses still scripted for one channel.
+    pub fn unscript_in(&self, channel: &str) {
+        self.state.lock().unwrap().scripted_in.remove(channel);
+    }
+
+    /// Sets `locked` on a thread started with [`Self::start_thread`], as Discord shows it.
+    pub fn lock_thread(&self, channel: &str, thread: &str) {
+        let mut s = self.state.lock().unwrap();
+        let lock = |t: &mut Value| t["thread_metadata"]["locked"] = json!(true);
+        if let Some(t) = s.channels.get_mut(thread) {
+            lock(t);
+        }
+        s.threads
+            .iter_mut()
+            .filter(|t| t["id"] == thread)
+            .for_each(lock);
+        if let Some(m) = s
+            .history
+            .get_mut(channel)
+            .and_then(|l| l.iter_mut().find(|m| m["id"] == thread))
+        {
+            lock(&mut m["thread"]);
+        }
     }
 
     pub fn seen(&self) -> Vec<Seen> {
@@ -749,8 +776,18 @@ fn edit_message(s: &mut State, id: &str, mid: &str, body: &Value) -> Response<Fu
     reply(200, &json!({ "id": mid, "channel_id": id }))
 }
 
-/// A message create: deduplicated by enforced nonce, a reply gets type 19 and its reference.
+/// A message create: deduplicated by enforced nonce (a repeat gets the stored message back), a
+/// reply gets type 19 and its reference. A scripted 4xx refuses before anything is stored.
 fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
+    let scripted = s
+        .scripted_in
+        .get_mut(id)
+        .and_then(VecDeque::pop_front)
+        .or_else(|| s.scripted.pop_front())
+        .filter(|status| *status != 0);
+    if let Some(status) = scripted.filter(|s| (400..500).contains(s)) {
+        return reply(status, &json!({ "message": "scripted", "code": 50001 }));
+    }
     let nonce = body["nonce"].as_str().unwrap_or_default().to_string();
     let enforced = body["enforce_nonce"] == true;
     let reference = body["message_reference"]["message_id"]
@@ -794,12 +831,14 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
             .entry((id).to_string())
             .or_default()
             .push(created.clone());
+    } else if let Some(stored) = s
+        .history
+        .values()
+        .flatten()
+        .find(|m| m["id"].as_str() == Some(created["id"].as_str().unwrap_or_default()))
+    {
+        created = stored.clone();
     }
-    let scripted = s
-        .scripted_in
-        .get_mut(id)
-        .and_then(VecDeque::pop_front)
-        .or_else(|| s.scripted.pop_front());
     if let Some(status) = scripted {
         return reply(status, &json!({ "message": "scripted" }));
     }

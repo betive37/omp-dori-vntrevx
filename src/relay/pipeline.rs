@@ -996,8 +996,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     }
 
     /// Where the answer to `h` goes: decided once per delivery, before its first post, so a retry
-    /// goes where the earlier attempt went (DISC-OUT req. 25).
-    async fn target(&self, h: &HandoffRow) -> Target {
+    /// goes where the earlier attempt went. After a restart in the middle of an answer the rest
+    /// follows its first part, wherever that is (DISC-OUT req. 25). `Err` when that cannot be read
+    /// now.
+    async fn target(&self, h: &HandoffRow, posted: Option<&str>) -> Result<Target, String> {
         let known = self
             .targets
             .lock()
@@ -1005,18 +1007,30 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .get(&h.message)
             .cloned();
         if let Some(target) = known {
-            return target;
+            return Ok(target);
         }
-        let room = self.relay.answer_room(&h.room, &h.message).await;
+        let room = self.relay.answer_room(&h.room, &h.message, posted).await?;
         if let Some(room) = &room {
             log::info(
                 "the answer goes to the room bound to its request",
                 &[("message", &h.message), ("room", room)],
             );
         }
-        let target = Target { room, held: false };
+        // Parts already out stay where they are: no fallback for the rest.
+        let target = Target {
+            room,
+            held: posted.is_some(),
+        };
         self.set_target(&h.message, &target);
-        target
+        Ok(target)
+    }
+
+    /// Marks a delivery stuck; true the first time, so it is logged once (DISC-OUT req. 27).
+    fn first_stuck(&self, source: &str) -> bool {
+        self.stuck
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source.to_string())
     }
 
     fn set_target(&self, source: &str, target: &Target) {
@@ -1081,7 +1095,22 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         if !parts.iter().any(|p| p.state == "pending") {
             return Ok(true);
         }
-        let mut target = self.target(h).await;
+        let posted = parts
+            .iter()
+            .find(|p| p.idx == 0 && p.state == "confirmed")
+            .and_then(|p| p.remote.as_deref());
+        let mut target = match self.target(h, posted).await {
+            Ok(target) => target,
+            Err(why) => {
+                if self.first_stuck(&h.message) {
+                    log::warn(
+                        "answer room of a half-posted answer not readable; retrying",
+                        &[("message", &h.message), ("reason", &why)],
+                    );
+                }
+                return Ok(false);
+            }
+        };
         for part in parts.iter().filter(|p| p.state == "pending") {
             match self.post_part(h, part, &mut target).await {
                 PartOutcome::Posted { id, linked } => {
@@ -1136,12 +1165,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     return Ok(true);
                 }
                 PartOutcome::Rejected(why) | PartOutcome::Uncertain(why) => {
-                    let first = self
-                        .stuck
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(h.message.clone());
-                    if first {
+                    if self.first_stuck(&h.message) {
                         log::warn(
                             "answer part not posted; retrying with the same nonce",
                             &[
