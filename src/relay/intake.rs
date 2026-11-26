@@ -79,8 +79,9 @@ pub(crate) struct LeadAnswer {
     pub(crate) done: oneshot::Sender<Result<String, String>>,
 }
 
-/// How long the lead's `answer` call waits for the relay's round.
-const ANSWER_WAIT: Duration = Duration::from_secs(90);
+/// How long the lead's `answer` call waits for the relay's round to take and post it; the lead's
+/// tool definition gives the bridge longer (`hub::tool`).
+pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(120);
 
 impl Shared {
     pub(crate) fn health(&self) -> Health {
@@ -137,7 +138,10 @@ impl Shared {
                             ANSWER_WAIT.as_secs()
                         ))
                     }
-                    None => Err("the answer is still being posted: do not repeat it".into()),
+                    None => Err(
+                        "the answer is still being posted: calling again with the same text only reports it"
+                            .into(),
+                    ),
                 }
             }
         }

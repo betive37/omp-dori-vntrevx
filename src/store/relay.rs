@@ -173,11 +173,13 @@ pub(crate) enum RelayWrite {
         message: String,
     },
     /// Stores the parts of an answer before the first post; nothing when parts already exist.
+    /// `to` names another room the parts go to; a pending part keeps it as its remote `<to>/`.
     Outbox {
         relay: String,
         room: String,
         source: String,
         parts: Vec<(String, String)>,
+        to: Option<String>,
     },
     /// One part confirmed with its remote ID; `linked` for a confirmed linked first part.
     PartDone {
@@ -671,6 +673,7 @@ fn write_replies(
             room,
             source,
             parts,
+            to,
         } => {
             let existing: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM outbox_parts WHERE relay = ?1 AND room = ?2 AND source = ?3",
@@ -680,8 +683,8 @@ fn write_replies(
             if existing == 0 {
                 for (idx, (nonce, text)) in parts.iter().enumerate() {
                     tx.execute(
-                        "INSERT INTO outbox_parts (relay, room, source, idx, text, nonce, state, created_ms, \
-                         updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
+                        "INSERT INTO outbox_parts (relay, room, source, idx, text, nonce, remote, state, \
+                         created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, 'pending', ?7, ?7)",
                         params![
                             relay,
                             room,
@@ -689,7 +692,8 @@ fn write_replies(
                             i64::try_from(idx).unwrap_or(i64::MAX),
                             text,
                             nonce,
-                            now
+                            now,
+                            to.as_ref().map(|t| format!("{t}/"))
                         ],
                     )?;
                 }
@@ -1114,6 +1118,7 @@ mod tests {
             room: "c".into(),
             source: "12".into(),
             parts: vec![("n0".into(), "a".into()), ("n1".into(), "b".into())],
+            to: None,
         })
         .await
         .unwrap();

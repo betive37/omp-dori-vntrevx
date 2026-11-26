@@ -528,11 +528,11 @@ fn a_restart_mid_answer_keeps_the_rest_with_its_first_part() {
     assert!(hub.stop().success());
 }
 
-/// After a restart in the middle of an answer whose first part is in the thread, a read of that
-/// part that fails for now (5xx) says nothing about where it is: the rest waits, nothing goes to
-/// the channel, and once the part can be read the rest follows it into the thread.
+/// After a restart in the middle of an answer whose first part is in the thread, the rest follows
+/// it into the thread from the stored part alone: no read of Discord is needed (here every read of
+/// that part fails), and nothing goes to the channel.
 #[test]
-fn a_failing_read_back_after_a_restart_holds_the_rest() {
+fn a_restart_mid_answer_in_a_thread_keeps_the_rest_there() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     hub.fixture(
@@ -563,20 +563,9 @@ fn a_failing_read_back_after_a_restart_holds_the_rest() {
     fake.fail_reads(&read_back, 503);
     let before = in_thread();
     hub.start();
-    fake.wait(WAIT, |f| {
-        (!f.calls("GET", &read_back).is_empty()).then_some(())
-    });
-    // Several handling rounds (3 s each) go by with the read failing.
-    std::thread::sleep(Duration::from_secs(8));
-    assert!(
-        fake.calls("POST", &format!("/channels/{CH}/messages"))
-            .is_empty(),
-        "nothing in the channel"
-    );
-    assert_eq!(in_thread(), before, "held while the part cannot be read");
-    fake.pass_reads(&read_back);
     fake.wait(WAIT, |_| (in_thread() > before).then_some(()));
     settled(&hub);
+    assert!(fake.calls("GET", &read_back).is_empty(), "no read back");
     assert_eq!(
         fake.bot_messages(source).len(),
         2,
@@ -591,9 +580,9 @@ fn a_failing_read_back_after_a_restart_holds_the_rest() {
 }
 
 /// After a restart in the middle of an answer whose first part is in a thread that has since been
-/// deleted (404, unknown channel) or shut to the bot (403), while the channel definitely lacks the
-/// part, the rest moves to the channel, its first part as the reply to the request, as when the
-/// thread closes while the hub runs; later answers are not held up.
+/// deleted (404, unknown channel) or shut to the bot (403), the thread refuses the next part and
+/// the rest moves to the channel, its first part as the reply to the request, as when the thread
+/// closes while the hub runs; later answers are not held up.
 #[test]
 fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
     for (message, refusal) in [
@@ -642,10 +631,14 @@ fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
             source.as_str(),
             "{refusal}: the moved part is the reply to the request"
         );
+        assert!(
+            in_thread() <= before + 1,
+            "{refusal}: at most the one refused try in the thread"
+        );
         assert_eq!(
-            in_thread(),
-            before,
-            "{refusal}: nothing more tried in the thread"
+            fake.bot_messages(&source).len(),
+            1,
+            "{refusal}: the thread keeps part 1"
         );
         settled(&hub);
         assert!(hub.stop().success());
@@ -1661,5 +1654,146 @@ fn with_tool_answers_the_answer_goes_into_the_started_thread() {
     assert!(posted[0].get("message_reference").is_none());
     assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
     settled(&hub);
+    assert!(hub.stop().success());
+}
+
+/// Sends one owner message to a tool-answers hub and waits until the lead has it.
+fn ask_tool_lead(hub: &TestHub, fake: &FakeDiscord, message: u64, text: &str) -> String {
+    let before = requests(hub).len();
+    fake.say(FakeDiscord::message(CH, message, OWNER, text));
+    hub.until(WAIT, || (requests(hub).len() > before).then_some(()));
+    message.to_string()
+}
+
+/// The same `answer` again (as after the bridge gave up waiting) posts nothing new and says so.
+#[test]
+fn a_repeated_answer_is_posted_once() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_321, "once");
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let call =
+        json!({ "op": "answer", "message": format!("discord:{CH}/{source}"), "text": "only once" });
+    let (said, error) = lead.tool(&call);
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    let (said, error) = lead.tool(&call);
+    assert!(!error && said.contains("already posted"), "{said}");
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        1,
+        "{:?}",
+        fake.bot_messages(CH)
+    );
+    assert!(hub.stop().success());
+}
+
+/// An answer sent to another room stays there: its remaining parts after a restart and a later
+/// follow-up without a room go to that room. While the answer is still being posted, another
+/// answer is refused rather than posted ahead of it.
+#[test]
+fn an_answer_in_another_room_keeps_its_room_across_a_restart() {
+    const ROOM: &str = "600000000000000077";
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    fake.channel(ROOM, 0, None);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_331, "answer elsewhere");
+    let message = format!("discord:{CH}/{source}");
+    // The first part goes out, the second ends uncertain until the restart.
+    let mut script = vec![0];
+    script.extend([500; 64]);
+    fake.script_in(ROOM, &script);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let long = "word ".repeat(600);
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": long, "room": ROOM }));
+    assert!(!error && said.contains("retried by itself"), "{said}");
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": "meanwhile" }));
+    assert!(error && said.contains("still being posted"), "{said}");
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": long, "room": ROOM }));
+    assert!(!error && said.contains("already stored"), "{said}");
+    drop(lead);
+    assert!(hub.stop().success());
+    fake.unscript_in(ROOM);
+    let before = fake
+        .calls("POST", &format!("/channels/{ROOM}/messages"))
+        .len();
+    hub.start();
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{ROOM}/messages")).len() > before).then_some(())
+    });
+    settled(&hub);
+    assert_eq!(fake.bot_messages(ROOM).len(), 2, "both parts in the room");
+    assert!(
+        fake.bot_messages(CH).is_empty(),
+        "nothing in the request's channel"
+    );
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": "a follow-up" }));
+    assert!(!error && said.contains("follow-up"), "{said}");
+    let posted = fake.bot_messages(ROOM);
+    assert_eq!(posted.len(), 3, "{posted:?}");
+    assert_eq!(posted[2]["content"], "a follow-up");
+    assert!(
+        fake.bot_messages(CH).is_empty(),
+        "nothing in the request's channel"
+    );
+    assert!(hub.stop().success());
+}
+
+/// A follow-up the thread refuses as such (locked or no access since the answer) goes to the
+/// request's channel as the reply to the request.
+#[test]
+fn a_follow_up_refused_by_a_closed_thread_goes_to_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_341, "thread then closed");
+    hub.until(WAIT, || (requests(&hub).len() == 1).then_some(()));
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let message = format!("discord:{CH}/{thread}");
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": "in the thread" }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    fake.script_in(&thread, &[403]);
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": "after it closed" }));
+    assert!(!error && said.contains("follow-up"), "{said}");
+    assert_eq!(fake.bot_messages(&thread).len(), 1);
+    let moved = fake.bot_messages(CH);
+    assert_eq!(moved.len(), 1, "{moved:?}");
+    assert_eq!(moved[0]["content"], "after it closed");
+    assert_eq!(moved[0]["message_reference"]["message_id"], thread.as_str());
+    assert!(hub.stop().success());
+}
+
+/// While onboarding runs (read-only) `answer` is refused like every other post.
+#[test]
+fn onboarding_blocks_the_answer_operation() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_351, "during onboarding");
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) = lead.tool(&json!({ "op": "onboarding.start" }));
+    assert!(!error, "{said}");
+    let (said, error) = lead.tool(&json!({
+        "op": "answer",
+        "message": format!("discord:{CH}/{source}"),
+        "text": "not now"
+    }));
+    assert!(
+        error && said.contains("refused while onboarding runs"),
+        "{said}"
+    );
+    assert!(fake.creates().is_empty());
     assert!(hub.stop().success());
 }

@@ -26,6 +26,9 @@ pub(crate) fn definition() -> Value {
     json!({
         "name": LEAD_TOOL,
         "label": "Cataly",
+        // `answer` waits for the messenger to post (at most `relay::intake::ANSWER_WAIT`); the
+        // bridge waits this long for the hub's answer.
+        "timeout_ms": 150_000,
         "description": "Cataly's records and watches. op is one of: answer (message: the owner message as \
     discord:<room>/<message> from its [discord <room>/<message>] tag, text, room?: another room such as a thread you \
     opened): posts your answer to that owner message like an automatic answer (split, into the thread started from \
