@@ -613,10 +613,17 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         let to_lead = match inbound.reply_to.clone() {
             Some(target) => {
                 let room = row.room.clone();
-                self.store
+                let read = self
+                    .store
                     .read(move |r| r.question_posted(&room, &target))
-                    .await
-                    .unwrap_or(false)
+                    .await;
+                match read {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        let why = format!("the question ledger could not be read: {e}");
+                        return self.hold(&row.room, &row.message, "failed", &why).await;
+                    }
+                }
             }
             None => false,
         };

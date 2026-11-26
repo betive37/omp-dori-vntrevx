@@ -195,10 +195,12 @@ operator who configures the daemon (in practice the same person).
 
 40. Each owner message goes through these steps in order and stops at the first that takes it:
     (a) the approval-form component, when the message is a reply or plain text that answers an
-    open question; (b) the session that owns this conversation; (c) the lead session.
+    open question; (a2) the lead session, when the message replies to a message bound to a lead
+    question (EVR req. 37); (b) the session that owns this conversation; (c) the lead session.
 41. A conversation is owned by a thread session when exactly one open session record names that
     conversation, and no other open record shares its session. If two records claim it, the
-    message is held, not sent to the lead.
+    message is held, not sent to the lead. A reply to a lead question is the lead's even in an
+    owned conversation (item 40 (a2)).
 42. Delivery to an owning session: if the session is running, the message is added to its inbox
     keyed by (session, channel, message), so a repeat is a no-op, and the session is woken. If the
     session is closing, or its identity cannot be verified, the message is held. If the session is

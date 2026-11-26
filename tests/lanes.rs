@@ -1057,6 +1057,12 @@ fn question_ask_posts_in_its_thread() {
         !lane_file().contains("answers question"),
         "the lane does not get it"
     );
+    // A reply to any other message in the lane's thread is still the lane's.
+    let mut other = FakeDiscord::message(THREAD, 700_000_000_000_000_002, OWNER, "lane reply");
+    other["message_reference"] =
+        json!({ "message_id": "700000000000000001", "channel_id": THREAD });
+    fake.say(other);
+    hub.until(WAIT, || lane_file().contains("lane reply").then_some(()));
     drop(b);
     hub.stop();
 }
