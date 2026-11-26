@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.3 (Unreleased)
+
+- When you start a Discord thread from your message, the lead's answer to it goes into that thread
+  instead of a reply in the channel: every part of a long answer, with the same once-only posting,
+  and the owed reply counts as answered. Typing shows in the thread while the lead works. With no
+  such thread, a locked one, a thread that refuses the post, a failed lookup (logged) or
+  `[discord] follow_threads = false`, the answer is the reply in the channel as before.
+
 ## 0.2.2 (2026-11-26)
 
 - The source and the releases now live together in vntrevx/Cataly.

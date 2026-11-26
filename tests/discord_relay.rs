@@ -135,6 +135,11 @@ fn owner_message_is_answered_in_linked_parts() {
         "only the first part is a reply"
     );
     for c in &creates {
+        assert_eq!(
+            c.path,
+            format!("/channels/{CH}/messages"),
+            "no thread: the channel"
+        );
         assert_eq!(c.body["enforce_nonce"], true);
         assert_eq!(c.body["nonce"].as_str().unwrap().len(), 25);
         assert_eq!(c.body["allowed_mentions"]["parse"], json!([]));
@@ -199,6 +204,141 @@ fn busy_lead_answers_in_order() {
     let asked = requests(&hub);
     assert_eq!(asked.len(), 2, "{asked:?}");
     assert!(asked[0].contains("> first") && asked[1].contains("> second"));
+    assert!(hub.stop().success());
+}
+
+/// Sends an owner message from which the owner has already started a thread (the thread takes the
+/// message's ID); `THREAD_CREATE` goes first, so intake follows the thread before the request.
+fn ask_with_thread(fake: &FakeDiscord, message: u64, text: &str) -> String {
+    let msg = FakeDiscord::message(CH, message, OWNER, text);
+    fake.put(msg.clone());
+    fake.start_thread(CH, &message.to_string(), OWNER);
+    fake.gw(Gw::Dispatch("MESSAGE_CREATE", msg));
+    message.to_string()
+}
+
+/// Waits until the owed reply of the one request settled and nothing is queued.
+fn settled(hub: &TestHub) -> Value {
+    hub.until(WAIT, || {
+        let s = status(hub);
+        (s["counts"]["owed_settled"] == 1 && s["counts"]["queued"] == 0).then_some(s)
+    })
+}
+
+/// A thread started from the owner's message takes the whole answer: every part is posted in the
+/// thread with its enforced nonce, none carries a message reference, nothing reaches the channel,
+/// typing shows in the thread, and the owed reply settles (DISC-OUT req. 25).
+#[test]
+fn an_answer_goes_into_the_thread_started_from_the_request() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &["slow"], "");
+    let long = "word ".repeat(600);
+    hub.fixture("omp", "answer.json", Some(&json!(long).to_string()));
+    hub.start();
+    ready(&hub);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_101, "in the thread, please");
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(creates.len(), 2, "two parts, posted once each");
+    for c in &creates {
+        assert_eq!(
+            c.path,
+            format!("/channels/{thread}/messages"),
+            "{creates:?}"
+        );
+        assert!(c.body.get("message_reference").is_none(), "{:?}", c.body);
+        assert_eq!(c.body["enforce_nonce"], true);
+        assert_eq!(c.body["nonce"].as_str().unwrap().len(), 25);
+    }
+    assert_ne!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    let s = settled(&hub);
+    assert_eq!(s["counts"]["owed_open"], 0, "{s}");
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing in the channel"
+    );
+    assert!(
+        !fake
+            .calls("POST", &format!("/channels/{thread}/typing"))
+            .is_empty()
+    );
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/typing"))
+            .is_empty()
+    );
+    let seen = fake.calls("PUT", &format!("/messages/{thread}/reactions/"));
+    assert_eq!(seen.len(), 1, "one seen mark");
+    assert_eq!(
+        seen[0].path,
+        format!("/channels/{CH}/messages/{thread}/reactions/%F0%9F%91%80/@me")
+    );
+    assert!(hub.stop().success());
+}
+
+/// When the thread lookup fails, the answer is the linked reply in the channel, as without a
+/// thread; the bounded lookup does not hold the answer back for long.
+#[test]
+fn a_failed_thread_lookup_replies_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000111";
+    fake.fail_reads(&format!("/channels/{CH}/messages/{source}"), 500);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_111, "lookup fails");
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    assert!(
+        !fake.calls("GET", &format!("/messages/{source}")).is_empty(),
+        "looked up"
+    );
+    settled(&hub);
+    assert!(
+        fake.calls("POST", &format!("/channels/{thread}/messages"))
+            .is_empty()
+    );
+    assert!(hub.stop().success());
+}
+
+/// A thread that refuses the bot's post (no permission, locked, gone) takes nothing: the answer
+/// falls back to the linked reply in the channel, with the same nonce.
+#[test]
+fn a_thread_that_refuses_the_post_falls_back_to_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000121";
+    fake.script_in(source, &[403]);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_121, "refused");
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(creates[0].path, format!("/channels/{thread}/messages"));
+    assert_eq!(creates[1].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[1]).as_deref(), Some(source));
+    assert_eq!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    settled(&hub);
+    assert_eq!(fake.creates().len(), 2);
+    assert!(hub.stop().success());
+}
+
+/// With `follow_threads = false` the hub reads no threads, so the answer stays in the channel.
+#[test]
+fn without_thread_following_the_answer_stays_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "follow_threads = false\n");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000131";
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_131, "not followed");
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    settled(&hub);
+    assert!(
+        fake.calls("POST", &format!("/channels/{thread}/messages"))
+            .is_empty()
+    );
     assert!(hub.stop().success());
 }
 

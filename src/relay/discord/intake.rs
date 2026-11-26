@@ -72,6 +72,8 @@ pub(crate) struct DiscordRelay {
     pub(crate) rest: Arc<Rest>,
     pub(crate) bot: Snowflake,
     pub(crate) checks: Checks,
+    /// `[discord] follow_threads`: only then may an answer go into a thread started from its request.
+    pub(crate) follow_threads: bool,
 }
 
 fn id(text: &str) -> Result<Snowflake, String> {
@@ -99,6 +101,25 @@ impl Relay for DiscordRelay {
         let raw: Value = serde_json::from_str(&row.raw).map_err(|e| e.to_string())?;
         let parent = row.parent.as_deref().and_then(Snowflake::parse);
         types::normalise(&raw, parent)
+    }
+
+    /// The thread started from the request, looked up once within 5 s (DISC-OUT req. 25).
+    async fn answer_room(&self, room: &str, source: &str) -> Option<String> {
+        if !self.follow_threads {
+            return None;
+        }
+        let (channel, message) = (id(room).ok()?, id(source).ok()?);
+        let lookup = self.rest.started_thread(channel, message);
+        let why = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(thread)) => return thread.map(|t| t.to_string()),
+            Ok(Err(why)) => why,
+            Err(_) => "no answer within 5 s".into(),
+        };
+        log::warn(
+            "thread lookup failed; the answer is a reply in the channel",
+            &[("message", &source), ("reason", &why)],
+        );
+        None
     }
 
     async fn post(
@@ -334,6 +355,7 @@ impl<T: Runtime> Intake<T> {
             rest: Arc::clone(&rest),
             bot,
             checks: config.outgoing.clone(),
+            follow_threads: settings.follow_threads,
         });
         let pipeline = Arc::new(Pipeline::new(
             relay,
@@ -587,9 +609,18 @@ impl<T: Runtime> Intake<T> {
         if !due {
             return;
         }
-        let Some(room) = self.pipeline.typing_room().await else {
+        let Some((room, message)) = self.pipeline.typing_room().await else {
             return;
         };
+        // Typing shows where the answer will go: a followed thread started from the request (it
+        // takes the request's ID) under the request's channel (DISC-OUT req. 25).
+        let started = Snowflake::parse(&message).filter(|m| {
+            self.scope()
+                .threads
+                .get(m)
+                .is_some_and(|p| Some(*p) == Snowflake::parse(&room))
+        });
+        let room = started.map_or(room, |thread| thread.to_string());
         *self.typed.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         if let Err(e) = self.pipeline.relay.typing(&room).await {
             log::debug("typing not shown", &[("error", &e)]);

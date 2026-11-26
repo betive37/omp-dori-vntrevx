@@ -666,6 +666,24 @@ impl Rest {
         .await
     }
 
+    /// The thread started from `message` in the text or announcement channel `channel` that may take
+    /// the answer to it (DISC-OUT req. 25); `None` when there is none.
+    pub(crate) async fn started_thread(
+        &self,
+        channel: Snowflake,
+        message: Snowflake,
+    ) -> Result<Option<Snowflake>, String> {
+        // Only messages of text and announcement channels start threads.
+        if !matches!(self.channel_type(channel).await?, 0 | 5) {
+            return Ok(None);
+        }
+        let source = self
+            .message(channel, message)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(thread_of(&source, channel))
+    }
+
     /// Active threads of a guild (DISC-IN req. 8).
     pub(crate) async fn active_threads(&self, guild: Snowflake) -> Result<Value, RestError> {
         self.call(
@@ -1020,6 +1038,26 @@ fn confirmed(resp: &Response, channel: Snowflake) -> Result<Snowflake, Sent> {
     }
 }
 
+/// The thread a message names as started from it, when that thread is under `channel` and not
+/// locked (a locked thread takes posts only from members who may manage threads).
+fn thread_of(message: &Value, channel: Snowflake) -> Option<Snowflake> {
+    let thread = message.get("thread")?;
+    let field = |key| {
+        thread
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(Snowflake::parse)
+    };
+    let kind = thread.get("type").and_then(Value::as_u64);
+    let locked = thread
+        .pointer("/thread_metadata/locked")
+        .and_then(Value::as_bool)
+        == Some(true);
+    (matches!(kind, Some(10..=12)) && field("parent_id") == Some(channel) && !locked)
+        .then(|| field("id"))
+        .flatten()
+}
+
 /// Caches a channel's type; a full cache starts over (`CHANNEL_TYPES_MAX`).
 fn cache_type(cache: &mut HashMap<Snowflake, u64>, id: Snowflake, kind: u64) {
     if cache.len() >= CHANNEL_TYPES_MAX {
@@ -1072,6 +1110,36 @@ mod tests {
         assert!(!e(404, Some(10_003)).unknown_message());
         assert_eq!(Snowflake::at_ms(1_420_070_400_000), 0);
         assert_eq!(Snowflake::at_ms(1_420_070_400_001), 1 << 22);
+    }
+
+    #[test]
+    fn a_thread_started_from_a_message_is_under_its_channel_and_open() {
+        let channel = Snowflake::parse("10").unwrap();
+        let message = |thread: Value| json!({ "id": "20", "channel_id": "10", "thread": thread });
+        let open = json!({ "id": "20", "type": 11, "parent_id": "10",
+            "thread_metadata": { "archived": true, "locked": false } });
+        assert_eq!(
+            thread_of(&message(open.clone()), channel),
+            Snowflake::parse("20")
+        );
+        assert_eq!(
+            thread_of(&json!({ "id": "20" }), channel),
+            None,
+            "no thread"
+        );
+        let mut other = open.clone();
+        other["parent_id"] = json!("11");
+        assert_eq!(thread_of(&message(other), channel), None, "another parent");
+        let mut locked = open.clone();
+        locked["thread_metadata"]["locked"] = json!(true);
+        assert_eq!(thread_of(&message(locked), channel), None, "locked");
+        let mut not_thread = open;
+        not_thread["type"] = json!(0);
+        assert_eq!(
+            thread_of(&message(not_thread), channel),
+            None,
+            "not a thread"
+        );
     }
 
     #[tokio::test]

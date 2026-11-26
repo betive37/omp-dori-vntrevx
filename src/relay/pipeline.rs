@@ -25,7 +25,9 @@ use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::omp::transcript::{self, Reply};
 use crate::store::Store;
-use crate::store::relay::{Arrived, HandoffRow, OWED_WINDOW_MS, QueueRow, RelayDone, RelayWrite};
+use crate::store::relay::{
+    Arrived, HandoffRow, OWED_WINDOW_MS, PartRow, QueueRow, RelayDone, RelayWrite,
+};
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
 
@@ -64,6 +66,17 @@ struct Live {
     row: Option<QueueRow>,
 }
 
+/// Where one answer goes (DISC-OUT req. 25).
+#[derive(Debug, Clone, Default)]
+struct Target {
+    /// The room bound to the request that takes the whole answer ([`Relay::answer_room`]); `None`
+    /// for the linked reply in the request's room.
+    room: Option<String>,
+    /// A part posted to `room` ended uncertain: the answer stays there, where its nonces keep each
+    /// part single, instead of falling back to the request's room.
+    held: bool,
+}
+
 /// The pipeline of one relay.
 pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     pub(crate) relay: Arc<R>,
@@ -78,6 +91,8 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     context: Context,
     /// Sources whose stuck delivery was logged (once per request, DISC-OUT req. 27).
     stuck: Mutex<HashSet<String>>,
+    /// Where each answer being posted goes, by source, decided before its first part.
+    targets: Mutex<HashMap<String, Target>>,
     /// A failed seen mark is logged once per run (MSG-04).
     seen_failed: AtomicBool,
     /// Live messages not handed off yet, by room and message.
@@ -110,6 +125,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             config: parts.config,
             context: Context::default(),
             stuck: Mutex::default(),
+            targets: Mutex::default(),
             seen_failed: AtomicBool::new(false),
             live: Mutex::default(),
             wake: Mutex::new(None),
@@ -855,13 +871,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
     }
 
-    /// The room of the newest request whose answer is still being written, for typing.
-    pub(crate) async fn typing_room(&self) -> Option<String> {
+    /// The room and message of the newest request whose answer is still being written, for typing.
+    pub(crate) async fn typing_room(&self) -> Option<(String, String)> {
         let open = self.store.read(|r| r.answers_open(R::NAME)).await.ok()?;
         open.into_iter()
             .rev()
             .find(|h| h.answer == "waiting")
-            .map(|h| h.room)
+            .map(|h| (h.room, h.message))
     }
 
     /// Reads finished answers from the lead's session file and posts them (DISC-OUT req. 21-28).
@@ -911,6 +927,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .map(|h| h.message.as_str())
             .collect();
         keep_only(&self.stuck, &still);
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|m, _| still.contains(m.as_str()));
         for h in posting.iter().filter(|h| h.answer == "posting") {
             if !self.post_parts(h).await? {
                 break;
@@ -975,6 +995,80 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
+    /// Where the answer to `h` goes: decided once per delivery, before its first post, so a retry
+    /// goes where the earlier attempt went (DISC-OUT req. 25).
+    async fn target(&self, h: &HandoffRow) -> Target {
+        let known = self
+            .targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&h.message)
+            .cloned();
+        if let Some(target) = known {
+            return target;
+        }
+        let room = self.relay.answer_room(&h.room, &h.message).await;
+        if let Some(room) = &room {
+            log::info(
+                "the answer goes to the room bound to its request",
+                &[("message", &h.message), ("room", room)],
+            );
+        }
+        let target = Target { room, held: false };
+        self.set_target(&h.message, &target);
+        target
+    }
+
+    fn set_target(&self, source: &str, target: &Target) {
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source.to_string(), target.clone());
+    }
+
+    /// Posts one part where the answer goes: in the room bound to the request without a reply, else
+    /// in the request's room with the first part as the reply.
+    async fn post_part(&self, h: &HandoffRow, part: &PartRow, target: &mut Target) -> PartOutcome {
+        loop {
+            let (room, reply_to) = target.room.as_deref().map_or_else(
+                || {
+                    let reply_to = (part.idx == 0).then_some(h.message.as_str());
+                    (h.room.as_str(), reply_to)
+                },
+                |room| (room, None),
+            );
+            let outcome = self
+                .relay
+                .post(room, reply_to, &part.text, &part.nonce)
+                .await;
+            let bound = target.room.is_some();
+            match outcome {
+                // Nothing was created there and nothing is in doubt: the first part goes as the
+                // linked reply in the request's room after all, with the same nonce.
+                PartOutcome::Rejected(why) if bound && part.idx == 0 && !target.held => {
+                    log::warn(
+                        "answer room refused the answer; replying in the request's room",
+                        &[("message", &h.message), ("reason", &why)],
+                    );
+                    *target = Target::default();
+                    self.set_target(&h.message, target);
+                }
+                PartOutcome::Uncertain(why) if bound => {
+                    target.held = true;
+                    self.set_target(&h.message, target);
+                    return PartOutcome::Uncertain(why);
+                }
+                PartOutcome::Posted { id, linked } => {
+                    // In the room bound to the request the first part answers it as a linked
+                    // reply would (DISC-OUT req. 25, 33).
+                    let linked = linked || (bound && part.idx == 0);
+                    return PartOutcome::Posted { id, linked };
+                }
+                other => return other,
+            }
+        }
+    }
+
     /// Posts the pending parts of one answer in order; `false` when it stopped on a failure.
     async fn post_parts(&self, h: &HandoffRow) -> Result<bool, String> {
         let parts = {
@@ -984,13 +1078,12 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 .await
                 .map_err(|e| e.to_string())?
         };
+        if !parts.iter().any(|p| p.state == "pending") {
+            return Ok(true);
+        }
+        let mut target = self.target(h).await;
         for part in parts.iter().filter(|p| p.state == "pending") {
-            let reply_to = (part.idx == 0).then_some(h.message.as_str());
-            match self
-                .relay
-                .post(&h.room, reply_to, &part.text, &part.nonce)
-                .await
-            {
+            match self.post_part(h, part, &mut target).await {
                 PartOutcome::Posted { id, linked } => {
                     self.store
                         .relay(RelayWrite::PartDone {

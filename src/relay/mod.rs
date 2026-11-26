@@ -84,6 +84,17 @@ pub(crate) trait Relay: Send + Sync + 'static {
     /// The queued raw message as the normalised owner message (MSG-01).
     fn normalise(&self, row: &crate::store::relay::QueueRow) -> Result<Inbound, String>;
 
+    /// Another room bound to `source` that takes the whole answer to it instead of a reply in `room`
+    /// (Discord: the thread started from that message); asked once per answer, before its first
+    /// part. `None` keeps the reply in `room`; so does a failed lookup, which the relay logs.
+    fn answer_room(
+        &self,
+        _room: &str,
+        _source: &str,
+    ) -> impl Future<Output = Option<String>> + Send {
+        async { None }
+    }
+
     /// Posts one part; the first part of an answer replies to `reply_to`.
     fn post(
         &self,

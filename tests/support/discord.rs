@@ -5,8 +5,8 @@
 //! Gateway WebSocket server. It records
 //! every request, deduplicates creates by their enforced nonce as Discord does, keeps a history per
 //! channel, answers a reply with message type 19 and its reference, and lets a test script the next
-//! create statuses, push dispatches, and send op 7, op 9 or a close code. With a token set, any
-//! other token gets 401.
+//! create statuses, fail every read of a path, start a thread from a message, push dispatches, and
+//! send op 7, op 9 or a close code. With a token set, any other token gets 401.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,8 @@ struct State {
     scripted: VecDeque<u16>,
     /// Channel -> statuses for its next message creates, used before `scripted`.
     scripted_in: HashMap<String, VecDeque<u16>>,
+    /// Path -> the status every GET of it gets.
+    failing_reads: HashMap<String, u16>,
     nonces: HashMap<String, u64>,
     next_id: u64,
     created: usize,
@@ -236,6 +238,35 @@ impl FakeDiscord {
             .threads
             .push(json!({"id": id, "parent_id": parent, "type": 11,
             "guild_id": GUILD, "thread_metadata": {"archived": false}}));
+    }
+
+    /// Starts a thread from a message as the Discord client does: the thread takes the message's
+    /// ID, the message names it in `thread`, the active listing has it and `THREAD_CREATE` is sent.
+    pub fn start_thread(&self, channel: &str, message: &str, by: &str) {
+        let thread = json!({"id": message, "parent_id": channel, "type": 11, "guild_id": GUILD,
+            "owner_id": by, "thread_metadata": {"archived": false, "locked": false}});
+        {
+            let mut s = self.state.lock().unwrap();
+            s.channels.insert(message.into(), thread.clone());
+            s.threads.push(thread.clone());
+            if let Some(m) = s
+                .history
+                .get_mut(channel)
+                .and_then(|l| l.iter_mut().find(|m| m["id"] == message))
+            {
+                m["thread"] = thread.clone();
+            }
+        }
+        self.gw(Gw::Dispatch("THREAD_CREATE", thread));
+    }
+
+    /// Every GET of `path` gets `status` from now on.
+    pub fn fail_reads(&self, path: &str, status: u16) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_reads
+            .insert(path.into(), status);
     }
 
     /// A message object.
@@ -563,6 +594,12 @@ fn setup_route(
     })
 }
 
+/// The scripted failure of a read (`FakeDiscord::fail_reads`).
+fn failed_read(s: &State, method: &str, path: &str) -> Option<Response<Full<Bytes>>> {
+    let status = s.failing_reads.get(path).filter(|_| method == "GET")?;
+    Some(reply(*status, &json!({ "message": "scripted", "code": 0 })))
+}
+
 async fn answer(
     req: Request<Incoming>,
     state: Arc<Mutex<State>>,
@@ -598,7 +635,8 @@ async fn answer(
             &json!({ "message": "401: Unauthorized", "code": 0 }),
         ));
     }
-    if let Some(r) = setup_route(&mut s, &method, &parts, &body) {
+    let failed = failed_read(&s, &method, &path);
+    if let Some(r) = failed.or_else(|| setup_route(&mut s, &method, &parts, &body)) {
         return Ok(r);
     }
     let unknown = json!({ "message": "Unknown Message", "code": 10008 });
