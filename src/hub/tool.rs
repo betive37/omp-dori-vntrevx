@@ -59,8 +59,8 @@ pub(crate) fn definition() -> Value {
                 "text": text("the text: next step, note, result, question, answer or profile"),
                 "title": text("one line"),
                 "source": text("where it came from, such as discord:<room>:<message>"),
-                "thread": text("the thread or room it belongs to"),
-                "room": text("the Discord channel to post a question in (default the home channel)"),
+                "thread": text("the thread or room it belongs to; question.ask posts in a discord:<id> thread when room is not given"),
+                "room": text("the Discord channel ID to post a question in (default the discord:<id> thread, else the home channel)"),
                 "message": text("the owner's or the announcing message ID"),
                 "reason": text("why"),
                 "options": { "type": "array", "items": { "type": "string" } },
@@ -286,9 +286,15 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     }
     body.push_str("\nReply to this message with a number or your answer.");
     let config = hub.config();
-    let room = s(input, "room")
-        .and_then(crate::relay::discord::Snowflake::parse)
-        .or_else(|| config.discord.home());
+    let snowflake = crate::relay::discord::Snowflake::parse;
+    let room = match s(input, "room") {
+        Some(r) => Some(snowflake(r).ok_or("room: a Discord channel ID is required")?),
+        None => thread
+            .as_deref()
+            .and_then(|t| t.strip_prefix("discord:"))
+            .and_then(snowflake)
+            .or_else(|| config.discord.home()),
+    };
     let posted = match (room, hub.discord_rest()) {
         (Some(room), Some(rest)) => {
             let nonce = crate::relay::discord::nonce(&format!("ledger:{id}"), 0);

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The lead's `question.ask` posts in the Discord thread it names (`thread: "discord:<id>"`) when
+  no `room` is given, instead of the home channel. A `room` that is not a Discord channel ID is
+  refused instead of silently posting in the home channel.
+
 ## 0.2.2 (2026-11-26)
 
 - The source and the releases now live together in vntrevx/Cataly.

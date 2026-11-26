@@ -291,8 +291,10 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 
 77. A lane's question goes only to that lane's own bound Discord thread or channel, never to the
     lead's. A lane without a Discord binding asks locally only.
-78. The lead's question goes to the lead's configured home channel if exactly one is configured;
-    discovered or followed channels are never defaults; with several candidates it stays local.
+78. The lead's question goes to the channel it names, else to the Discord thread it belongs to
+    (`discord:<id>`), else to the lead's configured home channel if exactly one is configured;
+    discovered or followed channels are never defaults; with several candidates it stays local. A
+    named channel that is not a Discord channel ID is refused, never replaced by the home channel.
 79. The owner may switch Discord questions off per session, or pin a session to a specific channel.
 80. No question is posted to a channel the daemon is not currently watching for the owner's answers.
 

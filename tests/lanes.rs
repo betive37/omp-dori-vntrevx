@@ -966,6 +966,42 @@ fn lead_tool(bridge: &mut Bridge, session: &Value, call: &str, input: Value) -> 
     )
 }
 
+/// `question.ask` posts in the Discord thread it names when no room is given, and refuses a room it
+/// cannot read instead of posting in the home channel.
+#[test]
+fn question_ask_posts_in_its_thread() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    fake.thread(THREAD, CH);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}{}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        fake.config(&token, OWNER, &[CH]),
+        work.display()
+    ));
+    start(&mut hub);
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    let ask = json!({ "op": "question.ask", "text": "Which?", "source": "discord:1:2",
+        "options": ["a", "b"], "thread": format!("discord:{THREAD}") });
+    let (said, err) = lead_tool(&mut b, &s, "q1", ask.clone());
+    assert!(
+        !err && said.contains(&format!("posted in {THREAD}")),
+        "{said}"
+    );
+    assert_eq!(fake.bot_messages(THREAD).len(), 1);
+    assert!(fake.bot_messages(CH).is_empty(), "not in the home channel");
+    let mut bad = ask;
+    bad["room"] = json!(format!("discord:{CH}"));
+    let (why, err) = lead_tool(&mut b, &s, "q2", bad);
+    assert!(err && why.contains("room"), "{why}");
+    assert!(fake.bot_messages(CH).is_empty(), "no fallback to home");
+    drop(b);
+    hub.stop();
+}
+
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
 /// recorded before it), a "no" is stored and not asked again (also after a restart), and messenger
 /// writes from the lead (tool posts and `cataly` commands in its shell) are refused while it runs.
