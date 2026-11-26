@@ -116,18 +116,21 @@ impl Relay for DiscordRelay {
             return Ok(None);
         };
         if let Some(posted) = posted {
-            let read = self.rest.message(message, id(posted)?);
-            return match tokio::time::timeout(LOOKUP_TIMEOUT, read).await {
-                Ok(Ok(_)) => Ok(Some(source.to_string())),
-                // No such thread or no such message in it: the part is in the channel.
-                Ok(Err(e))
-                    if e.status
-                        .is_some_and(|s| s != 429 && (400..500).contains(&s)) =>
-                {
-                    Ok(None)
-                }
-                Ok(Err(e)) => Err(e.why),
-                Err(_) => Err("no answer within 5 s".into()),
+            // Only reading the part itself says where it is: the thread, else the channel; a
+            // deleted thread takes nothing more either way. A read refused or failed in both says
+            // nothing, and the rest waits.
+            let posted = id(posted)?;
+            let in_thread = match self.read_part(message, posted).await {
+                Ok(()) => return Ok(Some(source.to_string())),
+                Err(e) if e.unknown_channel() => return Ok(None),
+                Err(e) => e.why,
+            };
+            return match self.read_part(channel, posted).await {
+                Ok(()) => Ok(None),
+                Err(e) => Err(format!(
+                    "the first part is not readable in the thread ({in_thread}) or in the channel ({})",
+                    e.why
+                )),
             };
         }
         if !self.follow_threads {
@@ -185,6 +188,22 @@ impl Relay for DiscordRelay {
                 .map(str::to_string),
             dm: matches!(kind, Some(1 | 3)),
         })
+    }
+}
+
+impl DiscordRelay {
+    /// Reads one message of `channel` within 5 s.
+    async fn read_part(&self, channel: Snowflake, message: Snowflake) -> Result<(), RestError> {
+        match tokio::time::timeout(LOOKUP_TIMEOUT, self.rest.message(channel, message)).await {
+            Ok(Ok(_)) => Ok(()),
+            Ok(Err(e)) => Err(e),
+            Err(_) => Err(RestError {
+                status: None,
+                code: None,
+                why: "no answer within 5 s".into(),
+                uncertain: false,
+            }),
+        }
     }
 }
 
@@ -312,8 +331,6 @@ pub(crate) struct Intake<T: Runtime> {
     /// A turn ended (no continuation) since the last turn start.
     turn_ended: AtomicBool,
     typed: Mutex<Option<Instant>>,
-    /// The request typing was last looked up for and where it shows.
-    typing_room: Mutex<Option<(String, String)>>,
     pub(super) cards: Cards,
     pub(super) events: Events,
     /// Voice's tap and whether the config wanted it at start.
@@ -426,7 +443,6 @@ impl<T: Runtime> Intake<T> {
             turn_running: AtomicBool::new(false),
             turn_ended: AtomicBool::new(false),
             typed: Mutex::new(None),
-            typing_room: Mutex::new(None),
             cards: Cards::default(),
         });
         intake.close_left_open().await;
@@ -639,7 +655,10 @@ impl<T: Runtime> Intake<T> {
         let Some((room, message)) = self.pipeline.typing_room().await else {
             return;
         };
-        let room = self.typing_target(room, message).await;
+        // Not known yet: the next round (at most 3 s on) shows it.
+        let Some(room) = self.typing_target(room, message) else {
+            return;
+        };
         *self.typed.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         if let Err(e) = self.pipeline.relay.typing(&room).await {
             log::debug("typing not shown", &[("error", &e)]);
@@ -648,8 +667,9 @@ impl<T: Runtime> Intake<T> {
 
     /// Where typing shows for the request `message` in `room`: where its answer would go now
     /// (DISC-OUT req. 25). Only a followed thread with the request's ID (a thread started from a
-    /// message takes its ID) costs the same lookup as the answer, once per request.
-    async fn typing_target(&self, room: String, message: String) -> String {
+    /// message takes its ID) needs the answer's own lookup, shared with posting and run off the
+    /// handling round; `None` while it runs.
+    fn typing_target(&self, room: String, message: String) -> Option<String> {
         let followed = Snowflake::parse(&message).is_some_and(|m| {
             self.scope()
                 .threads
@@ -657,26 +677,16 @@ impl<T: Runtime> Intake<T> {
                 .is_some_and(|p| Some(*p) == Snowflake::parse(&room))
         });
         if !followed {
-            return room;
+            return Some(room);
         }
-        if let Some((m, target)) = self
-            .typing_room
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone()
-            && m == message
-        {
-            return target;
+        if let Some(known) = self.pipeline.known_answer_room(&room, &message) {
+            return Some(known);
         }
-        let target = match self.pipeline.relay.answer_room(&room, &message, None).await {
-            Ok(Some(thread)) => thread,
-            _ => room,
-        };
-        *self
-            .typing_room
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some((message, target.clone()));
-        target
+        let pipeline = Arc::clone(&self.pipeline);
+        tokio::spawn(async move {
+            pipeline.answer_room(&room, &message).await;
+        });
+        None
     }
 
     /// Lists active threads and follows those under listed channels (DISC-IN req. 8).

@@ -136,14 +136,20 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     5 s; a failed or late read is logged and the answer is the reply in the channel. If the thread
     rejects the first part (rule 6) and no earlier attempt there was uncertain, the first part goes
     as the reply in the channel with the same nonce; once a part there was uncertain, or a later
-    part is rejected, the answer stays in the thread and is retried there. The choice lives in
-    daemon memory for that delivery. After a restart with the first part already confirmed, the
-    rest follows that part: the daemon reads it back from the thread (it has the source message's
-    ID) and uses the channel when the thread does not have it; while that read fails, posting
-    waits. A first part still pending at a restart is decided again, so if it ended uncertain in
-    the thread and the new lookup fails or finds no thread, it may be posted a second time in the
-    channel. While the lead works, typing shows where the answer would go now: in a followed thread
-    with the source message's ID, after the same lookup (once per request), else in the channel.
+    part is rejected for its own sake, the answer stays in the thread and is retried there. A
+    thread that refuses the bot as such (403, unknown channel, archived thread) takes nothing more:
+    that part and the rest go to the channel, the first of them as the reply to the source
+    message, so a thread locked or deleted mid-answer holds up no later answer. The lookup is
+    shared with typing, so both use one result per request. The choice lives in daemon memory for
+    that delivery. After a restart with the first part already confirmed, the rest follows that
+    part: the daemon reads that part back, from the thread (it has the source message's ID), else
+    from the channel, and posts the rest where it was read; a deleted thread (unknown channel)
+    sends the rest to the channel. While neither read succeeds (refused, failed or not found in
+    both), posting waits. A first part still pending at a restart is decided again, so if it
+    ended uncertain in the thread and the new lookup fails or finds no thread, it may be posted a
+    second time in the channel. While the lead works, typing shows where the answer would go: in a
+    followed thread with the source message's ID once the shared lookup (run off the handling
+    round) says so, else in the channel.
 26. If Discord reports the source message unknown (error 10008, on the post or on a follow-up check
     after a 400/404), the remaining parts for that request are discarded and logged; nothing is
     posted unlinked.

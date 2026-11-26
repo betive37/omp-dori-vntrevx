@@ -296,6 +296,11 @@ impl FakeDiscord {
             .insert(path.into(), status);
     }
 
+    /// Reads of `path` are answered as usual again.
+    pub fn pass_reads(&self, path: &str) {
+        self.state.lock().unwrap().failing_reads.remove(path);
+    }
+
     /// A message object.
     pub fn message(channel: &str, id: u64, author: &str, content: &str) -> Value {
         json!({"id": id.to_string(), "channel_id": channel, "type": 0, "content": content,
@@ -786,7 +791,13 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
         .or_else(|| s.scripted.pop_front())
         .filter(|status| *status != 0);
     if let Some(status) = scripted.filter(|s| (400..500).contains(s)) {
-        return reply(status, &json!({ "message": "scripted", "code": 50001 }));
+        // As Discord: no access, unknown channel (a deleted thread), else an invalid body.
+        let code = match status {
+            403 => 50_001,
+            404 => 10_003,
+            _ => 50_035,
+        };
+        return reply(status, &json!({ "message": "scripted", "code": code }));
     }
     let nonce = body["nonce"].as_str().unwrap_or_default().to_string();
     let enforced = body["enforce_nonce"] == true;

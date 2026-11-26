@@ -47,6 +47,9 @@ pub(crate) enum PartOutcome {
     SourceGone,
     /// Nothing was created.
     Rejected(String),
+    /// Nothing was created and the room takes no posts from the bot: it is gone, locked or out of
+    /// reach (Discord: 403, unknown channel, archived thread).
+    Closed(String),
     /// It may exist; a part with a deterministic enforced nonce may be posted again.
     Uncertain(String),
 }
@@ -88,7 +91,8 @@ pub(crate) trait Relay: Send + Sync + 'static {
     /// (Discord: the thread started from that message); asked once per delivery. For a new answer
     /// (`posted` is `None`) `Ok(None)` keeps the reply in `room`, and so does a failed lookup, which
     /// the relay logs. For an answer whose first part `posted` is already out (a restart in the
-    /// middle of it), the room that part is in; `Err` when that cannot be read now.
+    /// middle of it), the room that part was read back from; `Err` while it cannot be read in
+    /// either room.
     fn answer_room(
         &self,
         _room: &str,

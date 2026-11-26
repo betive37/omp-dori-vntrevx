@@ -75,7 +75,13 @@ struct Target {
     /// A part posted to `room` ended uncertain: the answer stays there, where its nonces keep each
     /// part single, instead of falling back to the request's room.
     held: bool,
+    /// The rest moved to the request's room after a part was out elsewhere: the next part posted
+    /// there is the reply to the request.
+    reply_next: bool,
 }
+
+/// The answer room of one request, looked up once and shared by typing and posting.
+type Lookup = Arc<tokio::sync::OnceCell<Option<String>>>;
 
 /// The pipeline of one relay.
 pub(crate) struct Pipeline<R: Relay, T: Runtime> {
@@ -93,6 +99,8 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     stuck: Mutex<HashSet<String>>,
     /// Where each answer being posted goes, by source, decided before its first part.
     targets: Mutex<HashMap<String, Target>>,
+    /// The answer room looked up per open request, by source.
+    lookups: Mutex<HashMap<String, Lookup>>,
     /// A failed seen mark is logged once per run (MSG-04).
     seen_failed: AtomicBool,
     /// Live messages not handed off yet, by room and message.
@@ -126,6 +134,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             context: Context::default(),
             stuck: Mutex::default(),
             targets: Mutex::default(),
+            lookups: Mutex::default(),
             seen_failed: AtomicBool::new(false),
             live: Mutex::default(),
             wake: Mutex::new(None),
@@ -841,7 +850,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             R::NAME
         );
         let nonce = self.relay.nonce(room, message, 9_999);
-        if let PartOutcome::Rejected(e) | PartOutcome::Uncertain(e) =
+        if let PartOutcome::Rejected(e) | PartOutcome::Closed(e) | PartOutcome::Uncertain(e) =
             self.relay.post(room, Some(message), &note, &nonce).await
         {
             log::warn("hold notice not posted", &[("error", &e)]);
@@ -889,6 +898,11 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .read(|r| r.answers_open(R::NAME))
             .await
             .map_err(|e| e.to_string())?;
+        // Lookups are kept while their request's answer is open.
+        self.lookups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|m, _| open.iter().any(|h| h.message == *m));
         if open.is_empty() {
             return Ok(());
         }
@@ -1009,7 +1023,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         if let Some(target) = known {
             return Ok(target);
         }
-        let room = self.relay.answer_room(&h.room, &h.message, posted).await?;
+        let room = match posted {
+            Some(_) => self.relay.answer_room(&h.room, &h.message, posted).await?,
+            None => self.answer_room(&h.room, &h.message).await,
+        };
         if let Some(room) = &room {
             log::info(
                 "the answer goes to the room bound to its request",
@@ -1020,9 +1037,44 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         let target = Target {
             room,
             held: posted.is_some(),
+            reply_next: false,
         };
         self.set_target(&h.message, &target);
         Ok(target)
+    }
+
+    fn lookup(&self, source: &str) -> Lookup {
+        Arc::clone(
+            self.lookups
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(source.to_string())
+                .or_default(),
+        )
+    }
+
+    /// The answer room of a new answer to `source` in `room`, looked up once per request; typing
+    /// and posting share it, so they agree and a failed lookup is logged once.
+    pub(crate) async fn answer_room(&self, room: &str, source: &str) -> Option<String> {
+        self.lookup(source)
+            .get_or_init(|| async {
+                // A new answer: the relay logs a failed lookup and keeps the reply in `room`.
+                self.relay
+                    .answer_room(room, source, None)
+                    .await
+                    .ok()
+                    .flatten()
+            })
+            .await
+            .clone()
+    }
+
+    /// Where the answer to `source` in `room` goes when that was looked up already (the room bound
+    /// to it, else `room`); `None` while it is not.
+    pub(crate) fn known_answer_room(&self, room: &str, source: &str) -> Option<String> {
+        self.lookup(source)
+            .get()
+            .map(|bound| bound.clone().unwrap_or_else(|| room.to_string()))
     }
 
     /// Marks a delivery stuck; true the first time, so it is logged once (DISC-OUT req. 27).
@@ -1041,13 +1093,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     }
 
     /// Posts one part where the answer goes: in the room bound to the request without a reply, else
-    /// in the request's room with the first part as the reply.
+    /// in the request's room with the first part (or the first part moved there) as the reply.
     async fn post_part(&self, h: &HandoffRow, part: &PartRow, target: &mut Target) -> PartOutcome {
         loop {
             let (room, reply_to) = target.room.as_deref().map_or_else(
                 || {
-                    let reply_to = (part.idx == 0).then_some(h.message.as_str());
-                    (h.room.as_str(), reply_to)
+                    let reply = part.idx == 0 || target.reply_next;
+                    (h.room.as_str(), reply.then_some(h.message.as_str()))
                 },
                 |room| (room, None),
             );
@@ -1057,6 +1109,24 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 .await;
             let bound = target.room.is_some();
             match outcome {
+                // The room bound to the request takes no posts at all (gone, locked, no access):
+                // this part and the rest go to the request's room, this part as the reply.
+                PartOutcome::Closed(why) if bound => {
+                    log::warn(
+                        "answer room closed; the rest of the answer goes to the request's room",
+                        &[
+                            ("message", &h.message),
+                            ("part", &part.idx),
+                            ("reason", &why),
+                        ],
+                    );
+                    *target = Target {
+                        room: None,
+                        held: true,
+                        reply_next: part.idx > 0,
+                    };
+                    self.set_target(&h.message, target);
+                }
                 // Nothing was created there and nothing is in doubt: the first part goes as the
                 // linked reply in the request's room after all, with the same nonce.
                 PartOutcome::Rejected(why) if bound && part.idx == 0 && !target.held => {
@@ -1076,6 +1146,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     // In the room bound to the request the first part answers it as a linked
                     // reply would (DISC-OUT req. 25, 33).
                     let linked = linked || (bound && part.idx == 0);
+                    if !bound && target.reply_next {
+                        target.reply_next = false;
+                        self.set_target(&h.message, target);
+                    }
                     return PartOutcome::Posted { id, linked };
                 }
                 other => return other,
@@ -1164,7 +1238,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                     return Ok(true);
                 }
-                PartOutcome::Rejected(why) | PartOutcome::Uncertain(why) => {
+                PartOutcome::Rejected(why)
+                | PartOutcome::Closed(why)
+                | PartOutcome::Uncertain(why) => {
                     if self.first_stuck(&h.message) {
                         log::warn(
                             "answer part not posted; retrying with the same nonce",

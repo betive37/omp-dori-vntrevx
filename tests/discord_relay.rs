@@ -338,8 +338,9 @@ fn an_uncertain_post_in_the_thread_keeps_the_answer_there() {
     hub.start();
     ready(&hub);
     let source = "800000000000000141";
-    // One call's four attempts end uncertain (the message may exist), then one refusal.
-    fake.script_in(source, &[500, 500, 500, 500, 403]);
+    // One call's four attempts end uncertain (the message may exist), then one refusal of the
+    // part itself (400, not the thread's).
+    fake.script_in(source, &[500, 500, 500, 500, 400]);
     let thread = ask_with_thread(&fake, 800_000_000_000_000_141, "held");
     settled(&hub);
     let creates = fake.creates();
@@ -355,8 +356,54 @@ fn an_uncertain_post_in_the_thread_keeps_the_answer_there() {
     assert!(hub.stop().success());
 }
 
-/// A refused later part is retried in the thread: only the first part may fall back, so an answer
-/// never ends up split between thread and channel.
+/// A thread that closes in the middle of an answer (locked or no access: 403; deleted: unknown
+/// channel) takes nothing more: the rest goes to the channel, its first part as the reply to the
+/// request, and later answers are not held up.
+#[test]
+fn a_thread_closed_mid_answer_moves_the_rest_to_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    for (n, (message, refusal)) in [
+        (800_000_000_000_000_201_u64, 403),
+        (800_000_000_000_000_202, 404),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = message.to_string();
+        fake.script_in(&source, &[0, refusal]);
+        ask_with_thread(&fake, message, "closes mid-answer");
+        hub.until(WAIT, || {
+            let s = status(&hub);
+            (s["counts"]["owed_settled"] == n + 1 && s["counts"]["queued"] == 0).then_some(())
+        });
+        fake.wait(WAIT, |f| {
+            let moved: Vec<Value> = f
+                .bot_messages(CH)
+                .into_iter()
+                .filter(|m| m["message_reference"]["message_id"] == source.as_str())
+                .collect();
+            (moved.len() == 1).then_some(())
+        });
+        assert_eq!(
+            fake.bot_messages(&source).len(),
+            1,
+            "only the first part in the thread"
+        );
+    }
+    assert_eq!(fake.bot_messages(CH).len(), 2, "one moved part per answer");
+    assert!(hub.stop().success());
+}
+
+/// A later part refused for its own sake (not the thread's: a 400) is retried in the thread: only
+/// the first part may fall back, so such a refusal never splits an answer.
 #[test]
 fn a_refused_second_part_stays_in_the_thread() {
     let fake = FakeDiscord::start();
@@ -369,7 +416,7 @@ fn a_refused_second_part_stays_in_the_thread() {
     hub.start();
     ready(&hub);
     let source = "800000000000000151";
-    fake.script_in(source, &[0, 403]);
+    fake.script_in(source, &[0, 400]);
     let thread = ask_with_thread(&fake, 800_000_000_000_000_151, "two parts");
     settled(&hub);
     hub.until(WAIT, || {
@@ -477,6 +524,68 @@ fn a_restart_mid_answer_keeps_the_rest_with_its_first_part() {
     assert_eq!(
         in_thread, 1,
         "only the first part's refused try went to the thread"
+    );
+    assert!(hub.stop().success());
+}
+
+/// After a restart in the middle of an answer whose first part is in the thread, a refused read of
+/// that part says nothing about where it is: the rest waits, nothing goes to the channel, and once
+/// the part can be read the rest follows it into the thread.
+#[test]
+fn a_refused_read_back_after_a_restart_holds_the_rest() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000191";
+    // The first part is confirmed in the thread, the second ends uncertain until the restart.
+    let mut thread = vec![0];
+    thread.extend([500; 64]);
+    fake.script_in(source, &thread);
+    ask_with_thread(&fake, 800_000_000_000_000_191, "read back");
+    let in_thread = || {
+        fake.calls("POST", &format!("/channels/{source}/messages"))
+            .len()
+    };
+    fake.wait(WAIT, |_| (in_thread() >= 3).then_some(()));
+    assert!(hub.stop().success());
+    fake.unscript_in(source);
+    let first = fake.bot_messages(source)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read_back = format!("/channels/{source}/messages/{first}");
+    fake.fail_reads(&read_back, 403);
+    let before = in_thread();
+    hub.start();
+    fake.wait(WAIT, |f| {
+        (!f.calls("GET", &read_back).is_empty()).then_some(())
+    });
+    // Several handling rounds (3 s each) go by with the read refused.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing in the channel"
+    );
+    assert_eq!(in_thread(), before, "held while the part cannot be read");
+    fake.pass_reads(&read_back);
+    fake.wait(WAIT, |_| (in_thread() > before).then_some(()));
+    settled(&hub);
+    assert_eq!(
+        fake.bot_messages(source).len(),
+        2,
+        "both parts in the thread"
+    );
+    assert_eq!(
+        fake.bot_messages(CH),
+        Vec::<Value>::new(),
+        "nothing in the channel"
     );
     assert!(hub.stop().success());
 }

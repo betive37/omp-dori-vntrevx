@@ -41,6 +41,10 @@ const CHANNEL_TYPES_MAX: usize = 512;
 
 /// Discord's unknown-message error code (DISC-OUT req. 26).
 const UNKNOWN_MESSAGE: u64 = 10_008;
+/// Discord's unknown-channel error code (a deleted thread).
+const UNKNOWN_CHANNEL: u64 = 10_003;
+/// Discord's "operation cannot be performed on an archived thread" error code.
+const ARCHIVED_THREAD: u64 = 50_083;
 /// Discord's epoch, in Unix milliseconds.
 const EPOCH_MS: u64 = 1_420_070_400_000;
 
@@ -123,6 +127,17 @@ impl RestError {
     /// 404 with Discord's unknown-message code.
     pub(crate) fn unknown_message(&self) -> bool {
         self.status == Some(404) && self.code == Some(UNKNOWN_MESSAGE)
+    }
+
+    /// 404 with Discord's unknown-channel code: the channel or thread is gone.
+    pub(crate) fn unknown_channel(&self) -> bool {
+        self.status == Some(404) && self.code == Some(UNKNOWN_CHANNEL)
+    }
+
+    /// A definite refusal of the channel itself: no access (403), unknown channel, or an archived
+    /// thread the bot may not reopen.
+    pub(crate) fn closed(&self) -> bool {
+        self.status == Some(403) || self.unknown_channel() || self.code == Some(ARCHIVED_THREAD)
     }
 }
 
@@ -932,15 +947,24 @@ impl Rest {
                 PartOutcome::Posted { id, linked }
             }
             Err(e) if e.unknown_message() => PartOutcome::SourceGone,
-            Err(e) if matches!(e.status, Some(400 | 404)) => match reply_to {
-                Some(source) => match self.message(channel, source).await {
-                    Err(check) if check.unknown_message() => PartOutcome::SourceGone,
-                    _ => PartOutcome::Rejected(e.why),
-                },
-                None => PartOutcome::Rejected(e.why),
-            },
-            Err(e) if e.uncertain => PartOutcome::Uncertain(e.why),
-            Err(e) => PartOutcome::Rejected(e.why),
+            Err(e) => {
+                let source_gone = match reply_to {
+                    Some(source) if matches!(e.status, Some(400 | 404)) => matches!(
+                        self.message(channel, source).await,
+                        Err(check) if check.unknown_message()
+                    ),
+                    _ => false,
+                };
+                if source_gone {
+                    PartOutcome::SourceGone
+                } else if e.closed() {
+                    PartOutcome::Closed(e.why)
+                } else if e.uncertain {
+                    PartOutcome::Uncertain(e.why)
+                } else {
+                    PartOutcome::Rejected(e.why)
+                }
+            }
         }
     }
 }
