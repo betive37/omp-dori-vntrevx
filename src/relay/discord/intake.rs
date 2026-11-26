@@ -26,7 +26,7 @@ pub(crate) use crate::relay::intake::Shared;
 use crate::relay::intake::{Stop, supervise};
 use crate::relay::pipeline::{Arrival, Pipeline, Step};
 use crate::relay::text::{self, Checks, DISCORD_LIMIT};
-use crate::relay::{Facts, Inbound, PartOutcome, Relay};
+use crate::relay::{Facts, Inbound, PartOutcome, Relay, Resume};
 use crate::store::Store;
 use crate::store::relay::{QueueRow, RelayDone, RelayWrite};
 use crate::sys::now_ms;
@@ -103,42 +103,15 @@ impl Relay for DiscordRelay {
         types::normalise(&raw, parent)
     }
 
-    /// The thread started from the request, looked up within 5 s; after a restart in the middle of
-    /// an answer, whether its first part is in that thread (it has the request's ID) (DISC-OUT req.
-    /// 25).
-    async fn answer_room(
-        &self,
-        room: &str,
-        source: &str,
-        posted: Option<&str>,
-    ) -> Result<Option<String>, String> {
-        let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
-            return Ok(None);
-        };
-        if let Some(posted) = posted {
-            // Only reading the part itself says where it is: the thread, else the channel; a
-            // deleted thread takes nothing more either way. A read refused or failed in both says
-            // nothing, and the rest waits.
-            let posted = id(posted)?;
-            let in_thread = match self.read_part(message, posted).await {
-                Ok(()) => return Ok(Some(source.to_string())),
-                Err(e) if e.unknown_channel() => return Ok(None),
-                Err(e) => e.why,
-            };
-            return match self.read_part(channel, posted).await {
-                Ok(()) => Ok(None),
-                Err(e) => Err(format!(
-                    "the first part is not readable in the thread ({in_thread}) or in the channel ({})",
-                    e.why
-                )),
-            };
-        }
+    /// The thread started from the request, looked up within 5 s (DISC-OUT req. 25).
+    async fn answer_room(&self, room: &str, source: &str) -> Option<String> {
         if !self.follow_threads {
-            return Ok(None);
+            return None;
         }
+        let (channel, message) = (id(room).ok()?, id(source).ok()?);
         let lookup = self.rest.started_thread(channel, message);
         let why = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
-            Ok(Ok(thread)) => return Ok(thread.map(|t| t.to_string())),
+            Ok(Ok(thread)) => return thread.map(|t| t.to_string()),
             Ok(Err(why)) => why,
             Err(_) => "no answer within 5 s".into(),
         };
@@ -146,7 +119,34 @@ impl Relay for DiscordRelay {
             "thread lookup failed; the answer is a reply in the channel",
             &[("message", &source), ("reason", &why)],
         );
-        Ok(None)
+        None
+    }
+
+    /// Where the first part of a half-posted answer is (DISC-OUT req. 25). Only reading the part
+    /// itself says so: the channel, else the thread started from the request (it has the request's
+    /// ID). When the channel definitely lacks it (unknown message) and the thread definitely takes
+    /// nothing from the bot (closed: no access, gone, archived) or lacks it too, the rest moves to
+    /// the channel, its first part as the reply. A read that fails for now says nothing, and the
+    /// rest waits.
+    async fn resume_room(&self, room: &str, source: &str, posted: &str) -> Result<Resume, String> {
+        let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
+            return Ok(Resume::Here);
+        };
+        let posted = id(posted)?;
+        let in_channel = match self.read_part(channel, posted).await {
+            Ok(()) => return Ok(Resume::Here),
+            Err(e) => e,
+        };
+        match self.read_part(message, posted).await {
+            Ok(()) => Ok(Resume::Bound(source.to_string())),
+            Err(e) if in_channel.unknown_message() && (e.closed() || e.unknown_message()) => {
+                Ok(Resume::Moved)
+            }
+            Err(e) => Err(format!(
+                "the first part is not readable in the channel ({}) or in the thread ({})",
+                in_channel.why, e.why
+            )),
+        }
     }
 
     async fn post(

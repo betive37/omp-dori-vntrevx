@@ -16,7 +16,7 @@ use std::time::Instant;
 use tokio::sync::{Notify, watch};
 
 use super::context::{self, Context};
-use super::{Inbound, PartOutcome, Relay};
+use super::{Inbound, PartOutcome, Relay, Resume};
 use crate::config::Config;
 use crate::host::inbox::{self, Message, ReceiptState};
 use crate::host::lead::{Events, Lead};
@@ -1023,22 +1023,43 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         if let Some(target) = known {
             return Ok(target);
         }
-        let room = match posted {
-            Some(_) => self.relay.answer_room(&h.room, &h.message, posted).await?,
-            None => self.answer_room(&h.room, &h.message).await,
+        // Parts already out stay where they are: no fallback for the rest.
+        let target = match posted {
+            Some(posted) => match self.relay.resume_room(&h.room, &h.message, posted).await? {
+                Resume::Here => Target {
+                    room: None,
+                    held: true,
+                    reply_next: false,
+                },
+                Resume::Bound(room) => Target {
+                    room: Some(room),
+                    held: true,
+                    reply_next: false,
+                },
+                Resume::Moved => {
+                    log::warn(
+                        "answer room gone; the rest of the answer goes to the request's room",
+                        &[("message", &h.message)],
+                    );
+                    Target {
+                        room: None,
+                        held: true,
+                        reply_next: true,
+                    }
+                }
+            },
+            None => Target {
+                room: self.answer_room(&h.room, &h.message).await,
+                held: false,
+                reply_next: false,
+            },
         };
-        if let Some(room) = &room {
+        if let Some(room) = &target.room {
             log::info(
                 "the answer goes to the room bound to its request",
                 &[("message", &h.message), ("room", room)],
             );
         }
-        // Parts already out stay where they are: no fallback for the rest.
-        let target = Target {
-            room,
-            held: posted.is_some(),
-            reply_next: false,
-        };
         self.set_target(&h.message, &target);
         Ok(target)
     }
@@ -1057,14 +1078,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     /// and posting share it, so they agree and a failed lookup is logged once.
     pub(crate) async fn answer_room(&self, room: &str, source: &str) -> Option<String> {
         self.lookup(source)
-            .get_or_init(|| async {
-                // A new answer: the relay logs a failed lookup and keeps the reply in `room`.
-                self.relay
-                    .answer_room(room, source, None)
-                    .await
-                    .ok()
-                    .flatten()
-            })
+            .get_or_init(|| self.relay.answer_room(room, source))
             .await
             .clone()
     }

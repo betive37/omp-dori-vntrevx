@@ -528,11 +528,11 @@ fn a_restart_mid_answer_keeps_the_rest_with_its_first_part() {
     assert!(hub.stop().success());
 }
 
-/// After a restart in the middle of an answer whose first part is in the thread, a refused read of
-/// that part says nothing about where it is: the rest waits, nothing goes to the channel, and once
-/// the part can be read the rest follows it into the thread.
+/// After a restart in the middle of an answer whose first part is in the thread, a read of that
+/// part that fails for now (5xx) says nothing about where it is: the rest waits, nothing goes to
+/// the channel, and once the part can be read the rest follows it into the thread.
 #[test]
-fn a_refused_read_back_after_a_restart_holds_the_rest() {
+fn a_failing_read_back_after_a_restart_holds_the_rest() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     hub.fixture(
@@ -560,13 +560,13 @@ fn a_refused_read_back_after_a_restart_holds_the_rest() {
         .unwrap()
         .to_string();
     let read_back = format!("/channels/{source}/messages/{first}");
-    fake.fail_reads(&read_back, 403);
+    fake.fail_reads(&read_back, 503);
     let before = in_thread();
     hub.start();
     fake.wait(WAIT, |f| {
         (!f.calls("GET", &read_back).is_empty()).then_some(())
     });
-    // Several handling rounds (3 s each) go by with the read refused.
+    // Several handling rounds (3 s each) go by with the read failing.
     std::thread::sleep(Duration::from_secs(8));
     assert!(
         fake.calls("POST", &format!("/channels/{CH}/messages"))
@@ -588,6 +588,68 @@ fn a_refused_read_back_after_a_restart_holds_the_rest() {
         "nothing in the channel"
     );
     assert!(hub.stop().success());
+}
+
+/// After a restart in the middle of an answer whose first part is in a thread that has since been
+/// deleted (404, unknown channel) or shut to the bot (403), while the channel definitely lacks the
+/// part, the rest moves to the channel, its first part as the reply to the request, as when the
+/// thread closes while the hub runs; later answers are not held up.
+#[test]
+fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
+    for (message, refusal) in [
+        (800_000_000_000_000_211_u64, 404),
+        (800_000_000_000_000_221, 403),
+    ] {
+        let fake = FakeDiscord::start();
+        let mut hub = relay_hub(&fake, &[], "");
+        hub.fixture(
+            "omp",
+            "answer.json",
+            Some(&json!("word ".repeat(600)).to_string()),
+        );
+        hub.start();
+        ready(&hub);
+        let source = message.to_string();
+        // The first part is confirmed in the thread; the second is refused for its own sake
+        // (nothing stored) until the restart.
+        let mut thread = vec![0];
+        thread.extend([400; 64]);
+        fake.script_in(&source, &thread);
+        ask_with_thread(&fake, message, "gone");
+        let in_thread = || {
+            fake.calls("POST", &format!("/channels/{source}/messages"))
+                .len()
+        };
+        fake.wait(WAIT, |_| (in_thread() >= 2).then_some(()));
+        assert!(hub.stop().success());
+        // While the hub is down the thread goes: reads and posts there are refused.
+        fake.unscript_in(&source);
+        fake.script_in(&source, &[refusal; 64]);
+        let first = fake.bot_messages(&source)[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fake.fail_reads(&format!("/channels/{source}/messages/{first}"), refusal);
+        let before = in_thread();
+        hub.start();
+        let moved = fake.wait(WAIT, |f| {
+            let posted = f.bot_messages(CH);
+            (!posted.is_empty()).then_some(posted)
+        });
+        assert_eq!(moved.len(), 1, "{refusal}: {moved:?}");
+        assert_eq!(
+            moved[0]["message_reference"]["message_id"],
+            source.as_str(),
+            "{refusal}: the moved part is the reply to the request"
+        );
+        assert_eq!(
+            in_thread(),
+            before,
+            "{refusal}: nothing more tried in the thread"
+        );
+        settled(&hub);
+        assert!(hub.stop().success());
+    }
 }
 
 /// A thread the lead started from the request with the bot (the work thread), here claimed by a

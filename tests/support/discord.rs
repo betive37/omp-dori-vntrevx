@@ -629,7 +629,19 @@ fn setup_route(
 /// The scripted failure of a read (`FakeDiscord::fail_reads`).
 fn failed_read(s: &State, method: &str, path: &str) -> Option<Response<Full<Bytes>>> {
     let status = s.failing_reads.get(path).filter(|_| method == "GET")?;
-    Some(reply(*status, &json!({ "message": "scripted", "code": 0 })))
+    Some(scripted_failure(*status))
+}
+
+/// A scripted failure with Discord's code for it: no access, unknown channel (a deleted thread),
+/// an invalid body for another 4xx.
+fn scripted_failure(status: u16) -> Response<Full<Bytes>> {
+    let code = match status {
+        403 => 50_001,
+        404 => 10_003,
+        400..500 => 50_035,
+        _ => 0,
+    };
+    reply(status, &json!({ "message": "scripted", "code": code }))
 }
 
 async fn answer(
@@ -791,13 +803,7 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
         .or_else(|| s.scripted.pop_front())
         .filter(|status| *status != 0);
     if let Some(status) = scripted.filter(|s| (400..500).contains(s)) {
-        // As Discord: no access, unknown channel (a deleted thread), else an invalid body.
-        let code = match status {
-            403 => 50_001,
-            404 => 10_003,
-            _ => 50_035,
-        };
-        return reply(status, &json!({ "message": "scripted", "code": code }));
+        return scripted_failure(status);
     }
     let nonce = body["nonce"].as_str().unwrap_or_default().to_string();
     let enforced = body["enforce_nonce"] == true;
