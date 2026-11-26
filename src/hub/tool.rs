@@ -287,7 +287,7 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     body.push_str("\nReply to this message with a number or your answer.");
     let config = hub.config();
     let snowflake = crate::relay::discord::Snowflake::parse;
-    let room = match s(input, "room") {
+    let room = match s(input, "room").map(str::trim).filter(|r| !r.is_empty()) {
         Some(r) => Some(snowflake(r).ok_or("room: a Discord channel ID is required")?),
         None => thread
             .as_deref()

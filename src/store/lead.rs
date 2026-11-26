@@ -383,6 +383,19 @@ impl Reads {
         self.0.query_row(&sql, [id], question_of).optional()
     }
 
+    /// Whether a lead question, in any state, was posted as this message (EVR req. 37). Any state,
+    /// so a hand-off made again after the answer was recorded still goes to the lead.
+    pub(crate) fn question_posted(&self, room: &str, message: &str) -> rusqlite::Result<bool> {
+        self.0
+            .query_row(
+                "SELECT 1 FROM questions WHERE room = ?1 AND message = ?2",
+                [room, message],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
+    }
+
     /// The open question bound to a posted message (EVR req. 37).
     pub(crate) fn question_at(
         &self,
