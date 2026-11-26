@@ -1470,3 +1470,196 @@ fn owed_messages_bring_a_reminder_after_a_minute() {
     assert!(text.contains(&format!("[discord {CH}/800000000000000095]")));
     assert!(hub.stop().success());
 }
+
+/// The lead's side of the bridge, as its OMP extension speaks it, for calls of its tool.
+struct LeadBridge {
+    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
+    writer: std::os::unix::net::UnixStream,
+    session: Value,
+    next: u64,
+}
+
+impl LeadBridge {
+    /// Connects as the live lead with its launch token; also returns the hello answer.
+    fn connect(hub: &TestHub) -> (Self, Value) {
+        let session = hub.until(WAIT, || {
+            let v = hub.json(&["lead", "status", "--json"]);
+            (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
+        });
+        let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
+        let token = launch
+            .lines()
+            .rfind(|l| l.split(' ').nth(1) == session.as_str())
+            .and_then(|l| l.split(' ').next())
+            .unwrap()
+            .to_string();
+        let writer = std::os::unix::net::UnixStream::connect(hub.socket()).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(120)))
+            .unwrap();
+        let reader = std::io::BufReader::new(writer.try_clone().unwrap());
+        let mut bridge = Self {
+            reader,
+            writer,
+            session: session.clone(),
+            next: 1,
+        };
+        let hello = bridge.call(
+            "bridge.hello",
+            &json!({ "ext": 1, "token": token, "session": session, "agent": "main" }),
+        );
+        (bridge, hello)
+    }
+
+    fn call(&mut self, method: &str, params: &Value) -> Value {
+        use std::io::{BufRead, Write};
+        let id = self.next;
+        self.next += 1;
+        let line = json!({ "v": 1, "id": id, "method": method, "params": params });
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        loop {
+            let mut reply = String::new();
+            self.reader.read_line(&mut reply).unwrap();
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            if v["id"] == id {
+                return v["ok"].clone();
+            }
+        }
+    }
+
+    /// One `cataly_lead` call: its text and whether it is an error.
+    fn tool(&mut self, input: &Value) -> (String, bool) {
+        let call = format!("call-{}", self.next);
+        let params =
+            json!({ "call": call, "tool": "cataly_lead", "session": self.session, "input": input });
+        let v = self.call("bridge.tool", &params);
+        (
+            v["text"].as_str().unwrap_or_default().to_string(),
+            v["error"] == true,
+        )
+    }
+}
+
+/// A hub whose lead answers only with its tool (`[lead] answers = "tool"`).
+fn tool_hub(fake: &FakeDiscord, fixtures: &[&str]) -> TestHub {
+    let hub = relay_hub(fake, fixtures, "");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&config.replace("[lead]\n", "[lead]\nanswers = \"tool\"\n"));
+    hub
+}
+
+/// With `answers = "tool"` the lead's final text is never posted, also not the text of a turn a
+/// background result starts after it: the owed reply stays open until the lead calls `answer`,
+/// which posts the linked reply at once and settles it. A later call is a follow-up; the same
+/// follow-up repeated posts nothing new. The lead's guidance and request say so.
+#[test]
+fn with_tool_answers_only_the_answer_call_posts() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("final text A").to_string()),
+    );
+    hub.fixture(
+        "omp",
+        "followup",
+        Some(&json!("background report B").to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000301";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_301,
+        OWNER,
+        "answer me with the tool",
+    ));
+    hub.until(WAIT, || {
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        text.contains("background report B").then_some(())
+    });
+    let asked = requests(&hub);
+    assert!(
+        asked[0].contains(&format!(
+            "cataly_lead op answer, message \"discord:{CH}/{source}\""
+        )),
+        "{asked:?}"
+    );
+    // Several handling rounds go by: nothing is posted, the reply stays owed.
+    std::thread::sleep(Duration::from_secs(7));
+    assert!(fake.creates().is_empty(), "{:?}", fake.creates());
+    let s = status(&hub);
+    assert_eq!(s["counts"]["owed_open"], 1, "{s}");
+    let (mut lead, hello) = LeadBridge::connect(&hub);
+    let guidance = hello["guidance"].as_str().unwrap();
+    assert!(
+        guidance.contains("Cataly does not post your final message.")
+            && !guidance.contains("Cataly posts your final message"),
+        "{guidance}"
+    );
+    let (said, error) = lead.tool(&json!({
+        "op": "answer",
+        "message": format!("discord:{CH}/{source}"),
+        "text": "the explicit answer"
+    }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    let creates = fake.creates();
+    assert_eq!(creates.len(), 1, "{creates:?}");
+    assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    assert_eq!(creates[0].body["content"], "the explicit answer");
+    let s = settled(&hub);
+    assert_eq!(s["counts"]["owed_open"], 0, "{s}");
+    // A follow-up, by the request's tag; the same call again posts nothing new.
+    for _ in 0..2 {
+        let (said, error) = lead.tool(&json!({
+            "op": "answer",
+            "message": format!("[discord {CH}/{source}]"),
+            "text": "and one more thing"
+        }));
+        assert!(!error && said.contains("follow-up"), "{said}");
+    }
+    let posted = fake.bot_messages(CH);
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(posted[1]["content"], "and one more thing");
+    assert_eq!(status(&hub)["counts"]["owed_settled"], 1);
+    // Messages the lead was not handed are refused.
+    let (said, error) = lead.tool(&json!({
+        "op": "answer",
+        "message": format!("discord:{CH}/800000000000000399"),
+        "text": "x"
+    }));
+    assert!(
+        error && said.contains("not an owner message handed to the lead"),
+        "{said}"
+    );
+    assert!(hub.stop().success());
+}
+
+/// With `answers = "tool"` the `answer` call follows the thread started from the request, like an
+/// automatic answer: posted there without a reference, and the owed reply settles.
+#[test]
+fn with_tool_answers_the_answer_goes_into_the_started_thread() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_311, "thread, tool");
+    hub.until(WAIT, || (requests(&hub).len() == 1).then_some(()));
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) = lead.tool(&json!({
+        "op": "answer",
+        "message": format!("discord:{CH}/{thread}"),
+        "text": "answered in the thread"
+    }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    let posted = fake.bot_messages(&thread);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert!(posted[0].get("message_reference").is_none());
+    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
+    settled(&hub);
+    assert!(hub.stop().success());
+}

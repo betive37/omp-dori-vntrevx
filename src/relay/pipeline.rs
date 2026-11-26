@@ -668,6 +668,18 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 Err(refused) => self.hold(&row.room, &row.message, "failed", &refused).await,
             };
         }
+        let mut text = text;
+        if self.config.borrow().tool_answers() {
+            // DISC-OUT req. 21: the lead's final message is not posted.
+            let _ = write!(
+                text,
+                "\n[answer] Your final message is not posted: answer with cataly_lead op answer, \
+                 message \"{}:{}/{}\".",
+                R::NAME,
+                row.room,
+                row.message
+            );
+        }
         self.lead_hand_off(row, handed, text, request_id, read_at)
             .await
     }
@@ -912,7 +924,25 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             // the session file: that entry is the confirmation itself.
             .filter(|h| h.answer == "waiting" && matches!(h.state.as_str(), "delivered" | "handed"))
             .collect();
-        if !waiting.is_empty()
+        let tool_answers = self.config.borrow().tool_answers();
+        if tool_answers {
+            // Only the lead's `answer` calls post (DISC-OUT req. 21): no turn text is read. A
+            // request still unanswered after the owed window is let go, as without an answer.
+            for h in waiting
+                .iter()
+                .filter(|h| now_ms() - h.created_ms > OWED_WINDOW_MS)
+            {
+                self.store
+                    .relay(RelayWrite::Answer {
+                        relay: R::NAME.into(),
+                        room: h.room.clone(),
+                        message: h.message.clone(),
+                        answer: "abandoned".into(),
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        } else if !waiting.is_empty()
             && let Some(snap) = self.lead.snapshot()
             && let Some(file) = snap.session_file.clone()
         {
@@ -951,6 +981,167 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             }
         }
         Ok(())
+    }
+
+    /// Takes the answers the lead gave with its tool and tells it each outcome (DISC-OUT req. 21).
+    pub(crate) async fn lead_answers(&self, shared: &super::intake::Shared) {
+        for a in shared.take_answers() {
+            let outcome = self
+                .lead_answer(&a.room, &a.message, &a.text, a.to.as_deref())
+                .await;
+            // The lead stopped waiting (its call timed out): the outcome is only logged.
+            if let Err(Err(why) | Ok(why)) = a.done.send(outcome) {
+                log::info(
+                    "answer outcome not read by the lead",
+                    &[("message", &a.message), ("outcome", &why)],
+                );
+            }
+        }
+    }
+
+    /// The lead's answer to the owner message `message` in `room`, posted where its auto answer
+    /// would go (or in `to`). The first is stored in the outbox like an auto answer, so it is posted
+    /// once, in parts, and settles the owed reply; a later one is a follow-up posted at once.
+    async fn lead_answer(
+        &self,
+        room: &str,
+        message: &str,
+        text: &str,
+        to: Option<&str>,
+    ) -> Result<String, String> {
+        let tag = Self::tag(room, message);
+        let h = self
+            .handoff(room, message)
+            .await?
+            .filter(|h| {
+                h.target == inbox::LEAD && matches!(h.state.as_str(), "handed" | "delivered")
+            })
+            .ok_or_else(|| format!("{tag} is not an owner message handed to the lead"))?;
+        let parts = self.relay.parts(text)?;
+        let to = to.filter(|t| *t != room);
+        match h.answer.as_str() {
+            "waiting" => self.first_answer(h, parts, text, to).await,
+            "dropped" => Err(format!("{tag} was deleted: nothing posted")),
+            _ => self.follow_up(room, message, &parts, text, to).await,
+        }
+    }
+
+    async fn handoff(&self, room: &str, message: &str) -> Result<Option<HandoffRow>, String> {
+        let (room, message) = (room.to_string(), message.to_string());
+        self.store
+            .read(move |r| r.handoff(R::NAME, &room, &message))
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// The first answer: stored in the outbox and posted now, so the owed reply is settled before
+    /// the lead's turn goes on; what is not posted now is retried like an auto answer.
+    async fn first_answer(
+        &self,
+        h: HandoffRow,
+        parts: Vec<String>,
+        text: &str,
+        to: Option<&str>,
+    ) -> Result<String, String> {
+        let tag = Self::tag(&h.room, &h.message);
+        if let Some(to) = to {
+            let target = Target {
+                room: Some(to.to_string()),
+                held: false,
+                reply_next: false,
+            };
+            self.set_target(&h.message, &target);
+        }
+        self.remember(&h.room, &format!("{}:answer", h.message), "lead", text)
+            .await;
+        let count = parts.len();
+        let parts = parts
+            .into_iter()
+            .enumerate()
+            .map(|(i, p)| (self.relay.nonce(&h.room, &h.message, i), p))
+            .collect();
+        self.store
+            .relay(RelayWrite::Outbox {
+                relay: R::NAME.into(),
+                room: h.room.clone(),
+                source: h.message.clone(),
+                parts,
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        let posting = HandoffRow {
+            answer: "posting".into(),
+            ..h
+        };
+        self.post_parts(&posting).await?;
+        let now = self.handoff(&posting.room, &posting.message).await?;
+        match now.map(|h| h.answer).as_deref() {
+            Some("posted") => Ok(format!(
+                "answer to {tag} posted as its reply ({count} part(s))"
+            )),
+            Some("dropped") => Err(format!("{tag} was deleted: nothing more posted")),
+            Some("abandoned") => Err(format!(
+                "answer to {tag} may not have been posted (uncertain): check before repeating it"
+            )),
+            _ => Ok(format!(
+                "answer to {tag} stored ({count} part(s)); posting failed for now and is retried by itself: do not repeat it"
+            )),
+        }
+    }
+
+    /// A later answer: posted now where the answer went, with nonces of its own text, so the same
+    /// call repeated posts nothing new where the platform enforces them.
+    async fn follow_up(
+        &self,
+        room: &str,
+        message: &str,
+        parts: &[String],
+        text: &str,
+        to: Option<&str>,
+    ) -> Result<String, String> {
+        let tag = Self::tag(room, message);
+        let known = self
+            .targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(message)
+            .and_then(|t| t.room.clone());
+        let dest = match to.map(str::to_string).or(known) {
+            Some(dest) => dest,
+            None => self
+                .answer_room(room, message)
+                .await
+                .unwrap_or_else(|| room.to_string()),
+        };
+        let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
+        let seed = format!(
+            "{message}:{}",
+            crate::sys::hex(digest.as_ref().get(..6).unwrap_or_default())
+        );
+        let count = parts.len();
+        for (i, part) in parts.iter().enumerate() {
+            let reply_to = (i == 0 && dest == room).then_some(message);
+            let nonce = self.relay.nonce(room, &seed, i);
+            match self.relay.post(&dest, reply_to, part, &nonce).await {
+                PartOutcome::Posted { .. } => {}
+                PartOutcome::SourceGone => {
+                    return Err(format!("{tag} was deleted: {i} of {count} part(s) posted"));
+                }
+                PartOutcome::Rejected(why)
+                | PartOutcome::Closed(why)
+                | PartOutcome::Uncertain(why) => {
+                    let again = if R::REPEATABLE {
+                        "repeating the same call posts only what is missing"
+                    } else {
+                        "check the room before repeating it"
+                    };
+                    return Err(format!(
+                        "follow-up to {tag}: {i} of {count} part(s) posted, then {why}; {again}"
+                    ));
+                }
+            }
+        }
+        Ok(format!("follow-up to {tag} posted ({count} part(s))"))
     }
 
     async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {

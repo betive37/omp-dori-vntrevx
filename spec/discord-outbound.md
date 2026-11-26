@@ -114,6 +114,17 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     normally (stop reason "stop"), the message contains no tool call, and it has non-empty visible
     text. Text the provider marks as commentary is excluded. A turn that continues automatically
     extends the wait; the answer is the last message of the final turn.
+    21a. With `[lead] answers = "tool"` no turn text is posted: the lead answers an owner message
+    only with its tool's `answer` operation, naming the message as `<relay>:<room>/<message>`
+    (or the request's tag) with the text and optionally another room. The first answer is stored
+    in the outbox and posted like an automatic answer (rules 24-28, the thread rule of 25), at
+    once, and settles the obligation (33); the call reports whether it was posted. Later calls
+    for the same message post follow-ups at once, with nonces derived from their own text, and
+    settle nothing. A request the lead never answers is let go after the obligation window (34);
+    reminders and the stop notice (35) name the operation, and a final message never counts as an
+    answer for the stop gate. The request text the lead receives says that its final message is
+    not posted. The operation is also available with the default `"final"`; an answer posted with
+    it replaces the automatic one. It works for Discord, Telegram and Slack alike.
 22. If, before that turn ends, another user input or request enters the same transcript, the pending
     reply is abandoned (the answer would belong to mixed work) and the obligation stays open.
 23. The daemon reads the answer from OMP's public surfaces (rpc-ui events or the session file) and
