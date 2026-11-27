@@ -1586,6 +1586,46 @@ fn with_tool_answers_the_answer_goes_into_the_started_thread() {
     assert!(hub.stop().success());
 }
 
+/// An idle lead that still owes an answer with reminders left stays awake for them
+/// (`idle_sleep = "5m"`, shortened to 3 s here): the reminder at a minute reaches the same live
+/// process, and once the answer settles the owed reply the lead sleeps.
+#[test]
+fn an_owed_answer_keeps_the_lead_awake_for_its_reminders() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&config.replace("[lead]\n", "[lead]\nidle_sleep = \"5m\"\n"));
+    hub.env
+        .push(("CATALY_IDLE_SLEEP".into(), PathBuf::from("3s")));
+    hub.start();
+    ready(&hub);
+    let pid = hub.json(&["lead", "status", "--json"])["session"]["pid"].clone();
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_321, "remind me");
+    hub.until(Duration::from_secs(100), || {
+        let lead = hub.json(&["lead", "status", "--json"]);
+        assert_eq!(
+            lead["phase"], "live",
+            "asleep while owing an answer: {lead}"
+        );
+        assert_eq!(lead["session"]["pid"], pid, "{lead}");
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        text.contains("[reminder]").then_some(())
+    });
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) = lead.tool(&json!({
+        "op": "answer",
+        "message": format!("discord:{CH}/{source}"),
+        "text": "answered after the reminder"
+    }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    settled(&hub);
+    hub.until(WAIT, || {
+        let lead = hub.json(&["lead", "status", "--json"]);
+        (lead["phase"] == "asleep").then_some(())
+    });
+    assert!(hub.stop().success());
+}
+
 /// Sends one owner message to a tool-answers hub and waits until the lead has it.
 fn ask_tool_lead(hub: &TestHub, fake: &FakeDiscord, message: u64, text: &str) -> String {
     let before = requests(hub).len();

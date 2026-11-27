@@ -17,6 +17,10 @@
   mode a background job's result that starts another turn can no longer have that turn's text
   taken for the answer. Reminders still come for unanswered messages. The operation also works
   with the default; the default, `"final"`, keeps posting the final message of the turn as before.
+- A lead with `[lead] idle_sleep` no longer sleeps through the reminders for a message of yours it
+  has not answered: while such a message still has a reminder to come (1, 4 and 16 minutes after
+  it arrived), the lead stays awake, with either `answers` mode. Once the message is answered or
+  its three reminders are used, the lead may sleep as before.
 - An answer part posted outside the request's channel (a thread, another room) is now stored with
   its room, so a restart and later follow-ups find it. An older version cannot read that: roll back
   only while no answer is being posted.
