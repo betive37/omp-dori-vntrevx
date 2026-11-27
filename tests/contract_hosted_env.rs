@@ -144,6 +144,35 @@ fn hostile_terminal(host: &Hosted, drop_pins: bool) {
 /// The first coding request of the lead (`None`) or of one lane after `from`.
 fn request(host: &Hosted, from: usize, lane: Option<&str>) -> Surface {
     let session = lane.map(|key| host.lane_session(key));
+    // On a timeout, say which requests did arrive and why none matched.
+    struct Seen<'a>(&'a Hosted, usize, Option<String>);
+    impl Drop for Seen<'_> {
+        fn drop(&mut self) {
+            if std::thread::panicking() {
+                let seen: Vec<String> = self
+                    .0
+                    .model
+                    .bodies()
+                    .iter()
+                    .skip(self.1)
+                    .map(Surface::parse)
+                    .map(|s| {
+                        format!(
+                            "{:?} lane_bridge={} agent={:?}",
+                            s.purpose,
+                            s.tools.contains(LANE_BRIDGE.name),
+                            s.agent.as_ref().map(|a| &a.session)
+                        )
+                    })
+                    .collect();
+                eprintln!(
+                    "requests after {} (want session {:?}): {seen:#?}",
+                    self.1, self.2
+                );
+            }
+        }
+    }
+    let _seen = Seen(host, from, session.clone());
     host.hub.until(WAIT, || {
         host.model
             .bodies()

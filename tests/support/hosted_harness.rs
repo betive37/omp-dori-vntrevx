@@ -120,12 +120,27 @@ impl Hosted {
                 "look_only": look_only, "checks": [{"kind": "command", "argv": ["true"]}],
             }),
         );
+        let last = std::cell::RefCell::new(Value::Null);
+        // On a timeout, the lane's last read says what the hub knew instead.
+        struct Last<'a>(&'a std::cell::RefCell<Value>);
+        impl Drop for Last<'_> {
+            fn drop(&mut self) {
+                if std::thread::panicking() {
+                    eprintln!(
+                        "last lane read before the goal wait gave up: {}",
+                        self.0.borrow()
+                    );
+                }
+            }
+        }
+        let _last = Last(&last);
         self.hub.until(WAIT, || {
             let read = self.lane("read", &json!({"key": key, "count": 1}));
-            (read["goal"]["status"]
+            let active = read["goal"]["status"]
                 .as_str()
-                .is_some_and(|s| s.eq_ignore_ascii_case("active")))
-            .then_some(())
+                .is_some_and(|s| s.eq_ignore_ascii_case("active"));
+            *last.borrow_mut() = read;
+            active.then_some(())
         });
     }
 
