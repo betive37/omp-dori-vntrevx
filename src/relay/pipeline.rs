@@ -17,7 +17,7 @@ use std::time::Instant;
 use tokio::sync::{Notify, watch};
 
 use super::context::{self, Context};
-use super::{Inbound, PartOutcome, Relay};
+use super::{Inbound, PartOutcome, Relay, Resume};
 use crate::config::Config;
 use crate::host::inbox::{self, Message, ReceiptState};
 use crate::host::lead::{Events, Lead};
@@ -26,7 +26,9 @@ use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::omp::transcript::{self, Reply};
 use crate::store::Store;
-use crate::store::relay::{Arrived, HandoffRow, OWED_WINDOW_MS, QueueRow, RelayDone, RelayWrite};
+use crate::store::relay::{
+    Arrived, HandoffRow, OWED_WINDOW_MS, PartRow, QueueRow, RelayDone, RelayWrite,
+};
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
 
@@ -34,6 +36,9 @@ use crate::sys::now_ms;
 const SPILL_BYTES: usize = 64 * 1024;
 /// The owed reply keeps this much of the request (DISC-OUT req. 32).
 const OWED_UNITS: usize = 500;
+/// Lookups of an answer room that may fail per request before its answer stays in the request's
+/// room (DISC-OUT req. 25).
+const LOOKUP_TRIES: usize = 3;
 
 /// Where a hand-off stands after a step.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -194,6 +199,37 @@ impl Drop for Arriving<'_> {
     }
 }
 
+/// Where one answer goes (DISC-OUT req. 25).
+#[derive(Debug, Clone, Default)]
+struct Target {
+    /// The room bound to the request that takes the whole answer ([`Relay::answer_room`]); `None`
+    /// for the linked reply in the request's room.
+    room: Option<String>,
+    /// A part posted to `room` ended uncertain: the answer stays there, where its nonces keep each
+    /// part single, instead of falling back to the request's room.
+    held: bool,
+    /// The rest moved to the request's room from this room after a part was out there: the next
+    /// part posted in the request's room is the reply to the request, after a note pointing back
+    /// here ([`Relay::moved_note`]).
+    moved_from: Option<String>,
+    /// The note for `moved_from` was tried (once per delivery, whatever came of it).
+    noted: bool,
+}
+
+/// The answer room of one request, shared by typing and posting: a found room (or none) is kept,
+/// a failed one is tried again, [`LOOKUP_TRIES`] lookups in all.
+type Lookup = Arc<tokio::sync::Mutex<LookupState>>;
+
+#[derive(Debug, Default)]
+struct LookupState {
+    /// A lookup answered (or the lookups ran out): `room` is kept for the request.
+    settled: bool,
+    /// The answer room found; `None` keeps the answer in the request's room.
+    room: Option<String>,
+    /// Lookups that failed so far.
+    failed: usize,
+}
+
 /// The pipeline of one relay.
 pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     pub(crate) relay: Arc<R>,
@@ -208,6 +244,10 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     context: Context,
     /// Sources whose stuck delivery was logged (once per request, DISC-OUT req. 27).
     stuck: Mutex<HashSet<String>>,
+    /// Where each answer being posted goes, by source, decided before its first part.
+    targets: Mutex<HashMap<String, Target>>,
+    /// The answer room looked up per open request, by source.
+    lookups: Mutex<HashMap<String, Lookup>>,
     /// A failed seen mark is logged once per run (MSG-04).
     seen_failed: AtomicBool,
     /// Live messages not handed off yet.
@@ -240,6 +280,8 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             config: parts.config,
             context: Context::default(),
             stuck: Mutex::default(),
+            targets: Mutex::default(),
+            lookups: Mutex::default(),
             seen_failed: AtomicBool::new(false),
             live: Mutex::default(),
             wake: Mutex::new(None),
@@ -909,7 +951,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             R::NAME
         );
         let nonce = self.relay.nonce(room, message, 9_999);
-        if let PartOutcome::Rejected(e) | PartOutcome::Uncertain(e) =
+        if let PartOutcome::Rejected(e) | PartOutcome::Closed(e) | PartOutcome::Uncertain(e) =
             self.relay.post(room, Some(message), &note, &nonce).await
         {
             log::warn("hold notice not posted", &[("error", &e)]);
@@ -939,13 +981,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
     }
 
-    /// The room of the newest request whose answer is still being written, for typing.
-    pub(crate) async fn typing_room(&self) -> Option<String> {
+    /// The room and message of the newest request whose answer is still being written, for typing.
+    pub(crate) async fn typing_room(&self) -> Option<(String, String)> {
         let open = self.store.read(|r| r.answers_open(R::NAME)).await.ok()?;
         open.into_iter()
             .rev()
             .find(|h| h.answer == "waiting")
-            .map(|h| h.room)
+            .map(|h| (h.room, h.message))
     }
 
     /// Reads finished answers from the lead's session file and posts them (DISC-OUT req. 21-28).
@@ -957,6 +999,11 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .read(|r| r.answers_open(R::NAME))
             .await
             .map_err(|e| e.to_string())?;
+        // Lookups are kept while their request's answer is open.
+        self.lookups
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|m, _| open.iter().any(|h| h.message == *m));
         if open.is_empty() {
             return Ok(());
         }
@@ -995,6 +1042,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .map(|h| h.message.as_str())
             .collect();
         keep_only(&self.stuck, &still);
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .retain(|m, _| still.contains(m.as_str()));
         for h in posting.iter().filter(|h| h.answer == "posting") {
             if !self.post_parts(h).await? {
                 break;
@@ -1059,6 +1110,238 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
+    /// Where the answer to `h` goes: decided once per delivery, before its first post, so a retry
+    /// goes where the earlier attempt went. After a restart in the middle of an answer the rest
+    /// follows its first part, wherever that is (DISC-OUT req. 25). `Err` when that cannot be read
+    /// now, or the answer room lookup failed and is tried again.
+    async fn target(&self, h: &HandoffRow, posted: Option<&str>) -> Result<Target, String> {
+        let known = self
+            .targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .get(&h.message)
+            .cloned();
+        if let Some(target) = known {
+            return Ok(target);
+        }
+        // Parts already out stay where they are: no fallback for the rest.
+        let target = match posted {
+            Some(posted) => match self.relay.resume_room(&h.room, &h.message, posted).await? {
+                Resume::Here => Target {
+                    room: None,
+                    held: true,
+                    ..Target::default()
+                },
+                Resume::Bound(room) => Target {
+                    room: Some(room),
+                    held: true,
+                    ..Target::default()
+                },
+                Resume::Moved(from) => {
+                    log::warn(
+                        "answer room gone; the rest of the answer goes to the request's room",
+                        &[("message", &h.message)],
+                    );
+                    Target {
+                        room: None,
+                        held: true,
+                        moved_from: Some(from),
+                        noted: false,
+                    }
+                }
+            },
+            // A failed lookup holds the first part until a later round looks again.
+            None => Target {
+                room: self.answer_room(&h.room, &h.message).await?,
+                ..Target::default()
+            },
+        };
+        if let Some(room) = &target.room {
+            log::info(
+                "the answer goes to the room bound to its request",
+                &[("message", &h.message), ("room", room)],
+            );
+        }
+        self.set_target(&h.message, &target);
+        Ok(target)
+    }
+
+    fn lookup(&self, source: &str) -> Lookup {
+        Arc::clone(
+            self.lookups
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .entry(source.to_string())
+                .or_default(),
+        )
+    }
+
+    /// The answer room of a new answer to `source` in `room`; typing and posting share it, so they
+    /// agree. A found room (or none) is kept for the request. A failed lookup is `Err` and is
+    /// tried again on a later call, until [`LOOKUP_TRIES`] lookups failed: then the answer stays
+    /// in `room`.
+    pub(crate) async fn answer_room(
+        &self,
+        room: &str,
+        source: &str,
+    ) -> Result<Option<String>, String> {
+        let lookup = self.lookup(source);
+        let mut state = lookup.lock().await;
+        if state.settled {
+            return Ok(state.room.clone());
+        }
+        match self.relay.answer_room(room, source).await {
+            Ok(found) => {
+                state.settled = true;
+                state.room.clone_from(&found);
+                Ok(found)
+            }
+            Err(why) => {
+                state.failed += 1;
+                if state.failed < LOOKUP_TRIES {
+                    log::warn(
+                        "answer room lookup failed; looking again on a later round",
+                        &[("message", &source), ("reason", &why)],
+                    );
+                    return Err(why);
+                }
+                log::warn(
+                    "answer room lookup failed again; the answer is a reply in the request's room",
+                    &[
+                        ("message", &source),
+                        ("tries", &state.failed),
+                        ("reason", &why),
+                    ],
+                );
+                state.settled = true;
+                Ok(None)
+            }
+        }
+    }
+
+    /// Where the answer to `source` in `room` goes when that was looked up already (the room bound
+    /// to it, else `room`); `None` while it is not (or a lookup runs).
+    pub(crate) fn known_answer_room(&self, room: &str, source: &str) -> Option<String> {
+        let lookup = self.lookup(source);
+        let state = lookup.try_lock().ok()?;
+        state
+            .settled
+            .then(|| state.room.clone().unwrap_or_else(|| room.to_string()))
+    }
+
+    /// Marks a delivery stuck; true the first time, so it is logged once (DISC-OUT req. 27).
+    fn first_stuck(&self, source: &str) -> bool {
+        self.stuck
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source.to_string())
+    }
+
+    fn set_target(&self, source: &str, target: &Target) {
+        self.targets
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(source.to_string(), target.clone());
+    }
+
+    /// Posts one part where the answer goes: in the room bound to the request without a reply, else
+    /// in the request's room with the first part (or the first part moved there, after a note
+    /// pointing back to where the answer began) as the reply.
+    async fn post_part(&self, h: &HandoffRow, part: &PartRow, target: &mut Target) -> PartOutcome {
+        loop {
+            let moved = target.room.is_none() && target.moved_from.is_some();
+            if moved && !target.noted {
+                self.post_moved_note(h, &h.message, target).await;
+            }
+            let (room, reply_to) = target.room.as_deref().map_or_else(
+                || {
+                    let reply = part.idx == 0 || moved;
+                    (h.room.as_str(), reply.then_some(h.message.as_str()))
+                },
+                |room| (room, None),
+            );
+            let outcome = self
+                .relay
+                .post(room, reply_to, &part.text, &part.nonce)
+                .await;
+            let bound = target.room.is_some();
+            match outcome {
+                // The room bound to the request takes no posts at all (gone, locked, no access):
+                // this part and the rest go to the request's room, this part as the reply.
+                PartOutcome::Closed(why) if bound => {
+                    log::warn(
+                        "answer room closed; the rest of the answer goes to the request's room",
+                        &[
+                            ("message", &h.message),
+                            ("part", &part.idx),
+                            ("reason", &why),
+                        ],
+                    );
+                    let from = target.room.take().filter(|_| part.idx > 0);
+                    *target = Target {
+                        room: None,
+                        held: true,
+                        moved_from: from,
+                        noted: false,
+                    };
+                    self.set_target(&h.message, target);
+                }
+                // Nothing was created there and nothing is in doubt: the first part goes as the
+                // linked reply in the request's room after all, with the same nonce.
+                PartOutcome::Rejected(why) if bound && part.idx == 0 && !target.held => {
+                    log::warn(
+                        "answer room refused the answer; replying in the request's room",
+                        &[("message", &h.message), ("reason", &why)],
+                    );
+                    *target = Target::default();
+                    self.set_target(&h.message, target);
+                }
+                PartOutcome::Uncertain(why) if bound => {
+                    target.held = true;
+                    self.set_target(&h.message, target);
+                    return PartOutcome::Uncertain(why);
+                }
+                PartOutcome::Posted { id, linked } => {
+                    // In the room bound to the request the first part answers it as a linked
+                    // reply would (DISC-OUT req. 25, 33).
+                    let linked = linked || (bound && part.idx == 0);
+                    if !bound && target.moved_from.is_some() {
+                        target.moved_from = None;
+                        self.set_target(&h.message, target);
+                    }
+                    return PartOutcome::Posted { id, linked };
+                }
+                other => return other,
+            }
+        }
+    }
+
+    /// Posts the note pointing back to the room the rest of the answer to `h` moved from
+    /// ([`Relay::moved_note`]): its own message with its own nonce, tried once per delivery and
+    /// never in the place of a part, so no part's text changes and a failed note holds nothing up.
+    async fn post_moved_note(&self, h: &HandoffRow, source: &str, target: &mut Target) {
+        target.noted = true;
+        self.set_target(source, target);
+        let Some(note) = target
+            .moved_from
+            .as_deref()
+            .and_then(|from| self.relay.moved_note(from))
+        else {
+            return;
+        };
+        let nonce = self.relay.nonce(&h.room, &format!("{source}~moved"), 0);
+        let outcome = self.relay.post(&h.room, None, &note, &nonce).await;
+        if !matches!(outcome, PartOutcome::Posted { .. }) {
+            log::warn(
+                "note on the moved answer not posted; the rest goes on",
+                &[
+                    ("message", &h.message),
+                    ("outcome", &format!("{outcome:?}")),
+                ],
+            );
+        }
+    }
+
     /// Posts the pending parts of one answer in order; `false` when it stopped on a failure.
     async fn post_parts(&self, h: &HandoffRow) -> Result<bool, String> {
         let parts = {
@@ -1068,13 +1351,27 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 .await
                 .map_err(|e| e.to_string())?
         };
+        if !parts.iter().any(|p| p.state == "pending") {
+            return Ok(true);
+        }
+        let posted = parts
+            .iter()
+            .find(|p| p.idx == 0 && p.state == "confirmed")
+            .and_then(|p| p.remote.as_deref());
+        let mut target = match self.target(h, posted).await {
+            Ok(target) => target,
+            Err(why) => {
+                if self.first_stuck(&h.message) {
+                    log::warn(
+                        "where the answer goes is not known yet; retrying",
+                        &[("message", &h.message), ("reason", &why)],
+                    );
+                }
+                return Ok(false);
+            }
+        };
         for part in parts.iter().filter(|p| p.state == "pending") {
-            let reply_to = (part.idx == 0).then_some(h.message.as_str());
-            match self
-                .relay
-                .post(&h.room, reply_to, &part.text, &part.nonce)
-                .await
-            {
+            match self.post_part(h, part, &mut target).await {
                 PartOutcome::Posted { id, linked } => {
                     self.store
                         .relay(RelayWrite::PartDone {
@@ -1126,13 +1423,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                     return Ok(true);
                 }
-                PartOutcome::Rejected(why) | PartOutcome::Uncertain(why) => {
-                    let first = self
-                        .stuck
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .insert(h.message.clone());
-                    if first {
+                PartOutcome::Rejected(why)
+                | PartOutcome::Closed(why)
+                | PartOutcome::Uncertain(why) => {
+                    if self.first_stuck(&h.message) {
                         log::warn(
                             "answer part not posted; retrying with the same nonce",
                             &[

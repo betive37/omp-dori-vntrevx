@@ -5,8 +5,8 @@
 //! Gateway WebSocket server. It records
 //! every request, deduplicates creates by their enforced nonce as Discord does, keeps a history per
 //! channel, answers a reply with message type 19 and its reference, and lets a test script the next
-//! create statuses, push dispatches, and send op 7, op 9 or a close code. With a token set, any
-//! other token gets 401.
+//! create statuses, fail every read of a path, start a thread from a message, push dispatches, and
+//! send op 7, op 9 or a close code. With a token set, any other token gets 401.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -57,6 +57,8 @@ struct State {
     scripted: VecDeque<u16>,
     /// Channel -> statuses for its next message creates, used before `scripted`.
     scripted_in: HashMap<String, VecDeque<u16>>,
+    /// Path -> the status a GET of it gets, and for how many GETs more (`None`: every one).
+    failing_reads: HashMap<String, (u16, Option<usize>)>,
     nonces: HashMap<String, u64>,
     next_id: u64,
     created: usize,
@@ -162,7 +164,9 @@ impl FakeDiscord {
         self.state.lock().unwrap().scripted.extend(statuses);
     }
 
-    /// Statuses for the next message creates in one channel (the message is stored regardless).
+    /// Statuses for the next message creates in one channel: a 4xx refuses before anything is
+    /// stored; any other status is answered after the message is stored (the create may have
+    /// happened); `0` answers as usual.
     pub fn script_in(&self, channel: &str, statuses: &[u16]) {
         self.state
             .lock()
@@ -171,6 +175,31 @@ impl FakeDiscord {
             .entry(channel.to_string())
             .or_default()
             .extend(statuses);
+    }
+
+    /// Drops the statuses still scripted for one channel.
+    pub fn unscript_in(&self, channel: &str) {
+        self.state.lock().unwrap().scripted_in.remove(channel);
+    }
+
+    /// Sets `locked` on a thread started with [`Self::start_thread`], as Discord shows it.
+    pub fn lock_thread(&self, channel: &str, thread: &str) {
+        let mut s = self.state.lock().unwrap();
+        let lock = |t: &mut Value| t["thread_metadata"]["locked"] = json!(true);
+        if let Some(t) = s.channels.get_mut(thread) {
+            lock(t);
+        }
+        s.threads
+            .iter_mut()
+            .filter(|t| t["id"] == thread)
+            .for_each(lock);
+        if let Some(m) = s
+            .history
+            .get_mut(channel)
+            .and_then(|l| l.iter_mut().find(|m| m["id"] == thread))
+        {
+            lock(&mut m["thread"]);
+        }
     }
 
     pub fn seen(&self) -> Vec<Seen> {
@@ -252,6 +281,49 @@ impl FakeDiscord {
             .threads
             .push(json!({"id": id, "parent_id": parent, "type": 11,
             "guild_id": GUILD, "thread_metadata": {"archived": false}}));
+    }
+
+    /// Starts a thread from a message as the Discord client does: the thread takes the message's
+    /// ID, the message names it in `thread`, the active listing has it and `THREAD_CREATE` is sent.
+    pub fn start_thread(&self, channel: &str, message: &str, by: &str) {
+        let thread = json!({"id": message, "parent_id": channel, "type": 11, "guild_id": GUILD,
+            "owner_id": by, "thread_metadata": {"archived": false, "locked": false}});
+        {
+            let mut s = self.state.lock().unwrap();
+            s.channels.insert(message.into(), thread.clone());
+            s.threads.push(thread.clone());
+            if let Some(m) = s
+                .history
+                .get_mut(channel)
+                .and_then(|l| l.iter_mut().find(|m| m["id"] == message))
+            {
+                m["thread"] = thread.clone();
+            }
+        }
+        self.gw(Gw::Dispatch("THREAD_CREATE", thread));
+    }
+
+    /// Every GET of `path` gets `status` from now on.
+    pub fn fail_reads(&self, path: &str, status: u16) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_reads
+            .insert(path.into(), (status, None));
+    }
+
+    /// The next `times` GETs of `path` get `status`; later ones are answered as usual.
+    pub fn fail_reads_times(&self, path: &str, status: u16, times: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_reads
+            .insert(path.into(), (status, Some(times)));
+    }
+
+    /// Reads of `path` are answered as usual again.
+    pub fn pass_reads(&self, path: &str) {
+        self.state.lock().unwrap().failing_reads.remove(path);
     }
 
     /// A message object.
@@ -627,6 +699,34 @@ fn setup_route(
     })
 }
 
+/// The scripted failure of a read (`FakeDiscord::fail_reads`).
+fn failed_read(s: &mut State, method: &str, path: &str) -> Option<Response<Full<Bytes>>> {
+    if method != "GET" {
+        return None;
+    }
+    let (status, left) = s.failing_reads.get_mut(path)?;
+    let status = *status;
+    if let Some(left) = left {
+        *left -= 1;
+        if *left == 0 {
+            s.failing_reads.remove(path);
+        }
+    }
+    Some(scripted_failure(status))
+}
+
+/// A scripted failure with Discord's code for it: no access, unknown channel (a deleted thread),
+/// an invalid body for another 4xx.
+fn scripted_failure(status: u16) -> Response<Full<Bytes>> {
+    let code = match status {
+        403 => 50_001,
+        404 => 10_003,
+        400..500 => 50_035,
+        _ => 0,
+    };
+    reply(status, &json!({ "message": "scripted", "code": code }))
+}
+
 async fn answer(
     req: Request<Incoming>,
     state: Arc<Mutex<State>>,
@@ -662,8 +762,10 @@ async fn answer(
             &json!({ "message": "401: Unauthorized", "code": 0 }),
         ));
     }
-    if let Some(r) =
-        setup_route(&mut s, &method, &parts, &body).or_else(|| access(&s, &method, &parts))
+    let failed = failed_read(&mut s, &method, &path);
+    if let Some(r) = failed
+        .or_else(|| setup_route(&mut s, &method, &parts, &body))
+        .or_else(|| access(&s, &method, &parts))
     {
         return Ok(r);
     }
@@ -823,8 +925,25 @@ fn edit_message(s: &mut State, id: &str, mid: &str, body: &Value) -> Response<Fu
     reply(200, &json!({ "id": mid, "channel_id": id }))
 }
 
-/// A message create: deduplicated by enforced nonce, a reply gets type 19 and its reference.
+/// A message create: deduplicated by enforced nonce (a repeat gets the stored message back), a
+/// reply gets type 19 and its reference. A scripted 4xx refuses before anything is stored.
 fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
+    let scripted = s
+        .scripted_in
+        .get_mut(id)
+        .and_then(VecDeque::pop_front)
+        .or_else(|| s.scripted.pop_front())
+        .filter(|status| *status != 0);
+    if let Some(status) = scripted.filter(|s| (400..500).contains(s)) {
+        return scripted_failure(status);
+    }
+    // As on Discord, content over 2000 UTF-16 units is an invalid body.
+    if body["content"]
+        .as_str()
+        .is_some_and(|c| c.encode_utf16().count() > 2000)
+    {
+        return reply(400, &json!({"message": "Invalid Form Body", "code": 50035}));
+    }
     let nonce = body["nonce"].as_str().unwrap_or_default().to_string();
     let enforced = body["enforce_nonce"] == true;
     let reference = body["message_reference"]["message_id"]
@@ -868,12 +987,14 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
             .entry((id).to_string())
             .or_default()
             .push(created.clone());
+    } else if let Some(stored) = s
+        .history
+        .values()
+        .flatten()
+        .find(|m| m["id"].as_str() == Some(created["id"].as_str().unwrap_or_default()))
+    {
+        created = stored.clone();
     }
-    let scripted = s
-        .scripted_in
-        .get_mut(id)
-        .and_then(VecDeque::pop_front)
-        .or_else(|| s.scripted.pop_front());
     if let Some(status) = scripted {
         return reply(status, &json!({ "message": "scripted" }));
     }

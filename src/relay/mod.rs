@@ -47,8 +47,23 @@ pub(crate) enum PartOutcome {
     SourceGone,
     /// Nothing was created.
     Rejected(String),
+    /// Nothing was created and the room takes no posts from the bot: it is gone, locked or out of
+    /// reach (Discord: 403, unknown channel, archived thread).
+    Closed(String),
     /// It may exist; a part with a deterministic enforced nonce may be posted again.
     Uncertain(String),
+}
+
+/// Where the rest of a half-posted answer goes after a restart ([`Relay::resume_room`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Resume {
+    /// The request's room, where the first part is.
+    Here,
+    /// The room bound to the request, where the first part is.
+    Bound(String),
+    /// The request's room, because the bound room holding the first part (named here) is gone:
+    /// the next part posted there is the reply to the request.
+    Moved(String),
 }
 
 /// What a relay knows about one room, for the channel facts line (DISC-IN req. 53).
@@ -83,6 +98,35 @@ pub(crate) trait Relay: Send + Sync + 'static {
 
     /// The queued raw message as the normalised owner message (MSG-01).
     fn normalise(&self, row: &crate::store::relay::QueueRow) -> Result<Inbound, String>;
+
+    /// Another room bound to `source` that takes the whole answer to it instead of a reply in `room`
+    /// (Discord: the thread started from that message). `None` keeps the reply in `room`; `Err`
+    /// when the lookup failed for now, which the pipeline asks again a bounded number of times.
+    fn answer_room(
+        &self,
+        _room: &str,
+        _source: &str,
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send {
+        async { Ok(None) }
+    }
+
+    /// A short message posted in the request's room just before the rest of an answer begun in
+    /// the bound room `from` continues there, pointing back to it; `None` posts none. It is its
+    /// own message, so no part's text ever changes with where it goes.
+    fn moved_note(&self, _from: &str) -> Option<String> {
+        None
+    }
+
+    /// Where the rest of an answer goes after a restart in the middle of it, its first part
+    /// `posted` being out: where that part is read back; `Err` while it cannot be read anywhere.
+    fn resume_room(
+        &self,
+        _room: &str,
+        _source: &str,
+        _posted: &str,
+    ) -> impl Future<Output = Result<Resume, String>> + Send {
+        async { Ok(Resume::Here) }
+    }
 
     /// Posts one part; the first part of an answer replies to `reply_to`.
     fn post(
