@@ -110,10 +110,11 @@ pub(crate) trait Relay: Send + Sync + 'static {
         async { Ok(None) }
     }
 
-    /// The part `text` that continues in the request's room an answer begun in the bound room
-    /// `from`, with a pointer back there; [`Relay::parts`] leaves room for it.
-    fn continued(&self, text: &str, _from: &str) -> String {
-        text.to_string()
+    /// A short message posted in the request's room just before the rest of an answer begun in
+    /// the bound room `from` continues there, pointing back to it; `None` posts none. It is its
+    /// own message, so no part's text ever changes with where it goes.
+    fn moved_note(&self, _from: &str) -> Option<String> {
+        None
     }
 
     /// Where the rest of an answer goes after a restart in the middle of it, its first part

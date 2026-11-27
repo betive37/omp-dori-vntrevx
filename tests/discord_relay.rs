@@ -146,6 +146,10 @@ fn owner_message_is_answered_in_linked_parts() {
         assert_eq!(c.body["allowed_mentions"]["parse"], json!([]));
     }
     assert_ne!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    // Split at Discord's full limit, as every earlier version stored its parts: a repeated
+    // answer is matched against those stored parts.
+    let first = creates[0].body["content"].as_str().unwrap();
+    assert!(first.encode_utf16().count() > 1958, "{}", first.len());
     let seen = fake.calls("PUT", "/messages/800000000000000001/reactions/");
     assert_eq!(seen.len(), 1, "one seen mark");
     let s = hub.until(WAIT, || {
@@ -389,13 +393,13 @@ fn an_uncertain_post_in_the_thread_keeps_the_answer_there() {
 
 /// A thread that closes in the middle of an answer (locked or no access: 403; deleted: unknown
 /// channel) takes nothing more: the rest goes to the channel, its first part as the reply to the
-/// request with a line pointing back to the thread (a full part still fits with it), and later
-/// answers are not held up.
+/// request, after a short note pointing back to the thread. The parts themselves are posted as
+/// stored (a full part stays a full part), and later answers are not held up.
 #[test]
 fn a_thread_closed_mid_answer_moves_the_rest_to_the_channel() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
-    // Three parts: the moved second one is a full one.
+    // Three parts split at the full limit: the moved second one is a full one.
     hub.fixture(
         "omp",
         "answer.json",
@@ -417,36 +421,39 @@ fn a_thread_closed_mid_answer_moves_the_rest_to_the_channel() {
             let s = status(&hub);
             (s["counts"]["owed_settled"] == n + 1 && s["counts"]["queued"] == 0).then_some(())
         });
-        let moved = fake.wait(WAIT, |f| {
-            let moved: Vec<Value> = f
-                .bot_messages(CH)
-                .into_iter()
-                .filter(|m| m["message_reference"]["message_id"] == source.as_str())
-                .collect();
-            (moved.len() == 1).then_some(moved)
+        let posted = fake.wait(WAIT, |f| {
+            let posted = f.bot_messages(CH);
+            posted
+                .iter()
+                .any(|m| m["message_reference"]["message_id"] == source.as_str())
+                .then_some(posted)
         });
-        let text = moved[0]["content"].as_str().unwrap();
-        assert!(
-            text.starts_with(&format!("-# continued from <#{source}>\n")),
-            "{text}"
-        );
-        assert!(text.encode_utf16().count() > 1900, "a full part");
+        let at = posted
+            .iter()
+            .position(|m| m["message_reference"]["message_id"] == source.as_str())
+            .unwrap();
+        let note = &posted[at - 1];
+        assert_eq!(note["content"], format!("-# continued from <#{source}>"));
+        assert!(note.get("message_reference").is_none_or(Value::is_null));
+        let text = posted[at]["content"].as_str().unwrap();
+        assert!(text.starts_with("word"), "the part as stored: {text}");
+        assert!(text.encode_utf16().count() > 1958, "a full part");
         assert_eq!(
             fake.bot_messages(&source).len(),
             1,
             "only the first part in the thread"
         );
     }
-    // Two moved parts per answer.
+    // A note and two moved parts per answer.
     let posted = fake.wait(WAIT, |f| {
         let posted = f.bot_messages(CH);
-        (posted.len() == 4).then_some(posted)
+        (posted.len() == 6).then_some(posted)
     });
-    let pointers = posted
+    let notes = posted
         .iter()
         .filter(|m| m["content"].as_str().unwrap().contains("continued from"))
         .count();
-    assert_eq!(pointers, 2, "one pointer per answer");
+    assert_eq!(notes, 2, "one note per answer");
     assert!(hub.stop().success());
 }
 
@@ -671,11 +678,16 @@ fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
         hub.start();
         let moved = fake.wait(WAIT, |f| {
             let posted = f.bot_messages(CH);
-            (!posted.is_empty()).then_some(posted)
+            (posted.len() >= 2).then_some(posted)
         });
-        assert_eq!(moved.len(), 1, "{refusal}: {moved:?}");
+        assert_eq!(moved.len(), 2, "{refusal}: a note and the part: {moved:?}");
         assert_eq!(
-            moved[0]["message_reference"]["message_id"],
+            moved[0]["content"],
+            format!("-# continued from <#{source}>"),
+            "{refusal}: the note points back to the thread"
+        );
+        assert_eq!(
+            moved[1]["message_reference"]["message_id"],
             source.as_str(),
             "{refusal}: the moved part is the reply to the request"
         );
@@ -683,10 +695,10 @@ fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
             in_thread() <= before + 1,
             "{refusal}: at most the one refused try in the thread"
         );
-        let text = moved[0]["content"].as_str().unwrap();
+        let text = moved[1]["content"].as_str().unwrap();
         assert!(
-            text.starts_with(&format!("-# continued from <#{source}>\n")),
-            "{refusal}: it points back to the thread: {text}"
+            text.starts_with("word"),
+            "{refusal}: the part as stored: {text}"
         );
         assert_eq!(
             fake.bot_messages(&source).len(),

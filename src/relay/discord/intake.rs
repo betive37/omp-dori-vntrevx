@@ -40,11 +40,6 @@ const THREADS_MAX: usize = 128;
 /// Cached thread lookups (DISC-IN req. 10).
 const LOOKUPS_MAX: usize = 256;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
-/// Opens the line that points a part moved to the channel back to the thread the answer began in
-/// (DISC-OUT req. 25); the thread's ID and `>` and a line break follow.
-const CONTINUED: &str = "-# continued from <#";
-/// What the pointer takes: the opening, a snowflake (at most 20 digits), `>` and a line break.
-const POINTER_ROOM: usize = CONTINUED.len() + 20 + 2;
 /// The handling round runs at least this often while work is open.
 const TICK: Duration = Duration::from_secs(3);
 const IDLE_TICK: Duration = Duration::from_secs(30);
@@ -94,13 +89,8 @@ impl Relay for DiscordRelay {
         let answer = answer.trim();
         text::check(answer, &self.checks)
             .map_err(|e| format!("refused by the outgoing text checks: {e}"))?;
-        let rendered = text::render_tables(answer);
-        let parts = text::split(&rendered, DISCORD_LIMIT).ok_or("empty answer")?;
-        if parts.len() == 1 {
-            return Ok(parts);
-        }
-        // A later part may move to the channel with a pointer back to the thread.
-        text::split(&rendered, DISCORD_LIMIT - POINTER_ROOM).ok_or_else(|| "empty answer".into())
+        text::split(&text::render_tables(answer), DISCORD_LIMIT)
+            .ok_or_else(|| "empty answer".into())
     }
 
     fn nonce(&self, room: &str, source: &str, index: usize) -> String {
@@ -130,8 +120,8 @@ impl Relay for DiscordRelay {
     }
 
     /// The pointer back to the thread where the answer began (DISC-OUT req. 25).
-    fn continued(&self, text: &str, from: &str) -> String {
-        format!("{CONTINUED}{from}>\n{text}")
+    fn moved_note(&self, from: &str) -> Option<String> {
+        Some(format!("-# continued from <#{from}>"))
     }
 
     /// Where the first part of a half-posted answer is (DISC-OUT req. 25). Only reading the part

@@ -173,8 +173,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     thread that refuses the bot as such (403, unknown channel, archived thread) takes nothing more:
     that part and the rest go to the channel, the first of them as the reply to the source
     message, so a thread locked or deleted mid-answer holds up no later answer. When a part was
-    already out in the thread, that first moved part opens with the line
-    `-# continued from <#thread>`; an answer of more than one part is split with room for it.
+    already out in the thread, a note `-# continued from <#thread>` is posted in the channel just
+    before that first moved part, as its own message with its own nonce, tried once per delivery;
+    a note that fails is logged and holds nothing up. The parts keep their stored text.
     The lookup is shared with typing, so both use one result per request (typing's failed reads
     count toward the three). The choice lives in daemon memory for that delivery. A part posted
     outside the request's room is stored with that room
