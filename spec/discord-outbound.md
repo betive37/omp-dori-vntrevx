@@ -114,6 +114,30 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     normally (stop reason "stop"), the message contains no tool call, and it has non-empty visible
     text. Text the provider marks as commentary is excluded. A turn that continues automatically
     extends the wait; the answer is the last message of the final turn.
+    21a. With `[lead] answers = "tool"` no turn text is posted: the lead answers an owner message
+    only with its tool's `answer` operation, naming the message as `<relay>:<room>/<message>`
+    (or the request's tag) with the text and optionally another room. The first answer is stored
+    in the outbox and posted like an automatic answer (rules 24-28, the thread rule of 25), at
+    once, and settles the obligation (33); the call reports whether it was posted. The same text
+    again (a retry) posts nothing and says so. While the answer is still being posted, another
+    text is refused, so nothing goes ahead of its remaining parts. Later calls for the same
+    message are follow-ups: each is stored as its own outbox entry (the message and a digest of
+    its text, nonces from those) for the room the answer went to (another room given now, else
+    the room its last part was posted in; for parts stored without a room it is read back as in
+    rule 25), posted at once, and settles nothing; the same text again posts only what is missing,
+    also after a restart, and a room that refuses the bot as such sends the follow-up to the
+    request's room as its reply. Where the messenger enforces no nonce (Telegram, Slack) an answer
+    or follow-up whose send ended uncertain is never posted again, by a round or by the same call:
+    the call says to check the room. The bridge waits up to 150 s for
+    the call; the hub takes an answer back unposted when its messenger has not taken it within
+    120 s. A request the lead never answers is let go after the obligation window (34);
+    reminders and the stop notice (35) name the operation, and a final message never counts as an
+    answer for the stop gate. While onboarding runs (read-only) an answer in place, as the reply
+    to the owner's message, still goes out (it carries onboarding's questions); one that would go
+    to another room, named now or inherited from an earlier answer, is refused. The
+    request text the lead receives says that its final message is not posted. The operation is
+    also available with the default `"final"`; an answer posted with it replaces the automatic
+    one. It works for Discord, Telegram and Slack alike.
 22. If, before that turn ends, another user input or request enters the same transcript, the pending
     reply is abandoned (the answer would belong to mixed work) and the obligation stays open.
 23. The daemon reads the answer from OMP's public surfaces (rpc-ui events or the session file) and
@@ -141,12 +165,18 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     that part and the rest go to the channel, the first of them as the reply to the source
     message, so a thread locked or deleted mid-answer holds up no later answer. The lookup is
     shared with typing, so both use one result per request. The choice lives in daemon memory for
-    that delivery. After a restart with the first part already confirmed, the rest follows that
-    part: the daemon reads that part back, from the channel, else from the thread (it has the
-    source message's ID), and posts the rest where it was read. When the channel definitely lacks
-    it (unknown message) and the thread definitely takes nothing from the bot (403, unknown
-    channel, archived) or lacks it too, the rest moves to the channel, its first part as the reply
-    to the source message, as when the thread closes mid-answer. While a read only fails for now
+    that delivery. A part posted outside the request's room is stored with that room
+    (`<room>/<id>`), and a part stored for another room keeps it while pending (`<room>/`); an
+    earlier version reads such a value as a message ID, so roll back only when no answer is
+    being posted. After a
+    restart in the middle of an answer the rest follows the last part out, in the room stored
+    with it, or the stored room of the pending parts. For parts stored without a room (in the
+    request's room, or by an earlier version) the daemon reads the first part back, from the
+    channel, else from the thread (it has the source message's ID), and posts the rest where it
+    was read. When the channel definitely lacks it (unknown message) and the thread definitely
+    takes nothing from the bot (403, unknown channel, archived) or lacks it too, the rest moves to
+    the channel, its first part as the reply to the source message, as when the thread closes
+    mid-answer. While a read only fails for now
     (timeout, 5xx, rate limit), posting waits. A first part still pending at a restart is decided
     again, so if it ended uncertain in the thread and the new lookup fails or finds no thread, it
     may be posted a second time in the channel. While the lead works, typing shows where the

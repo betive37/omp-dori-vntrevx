@@ -548,3 +548,44 @@ fn a_hung_relay_never_delays_another() {
     tg.set_hang(false);
     assert!(hub.stop().success());
 }
+
+/// Telegram enforces no nonce, so an `answer` whose send ended uncertain is never posted again: not
+/// by a handling round and not by the same call; the lead is told to check the room. This holds
+/// for the first answer and for a follow-up alike.
+#[test]
+fn an_uncertain_telegram_answer_is_never_posted_again() {
+    let tg = FakeTelegram::start();
+    let mut hub = relay_hub(Some(&tg), None, "");
+    hub.tool_answers();
+    hub.start();
+    ready(&hub, &["telegram"]);
+    tg.push(
+        "message",
+        FakeTelegram::message(21, FakeTelegram::dm(), 7, "tool answers"),
+    );
+    hub.until(WAIT, || {
+        (requests(&hub, "[telegram 7/21]").len() == 1).then_some(())
+    });
+    let (mut lead, _) = support::LeadBridge::connect(&hub);
+    let sends = || tg.calls("sendMessage").len();
+    let call = |text: &str| json!({ "op": "answer", "message": "telegram:7/21", "text": text });
+    // The first answer's send is lost on the way.
+    tg.script_send(500);
+    let (said, error) = lead.tool(&call("first"));
+    assert!(error && said.contains("may not have been posted"), "{said}");
+    assert_eq!(sends(), 1);
+    let (said, error) = lead.tool(&call("first"));
+    assert!(error && said.contains("check the room"), "{said}");
+    // A follow-up goes out; then one whose send is lost, asked again.
+    let (said, error) = lead.tool(&call("second"));
+    assert!(!error && said.contains("follow-up"), "{said}");
+    assert_eq!(sends(), 2);
+    tg.script_send(500);
+    let (said, error) = lead.tool(&call("third"));
+    assert!(error && said.contains("check the room"), "{said}");
+    let (said, error) = lead.tool(&call("third"));
+    assert!(error && said.contains("check the room"), "{said}");
+    std::thread::sleep(Duration::from_secs(4));
+    assert_eq!(sends(), 3, "nothing sent again");
+    assert!(hub.stop().success());
+}

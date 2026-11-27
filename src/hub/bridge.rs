@@ -35,6 +35,23 @@ const SILENT: Duration = Duration::from_secs(45);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(5);
 /// The guidance appended to the lead's system prompt (EXT req. 36-37, OPC list).
 pub(crate) const LEAD_GUIDANCE: &str = include_str!("../../assets/lead.md");
+/// How the lead's guidance says its answers are posted, and its wording with `[lead] answers =
+/// "tool"` (DISC-OUT req. 21).
+const FINAL_ANSWERS: &str =
+    "Cataly posts your final message of a turn as the reply, split as needed.";
+const TOOL_ANSWERS: &str = "Cataly does not post your final message. Answer each owner message with \
+cataly_lead op answer (message: the [discord <room>/<message>] tag of the request, text); it posts the reply, split \
+as needed, and a later call for the same message posts a follow-up.";
+
+/// The lead's guidance for the configured way of answering.
+fn lead_guidance(tool_answers: bool) -> String {
+    if tool_answers {
+        LEAD_GUIDANCE.replacen(FINAL_ANSWERS, TOOL_ANSWERS, 1)
+    } else {
+        LEAD_GUIDANCE.to_string()
+    }
+}
+
 /// Obligations listed in one stop notice (DISC-OUT req. 35).
 const STOP_LIST: usize = 5;
 /// What the lead sees when rule 0 refuses its shell command (DESIGN 9.2).
@@ -224,8 +241,13 @@ pub(crate) async fn serve<R: AsyncBufRead + Unpin>(
         hub.links.connect(&handle, role, &key, &hello.session);
     }
     let role_name = if role == Role::Lane { "lane" } else { "lead" };
-    let notes = crate::jobs::notes::Notes::new(&hub.paths.state_dir).exists();
-    let mut answer = welcome(&key, sub, lane_pin.as_ref(), notes);
+    let mut guidance = lead_guidance(hub.config().tool_answers());
+    // The owner notes are named only when they exist, never embedded (COORD req. 48).
+    if crate::jobs::notes::Notes::new(&hub.paths.state_dir).exists() {
+        guidance.push('\n');
+        guidance.push_str(NOTES_LINE);
+    }
+    let mut answer = welcome(&key, sub, lane_pin.as_ref(), &guidance);
     if let (Some(_), Some(map)) = (&port, answer.as_object_mut()) {
         map.insert("tern".into(), Value::Bool(true));
     }
@@ -339,8 +361,8 @@ async fn pump(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Response>) {
 }
 
 /// The hello answer: the role with its guidance and tools and, for a lane, its pin and shell rules.
-/// A worker in its own realm gets only the rules, no guidance and no tool.
-fn welcome(key: &str, sub: bool, lane: Option<&(String, String)>, notes: bool) -> Value {
+/// A worker in its own realm gets only the rules, no guidance and no tool. `guidance` is the lead's.
+fn welcome(key: &str, sub: bool, lane: Option<&(String, String)>, guidance: &str) -> Value {
     match lane {
         Some((lane_key, pin)) => json!({
             "role": "lane",
@@ -356,12 +378,7 @@ fn welcome(key: &str, sub: bool, lane: Option<&(String, String)>, notes: bool) -
         None => json!({
             "role": "lead",
             "key": key,
-            // The owner notes are named only when they exist, never embedded (COORD req. 48).
-            "guidance": match (sub, notes) {
-                (true, _) => String::new(),
-                (false, true) => format!("{LEAD_GUIDANCE}\n{NOTES_LINE}"),
-                (false, false) => LEAD_GUIDANCE.to_string(),
-            },
+            "guidance": if sub { "" } else { guidance },
             "tools": if sub { json!([]) } else { json!([super::tool::definition()]) },
             // The hub judges the lead's shell calls by the built-in rule 0 (DESIGN 9.2).
             "shell": true,
@@ -420,8 +437,10 @@ fn answer_later(
             ("bridge.tool", _) => tool(&hub, caller, &request.params).await,
             (_, Some(_)) => json!({}),
             (_, None) => {
-                let answered =
-                    request.params.get("answered").and_then(Value::as_bool) == Some(true);
+                // A final message answers nothing when only `answer` calls post (DISC-OUT req. 21).
+                let answered = request.params.get("answered").and_then(Value::as_bool)
+                    == Some(true)
+                    && !hub.config().tool_answers();
                 json!({ "context": stop_gate(&hub, answered).await })
             }
         };
@@ -554,7 +573,11 @@ pub(crate) async fn stop_gate(hub: &Hub, answered: bool) -> Option<String> {
     if more > 0 {
         let _ = write!(text, "\nand {more} more");
     }
-    text.push_str("\nAnswer each, or say in one line what happens next.");
+    text.push_str(if hub.config().tool_answers() {
+        "\nAnswer each with cataly_lead op answer (message: its tag above), or say in one line what happens next the same way."
+    } else {
+        "\nAnswer each, or say in one line what happens next."
+    });
     Some(text)
 }
 
@@ -572,6 +595,14 @@ pub(crate) fn owed_line(room: &str, message: &str, at_ms: i64, text: &str) -> St
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_answers_change_how_the_guidance_says_answers_are_posted() {
+        assert!(LEAD_GUIDANCE.contains(FINAL_ANSWERS));
+        let tool = lead_guidance(true);
+        assert!(tool.contains(TOOL_ANSWERS) && !tool.contains(FINAL_ANSWERS));
+        assert_eq!(lead_guidance(false), LEAD_GUIDANCE);
+    }
 
     #[test]
     fn a_subagents_parent_resolves_to_its_root_session() {
