@@ -632,15 +632,30 @@ fn model_selectors_are_verified_against_stock_omp() {
         selector_models(sandbox.model.port),
     )
     .unwrap();
-    let run = |selector: &str, flags: Option<&Path>| {
+    // An old bridge in place of the installed one: hosted sessions refuse extension flags, so a
+    // wrapper around stock OMP loads only that file in a session's rpc-ui process (not the probe).
+    let run = |selector: &str, old: Option<&Path>| {
         let mut hub = lead_hub(&sandbox, selector, "");
-        if let Some(old) = flags {
-            let config = lead_config(selector, Some(&sandbox.root.join("work")), "").replace(
-                "extra_flags = [",
-                &format!(
-                    "extra_flags = [\"--no-extensions\", \"-e\", \"{}\", ",
-                    old.display()
+        if let Some(old) = old {
+            let real = installed_omp();
+            let wrapper = sandbox.root.join("omp-old-bridge");
+            std::fs::write(
+                &wrapper,
+                format!(
+                    "#!/bin/sh\ncase \" $* \" in\n*' --no-session '*) ;;\n*' --mode rpc-ui '*) exec '{real}' \"$@\" --no-extensions -e '{old}' ;;\nesac\nexec '{real}' \"$@\"\n",
+                    real = real.display(),
+                    old = old.display(),
                 ),
+            )
+            .unwrap();
+            std::fs::set_permissions(
+                &wrapper,
+                std::os::unix::fs::PermissionsExt::from_mode(0o755),
+            )
+            .unwrap();
+            let config = lead_config(selector, Some(&sandbox.root.join("work")), "").replace(
+                &format!("path = \"{}\"", real.display()),
+                &format!("path = \"{}\"", wrapper.display()),
             );
             hub.write_config(&config);
         }

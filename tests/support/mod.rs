@@ -159,8 +159,10 @@ impl TestHub {
             .map_or_else(|| self.root.join("home/.omp/agent"), |(_, v)| v.clone());
         let link = agent.join("extensions/cataly.ts");
         std::fs::create_dir_all(link.parent().unwrap()).unwrap();
-        // An installed link (`cataly install` made it) is the real thing; it stays.
-        if std::fs::symlink_metadata(&link).is_err() {
+        // An installed link (`cataly install` made it) is the real thing; it stays. A link left
+        // dangling by an earlier hub of the same agent directory, whose root is gone, is replaced.
+        if std::fs::metadata(&link).is_err() {
+            let _ = std::fs::remove_file(&link);
             std::os::unix::fs::symlink(&file, &link).unwrap();
         }
         link
