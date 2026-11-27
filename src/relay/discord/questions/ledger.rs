@@ -275,7 +275,7 @@ mod tests {
             "Withdrawn.",
         );
         assert!(!escaped.contains("\\…"), "{escaped}");
-        assert!(excerpt(&"q".repeat(900)).chars().count() == EXCERPT_MAX);
+        assert_eq!(excerpt(&"q".repeat(900)).chars().count(), EXCERPT_MAX);
     }
 
     #[test]
