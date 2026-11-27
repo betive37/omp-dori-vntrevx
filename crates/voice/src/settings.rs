@@ -143,20 +143,6 @@ pub mod starting {
     pub const SPEECH_PRICE_PER_MINUTE: f64 = 0.06;
 }
 
-/// The required fields, in the order their absence is reported.
-pub const REQUIRED: [&str; 10] = [
-    "voice_channel",
-    "text_channel",
-    "speech_model",
-    "backend_model",
-    "summary_model",
-    "voice",
-    "backend_prices",
-    "summary_prices",
-    "search_price",
-    "key",
-];
-
 /// A price: finite and not negative.
 #[must_use]
 pub fn valid_price(p: f64) -> bool {

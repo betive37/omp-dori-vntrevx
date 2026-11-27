@@ -15,6 +15,16 @@ const RENDERED_MAX: usize = 64 * 1024;
 /// Room kept in every part for a closing fence line.
 const CLOSE: &str = "\n```";
 
+/// `text` on one line: whitespace runs become one space, cut to `max` characters with no marker.
+pub(crate) fn one_line(text: &str, max: usize) -> String {
+    text.split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+        .chars()
+        .take(max)
+        .collect()
+}
+
 /// Length in UTF-16 code units, the unit Discord counts in.
 pub(crate) fn utf16_len(text: &str) -> usize {
     text.chars().map(char::len_utf16).sum()
