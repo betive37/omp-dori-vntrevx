@@ -1539,19 +1539,17 @@ struct ToolBridge {
 }
 
 impl ToolBridge {
-    /// Connects as the live lead with its launch token.
+    /// Connects as the live lead with the reconnect key its fake bridge got (that bridge's own
+    /// hello used the launch token).
     fn connect(hub: &TestHub) -> Self {
         let session = hub.until(WAIT, || {
             let v = hub.json(&["lead", "status", "--json"]);
             (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
         });
-        let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
-        let token = launch
-            .lines()
-            .rfind(|l| l.split(' ').nth(1) == session.as_str())
-            .and_then(|l| l.split(' ').next())
-            .unwrap()
-            .to_string();
+        let file = hub
+            .root
+            .join(format!("bin/omp-data/bridge-{}", session.as_str().unwrap()));
+        let key = hub.until(WAIT, || std::fs::read_to_string(&file).ok());
         let writer = UnixStream::connect(hub.socket()).unwrap();
         writer
             .set_read_timeout(Some(Duration::from_secs(180)))
@@ -1565,7 +1563,7 @@ impl ToolBridge {
         };
         bridge.call(
             "bridge.hello",
-            &json!({ "ext": 1, "token": token, "session": session, "agent": "main" }),
+            &json!({ "ext": 1, "key": key, "session": session, "agent": "main" }),
         );
         bridge
     }

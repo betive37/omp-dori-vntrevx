@@ -20,7 +20,8 @@ fn bridge_block(hub: &TestHub, file: &Path, number: usize) -> std::thread::JoinH
         let mut sequence = 1;
         let hello = json!({"v":1,"id":sequence,"method":"bridge.hello", "params":{
             "ext":1,"token":block["token"],"session":SESSION,"file":file,
-            "pid":block["pid"],"agent":"main","idle":true,"model":"fake/primary"
+            "pid":block["pid"],"agent":"main","idle":true,"model":"fake/primary",
+            "model_resolution_version":1
         }});
         writeln!(wire, "{hello}").unwrap();
         let mut status = "active";
@@ -61,14 +62,19 @@ fn bridge_block(hub: &TestHub, file: &Path, number: usize) -> std::thread::JoinH
                         .unwrap();
                     assert!(killed.status.success(), "{killed:?}");
                 }
-                "state" => {}
+                "state" | "model.resolve" => {}
                 other => panic!("unexpected command {other}: {cmd}"),
             }
             sequence += 1;
-            let reply = json!({"v":1,"id":sequence,"method":"bridge.reply","params":{
+            let mut reply = json!({"v":1,"id":sequence,"method":"bridge.reply","params":{
                 "n":cmd["n"],"idle":true,"session":SESSION,"file":file,
                 "goal":{"status":status,"objective":"Work."}
             }});
+            if op == "model.resolve" {
+                // Stock OMP resolving `fake/primary`: no suffix, nothing requested.
+                reply["params"]["model_resolution"] = json!({"version":1,"selector":cmd["selector"],
+                    "provider":"fake","id":"primary","thinking":{"requested":null,"observed":"high"}});
+            }
             writeln!(wire, "{reply}").unwrap();
             if op == "deliver" && status == "paused" {
                 sequence += 1;

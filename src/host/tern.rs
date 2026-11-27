@@ -28,8 +28,8 @@ use tokio::time::{Instant, timeout};
 
 use super::dialogs::{
     self, Dialog, DialogKind, Entry, EntryKind, Facts, Goal, GoalStatus, ReadState, Status,
-    same_model,
 };
+use super::model::Proof;
 use super::{
     Control, DeliverOutcome, Delivery, EventPage, Role, Runtime, SessionEvent, Snapshot,
     StartError, StartSpec, Started, StopRecord, Timing,
@@ -257,7 +257,7 @@ impl Runtime for Tern {
                     attached.await.map_err(|_| "the terminal bridge closed before binding".to_string())?;
                     let pid = port.lock().pid;
                     ownership.spawned(pid).await?;
-                    port.bind(&spec)
+                    port.bind(&spec).await.inspect(|_| port.share_resolution(&self.links))
                 }) => match result {
                     Ok(result) => (super::startup::StartupOutcome::Rejected, result),
                     Err(_) => (super::startup::StartupOutcome::Timeout,
@@ -311,6 +311,10 @@ struct State {
     fault: Option<String>,
     held: Option<String>,
     asked_model: Option<String>,
+    /// Why the attached bridge cannot answer `model.resolve`, when its hello lacks the capability.
+    unresolvable: Option<String>,
+    /// What OMP resolved the expected selector to, as the bridge proved it.
+    resolution: Option<super::model::Resolution>,
     stopping: bool,
     stop: Option<StopRecord>,
     dialogs: Vec<Dialog>,
@@ -638,6 +642,11 @@ impl Port {
         });
         st.generation += 1;
         st.last_rx = Some(Instant::now());
+        st.unresolvable = (hello
+            .get("model_resolution_version")
+            .and_then(Value::as_u64)
+            != Some(super::model::VERSION))
+        .then(|| super::model::old_bridge(text_of(hello, "version").unwrap_or_default()));
         Self::read_facts(&mut st, hello);
         if std::mem::take(&mut st.lost) {
             Self::notice(&mut st, "the bridge reconnected".into());
@@ -951,32 +960,35 @@ impl Port {
     }
 
     /// The identity check of a start (HOST req. 26-27): a resume must bind the session asked for,
-    /// and a model other than the requested one holds the session.
-    fn bind(&self, spec: &StartSpec) -> Result<Started, String> {
-        let mut st = self.lock();
-        let (id, file) = st.bound.clone().ok_or("no identity in the hello")?;
-        if id.is_empty() || !Path::new(&file).is_absolute() {
-            return Err("the bridge reported no session ID or no absolute transcript path".into());
-        }
-        if let (Some(expected), Target::Resume(want)) = (&spec.expected_id, &spec.target) {
-            let same = std::fs::canonicalize(&file).ok() == std::fs::canonicalize(want).ok();
-            if &id != expected || !same {
-                return Err(format!(
-                    "OMP resumed a different session: expected {expected} at {}, got {id} at {file}",
-                    want.display()
-                ));
+    /// and a model other than the one OMP resolves the selector to holds the session, as does a
+    /// bridge too old to say (unverified, at once and without a query).
+    async fn bind(&self, spec: &StartSpec) -> Result<Started, String> {
+        let (id, file) = {
+            let st = self.lock();
+            let (id, file) = st.bound.clone().ok_or("no identity in the hello")?;
+            if id.is_empty() || !Path::new(&file).is_absolute() {
+                return Err(
+                    "the bridge reported no session ID or no absolute transcript path".into(),
+                );
             }
-        }
-        let held = match &st.model {
-            Some(model) if same_model(model, &spec.model) => None,
-            Some(model) => Some(format!(
-                "model mismatch: {} requested, OMP reports {model}",
-                spec.model
-            )),
-            None => Some(format!(
-                "model mismatch: {} requested, OMP reports none",
-                spec.model
-            )),
+            if let (Some(expected), Target::Resume(want)) = (&spec.expected_id, &spec.target) {
+                let same = std::fs::canonicalize(&file).ok() == std::fs::canonicalize(want).ok();
+                if &id != expected || !same {
+                    return Err(format!(
+                        "OMP resumed a different session: expected {expected} at {}, got {id} at {file}",
+                        want.display()
+                    ));
+                }
+            }
+            (id, file)
+        };
+        let proof = self
+            .resolve_model(&spec.model, spec.thinking.as_deref())
+            .await?;
+        let mut st = self.lock();
+        let held = match &proof {
+            Proof::Resolved(r) => r.judge(st.model.as_deref(), r.observed.as_deref()),
+            Proof::Unverified(_) => proof.hold(None, None),
         };
         st.held.clone_from(&held);
         self.publish(&mut st);
@@ -987,6 +999,32 @@ impl Port {
             pid: st.pid,
             held,
         })
+    }
+
+    /// Hands what the bridge proved about the model to the registry, for the lane barrier.
+    fn share_resolution(&self, links: &super::bridge::Links) {
+        if let Some(r) = self.lock().resolution.clone() {
+            links.resolved(&self.handle, r);
+        }
+    }
+
+    /// What OMP in this session makes of `selector`, asked with the read-only `model.resolve`;
+    /// a bridge whose hello lacks the capability is unverified without a query.
+    async fn resolve_model(&self, selector: &str, thinking: Option<&str>) -> Result<Proof, String> {
+        if let Some(why) = self.lock().unresolvable.clone() {
+            return Ok(Proof::Unverified(why));
+        }
+        let reply = self
+            .command(
+                "model.resolve",
+                json!({ "selector": selector, "thinking": thinking }),
+            )
+            .await?;
+        let proof = Proof::from_reply(&reply)?;
+        if let Proof::Resolved(r) = &proof {
+            self.lock().resolution = Some(r.clone());
+        }
+        Ok(proof)
     }
 
     /// Text for the bridge: at most 64 KiB, the rest written to a file the agent is pointed at.
@@ -1183,10 +1221,17 @@ impl Control for Session {
         )
     }
 
+    /// Moves the session to what OMP resolves `selector` to: the bridge's `model` command sets
+    /// the base model and the level its suffix requests, and answers with the resolution, which
+    /// must match what OMP then runs (a literal colon ID stays whole). A bridge too old to
+    /// resolve the selector is not asked to change anything.
     async fn set_model(&self, selector: &str) -> Result<String, String> {
         let _busy = self.begin()?;
         if self.snapshot().status != Status::Idle {
             return Err("refused while a turn is running".into());
+        }
+        if let Some(why) = self.port.lock().unresolvable.clone() {
+            return Err(format!("model unverified: {why}; nothing was changed"));
         }
         let reply = self
             .port
@@ -1196,14 +1241,13 @@ impl Control for Session {
             return Err(r);
         }
         let observed = text_of(&reply, "model").unwrap_or_default().to_string();
-        let base = selector.split(':').next().unwrap_or(selector);
-        if !same_model(&observed, base) {
-            return Err(format!(
-                "OMP reports {observed} after asking for {selector}"
-            ));
-        }
+        let r = match Proof::from_reply(&reply)? {
+            Proof::Resolved(r) => r,
+            Proof::Unverified(why) => return Err(format!("model unverified: {why}")),
+        };
         let mut st = self.port.lock();
         st.model = Some(observed.clone());
+        st.thinking.clone_from(&r.observed);
         st.asked_model = Some(selector.to_string());
         self.port.emit(
             &mut st,
@@ -1211,8 +1255,13 @@ impl Control for Session {
                 model: observed.clone(),
             },
         );
+        let mismatch = r.judge(Some(&observed), r.observed.as_deref());
+        st.resolution = Some(r);
         self.port.publish(&mut st);
-        Ok(observed)
+        match mismatch {
+            None => Ok(observed),
+            Some(reason) => Err(format!("after asking for {selector}: {reason}")),
+        }
     }
 
     /// `create` enters OMP's goal mode with the objective, `pause` and `resume` move it (TUI session

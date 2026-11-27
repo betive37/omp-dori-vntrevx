@@ -1,13 +1,22 @@
 //! The bridge registry (DESIGN 8 "Bridge link", EXT req. 2-5): single-use launch tokens issued to
 //! the hub's own OMP children, the reconnect key of each accepted connection, and what the hub knows
 //! about each session's bridge. Roles are assigned here, never claimed by the bridge.
+//!
+//! It also carries the one query the hub may send any accepted session's bridge, headless or not:
+//! the read-only `model.resolve` (HOST req. 27). It never changes the model or the effort; a
+//! terminal session's other commands stay with its port.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde::Serialize;
+use serde_json::{Value, json};
+use tokio::sync::{Notify, mpsc, oneshot};
+use tokio::time::Instant;
 
 use super::Role;
+use super::model::{Proof, Resolution};
+use crate::proto::Response;
 use crate::sys::now_ms;
 
 /// A launch token is good for one hello within this time of the launch.
@@ -21,6 +30,8 @@ const PIDS_MAX: usize = 256;
 /// Bridge links kept at most. Every session start (a lead restart, each lane) gets a new handle, so
 /// links of ended sessions are dropped, the longest disconnected first, beyond this many.
 const LINKS_MAX: usize = 64;
+/// Model queries waiting for their answer at most.
+const ASKED_MAX: usize = 64;
 
 /// What the hub shows about one session's bridge.
 #[derive(Clone, Debug, Default, Serialize, PartialEq, Eq)]
@@ -43,6 +54,17 @@ struct Link {
     key: String,
     role: Role,
     view: LinkView,
+    /// What the bridge last proved about the session's model; kept across reconnects.
+    resolution: Option<Resolution>,
+}
+
+/// An accepted main-agent connection the hub may query.
+struct Query {
+    key: String,
+    session: String,
+    /// `Err` with the reason when the hello lacks the model-resolution capability.
+    capable: Result<(), String>,
+    tx: mpsc::Sender<Response>,
 }
 
 #[derive(Default)]
@@ -54,11 +76,20 @@ struct Inner {
     ports: HashMap<String, Arc<super::tern::Port>>,
     /// The OMP process of each session: the hub's own child, or the peer of its accepted bridge.
     pids: VecDeque<(u32, String, Role)>,
+    /// The queryable connection of each session.
+    queries: HashMap<String, Query>,
+    /// Queries sent, by number: the session's handle and the waiter.
+    asked: HashMap<u64, (String, oneshot::Sender<Value>)>,
+    next: u64,
 }
 
 /// Launch tokens and accepted bridge connections of this hub run.
 #[derive(Default)]
-pub(crate) struct Links(Mutex<Inner>);
+pub(crate) struct Links {
+    inner: Mutex<Inner>,
+    /// Wakes a query waiting for its session's bridge to connect.
+    arrived: Notify,
+}
 
 impl std::fmt::Debug for Links {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -68,7 +99,7 @@ impl std::fmt::Debug for Links {
 
 impl Links {
     fn lock(&self) -> MutexGuard<'_, Inner> {
-        self.0.lock().unwrap_or_else(PoisonError::into_inner)
+        self.inner.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
     /// Records the token handed to a session's OMP child before it is spawned.
@@ -127,6 +158,7 @@ impl Links {
     /// An accepted connection; replaces an earlier one of the same session.
     pub(crate) fn connect(&self, handle: &str, role: Role, key: &str, session: &str) {
         let mut inner = self.lock();
+        let resolution = inner.links.remove(handle).and_then(|l| l.resolution);
         inner.links.insert(
             handle.to_string(),
             Link {
@@ -139,6 +171,7 @@ impl Links {
                     last_seq: 0,
                     dropped: 0,
                 },
+                resolution,
             },
         );
         while inner.links.len() > LINKS_MAX {
@@ -160,25 +193,142 @@ impl Links {
         self.lock().links.len()
     }
 
-    /// The connection with `key` closed; a newer connection of the session is left alone.
+    /// The connection with `key` closed; a newer connection of the session is left alone. Its
+    /// queries end unanswered.
     pub(crate) fn disconnect(&self, handle: &str, key: &str) {
-        if let Some(link) = self.lock().links.get_mut(handle)
+        let mut inner = self.lock();
+        if let Some(link) = inner.links.get_mut(handle)
             && link.key == key
         {
             link.view.connected = false;
             link.view.since_ms = Some(now_ms());
         }
+        if inner.queries.get(handle).is_some_and(|q| q.key == key) {
+            inner.queries.remove(handle);
+            inner.asked.retain(|_, (h, _)| h != handle);
+        }
     }
 
     /// Notes an event: its number, a new session ID, events the bridge had to drop.
     pub(crate) fn observe(&self, handle: &str, seq: u64, session: Option<&str>, dropped: u64) {
-        if let Some(link) = self.lock().links.get_mut(handle) {
+        let mut inner = self.lock();
+        let session = session.filter(|s| !s.is_empty());
+        if let Some(link) = inner.links.get_mut(handle) {
             link.view.last_seq = link.view.last_seq.max(seq);
             link.view.dropped += dropped;
-            if let Some(s) = session.filter(|s| !s.is_empty()) {
+            if let Some(s) = session {
                 link.view.session = Some(s.to_string());
             }
         }
+        if let (Some(query), Some(s)) = (inner.queries.get_mut(handle), session) {
+            s.clone_into(&mut query.session);
+        }
+    }
+
+    /// Opens an accepted main-agent connection with `key` to the hub's model query; `hello` says
+    /// whether its bridge can answer one (`model_resolution_version`).
+    pub(crate) fn open_query(
+        &self,
+        handle: &str,
+        key: &str,
+        hello: &Value,
+        tx: mpsc::Sender<Response>,
+    ) {
+        let text = |k: &str| hello.get(k).and_then(Value::as_str).unwrap_or_default();
+        let capable = match hello
+            .get("model_resolution_version")
+            .and_then(Value::as_u64)
+        {
+            Some(super::model::VERSION) => Ok(()),
+            _ => Err(super::model::old_bridge(text("version"))),
+        };
+        let query = Query {
+            key: key.to_string(),
+            session: text("session").to_string(),
+            capable,
+            tx,
+        };
+        self.lock().queries.insert(handle.to_string(), query);
+        self.arrived.notify_waiters();
+    }
+
+    /// A `bridge.reply` to a query.
+    pub(crate) fn answer(&self, params: &Value) {
+        let n = params.get("n").and_then(Value::as_u64).unwrap_or(0);
+        if let Some((_, waiter)) = self.lock().asked.remove(&n) {
+            let _ = waiter.send(params.clone());
+        }
+    }
+
+    /// What OMP in session `handle` makes of `selector` (with an explicit `thinking`, which wins
+    /// over its suffix), asked of the session's bridge with the read-only `model.resolve`. It
+    /// waits for the bridge to connect and answer until `until`, the caller's deadline. A bridge
+    /// whose hello lacks the capability is unverified at once, without a query. `Err` when no
+    /// answer came.
+    pub(crate) async fn resolve_model(
+        &self,
+        handle: &str,
+        selector: &str,
+        thinking: Option<&str>,
+        until: Instant,
+    ) -> Result<Proof, String> {
+        let (session, tx) = loop {
+            let arrived = self.arrived.notified();
+            tokio::pin!(arrived);
+            arrived.as_mut().enable();
+            if let Some(q) = self.lock().queries.get(handle) {
+                if let Err(why) = &q.capable {
+                    return Ok(Proof::Unverified(why.clone()));
+                }
+                break (q.session.clone(), q.tx.clone());
+            }
+            if tokio::time::timeout_at(until, arrived).await.is_err() {
+                return Err("the session's Cataly bridge did not connect in time".into());
+            }
+        };
+        let (waiter, answered) = oneshot::channel();
+        let n = {
+            let mut inner = self.lock();
+            if inner.asked.len() >= ASKED_MAX {
+                return Err("too many model queries are waiting".into());
+            }
+            inner.next += 1;
+            let n = inner.next;
+            inner.asked.insert(n, (handle.to_string(), waiter));
+            n
+        };
+        let cmd = json!({ "cmd": { "op": "model.resolve", "n": n, "session": session,
+            "selector": selector, "thinking": thinking } });
+        let closed = "the session's Cataly bridge closed before answering";
+        let reply = match tokio::time::timeout_at(until, tx.send(Response::item(0, cmd))).await {
+            Ok(Ok(())) => match tokio::time::timeout_at(until, answered).await {
+                Ok(Ok(reply)) => Ok(reply),
+                Ok(Err(_)) => Err(closed),
+                Err(_) => Err("the session's Cataly bridge did not answer in time"),
+            },
+            _ => Err(closed),
+        };
+        self.lock().asked.remove(&n);
+        let proof = Proof::from_reply(&reply?)?;
+        if let Proof::Resolved(r) = &proof {
+            self.resolved(handle, r.clone());
+        }
+        Ok(proof)
+    }
+
+    /// Records what a bridge proved about a session's model (also over a terminal port).
+    pub(crate) fn resolved(&self, handle: &str, resolution: Resolution) {
+        if let Some(link) = self.lock().links.get_mut(handle) {
+            link.resolution = Some(resolution);
+        }
+    }
+
+    /// What the session's bridge last proved about its model.
+    pub(crate) fn resolution(&self, handle: &str) -> Option<Resolution> {
+        self.lock()
+            .links
+            .get(handle)
+            .and_then(|l| l.resolution.clone())
     }
 
     pub(crate) fn view(&self, handle: &str) -> LinkView {
@@ -279,5 +429,66 @@ mod tests {
         assert!(links.kept() <= LINKS_MAX, "{} links kept", links.kept());
         assert!(links.view("lead").connected);
         assert_eq!(links.by_key("k-lead"), Some(("lead".into(), Role::Lead)));
+    }
+
+    /// The model query waits for the session's bridge, goes out on its connection with the
+    /// session it names, and comes back by number; an old hello is unverified without a query,
+    /// and a closed connection ends the query instead of letting it wait for the deadline.
+    #[tokio::test]
+    async fn the_model_query_is_answered_by_the_sessions_bridge() {
+        let links = Arc::new(Links::default());
+        let until = Instant::now() + std::time::Duration::from_secs(5);
+        let (tx, mut rx) = mpsc::channel(8);
+        let asked = {
+            let links = Arc::clone(&links);
+            tokio::spawn(async move { links.resolve_model("h1", "p/m:high", None, until).await })
+        };
+        tokio::task::yield_now().await;
+        links.connect("h1", Role::Lead, "k1", "s1");
+        let hello = json!({ "session": "s1", "model_resolution_version": 1 });
+        links.open_query("h1", "k1", &hello, tx);
+        let cmd = rx.recv().await.unwrap().item.unwrap()["cmd"].clone();
+        assert_eq!(
+            (&cmd["op"], &cmd["session"], &cmd["selector"]),
+            (&json!("model.resolve"), &json!("s1"), &json!("p/m:high"))
+        );
+        links.answer(&json!({ "n": cmd["n"], "model_resolution": { "version": 1,
+            "selector": "p/m:high", "provider": "p", "id": "m",
+            "thinking": { "requested": "high", "observed": "high" } } }));
+        let Ok(Ok(Proof::Resolved(r))) = asked.await else {
+            panic!("no resolution");
+        };
+        assert_eq!(
+            (r.model(), r.requested.as_deref()),
+            ("p/m".into(), Some("high"))
+        );
+        assert_eq!(links.resolution("h1"), Some(r));
+
+        let (tx, _rx) = mpsc::channel(8);
+        links.open_query(
+            "h2",
+            "k2",
+            &json!({ "session": "s2", "version": "0.2.6" }),
+            tx,
+        );
+        let old = links.resolve_model("h2", "p/m", None, until).await.unwrap();
+        assert!(
+            matches!(&old, Proof::Unverified(why) if why.contains("(0.2.6)")),
+            "{old:?}"
+        );
+
+        let (tx, _rx) = mpsc::channel(8);
+        links.open_query("h3", "k3", &json!({ "model_resolution_version": 1 }), tx);
+        let closing = {
+            let links = Arc::clone(&links);
+            tokio::spawn(async move { links.resolve_model("h3", "p/m", None, until).await })
+        };
+        while links.lock().asked.is_empty() {
+            tokio::task::yield_now().await;
+        }
+        links.disconnect("h3", "k3");
+        let closed = closing.await.unwrap().unwrap_err();
+        assert!(closed.contains("closed"), "{closed}");
+        assert!(Instant::now() < until);
     }
 }

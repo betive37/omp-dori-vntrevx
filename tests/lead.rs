@@ -1460,3 +1460,72 @@ fn a_startup_model_mismatch_keeps_the_session_fenced_until_owner_acceptance() {
     );
     assert!(w.hub.stop().success());
 }
+
+/// HOST req. 27 with a thinking suffix: a fresh install whose bridge matches the hub verifies
+/// `fake/primary:high` (OMP runs `fake/primary` at high) and delivers. A bridge older than the hub
+/// fences the session as unverified at once, without a retry; the owner is told once, in his
+/// language, with the fix and the accept command, also over hub restarts; `lead accept-model`
+/// releases it.
+#[test]
+fn a_suffixed_model_verifies_and_an_old_bridge_is_fenced_unverified_once() {
+    let mut w = wrapped("", None);
+    w.hub.write_config(
+        &w.config
+            .replace("\"fake/primary\"", "\"fake/primary:high\""),
+    );
+    let first = original(&mut w);
+    assert_eq!(first["session"]["input_blocked"], false, "{first}");
+    assert_eq!(first["session"]["model"], "fake/primary", "{first}");
+
+    assert!(w.hub.cli(&["lead", "stop"]).status.success());
+    w.hub.fixture("omp", "old-bridge", Some(""));
+    let asked = std::time::Instant::now();
+    let out = w.hub.cli(&["lead", "start"]);
+    assert!(out.status.success(), "{out:?}");
+    let fenced = live(&w.hub, &first["session"]["pid"]);
+    assert!(
+        asked.elapsed() < Duration::from_secs(15),
+        "no deadline spent"
+    );
+    assert_eq!(fenced["session"]["input_blocked"], true, "{fenced}");
+    let reason = fenced["session"]["reason"].as_str().unwrap_or_default();
+    assert!(reason.starts_with("model unverified"), "{fenced}");
+    assert_eq!(w.starts("resume").len(), 1, "never retried");
+    let notices = w.hub.until(Duration::from_secs(10), || {
+        let n = told(&w.hub, "lead.held");
+        (!n.is_empty()).then_some(n)
+    });
+    let text = notices[0]["text"].as_str().unwrap();
+    for part in [
+        "`cataly update`",
+        "`cataly lead accept-model`",
+        "`cataly lead start`",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    for _ in 0..2 {
+        assert!(w.hub.stop().success());
+        w.hub.start();
+        let again = live(&w.hub, &Value::Null);
+        assert_eq!(again["session"]["input_blocked"], true, "{again}");
+        std::thread::sleep(Duration::from_secs(2));
+        assert_eq!(told(&w.hub, "lead.held").len(), 1, "told only once");
+    }
+    assert!(
+        w.hub
+            .cli(&["lead", "send", "AFTER-ACCEPT"])
+            .status
+            .success()
+    );
+    let again = lead_view(&w.hub);
+    assert_eq!(
+        user_entries(&again["session"]["session_file"], "AFTER-ACCEPT"),
+        0
+    );
+    let accepted = w.hub.cli(&["lead", "accept-model"]);
+    assert!(accepted.status.success(), "{accepted:?}");
+    w.hub.until(Duration::from_secs(10), || {
+        (user_entries(&again["session"]["session_file"], "AFTER-ACCEPT") == 1).then_some(())
+    });
+    assert!(w.hub.stop().success());
+}

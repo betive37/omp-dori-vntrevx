@@ -12,7 +12,21 @@ use crate::host::testing::spec;
 
 type Seen = Arc<StdMutex<Vec<Value>>>;
 
-/// A bridge stand-in: records each command and answers it with `answer`.
+/// What OMP's resolver answers for `selector` with no literal colon IDs in its catalogue: the
+/// base model, the suffix level, and `observed` as the level it runs.
+fn resolution(selector: &str, observed: Option<&str>) -> Value {
+    const LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let (base, level) = match selector.rsplit_once(':') {
+        Some((base, level)) if LEVELS.contains(&level) => (base, Some(level)),
+        _ => (selector, None),
+    };
+    let (provider, id) = base.split_once('/').unwrap();
+    json!({ "model_resolution": { "version": 1, "selector": selector, "provider": provider,
+        "id": id, "thinking": { "requested": level, "observed": observed.or(level) } } })
+}
+
+/// A bridge stand-in: records each command and answers it with `answer`; the read-only
+/// `model.resolve` is answered as OMP resolves the selector and not recorded.
 fn fake_bridge(
     port: &Arc<Port>,
     answer: impl Fn(&Value) -> Value + Send + 'static,
@@ -27,8 +41,12 @@ fn fake_bridge(
             if cmd.is_null() {
                 continue;
             }
-            log.lock().unwrap().push(cmd.clone());
-            let mut reply = answer(&cmd);
+            let mut reply = if cmd["op"] == "model.resolve" {
+                resolution(cmd["selector"].as_str().unwrap(), None)
+            } else {
+                log.lock().unwrap().push(cmd.clone());
+                answer(&cmd)
+            };
             reply["n"] = cmd["n"].clone();
             port.reply(&reply);
         }
@@ -38,7 +56,17 @@ fn fake_bridge(
 
 fn hello(session: &str, pid: u64) -> Value {
     json!({ "session": session, "file": format!("/tmp/{session}.jsonl"), "pid": pid, "idle": true,
-        "model": "fake/primary", "goal": { "status": "active" } })
+        "model": "fake/primary", "goal": { "status": "active" }, "model_resolution_version": 1 })
+}
+
+/// The hello of a bridge older than the hub: no model-resolution capability.
+fn old_hello(session: &str, pid: u64) -> Value {
+    let mut hello = hello(session, pid);
+    hello
+        .as_object_mut()
+        .unwrap()
+        .remove("model_resolution_version");
+    hello
 }
 
 fn port() -> (Arc<Port>, oneshot::Receiver<()>) {
@@ -55,7 +83,7 @@ async fn bound(answer: impl Fn(&Value) -> Value + Send + 'static) -> (Session, S
     let (seen, tx) = fake_bridge(&port, answer);
     port.attach(&hello("s1", 42), "k1", tx).unwrap();
     attached.await.unwrap();
-    let started = port.bind(&spec("t1", None)).unwrap();
+    let started = port.bind(&spec("t1", None)).await.unwrap();
     assert_eq!(
         (started.session_id.as_str(), started.pid, started.held),
         ("s1", Some(42), None)
@@ -262,7 +290,11 @@ async fn interrupt_model_goal_and_shutdown_are_bridge_commands() {
     let refused = AtomicBool::new(false);
     let (session, seen) = bound(move |cmd| match cmd["op"].as_str() {
         Some("interrupt") => json!({ "idle": true }),
-        Some("model") => json!({ "model": "fake/second" }),
+        Some("model") => {
+            let mut reply = resolution(cmd["model"].as_str().unwrap(), None);
+            reply["model"] = json!("fake/second");
+            reply
+        }
         Some("goal") if cmd["action"] == "enter" => {
             if refused.swap(true, Ordering::SeqCst) {
                 json!({ "goal": { "status": "active", "objective": cmd["objective"] } })
@@ -415,11 +447,11 @@ async fn a_detached_terminal_process_exit_emits_a_confirmed_stop() {
     owner.spawned(child.pid()).await.unwrap();
     let (port, attached) = port();
     *port.ownership.lock().unwrap() = Some(owner);
-    let (tx, _rx) = mpsc::channel(8);
+    let (_seen, tx) = fake_bridge(&port, |_| json!({}));
     port.attach(&hello("s1", u64::from(child.pid().unwrap())), "owned", tx)
         .unwrap();
     attached.await.unwrap();
-    port.bind(&spec("t1", None)).unwrap();
+    port.bind(&spec("t1", None)).await.unwrap();
     let mut states = port.snapshot.subscribe();
     let (exit, _) = child
         .close(Duration::from_secs(1), Duration::from_secs(1))
@@ -474,5 +506,68 @@ async fn a_failed_terminal_open_does_not_claim_no_writer_was_spawned() {
             }
         ),
         "{error:?}"
+    );
+}
+
+/// A start with a thinking suffix binds the base model at that level (HOST req. 27); a bridge
+/// older than the hub leaves the model unverified at once, without a query, and the owner may
+/// accept it; no model change is asked of such a bridge.
+#[tokio::test]
+async fn a_suffixed_selector_verifies_and_an_old_bridge_is_unverified_at_once() {
+    let (current, attached) = port();
+    let (_seen, tx) = fake_bridge(&current, |_| json!({}));
+    current.attach(&hello("s1", 42), "k1", tx).unwrap();
+    attached.await.unwrap();
+    let mut high = spec("t1", None);
+    high.model = "fake/primary:high".into();
+    let started = current.bind(&high).await.unwrap();
+    assert_eq!(started.held, None);
+
+    let (old, attached) = port();
+    let (seen, tx) = fake_bridge(&old, |_| json!({}));
+    old.attach(&old_hello("s1", 42), "k1", tx).unwrap();
+    attached.await.unwrap();
+    let held = old.bind(&high).await.unwrap().held.unwrap();
+    assert!(
+        held.starts_with("model unverified") && held.contains("older than the hub"),
+        "{held}"
+    );
+    let session = Session { port: old };
+    assert!(session.snapshot().input_blocked);
+    session.accept_model().unwrap();
+    assert!(!session.snapshot().input_blocked);
+    let refused = session.set_model("fake/second").await.unwrap_err();
+    assert!(refused.contains("model unverified"), "{refused}");
+    assert!(
+        seen.lock().unwrap().is_empty(),
+        "{:?}",
+        seen.lock().unwrap()
+    );
+}
+
+/// `set_model` judges OMP's resolution, not the selector's text: a literal colon ID matches
+/// whole, and a level OMP clamped is a mismatch.
+#[tokio::test]
+async fn a_model_change_keeps_literal_ids_and_reports_a_clamped_level() {
+    let (session, _) = bound(|cmd| match cmd["model"].as_str() {
+        Some("ollama/qwen:14b") => json!({ "model": "ollama/qwen:14b", "model_resolution": {
+            "version": 1, "selector": "ollama/qwen:14b", "provider": "ollama", "id": "qwen:14b",
+            "thinking": { "requested": null, "observed": "high" } } }),
+        Some(selector) => {
+            let mut reply = resolution(selector, Some("medium"));
+            reply["model"] = json!("fake/plain");
+            reply
+        }
+        None => json!({}),
+    })
+    .await;
+    assert_eq!(
+        session.set_model("ollama/qwen:14b").await.unwrap(),
+        "ollama/qwen:14b"
+    );
+    let clamped = session.set_model("fake/plain:high").await.unwrap_err();
+    assert!(
+        clamped.contains("thinking high requested, OMP reports medium"),
+        "{clamped}"
     );
 }

@@ -1175,12 +1175,17 @@ impl<R: Runtime> Lead<R> {
                     },
                 ),
         );
-        if let Some(reason) = &started.held {
-            self.emit(
+        match &started.held {
+            // An unverified model is told once, not on every start (HOST req. 27).
+            Some(reason) if super::model::unverified(reason) => self
+                .notices
+                .send(notice::Notice::Unverified(reason.clone())),
+            Some(reason) => self.emit(
                 Emit::new(EventKind::SessionFenced, Severity::Warning, true, "lead")
                     .with("role", "lead")
                     .with("reason", reason),
-            );
+            ),
+            None => {}
         }
         if let Some(note) = note {
             let _ = self
@@ -1988,9 +1993,11 @@ impl<R: Runtime> Lead<R> {
         if !snapshot
             .reason
             .as_deref()
-            .is_some_and(|reason| reason.starts_with("model mismatch"))
+            .is_some_and(super::model::accepts)
         {
-            return Err("the session is not held for a model mismatch".into());
+            return Err(
+                "the session is not held for a model mismatch or an unverified model".into(),
+            );
         }
         let file = snapshot
             .session_file

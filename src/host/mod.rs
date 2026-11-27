@@ -11,6 +11,7 @@ pub(crate) mod headless;
 pub(crate) mod hosted;
 pub(crate) mod inbox;
 pub(crate) mod lead;
+pub(crate) mod model;
 #[path = "lead/startup.rs"]
 pub(crate) mod startup;
 pub(crate) mod tern;

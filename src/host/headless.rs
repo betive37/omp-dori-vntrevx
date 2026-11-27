@@ -21,10 +21,12 @@ use std::time::{Duration, Instant};
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, watch};
 
+use super::bridge::Links;
 use super::dialogs::{
     self, AnswerFrame, Dialog, Entry, Facts, ReadState, Status, UiFrame, read_state, same_model,
     spend_offer,
 };
+use super::model::{Proof, Resolution};
 use super::startup::{Cleanup, STARTUP_BUDGET, StartupOutcome, StartupStage};
 use super::{
     Control, DeliverOutcome, Delivery, EventPage, Role, Runtime, SessionEvent, Snapshot,
@@ -115,7 +117,7 @@ impl Runtime for Headless {
 
 impl Headless {
     /// What every session of this runtime is bound with: its own deadline, cancellation and
-    /// local ownership, and the hub's spend phrases and latency ring.
+    /// local ownership, and the hub's spend phrases, latency ring and bridge registry.
     fn settings(
         &self,
         deadline: tokio::time::Instant,
@@ -125,6 +127,7 @@ impl Headless {
         Settings {
             spend_phrases: self.spend_phrases.clone(),
             agent_start: self.agent_start.clone(),
+            links: Arc::clone(&self.links),
             deadline: Some(deadline),
             cancel: Some(cancel),
             ownership,
@@ -445,6 +448,8 @@ fn spawn_failed(worker: &str, error: crate::worker::link::SpawnError) -> StartEr
 pub(crate) struct Settings {
     pub(crate) spend_phrases: Vec<String>,
     pub(crate) agent_start: Latency,
+    /// The bridge registry, which carries the session's model query (HOST req. 27).
+    pub(crate) links: Arc<Links>,
     deadline: Option<tokio::time::Instant>,
     cancel: Option<watch::Receiver<bool>>,
     ownership: Option<super::lead::ownership::Ownership>,
@@ -473,6 +478,8 @@ struct State {
     fallback_report: Option<FallbackReport>,
     /// The model the hub asked for with `set_model`, which replaces the start model as expected.
     asked_model: Option<String>,
+    /// What OMP resolved the expected selector to, as the bridge proved it.
+    resolution: Option<Resolution>,
     /// The unexpected model already reported, so one model is reported once (DESIGN 6.1).
     unexpected: Option<String>,
     /// When the last delivery's line was written, until its turn starts.
@@ -792,31 +799,33 @@ impl Session {
                 )));
             }
         }
-        let held = match &first.model {
-            Some(model) if same_model(model, &spec.model) => spec
-                .thinking
-                .as_ref()
-                .filter(|t| first.thinking.as_ref() != Some(*t))
-                .map(|t| {
-                    format!(
-                        "model mismatch: thinking {} requested, OMP reports {}",
-                        t,
-                        first.thinking.as_deref().unwrap_or("none")
-                    )
-                }),
-            Some(model) => Some(format!(
-                "model mismatch: {} requested, OMP reports {model}",
-                spec.model
-            )),
-            None => Some(format!(
-                "model mismatch: {} requested, OMP reports none",
-                spec.model
-            )),
-        };
+        // What OMP makes of the selector, from the session's own bridge, within the same deadline
+        // (HOST req. 23, 27). A bridge that cannot tell leaves the model unverified, never retried.
+        let proof = inner
+            .settings
+            .links
+            .resolve_model(
+                &inner.handle,
+                &spec.model,
+                spec.thinking.as_deref(),
+                deadline,
+            )
+            .await
+            .map_err(|e| {
+                if tokio::time::Instant::now() >= deadline {
+                    BindFailure::Rpc(RpcError::Timeout("startup deadline"))
+                } else {
+                    BindFailure::Invalid(format!("model resolution: {e}"))
+                }
+            })?;
+        let held = proof.hold(first.model.as_deref(), first.thinking.as_deref());
         {
             let mut st = inner.lock();
             st.bound = Some((first.session_id.clone(), reported_file.clone()));
             st.held.clone_from(&held);
+            if let Proof::Resolved(r) = proof {
+                st.resolution = Some(r);
+            }
             st.latest = Some(first.clone());
             st.fresh = true;
             inner.publish(&mut st);
@@ -1145,7 +1154,7 @@ impl Inner {
             .clone()
             .unwrap_or_else(|| self.requested_model.clone());
         let expected =
-            names_model(&requested, &model) || st.fallback_to.as_deref() == Some(model.as_str());
+            self.expects(st, &model) || st.fallback_to.as_deref() == Some(model.as_str());
         if expected {
             st.unexpected = None;
         } else if st.unexpected.as_deref() != Some(model.as_str()) {
@@ -1154,12 +1163,24 @@ impl Inner {
         }
     }
 
+    /// Whether `model` is the one the hub expects: what OMP resolved the selector to once the
+    /// bridge proved it (HOST req. 27), else the selector read as `provider/id[:level]`.
+    fn expects(&self, st: &State, model: &str) -> bool {
+        match &st.resolution {
+            Some(r) => same_model(model, &r.model()),
+            None => names_model(
+                st.asked_model.as_deref().unwrap_or(&self.requested_model),
+                model,
+            ),
+        }
+    }
+
     /// Matches a pending fallback report against the model in use.
     fn settle_fallback(&self, st: &mut State) {
         let Some(model) = st.latest.as_ref().and_then(|s| s.model.clone()) else {
             return;
         };
-        if st.fallback_to.is_some() && same_model(&model, &self.requested_model) {
+        if st.fallback_to.is_some() && self.expects(st, &model) {
             st.fallback_to = None;
             self.emit(
                 st,
@@ -1661,15 +1682,15 @@ impl Control for Session {
         }
     }
 
+    /// Moves the session to what OMP resolves `selector` to (HOST req. 27): the base model, then
+    /// the level its suffix requests, each read back. A bridge that cannot resolve it changes
+    /// nothing.
     async fn set_model(&self, selector: &str) -> Result<String, String> {
         let _busy = self.begin()?;
         let inner = &self.inner;
         if selector.len() > 256 || !crate::omp::transcript::model_selector(selector) {
             return Err("expected provider/id without spaces, at most 256 characters".into());
         }
-        let Some((provider, id)) = selector.split_once('/') else {
-            return Err("expected provider/id".into());
-        };
         inner.readback().await?;
         let current = {
             let st = inner.lock();
@@ -1679,27 +1700,45 @@ impl Control for Session {
             if !st.latest.as_ref().is_some_and(ReadState::idle) {
                 return Err("the session is not idle".into());
             }
-            st.latest.as_ref().and_then(|s| s.model.clone())
+            st.latest.clone()
         };
-        if current.as_deref().is_some_and(|m| same_model(m, selector)) {
-            return Ok(selector.to_string());
-        }
-        match inner
-            .call(
-                "set_model",
-                &[("provider", json!(provider)), ("modelId", json!(id))],
-            )
-            .await
+        let until = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
+        let r = match inner
+            .settings
+            .links
+            .resolve_model(&inner.handle, selector, None, until)
+            .await?
         {
-            Ok(reply) if reply.success => {}
-            Ok(reply) => {
-                return Err(reply
-                    .error
-                    .unwrap_or_else(|| "OMP refused the model".into()));
+            Proof::Resolved(r) => r,
+            Proof::Unverified(why) => {
+                return Err(format!("model unverified: {why}; nothing was changed"));
             }
-            Err(e) => {
-                inner.fault(&format!("model change unconfirmed: {e}"));
-                return Err("model change unconfirmed; check the current model".into());
+        };
+        let (model, thinking) = current.map_or((None, None), |s| (s.model, s.thinking));
+        let mut calls = Vec::new();
+        if !model.as_deref().is_some_and(|m| same_model(m, &r.model())) {
+            calls.push((
+                "set_model",
+                vec![("provider", json!(r.provider)), ("modelId", json!(r.id))],
+            ));
+        }
+        if let Some(level) = r
+            .requested
+            .as_deref()
+            .filter(|l| thinking.as_deref() != Some(*l))
+        {
+            calls.push(("set_thinking_level", vec![("level", json!(level))]));
+        }
+        for (kind, fields) in calls {
+            match inner.call(kind, &fields).await {
+                Ok(reply) if reply.success => {}
+                Ok(reply) => {
+                    return Err(reply.error.unwrap_or_else(|| format!("OMP refused {kind}")));
+                }
+                Err(e) => {
+                    inner.fault(&format!("model change unconfirmed: {e}"));
+                    return Err("model change unconfirmed; check the current model".into());
+                }
             }
         }
         {
@@ -1708,17 +1747,19 @@ impl Control for Session {
             let mut st = inner.lock();
             st.fallback_report = None;
             st.asked_model = Some(selector.to_string());
+            st.resolution = Some(r.clone());
             st.fresh = false;
             inner.publish(&mut st);
         }
         inner.readback().await?;
-        let now = inner.lock().latest.as_ref().and_then(|s| s.model.clone());
-        match now {
-            Some(m) if same_model(&m, selector) => Ok(m),
-            other => Err(format!(
-                "model readback shows {}",
-                other.unwrap_or_else(|| "none".into())
-            )),
+        let (model, thinking) = inner
+            .lock()
+            .latest
+            .clone()
+            .map_or((None, None), |s| (s.model, s.thinking));
+        match r.judge(model.as_deref(), thinking.as_deref()) {
+            None => Ok(r.model()),
+            Some(reason) => Err(format!("model readback: {reason}")),
         }
     }
 
@@ -1792,16 +1833,20 @@ impl Control for Session {
         Ok(())
     }
 
+    /// Accepts the model OMP reports after a mismatch or an unverified model: it becomes the
+    /// expected one.
     fn accept_model(&self) -> Result<(), String> {
         let mut st = self.inner.lock();
-        match &st.held {
-            Some(reason) if reason.starts_with("model mismatch") => {
-                st.held = None;
-                self.inner.publish(&mut st);
-                Ok(())
-            }
-            _ => Err("the session is not held for a model mismatch".into()),
+        if !st.held.as_deref().is_some_and(super::model::accepts) {
+            return Err(
+                "the session is not held for a model mismatch or an unverified model".into(),
+            );
         }
+        st.held = None;
+        st.resolution = None;
+        st.asked_model = st.latest.as_ref().and_then(|s| s.model.clone());
+        self.inner.publish(&mut st);
+        Ok(())
     }
 
     async fn close(&self, force: bool) -> Result<StopRecord, String> {
@@ -2387,6 +2432,57 @@ mod tests {
         assert_eq!(fake.seen("set_model").len(), 0);
         assert_eq!(session.set_model("fake/other").await.unwrap(), "fake/other");
         assert!(session.set_model("bad model").await.is_err());
+    }
+
+    /// HOST req. 27 with selectors: `x:high` binds the base model at high; a clamped level
+    /// fences; a bridge older than the hub fences as unverified at once and the owner may accept
+    /// it; a suffixed change sets the base model and the level separately.
+    #[tokio::test]
+    async fn selectors_are_verified_by_what_omp_resolved() {
+        let high = || {
+            let mut s = spec("h1", None);
+            s.model = "fake/primary:high".into();
+            s
+        };
+        let fake = Fake::start();
+        fake.set(|s| s.thinking = Some("high".into()));
+        let (session, bound) = fake.bind(high()).await.unwrap();
+        assert_eq!(bound.held, None);
+        assert!(!session.snapshot().input_blocked);
+
+        let fake = Fake::start();
+        fake.set(|s| s.thinking = Some("medium".into()));
+        let held = fake.bind(high()).await.unwrap().1.held.unwrap();
+        assert!(
+            held.contains("thinking high requested, OMP reports medium"),
+            "{held}"
+        );
+
+        let fake = Fake::start();
+        fake.set(|s| s.resolution_version = None);
+        let began = tokio::time::Instant::now();
+        let (session, bound) = fake.bind(high()).await.unwrap();
+        let held = bound.held.unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(
+            held.starts_with("model unverified") && held.contains("older than the hub"),
+            "{held}"
+        );
+        assert!(session.snapshot().input_blocked);
+        session.accept_model().unwrap();
+        assert!(!session.snapshot().input_blocked);
+        let refused = session.set_model("fake/other:low").await.unwrap_err();
+        assert!(refused.contains("nothing was changed"), "{refused}");
+        assert_eq!(fake.seen("set_model"), Vec::<Value>::new());
+
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        assert_eq!(
+            session.set_model("fake/other:low").await.unwrap(),
+            "fake/other"
+        );
+        assert_eq!(fake.seen("set_model")[0]["modelId"], "other");
+        assert_eq!(fake.seen("set_thinking_level")[0]["level"], "low");
     }
 
     #[tokio::test]

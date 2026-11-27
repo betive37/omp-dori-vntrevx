@@ -64,6 +64,7 @@ async fn start(delays: Delays) -> (Result<Started, StartError>, Duration) {
         Ok(rpc) => {
             let settings = Settings {
                 deadline: Some(deadline),
+                links: crate::host::testing::bridged("deadline"),
                 ..Settings::default()
             };
             match Session::bind(

@@ -600,6 +600,92 @@ fn lead_resumes_in_its_recorded_folder_after_the_default_changed() {
     assert!(hub.stop().success());
 }
 
+/// The fake catalogue of the selector cases: a reasoning model, one whose efforts stop at medium,
+/// a literal ID ending in a level, and an `ollama` ID with a colon part.
+fn selector_models(port: u16) -> String {
+    let model = |id: &str, thinking: &str| {
+        format!(
+            "      - id: \"{id}\"\n        name: Fake {id}\n        reasoning: true\n{thinking}        contextWindow: 32768\n        maxTokens: 1024\n"
+        )
+    };
+    let capped = "        thinking:\n          mode: effort\n          efforts: [low, medium]\n";
+    format!(
+        "providers:\n  fake:\n    baseUrl: http://127.0.0.1:{port}/v1\n    api: openai-completions\n    auth: none\n    models:\n{}{}{}  ollama:\n    baseUrl: http://127.0.0.1:{port}/v1\n    api: openai-completions\n    auth: none\n    models:\n{}",
+        model("primary", ""),
+        model("plain", capped),
+        model("glm:high", ""),
+        model("qwen:14b", ""),
+    )
+}
+
+/// HOST req. 27 against stock OMP: the lead's selector is judged by what OMP resolves it to.
+/// `x:high` verifies; a level OMP clamps fences; a literal ID with a colon and `ollama/qwen:14b`
+/// verify as whole IDs; a bridge whose hello predates the capability fences as unverified.
+#[test]
+fn model_selectors_are_verified_against_stock_omp() {
+    if !enabled() {
+        return;
+    }
+    let sandbox = Sandbox::new("selectors");
+    std::fs::write(
+        sandbox.root.join("agent/models.yml"),
+        selector_models(sandbox.model.port),
+    )
+    .unwrap();
+    let run = |selector: &str, flags: Option<&Path>| {
+        let mut hub = lead_hub(&sandbox, selector, "");
+        if let Some(old) = flags {
+            let config = lead_config(selector, Some(&sandbox.root.join("work")), "").replace(
+                "extra_flags = [",
+                &format!(
+                    "extra_flags = [\"--no-extensions\", \"-e\", \"{}\", ",
+                    old.display()
+                ),
+            );
+            hub.write_config(&config);
+        }
+        hub.start();
+        let live = wait_lead(&hub, |v| {
+            v["phase"] == "live" && v["session"]["pid"].is_u64()
+        });
+        assert!(hub.stop().success());
+        live
+    };
+    for (selector, model) in [
+        ("fake/primary:high", "fake/primary"),
+        ("fake/glm:high", "fake/glm:high"),
+        ("ollama/qwen:14b", "ollama/qwen:14b"),
+    ] {
+        let live = run(selector, None);
+        assert_eq!(
+            live["session"]["input_blocked"], false,
+            "{selector}: {live}"
+        );
+        assert_eq!(live["session"]["model"], model, "{selector}: {live}");
+    }
+    let clamped = run("fake/plain:high", None);
+    assert_eq!(clamped["session"]["input_blocked"], true, "{clamped}");
+    let reason = clamped["session"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("thinking high requested, OMP reports medium"),
+        "{clamped}"
+    );
+    // The extension as it was before the capability: the same bridge without it in its hello.
+    let current = TestHub::new("").command(&["extension"]).output().unwrap();
+    let current = String::from_utf8(current.stdout).unwrap();
+    let older = current.replacen("...ids, ...caps, ", "...ids, ", 1);
+    assert_ne!(older, current, "the hello changed shape");
+    let old = sandbox.root.join("old-cataly.ts");
+    std::fs::write(&old, older).unwrap();
+    let unverified = run("fake/primary:high", Some(&old));
+    assert_eq!(unverified["session"]["input_blocked"], true, "{unverified}");
+    let reason = unverified["session"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("model unverified") && reason.contains("older than the hub"),
+        "{unverified}"
+    );
+}
+
 /// Acceptance check 9 with stock OMP: a usage-limited model falls back along the owner's chain.
 #[test]
 fn lead_falls_back_along_the_owner_chain() {

@@ -311,14 +311,10 @@ fn omp_data(hub: &TestHub) -> PathBuf {
     hub.root.join("bin/omp-data")
 }
 
-/// The launch token the fake OMP of this session recorded.
-fn token(hub: &TestHub, session: &str) -> String {
-    let text = std::fs::read_to_string(omp_data(hub).join("launch")).unwrap();
-    text.lines()
-        .rfind(|l| l.split(' ').nth(1) == Some(session))
-        .and_then(|l| l.split(' ').next())
-        .unwrap()
-        .to_string()
+/// The reconnect key the fake OMP's bridge of this session got (its own hello used the token).
+fn bridge_key(hub: &TestHub, session: &str) -> String {
+    let file = omp_data(hub).join(format!("bridge-{session}"));
+    hub.until(WAIT, || std::fs::read_to_string(&file).ok())
 }
 
 /// A lane opened, its bridge connected and disconnected, the lane closed.
@@ -334,7 +330,7 @@ fn lane_cycle(hub: &TestHub, key: &str) {
     let stream = UnixStream::connect(hub.socket()).unwrap();
     stream.set_read_timeout(Some(WAIT)).unwrap();
     let hello = json!({ "v": 1, "id": 1, "method": "bridge.hello",
-        "params": { "ext": 1, "token": token(hub, &session), "session": session, "agent": "main" } });
+        "params": { "ext": 1, "key": bridge_key(hub, &session), "session": session, "agent": "main" } });
     (&stream)
         .write_all(format!("{hello}\n").as_bytes())
         .unwrap();

@@ -287,6 +287,10 @@ pub(crate) async fn serve<R, W>(
         &[("session", &hello.session), ("handle", &handle)],
     );
     let mut session = hello.session.clone();
+    if !sub && port.is_none() {
+        // The hub's read-only model query goes over this connection; a terminal port owns its own.
+        hub.links.open_query(&handle, &key, &raw, tx.clone());
+    }
     let writer_task = tokio::spawn(pump(writer, rx));
     if fresh && role == Role::Lead {
         recap(hub, &handle, "start".into());
@@ -302,6 +306,7 @@ pub(crate) async fn serve<R, W>(
         let form = terminal(port.as_ref(), &request);
         let method = request.method.clone();
         match method.as_str() {
+            "bridge.reply" if port.is_none() => hub.links.answer(&request.params),
             "bridge.ping" | "bridge.reply" => {}
             "bridge.event" => event(hub, &handle, role, &request.params),
             "bridge.form" => {
@@ -464,7 +469,12 @@ fn answer_later(
             }
             ("bridge.shell", Some(_)) => verdict(hub.lanes.veto(&handle, &request.params).await),
             ("bridge.model", Some(_)) => {
-                verdict(hub.lanes.model_check(&handle, &request.params).await)
+                let resolved = hub.links.resolution(&handle);
+                verdict(
+                    hub.lanes
+                        .model_check(&handle, &request.params, resolved)
+                        .await,
+                )
             }
             ("bridge.tool", _) => {
                 let pair = lane.as_ref().map(|(h, s)| (h.as_str(), s.as_str()));

@@ -67,6 +67,15 @@
   `--fresh` when no conversation ever bound. Startup model mismatch keeps the process open and
   input fenced until `lead accept-model` durably commits the accepted identity.
   A model fence also prevents idle sleep, so the session stays available for that decision.
+- **No more false "model mismatch" for thinking suffixes.** A configured model such as
+  `anthropic/claude-opus-5-5:high` is checked against what OMP itself resolves it to: the base
+  model at that thinking level. The hub asks the session's bridge with a read-only query within
+  the startup deadline; an ID with a colon part of its own (`ollama/qwen:14b`) stays whole, and a
+  level OMP clamped is still a mismatch. The lead, lanes, the lane model barrier, `lead model` and
+  terminal sessions all use the resolution; a terminal `lead model` no longer splits the selector
+  at its first colon. A bridge older than the hub cannot answer: the session stays open and fenced
+  as "model unverified" at once, and the owner hears once (not on every restart) to restart the
+  session or run `cataly update`, or to keep the model with `cataly lead accept-model`.
 - Tern startup journals retain the block ID and process birth identity; confirmed block close
   or disappearance of that exact process proves termination. Unknown exits remain held.
   Settled startup receipts are pruned only after no anchor, recovery episode or lane references

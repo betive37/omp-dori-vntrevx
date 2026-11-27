@@ -759,8 +759,15 @@ impl<R: Runtime> Lanes<R> {
 
     /// The model barrier's judgement for a lane's main agent (EXT req. 38-39). The bridge reports
     /// the model OMP runs, its thinking level and the fallback OMP announced; the pin or that
-    /// fallback (decision 7) passes, anything else holds the turn and the lead hears it.
-    pub(crate) async fn model_check(&self, handle: &str, facts: &Value) -> (bool, String) {
+    /// fallback (decision 7) passes, anything else holds the turn and the lead hears it. The pin
+    /// is what OMP resolved the lane's selector to (`resolved`, HOST req. 27); before the bridge
+    /// proved one, the record's model and thinking as written.
+    pub(crate) async fn model_check(
+        &self,
+        handle: &str,
+        facts: &Value,
+        resolved: Option<crate::host::model::Resolution>,
+    ) -> (bool, String) {
         let found = match self.key_of(handle).await {
             Some(key) => self.load(&key).await.ok().filter(|(r, _)| r.open()),
             None => None,
@@ -773,11 +780,12 @@ impl<R: Runtime> Lanes<R> {
         let same = |m: &str| !m.is_empty() && crate::host::dialogs::same_model(now, m);
         // OMP names a fallback with its thinking suffix (`provider/model:level`).
         let fell_back = same(fallback) || fallback.rsplit_once(':').is_some_and(|(m, _)| same(m));
-        let thinking_ok = rec
-            .thinking
-            .as_deref()
-            .is_none_or(|t| fact("thinking") == t);
-        if (same(&rec.model) || fell_back) && thinking_ok {
+        let (model, thinking) = resolved.map_or_else(
+            || (rec.model.clone(), rec.thinking.clone()),
+            |r| (r.model(), r.requested),
+        );
+        let thinking_ok = thinking.as_deref().is_none_or(|t| fact("thinking") == t);
+        if (same(&model) || fell_back) && thinking_ok {
             return (true, String::new());
         }
         let pin = rec

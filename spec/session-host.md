@@ -133,10 +133,17 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
     readback after a completed turn, the session is faulted.
 26. Every later get_state answer is compared with the bound pair. A different session id or path means OMP switched
     transcripts: the session becomes faulted (HOST-11) and receives no further input.
-27. The model OMP reports in get_state must equal the requested provider/id (provider exact, id case-insensitive),
-    and the reported thinking level must equal the requested one when one was requested. If not, the session
-    stays open but held with reason "model mismatch"; no input is delivered and no goal is set until the owner
-    closes it or explicitly accepts the observed model.
+27. The requested model is a selector, never compared as text: within the deadline of 23 the session's bridge
+    answers the read-only `model.resolve` with the provider/id OMP itself resolves it to and the thinking level
+    it requests (a suffix `:<level>` of the documented levels, or the explicit thinking setting, which wins; an ID
+    with a colon part of its own stays whole). The model OMP reports in get_state must equal that provider/id
+    (provider exact, id case-insensitive), and the reported thinking level must equal the requested one when one
+    was requested; a clamped level is a mismatch. If not, the session stays open but held with reason
+    "model mismatch". A bridge whose hello lacks `model_resolution_version` 1 (older than the hub) cannot answer:
+    the model is unverified at once, without a query, a retry or waiting for the deadline, and the session is
+    held with reason "model unverified"; the owner hears it once, not on every start, with the fix (restart the
+    session or `cataly update`) and `cataly lead accept-model`. Either way no input is delivered and no goal is
+    set until the owner closes it or explicitly accepts the observed model.
 28. Start returns only after steps 23-27 complete or fail: within the 60 s deadline of 23 plus at most 30 s of
     owned cleanup (end of input, TERM, KILL and reap). At 15 s a still-starting attempt is reported as still
     starting, not failed (108). Callers are notified by event, not by polling.

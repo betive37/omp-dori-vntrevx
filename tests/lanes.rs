@@ -125,14 +125,11 @@ fn goal(hub: &TestHub, session: &Value) -> String {
         .to_string()
 }
 
-/// The launch token the fake OMP of this session recorded.
-fn token(hub: &TestHub, session: &Value) -> String {
-    let text = std::fs::read_to_string(data(hub).join("launch")).unwrap();
-    text.lines()
-        .rfind(|l| l.split(' ').nth(1) == session.as_str())
-        .and_then(|l| l.split(' ').next())
-        .unwrap()
-        .to_string()
+/// The reconnect key the fake OMP's bridge of this session got: its launch token is used by that
+/// bridge's own hello, so a test speaks for the session as a reconnect.
+fn bridge_key(hub: &TestHub, session: &Value) -> String {
+    let file = data(hub).join(format!("bridge-{}", session.as_str().unwrap()));
+    hub.until(WAIT, || std::fs::read_to_string(&file).ok())
 }
 
 /// A test-side bridge connection.
@@ -184,10 +181,10 @@ impl Bridge {
 }
 
 fn hello(hub: &TestHub, rec: &Value) -> (Bridge, Value) {
-    let tok = token(hub, &rec["session_id"]);
+    let key = bridge_key(hub, &rec["session_id"]);
     Bridge::connect(
         hub,
-        json!({ "ext": 1, "token": tok, "session": rec["session_id"], "agent": "main" }),
+        json!({ "ext": 1, "key": key, "session": rec["session_id"], "agent": "main" }),
     )
 }
 
@@ -337,7 +334,7 @@ fn reports_need_the_current_run_and_novelty_counts_only_new_evidence() {
     let other = record(&hub, "r-2");
     let (mut b2, _) = Bridge::connect(
         &hub,
-        json!({ "ext": 1, "token": token(&hub, &other["session_id"]), "session": "not-this-one", "agent": "main" }),
+        json!({ "ext": 1, "key": bridge_key(&hub, &other["session_id"]), "session": "not-this-one", "agent": "main" }),
     );
     let refused = report(&mut b2, "c3", &json!("not-this-one"));
     assert_eq!(refused["error"], true);
@@ -1087,7 +1084,7 @@ fn lead_bridge(hub: &TestHub) -> (Bridge, Value) {
     });
     let (bridge, hello) = Bridge::connect(
         hub,
-        json!({ "ext": 1, "token": token(hub, &session), "session": session, "agent": "main" }),
+        json!({ "ext": 1, "key": bridge_key(hub, &session), "session": session, "agent": "main" }),
     );
     (bridge, json!({ "hello": hello, "session": session }))
 }

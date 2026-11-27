@@ -20,6 +20,7 @@ const JOB: &str = "@lead";
 const SUBJECT: &str = "notice";
 const HELD: &str = "held";
 const SLOW: &str = "slow";
+const UNVERIFIED: &str = "unverified";
 /// Longest reason quoted to the owner.
 const REASON_MAX: usize = 300;
 
@@ -35,6 +36,9 @@ pub(super) enum Notice {
     Held(String),
     /// The lead bound a session: a later hold is a new one.
     Bound,
+    /// The lead bound with a model its bridge could not check: told once per reason, not again
+    /// on a later start or after a hub restart (HOST req. 27).
+    Unverified(String),
 }
 
 /// The sending side, kept by the lead; the task takes the receiver once.
@@ -226,6 +230,23 @@ async fn one(env: &Env, notice: Notice) -> Result<(), String> {
             (env.events)(
                 Emit::new(EventKind::LeadHeld, Severity::Warning, true, LEAD)
                     .with("notice", text)
+                    .with("reason", reason)
+                    .with("session", anchor.map_or_default(|a| a.session_id))
+                    .for_owner(),
+            );
+        }
+        Notice::Unverified(reason) => {
+            if told(UNVERIFIED).as_deref() == Some(reason.as_str()) {
+                return Ok(());
+            }
+            remember(env, UNVERIFIED, Some(reason.clone())).await?;
+            let anchor = super::anchor_view(selected);
+            (env.events)(
+                Emit::new(EventKind::LeadHeld, Severity::Warning, true, LEAD)
+                    .with(
+                        "notice",
+                        crate::host::model::unverified_text(language, &reason),
+                    )
                     .with("reason", reason)
                     .with("session", anchor.map_or_default(|a| a.session_id))
                     .for_owner(),

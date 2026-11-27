@@ -493,6 +493,11 @@ impl WorkerBox {
             .collect()
     }
 
+    /// The reconnect key the worker's fake bridge got for `session` (its hello used the token).
+    fn bridge_key(&self, session: &Value) -> String {
+        bridge_key(&self.root, session)
+    }
+
     /// The PID of the `serve` that holds this hub's connection now.
     fn serve_pid(&self, hub_id: &str) -> Option<i32> {
         let lock = self
@@ -641,20 +646,32 @@ impl Bridge {
     }
 }
 
-/// The lead's bridge with its launch token, and its session.
+/// The reconnect key the fake bridge of `session` under `root` got; its own hello used the launch
+/// token, so a test speaks for the session as a reconnect.
+fn bridge_key(root: &Path, session: &Value) -> String {
+    let file = root.join(format!("bin/omp-data/bridge-{}", session.as_str().unwrap()));
+    let deadline = std::time::Instant::now() + WAIT;
+    loop {
+        if let Ok(key) = std::fs::read_to_string(&file) {
+            return key;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "no bridge key in {}",
+            file.display()
+        );
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+/// The lead's bridge, reconnected with its fake bridge's key, and its session.
 fn lead_bridge(hub: &TestHub) -> (Bridge, Value) {
     let session = hub.until(WAIT, || {
         let v = hub.json(&["lead", "status", "--json"]);
         (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
     });
-    let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
-    let token = launch
-        .lines()
-        .rfind(|l| l.split(' ').nth(1) == session.as_str())
-        .and_then(|l| l.split(' ').next())
-        .unwrap()
-        .to_string();
-    let hello = json!({ "ext": 1, "token": token, "session": session, "agent": "main" });
+    let key = bridge_key(&hub.root, &session);
+    let hello = json!({ "ext": 1, "key": key, "session": session, "agent": "main" });
     let (bridge, answer) = Bridge::connect(&hub.socket(), hello);
     assert_eq!(answer["role"], "lead", "{answer}");
     (
@@ -835,9 +852,8 @@ fn a_worker_lane_runs_from_a_thread_and_checks_there() {
     assert!(first.contains(&format!("box ({os}")), "{first}");
 
     // A report through the worker's bridge socket reaches the thread.
-    let tokens = w.tokens(&rec["session_id"]);
-    let hello =
-        json!({ "ext": 1, "token": tokens[0], "session": rec["session_id"], "agent": "main" });
+    let key = w.bridge_key(&rec["session_id"]);
+    let hello = json!({ "ext": 1, "key": key, "session": rec["session_id"], "agent": "main" });
     let (mut lb, welcome) = Bridge::connect(&w.socket(&hub_id), hello);
     assert_eq!(welcome["role"], "lane", "{welcome}");
     lb.tool(
@@ -1101,8 +1117,8 @@ fn a_worker_bridge_reaches_only_its_own_lanes() {
     });
     assert_eq!(lane(&hub, "open", &open).unwrap()["outcome"], "started");
     let rec = record(&hub, "mine");
-    let token = w.tokens(&rec["session_id"])[0].clone();
-    let hello = json!({ "ext": 1, "token": token, "session": rec["session_id"], "agent": "main" });
+    let own = w.bridge_key(&rec["session_id"]);
+    let hello = json!({ "ext": 1, "key": own, "session": rec["session_id"], "agent": "main" });
     let (_own, welcome) = Bridge::connect(&w.socket(&hub_id), hello);
     assert_eq!(welcome["role"], "lane", "{welcome}");
     let key = welcome["key"].clone();
