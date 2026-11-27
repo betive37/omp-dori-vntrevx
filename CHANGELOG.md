@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- A message to a busy lead or lane (in a long tool call, waiting on a subagent, or in a dialog) is
+  no longer in doubt after 30 s. OMP writes a follow-up into the session file only when the running
+  tool call is over, so the hub declared normal queueing in doubt, told the lead "[in-doubt
+  delivery]", and held the owner's Discord room until `cataly discord release`. While the session
+  works the delivery now waits; the 30 s run once it is idle, from the end of the turn it waited
+  behind, and a session busy for 6 h without the entry still ends it in doubt. A lane now checks
+  an unconfirmed message every 5 s, as the lead does, instead of only when its turn ends.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
