@@ -113,14 +113,6 @@ impl Hosted {
     }
 
     pub(crate) fn open(&self, key: &str, look_only: bool) {
-        self.lane(
-            "open",
-            &json!({
-                "key": key, "title": key, "brief": format!("Witness {key}."),
-                "look_only": look_only, "checks": [{"kind": "command", "argv": ["true"]}],
-            }),
-        );
-        let last = std::cell::RefCell::new(Value::Null);
         // On a timeout, the lane's last read says what the hub knew instead.
         struct Last<'a>(&'a std::cell::RefCell<Value>);
         impl Drop for Last<'_> {
@@ -133,6 +125,14 @@ impl Hosted {
                 }
             }
         }
+        self.lane(
+            "open",
+            &json!({
+                "key": key, "title": key, "brief": format!("Witness {key}."),
+                "look_only": look_only, "checks": [{"kind": "command", "argv": ["true"]}],
+            }),
+        );
+        let last = std::cell::RefCell::new(Value::Null);
         let _last = Last(&last);
         self.hub.until(WAIT, || {
             let read = self.lane("read", &json!({"key": key, "count": 1}));

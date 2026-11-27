@@ -143,7 +143,6 @@ fn hostile_terminal(host: &Hosted, drop_pins: bool) {
 
 /// The first coding request of the lead (`None`) or of one lane after `from`.
 fn request(host: &Hosted, from: usize, lane: Option<&str>) -> Surface {
-    let session = lane.map(|key| host.lane_session(key));
     // On a timeout, say which requests did arrive and why none matched.
     struct Seen<'a>(&'a Hosted, usize, Option<String>);
     impl Drop for Seen<'_> {
@@ -172,6 +171,7 @@ fn request(host: &Hosted, from: usize, lane: Option<&str>) -> Surface {
             }
         }
     }
+    let session = lane.map(|key| host.lane_session(key));
     let _seen = Seen(host, from, session.clone());
     host.hub.until(WAIT, || {
         host.model
