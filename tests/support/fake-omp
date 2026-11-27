@@ -18,6 +18,8 @@
 #                               follow-up meanwhile waits for the turn end, as OMP's follow-up does);
 #                               omp-data/followup (a JSON string) adds a background result after the
 #                               answer and a second turn ending with that text;
+#                               with omp-data/hold (a text) a message containing that text waits for
+#                               omp-data/release before its answer;
 #                               omp-data/noentry answers the prompt and writes nothing; with omp-data/ask
 #                               a message containing ASK opens the HTML `form` dialog stock OMP's ask
 #                               tool sends, and the turn ends when it is answered: "picked <choice>";
@@ -54,6 +56,13 @@ turn() {
     fi
     answer='"ok"'
     [ -f "$dir/answer.json" ] && answer=$(cat "$dir/answer.json")
+    if [ -f "$dir/hold" ] && printf '%s' "$msg" | grep -qF "$(cat "$dir/hold")"; then
+        (
+            while [ -d "$dir" ] && [ ! -f "$dir/release" ]; do sleep 0.1; done
+            [ -f "$dir/release" ] && finish "$answer" "$2"
+        ) &
+        return
+    fi
     if [ -f "$dir/slow" ]; then
         touch "$dir/busy"
         (

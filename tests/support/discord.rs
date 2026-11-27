@@ -828,7 +828,7 @@ fn decode(content_type: Option<&str>, bytes: &[u8]) -> (Value, Vec<(String, usiz
 }
 
 /// A public thread as Discord starts it: from a message (the thread takes the message's ID, one
-/// thread per message, none inside a thread) or without one.
+/// thread per message, none inside a thread, and the message names it in `thread`) or without one.
 fn start_thread(
     s: &mut State,
     parent: &str,
@@ -866,6 +866,14 @@ fn start_thread(
     };
     let thread = json!({ "id": id, "type": 11, "parent_id": parent, "guild_id": GUILD,
         "name": body["name"], "thread_metadata": { "archived": false } });
+    if let Some(m) = message
+        && let Some(source) = s
+            .history
+            .get_mut(parent)
+            .and_then(|l| l.iter_mut().find(|x| x["id"] == m))
+    {
+        source["thread"] = thread.clone();
+    }
     s.channels.insert(id, thread.clone());
     s.threads.push(thread.clone());
     reply(201, &thread)
