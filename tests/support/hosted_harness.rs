@@ -164,7 +164,7 @@ impl Hosted {
                 .bodies()
                 .iter()
                 .skip(from)
-                .find_map(|body| tool_result(body, tool));
+                .find_map(|body| tool_result(body, tool, from));
             if result.is_none()
                 && let Some(key) = lane
             {
@@ -182,11 +182,18 @@ impl Hosted {
     }
 }
 
-pub(crate) fn tool_result(body: &Value, tool: &str) -> Option<String> {
+pub(crate) fn tool_result(body: &Value, tool: &str, from: usize) -> Option<String> {
     let messages = body["messages"].as_array()?;
-    for call in messages {
+    for call in messages.iter().rev() {
         for entry in call["tool_calls"].as_array().into_iter().flatten() {
-            if entry["function"]["name"] == tool {
+            // A later request repeats earlier history. Bind the result to a call the scripted
+            // fake issued after this action, not the first same-named tool in that history.
+            let current = entry["id"]
+                .as_str()?
+                .strip_prefix("call_named_")
+                .and_then(|number| number.parse::<usize>().ok())
+                .is_some_and(|number| number > from);
+            if current && entry["function"]["name"] == tool {
                 let result = messages.iter().find(|message| {
                     message["role"] == "tool" && message["tool_call_id"] == entry["id"]
                 })?;

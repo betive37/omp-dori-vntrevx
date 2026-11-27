@@ -101,6 +101,11 @@ impl Hosted {
     }
 
     pub(crate) fn stock(&self, args: &[&str]) -> String {
+        self.stock_result(args)
+            .unwrap_or_else(|error| panic!("{error}"))
+    }
+
+    pub(crate) fn stock_result(&self, args: &[&str]) -> Result<String, String> {
         let stdout = self.hub.root.join("stock.stdout");
         let stderr = self.hub.root.join("stock.stderr");
         let mut command = Command::new(installed_omp());
@@ -119,12 +124,14 @@ impl Hosted {
         let mut running = Running(command.spawn().unwrap());
         let status = self.hub.until(WAIT, || running.0.try_wait().unwrap());
         let stdout = std::fs::read_to_string(stdout).unwrap();
-        assert!(
-            status.success(),
-            "stock {args:?}: {stdout}\n{}",
-            std::fs::read_to_string(stderr).unwrap()
-        );
-        stdout
+        if status.success() {
+            Ok(stdout)
+        } else {
+            Err(format!(
+                "stock {args:?}: {stdout}\n{}",
+                std::fs::read_to_string(stderr).unwrap()
+            ))
+        }
     }
 }
 

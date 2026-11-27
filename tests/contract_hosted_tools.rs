@@ -10,6 +10,8 @@ mod hosted_red;
 mod hosted_surface;
 #[path = "../src/omp/tools.rs"]
 mod policy;
+#[path = "support/hosted_schema.rs"]
+mod schema;
 mod support;
 
 use hosted_controls::eval_call;
@@ -60,7 +62,7 @@ fn headless_profile(commands: bool) {
     let mut host = Hosted::new("headless", "");
     // Both lower-precedence layers deliberately disagree with the hosted hard policy.
     let attempt = format!(
-        "eval:\n  py: true\n  js: true\ntools:\n  commands: {commands}\n  approval:\n    eval: allow\n"
+        "eval:\n  py: true\n  js: true\narchive:\n  enabled: true\ntools:\n  commands: {commands}\n  approval:\n    eval: allow\n"
     );
     std::fs::write(host.hub.root.join("agent/config.yml"), &attempt).unwrap();
     std::fs::write(host.hub.root.join("work/.omp/config.yml"), &attempt).unwrap();
@@ -217,24 +219,33 @@ fn transport_normalization_keeps_side_requests_separate() {
 }
 
 #[test]
-fn every_policy_feature_gate_exists_in_stock_settings() {
-    if !enabled() {
-        return;
-    }
-    let host = Hosted::new("headless", "");
-    let schema: Value = serde_json::from_str(&host.stock(&["config", "list", "--json"])).unwrap();
-    for tool in policy::STOCK {
-        match tool.hiding {
-            policy::Hiding::Features(settings) => {
-                for (key, _) in settings {
-                    assert!(
-                        schema.get(key).is_some(),
-                        "{} has unknown stock gate {key}",
-                        tool.name
-                    );
-                }
-            }
-            policy::Hiding::LaunchSelection | policy::Hiding::NoSwitch => {}
-        }
+fn protocol_cross_references_do_not_advertise_eval_but_calls_and_preludes_do() {
+    let cases = [
+        (
+            "- history://<id>: query as `archive.transcript`: ?budget=4000",
+            false,
+        ),
+        ("Use archive.transcript for history.", true),
+        ("await archive.transcript('session')", true),
+        ("Use commit.draft before committing.", true),
+        ("Read help://eval/archive for the archive namespace.", true),
+        (
+            "<namespaces>\narchive: use archive.transcript\n</namespaces>",
+            true,
+        ),
+        ("- history://<id>: call archive.transcript('session')", true),
+        ("- history://<id>: read help://eval/archive", true),
+    ];
+    for (instruction, forbidden) in cases {
+        let body = serde_json::json!({
+            "tools":[{"type":"function","function":{"name":"read"}}],
+            "messages":[{"role":"system","content":instruction}],
+        });
+        let violations = Surface::parse(&body).violations(Role::Lead);
+        assert_eq!(
+            !violations.is_empty(),
+            forbidden,
+            "{instruction}: {violations:?}"
+        );
     }
 }

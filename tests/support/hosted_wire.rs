@@ -58,11 +58,23 @@ fn text(value: &Value, visit: &mut impl FnMut(&str)) {
 }
 
 fn references(text: &str, out: &mut BTreeSet<String>) {
-    // Match capability addresses, including references without a call's parentheses.
-    for token in text.split(|c: char| !(c.is_ascii_alphanumeric() || "_./:-".contains(c))) {
-        let token = token.trim_end_matches('.');
-        if token.starts_with("help://eval/")
-            || token.split_once('.').is_some_and(|(namespace, _)| {
+    for line in text.lines() {
+        // A URI declaration documents the offered read protocol, not an eval namespace.
+        // Still reject actual calls or eval documentation even inside such a declaration.
+        let declaration = line
+            .trim()
+            .strip_prefix("- ")
+            .unwrap_or(line.trim())
+            .trim_start_matches('`');
+        let protocol = declaration.split_once("://").is_some_and(|(scheme, _)| {
+            !scheme.is_empty()
+                && scheme
+                    .bytes()
+                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
+        });
+        for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || "_./:-".contains(c))) {
+            let token = token.trim_end_matches('.');
+            let helper = token.split_once('.').is_some_and(|(namespace, _)| {
                 matches!(
                     namespace,
                     "commit"
@@ -74,9 +86,15 @@ fn references(text: &str, out: &mut BTreeSet<String>) {
                         | "judge"
                         | "completion"
                 )
-            })
-        {
-            out.insert(token.to_owned());
+            });
+            let callable = !protocol
+                || line.match_indices(token).any(|(at, _)| {
+                    line.get(at + token.len()..)
+                        .is_some_and(|tail| tail.trim_start().starts_with('('))
+                });
+            if token.starts_with("help://eval/") || (helper && callable) {
+                out.insert(token.to_owned());
+            }
         }
     }
 }
@@ -86,7 +104,10 @@ fn commands(text: &str, out: &mut BTreeSet<String>) {
     for line in text.lines() {
         if line.starts_with('#') {
             let depth = line.bytes().take_while(|byte| *byte == b'#').count();
-            if line.trim_start_matches('#').trim() == "Tool Commands" {
+            if matches!(
+                line.trim_start_matches('#').trim(),
+                "Tool Commands" | "MCP Tool Commands"
+            ) {
                 catalog_depth = Some(depth);
             } else if catalog_depth.is_some_and(|start| depth <= start) {
                 catalog_depth = None;
@@ -95,7 +116,11 @@ fn commands(text: &str, out: &mut BTreeSet<String>) {
         if catalog_depth.is_some()
             && let Some(name) = line
                 .trim()
-                .strip_prefix("- `")
+                .strip_prefix("- ")
+                .and_then(|s| {
+                    s.strip_prefix('`')
+                        .or_else(|| s.split_once("→ `").map(|(_, rest)| rest))
+                })
                 .and_then(|s| s.split_once('`'))
                 .map(|(name, _)| name)
         {

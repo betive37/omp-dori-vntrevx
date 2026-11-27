@@ -69,6 +69,18 @@ pub(crate) const STOCK: &[Tool] = &[
             "help://eval/browser",
             "help://eval/computer",
             "help://eval/dsm",
+            "help://eval/archive",
+            "archive.projects",
+            "archive.sessions",
+            "archive.recaps",
+            "archive.session",
+            "archive.transcript",
+            "archive.prompts",
+            "archive.search",
+            "archive.calls",
+            "archive.grep",
+            "archive.stats",
+            "archive.messages",
         ],
         ..tool!(
             "eval",
@@ -76,6 +88,7 @@ pub(crate) const STOCK: &[Tool] = &[
             Hiding::Features(&[
                 ("eval.py", SettingValue::Bool(false)),
                 ("eval.js", SettingValue::Bool(false)),
+                ("archive.enabled", SettingValue::Bool(false)),
             ])
         )
     },
@@ -89,7 +102,11 @@ pub(crate) const STOCK: &[Tool] = &[
         "code intelligence; trusted executable configuration",
         off!("lsp.enabled")
     ),
-    tool!("find", "optional semantic search", off!("find.enabled")),
+    tool!(
+        "find",
+        "optional semantic search",
+        Hiding::Features(&[("find.enabled", SettingValue::Text("off"))])
+    ),
     tool!(
         "task",
         "delegation with inherited hosted policy",
