@@ -82,7 +82,16 @@ async fn start(delays: Delays) -> (Result<Started, StartError>, Duration) {
                 Err(error) => Err(error),
             }
         }
-        Err(error) => Err(StartError::Failed(error.to_string())),
+        Err(error) => {
+            // The in-process peer stands in for the child, as `Proc::Fake` does after binding.
+            let failure = local_cleanup::Failure::rpc(&error, false);
+            Err(StartError::Startup {
+                stage: failure.stage,
+                outcome: failure.outcome,
+                cleanup: Cleanup::LocalReaped,
+                detail: failure.detail,
+            })
+        }
     };
     let elapsed = began.elapsed();
     peer.abort();
@@ -98,6 +107,8 @@ async fn factory_hook_and_binding_share_the_same_sixty_second_deadline() {
         (59, 0, 0, true, 59),
         (61, 0, 0, false, 60),
         (0, 59, 0, true, 59),
+        (0, 60, 0, false, 60),
+        (0, 0, 60, false, 60),
         (0, 61, 0, false, 60),
         (30, 29, 0, true, 59),
         (40, 21, 0, false, 60),

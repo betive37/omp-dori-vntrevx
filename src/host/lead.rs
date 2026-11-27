@@ -497,7 +497,8 @@ impl<R: Runtime> Lead<R> {
         for row in rows {
             let update = match &row.session_id {
                 None => {
-                    let cleanup = ownership::reconcile(&self.env.state_dir, &row.handle).await;
+                    let cleanup =
+                        ownership::reconcile_attempt(&self.env.state_dir, &row.handle, None).await;
                     let confirmed = cleanup.as_ref().is_ok_and(|c| c.confirmed());
                     SessionUpdate {
                         state: Some(if confirmed { "failed" } else { "held" }.into()),
@@ -1067,7 +1068,7 @@ impl<R: Runtime> Lead<R> {
             && let Some(row) = &selected.row
             && row.runtime == "headless"
         {
-            match ownership::reconcile(&self.env.state_dir, &row.handle).await {
+            match ownership::reconcile_attempt(&self.env.state_dir, &row.handle, None).await {
                 Ok(cleanup) if cleanup.confirmed() => {}
                 evidence => {
                     selected.hold = Some(format!(
