@@ -114,10 +114,13 @@ impl Tern {
             format!("CATALY_LAUNCH={token}"),
             format!("CATALY_SOCKET={}", self.socket.display()),
         ]);
-        // The probe's variables (notifications off, profile overrides), as headless sessions get them.
+        // The probe's variables (notifications off, profile overrides), as headless sessions get them,
+        // then the role's policy pins: the tab inherits the terminal's environment, and OMP ranks a
+        // bound variable above `--config` and fills an unset one from `.env` (DESIGN 12.2 A13).
         argv.extend(
             crate::omp::child_env()
                 .into_iter()
+                .chain(crate::omp::launch::policy_env(spec.tool_role()))
                 .map(|(k, v)| format!("{k}={v}")),
         );
         argv.extend(omp);

@@ -195,16 +195,23 @@ path = "/home/me/.bun/bin/omp"
 
 Settings for every OMP session the hub starts (lead, lanes and helper roles).
 
-Hosted sessions hide and deny `eval`, including its unavailable helper instructions. Debug and LSP
-remain offered when enabled in your OMP configuration; your approvals still apply. Owner-installed
-MCP servers and extensions are trusted, and their live non-stock tools are reported at startup.
+Every OMP session the hub launches (lead, lanes, look-only lanes, worker lanes and the built-in PR
+reviewer, in both runtimes) hides and denies `eval`: its overlay sets `eval.py: false`, `eval.js: false`
+and `archive.enabled: false` (the archive prelude in eval's instructions), and `tools.approval.eval: deny`,
+so neither eval nor its helper instructions are advertised. OMP lets `PI_PY` and `PI_JS` outrank that
+overlay and reads them from `.env` files (the working tree's included) when they are unset, so every
+launch sets `PI_PY=0` and `PI_JS=0` last; a Tern tab's inherited values, a `.env` file or a
+`credentials` entry of the same name cannot turn eval back on. A custom `[coord] reviewer` command is
+your own command and gets none of this. Debug and LSP remain offered when enabled in your OMP
+configuration; your approvals still apply. Owner-installed MCP servers and extensions are trusted, and
+their live non-stock tools are reported at startup.
 These controls are not a sandbox: provider credentials and same-user stored OMP authentication remain
 usable by hosted code. See [the safety limits](../DESIGN.md#92-accidental-spend-guards-fallback-allowed).
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `cap` | integer | `8` | 1–32 | Live OMP sessions at most, all roles together. |
-| `credentials` | list of strings | `[]` | environment variable names: upper-case letters, digits, `_`, not starting with a digit, not starting with `CATALY_` | Variables passed from the hub's environment to OMP (provider keys). Nothing else is passed. |
+| `credentials` | list of strings | `[]` | environment variable names: upper-case letters, digits, `_`, not starting with a digit, not starting with `CATALY_` | Variables passed from the hub's environment to OMP (provider keys). Nothing else is passed. A name the hosted policy pins (`PI_PY`, `PI_JS`) gets the policy's value instead. |
 | `extra_flags` | list of strings | `[]` | `--name` or `--name=value` only | Extra OMP command-line flags. Refused: flags the hub sets itself (`--mode`, `--session-dir`, `--resume`/`-r`, `--continue`/`-c`, `--restore`, `--fork`, `--print`/`-p`, `--goal`, `--plan`, `--approval-mode`, `--auto-approve`, `--yolo`, `--cwd`, `--config`, `--model`, `--thinking`, `--append-system-prompt`, `--system-prompt`, `--tools`, `--max-cost`, `--no-session`), `--extension`, and anything starting with `approval` or containing `approve`. |
 | `spend_phrases` | list of strings | `[]` | any; matched case-insensitively, blanks dropped | Extra phrases that mark an OMP dialog as an offer to spend money, beside the built-in ones. Such dialogs are never accepted for you. |
 | `runtime` | string | `"headless"` | `headless`, `tern` | Where new sessions run. A stored session keeps the runtime it started with. |

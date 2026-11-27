@@ -8,8 +8,12 @@
 //! revert (decision 7, OJ-10/11). `retry.fallbackOn` and `retry.fallbackChains` appear only when the
 //! owner set them in Cataly's `[fallback]` section; Cataly never invents a chain. Approvals follow
 //! the owner's own OMP settings: no approval mode and no shell patterns are set here (decision 19,
-//! DESIGN 12.2 A13). Both eval kernels are disabled and the eval approval is denied. JSON is
-//! valid YAML, so the overlay is written as JSON.
+//! DESIGN 12.2 A13). Every hidden tool comes from the policy table ([`tools::STOCK`]): eval is
+//! hidden by `eval.py: false`, `eval.js: false` and `archive.enabled: false` (its archive prelude),
+//! and its approval is denied. OMP ranks a setting's own environment variable (`PI_PY`, `PI_JS`)
+//! above `--config` and fills an unset one from `.env` files, so every launch also sets each bound
+//! variable to the overlay's value ([`policy_env`], [`tools::ENV`]), last in its environment. JSON
+//! is valid YAML, so the overlay is written as JSON.
 
 use std::path::{Path, PathBuf};
 
@@ -90,25 +94,38 @@ impl Launch<'_> {
 
 /// The child environment beyond the runner's pass-through list (HOST req. 21-22): the probe's
 /// variables (notifications off, profile overrides), the owner's listed provider credentials that the
-/// hub itself has, the hub socket and the single-use launch token. Never a relay token or a Cataly
-/// secret; nothing secret goes into argv.
+/// hub itself has, the hub socket, the single-use launch token and, last, the role's policy pins
+/// ([`policy_env`]), which a listed credential of the same name never replaces. Never a relay token
+/// or a Cataly secret; nothing secret goes into argv.
 pub(crate) fn session_env(
     credentials: &[String],
     socket: &Path,
     token: &str,
+    role: Role,
 ) -> Vec<(String, String)> {
+    let pins = policy_env(role);
     let mut env: Vec<(String, String)> = super::child_env()
         .into_iter()
         .map(|(k, v)| (k.to_string(), v))
         .collect();
     for name in credentials {
+        if pins.iter().any(|(pinned, _)| pinned == name) {
+            continue;
+        }
         if let Ok(value) = std::env::var(name) {
             env.push((name.clone(), value));
         }
     }
     env.push(("CATALY_SOCKET".into(), socket.display().to_string()));
     env.push(("CATALY_LAUNCH".into(), token.to_string()));
+    env.extend(pins.into_iter().map(|(k, v)| (k.to_string(), v)));
     env
+}
+
+/// The variables that pin the role's env-bound overlay settings, from the same rendering as the
+/// overlay. Every launch sets them after anything it inherits or passes on.
+pub(crate) fn policy_env(role: Role) -> Vec<(&'static str, String)> {
+    render(&FallbackSettings::default(), role).1
 }
 
 /// The overlay file of a session kind in the state directory. Lanes run OMP goals (decision 5);
@@ -137,6 +154,11 @@ pub(crate) const NO_REDEEM: [(&str, &str); 5] = [
 
 /// The role's overlay. Goal continuation is explicit; every hidden capability comes from the table.
 pub(crate) fn overlay(fallback: &FallbackSettings, role: Role) -> Value {
+    render(fallback, role).0
+}
+
+/// The overlay and its environment pins, rendered together.
+fn render(fallback: &FallbackSettings, role: Role) -> (Value, Vec<(&'static str, String)>) {
     let mut retry = Map::new();
     retry.insert("modelFallback".into(), Value::Bool(true));
     retry.insert("fallbackRevertPolicy".into(), json!("cooldown-expiry"));
@@ -164,8 +186,8 @@ pub(crate) fn overlay(fallback: &FallbackSettings, role: Role) -> Value {
         }
     }
     root.insert("retry".into(), Value::Object(retry));
-    tools::apply(&mut root, role);
-    Value::Object(root)
+    let env = tools::apply(&mut root, role);
+    (Value::Object(root), env)
 }
 
 /// Writes the overlay file of a session kind (mode 0600, atomically) and returns its path.
@@ -257,6 +279,7 @@ mod tests {
             &["CATALY_NOT_SET_ANYWHERE".into()],
             Path::new("/s.sock"),
             "t",
+            Role::Lead,
         );
         assert!(
             env.iter()
@@ -300,6 +323,85 @@ mod tests {
             let o = overlay(&FallbackSettings::default(), role);
             assert!(o.get("bash").is_none(), "no shell patterns, {role:?}");
             assert!(o["tools"].get("approvalMode").is_none(), "{role:?}");
+        }
+    }
+
+    const ROLES: [Role; 5] = [
+        Role::Lead,
+        Role::Lane,
+        Role::Subagent,
+        Role::Reviewer,
+        Role::LookOnly,
+    ];
+
+    #[test]
+    /// Finding 7: denial alone leaves a tool advertised, so a hidden row must have a feature gate.
+    fn every_hidden_row_hides_through_feature_settings() {
+        for role in ROLES {
+            for tool in tools::STOCK
+                .iter()
+                .filter(|t| t.class(role) == Class::Hidden)
+            {
+                assert!(
+                    matches!(tool.hiding, tools::Hiding::Features(gates) if !gates.is_empty()),
+                    "{} is hidden for {role:?} but only deny-only: {:?}",
+                    tool.name,
+                    tool.hiding
+                );
+            }
+        }
+    }
+
+    #[test]
+    /// OMP ranks `PI_PY`/`PI_JS` above `--config` and fills them from `.env` when unset: every
+    /// launch environment sets them to the overlay's own value, after anything passed on.
+    fn every_bound_setting_is_pinned_last_in_every_launch_environment() {
+        let mut chains = std::collections::BTreeMap::new();
+        chains.insert("default".to_string(), vec!["p/backup".to_string()]);
+        let owner = FallbackSettings {
+            on: Some("usage-limit".into()),
+            chains,
+        };
+        for role in ROLES {
+            let pins = policy_env(role);
+            assert_eq!(
+                pins,
+                [("PI_PY", "0".into()), ("PI_JS", "0".into())],
+                "{role:?}"
+            );
+            assert_eq!(
+                render(&owner, role).1,
+                pins,
+                "owner fallback never moves a pin"
+            );
+            let o = overlay(&FallbackSettings::default(), role);
+            assert_eq!(o["archive"]["enabled"], false, "{role:?}");
+            for binding in tools::ENV {
+                let value = binding
+                    .setting
+                    .split('.')
+                    .fold(&o, |value, segment| &value[segment]);
+                assert_eq!(value, &json!(false), "{} {role:?}", binding.name);
+            }
+            let env = session_env(
+                &["PI_PY".into(), "PI_JS".into(), "CATALY_NOT_SET".into()],
+                Path::new("/s.sock"),
+                "t",
+                role,
+            );
+            let bound = env
+                .iter()
+                .filter(|(k, _)| tools::ENV.iter().any(|b| b.name == k))
+                .count();
+            assert_eq!(
+                bound, 2,
+                "a listed credential never adds a second value: {env:?}"
+            );
+            let tail: Vec<(&str, &str)> = env[env.len() - 2..]
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(tail, [("PI_PY", "0"), ("PI_JS", "0")], "{role:?}");
         }
     }
 }

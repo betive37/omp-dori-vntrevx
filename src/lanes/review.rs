@@ -323,6 +323,7 @@ impl<R: Runtime> Lanes<R> {
                 &config.sessions.credentials,
                 Path::new("/nonexistent"),
                 "",
+                ToolRole::Reviewer,
             )
             .into_iter()
             .filter(|(k, _)| k != "CATALY_SOCKET" && k != "CATALY_LAUNCH")

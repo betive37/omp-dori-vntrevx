@@ -248,12 +248,20 @@ time with immediate "busy" refusal; delivery receipts keyed by request ID (HOST-
   cooldown-expiry` (both OMP's defaults, pinned so an owner config cannot silently differ); `retry.fallbackOn`
   and `retry.fallbackChains` only when set in Cataly's `[fallback]` config (9.2).
 - One hosted-tool policy table generates hiding settings and execution denial across hosted roles:
-  `eval.py: false`, `eval.js: false` and `tools.approval.eval: deny`, without unavailable eval-helper
-  guidance. Debug and LSP remain offered when owner-enabled; offered tools retain owner approvals.
+  `eval.py: false`, `eval.js: false`, `archive.enabled: false` (eval's archive prelude) and
+  `tools.approval.eval: deny`, without unavailable eval-helper guidance. OMP ranks a setting's own
+  environment variable above `--config` and fills an unset or empty one from `.env` files (the working
+  tree's included), so the table also lists every stock variable bound to a pinned setting (`PI_PY`,
+  `PI_JS` in 19.1.1 and 19.2.1) and each launch sets it to the overlay's value (`PI_PY=0`, `PI_JS=0`),
+  last: headless and reviewer environments, the Tern block's `/usr/bin/env` assignments (the tab otherwise
+  inherits the terminal's environment) and a worker's spawn. Removing the variable would not do: `.env`
+  would refill it. `contract_hosted_env` fails when stock OMP binds a pinned setting the table omits.
+  Debug and LSP remain offered when owner-enabled; offered tools retain owner approvals.
   Owner-installed MCP and extensions are trusted, and their live non-stock tools are reported at startup.
 - Child environment starts empty: `PATH`, `HOME`, `TMPDIR`, `LANG`, listed provider credentials,
-  `PI_NOTIFICATIONS=off`, `CATALY_LAUNCH=<single-use token>`, `CATALY_SOCKET=<path>`. No relay token, no
-  Cataly secret, nothing secret in argv (HOST-06, req. 21).
+  `PI_NOTIFICATIONS=off`, `CATALY_LAUNCH=<single-use token>`, `CATALY_SOCKET=<path>`, then the policy's
+  pins, which a listed credential of the same name never replaces. No relay token, no Cataly secret,
+  nothing secret in argv (HOST-06, req. 21).
 - Start sequence (HOST req. 23-28): record first, spawn, `ready` within 15 s, two equal `get_state`
   answers bind identity, model readback, bridge hello within the start budget (a lane without its bridge
   cannot have shell rules, so it fails closed), 30 s total (lanes 180 s, LANE-15).
@@ -881,7 +889,7 @@ numbers are kept from the first draft so references stay stable; decided rows mo
 | A10 | Queued launches (LANE Q4), auto close after 5 min (LANE Q7) | Kept; 5-minute window kept | Config. |
 | A11 | systemd scopes per lane (LANE Q5) | Not in the first release | Linux-only addition in the `sys` module. |
 | A12 | Worktrees without a list (LANE Q6) | No migration exists (IR-43), so unrecorded worktrees are always kept | — |
-| A13 | Hosted tools and approval mode (HOST-05) | Owner decision 19 (`docs/decisions.md`): approvals follow the owner's OMP settings, with no forced `--approval-mode` or `bash.patterns`. One hosted-tool policy table hides and denies `eval` (both kernels disabled), removing unavailable helper guidance; debug and LSP remain offered when owner-enabled, without overriding approvals. Owner-installed MCP and extensions are trusted and their live non-stock tools reported at startup. Cataly's tools remain `loadMode: essential`, `policy: allow`; shell misuse points to direct calls. The shell veto is an accidental-command guard, not a sandbox; `NO_REDEEM` stops only OMP's automatic redemption. Hard no-spend needs credential isolation, which is not built (9.2). Dialogs go to the lead (LANE-31) and, when enabled, owner-only approval cards. Print reviewers keep `always-ask`. Latest-stock-OMP contracts gate PRs and releases alongside the minimum. | Forcing approvals duplicates the owner's OMP configuration; hostile-code containment requires a separate credential and OS boundary, not more tool bans. |
+| A13 | Hosted tools and approval mode (HOST-05) | Owner decision 19 (`docs/decisions.md`): approvals follow the owner's OMP settings, with no forced `--approval-mode` or `bash.patterns`. One hosted-tool policy table hides and denies `eval` in every hub-launched session (both kernels disabled, `archive.enabled: false`), removing unavailable helper guidance; the same rendering sets the stock variables bound to those pins (`PI_PY=0`, `PI_JS=0`) last in every launch environment, headless, Tern, worker and reviewer, because they outrank `--config` and `.env` files refill an unset one. Debug and LSP remain offered when owner-enabled, without overriding approvals. Owner-installed MCP and extensions are trusted and their live non-stock tools reported at startup. Cataly's tools remain `loadMode: essential`, `policy: allow`; shell misuse points to direct calls. The shell veto is an accidental-command guard, not a sandbox; `NO_REDEEM` stops only OMP's automatic redemption. Hard no-spend needs credential isolation, which is not built (9.2). Dialogs go to the lead (LANE-31) and, when enabled, owner-only approval cards. Print reviewers keep `always-ask`. Latest-stock-OMP contracts gate PRs and releases alongside the minimum. | Forcing approvals duplicates the owner's OMP configuration; hostile-code containment requires a separate credential and OS boundary, not more tool bans. |
 | A14 | OMP's automatic rotation between the owner's own logged-in accounts | Not controlled by Cataly (no documented switch); allowed like a configured fallback | If the owner counts it as "switching account", keep one login per provider. |
 | A15 | Discord: all-channels mode, lookup, auto resend, busy lead, rejected intents (DISC-IN Q1-5) | Dropped; lookup opt-in and off; auto resend when the file is final; follow-up while busy; intake stays down | Each is a small switch except REST polling, which stays out. |
 | A16 | Hub posts final answers (DISC-OUT Q1) | Yes, lead and lanes | Model-driven replies need the stop-gate machinery as the main path. |

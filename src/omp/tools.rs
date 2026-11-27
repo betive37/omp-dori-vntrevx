@@ -93,8 +93,37 @@ impl Tool {
     }
 }
 
-/// Adds only H settings and H denials. Never enables or approves an offered stock tool.
-pub(crate) fn apply(root: &mut Map<String, Value>, role: Role) {
+/// A stock environment variable bound to a setting the hosted overlay pins. OMP ranks it above
+/// every `--config` overlay and fills it from `.env` files (the working tree's included) when it is
+/// unset or empty, so removing it is not enough: each launch sets it to the overlay's own value.
+/// `contract_hosted_env` fails when stock OMP binds a pinned setting that this table omits.
+#[derive(Debug, Serialize)]
+pub(crate) struct EnvBinding {
+    pub(crate) name: &'static str,
+    pub(crate) setting: &'static str,
+    /// Where stock OMP declares the binding.
+    pub(crate) source: &'static str,
+}
+
+/// Every binding of a pinned setting in stock OMP 19.1.1 and 19.2.1.
+pub(crate) const ENV: &[EnvBinding] = &[
+    EnvBinding {
+        name: "PI_PY",
+        setting: "eval.py",
+        source: "19.1.1 src/eval/settings.ts cfgEvalPy `env: \"PI_PY\"`; \
+                 19.2.1 omp://settings.md Environment overrides; `omp config set --json` overriddenBy",
+    },
+    EnvBinding {
+        name: "PI_JS",
+        setting: "eval.js",
+        source: "19.1.1 src/eval/settings.ts cfgEvalJs `env: \"PI_JS\"`; \
+                 19.2.1 omp://settings.md Environment overrides; `omp config set --json` overriddenBy",
+    },
+];
+
+/// Adds only H settings and H denials. Never enables or approves an offered stock tool. Returns
+/// the environment that pins every bound setting of the completed overlay ([`env`]).
+pub(crate) fn apply(root: &mut Map<String, Value>, role: Role) -> Vec<(&'static str, String)> {
     let mut denied = Map::new();
     for tool in STOCK.iter().filter(|t| t.class(role) == Class::Hidden) {
         match tool.hiding {
@@ -118,6 +147,26 @@ pub(crate) fn apply(root: &mut Map<String, Value>, role: Role) {
         denied.insert(tool.name.into(), json!("deny"));
     }
     root.insert("tools".into(), json!({ "approval": denied }));
+    env(root)
+}
+
+/// Each [`ENV`] binding whose setting `root` pins, as the text OMP parses to the pinned value:
+/// booleans `1`/`0` (OMP's flag parser), other values as written. Unpinned settings stay the owner's.
+pub(crate) fn env(root: &Map<String, Value>) -> Vec<(&'static str, String)> {
+    ENV.iter()
+        .filter_map(|binding| {
+            let mut segments = binding.setting.split('.');
+            let first = root.get(segments.next()?)?;
+            let value = segments.try_fold(first, |value, segment| value.get(segment))?;
+            let text = match value {
+                Value::Null => return None,
+                Value::Bool(on) => if *on { "1" } else { "0" }.to_owned(),
+                Value::String(text) => text.clone(),
+                Value::Number(_) | Value::Array(_) | Value::Object(_) => value.to_string(),
+            };
+            Some((binding.name, text))
+        })
+        .collect()
 }
 
 /// An explicit inspection selection, derived from the same catalog as the overlay.

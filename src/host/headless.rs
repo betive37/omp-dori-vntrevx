@@ -104,7 +104,7 @@ impl Runtime for Headless {
             role: spec.tool_role(),
         }
         .argv();
-        let env = session_env(&self.credentials, &self.socket, &token);
+        let env = session_env(&self.credentials, &self.socket, &token, spec.tool_role());
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         crate::sys::fs::ensure_private_dir(&self.logs)
             .map_err(|e| StartError::Refused(e.to_string()))?;
@@ -200,11 +200,17 @@ impl Headless {
             role: spec.tool_role(),
         }
         .argv();
-        // The worker's own OMP profile and logins: nothing of this machine's environment goes along.
-        let env = [
+        // The worker's own OMP profile and logins: nothing of this machine's environment goes along,
+        // and the role's policy pins outrank the worker's own `.env` files (DESIGN 12.2 A13).
+        let mut env = vec![
             ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
             ("CATALY_LAUNCH".to_string(), token.to_string()),
         ];
+        env.extend(
+            crate::omp::launch::policy_env(spec.tool_role())
+                .into_iter()
+                .map(|(k, v)| (k.to_string(), v)),
+        );
         let cwd = spec.cwd.display().to_string();
         let (channel, stream, hold) = link.spawn(&argv, &cwd, &env).await.map_err(refused)?;
         let (read, write) = tokio::io::split(stream);
