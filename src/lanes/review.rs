@@ -318,16 +318,9 @@ impl<R: Runtime> Lanes<R> {
                 prompt(&repo, number, &head, &text),
             );
             text_file = Some(text);
-            // No lane or role identity: no hub socket, no launch token.
-            let env = crate::omp::launch::session_env(
-                &config.sessions.credentials,
-                Path::new("/nonexistent"),
-                "",
-                ToolRole::Reviewer,
-            )
-            .into_iter()
-            .filter(|(k, _)| k != "CATALY_SOCKET" && k != "CATALY_LAUNCH")
-            .collect::<Vec<_>>();
+            let env = reviewer_env(&config.sessions.credentials, |name| {
+                std::env::var(name).ok()
+            });
             (argv, env, model.unwrap_or_else(|| "omp default".into()))
         };
         let env_ref: Vec<(&str, &str)> =
@@ -525,9 +518,54 @@ impl<R: Runtime> Lanes<R> {
     }
 }
 
+/// The local reviewer's environment: the session environment without a lane or role identity (no
+/// hub socket, no launch token), still ending with the reviewer's policy pins.
+fn reviewer_env(
+    credentials: &[String],
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
+    crate::omp::launch::session_env_with(
+        credentials,
+        Path::new("/nonexistent"),
+        "",
+        ToolRole::Reviewer,
+        lookup,
+    )
+    .into_iter()
+    .filter(|(k, _)| k != "CATALY_SOCKET" && k != "CATALY_LAUNCH")
+    .collect()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reviewer_env_ends_with_the_policy_pins_and_no_identity() {
+        let listed = ["PI_PY".into(), "PI_JS".into(), "CATALY_CRED".into()];
+        let env = reviewer_env(&listed, |_| Some("1".into()));
+        let tail: Vec<(&str, &str)> = env[env.len() - 3..]
+            .iter()
+            .map(|(k, v)| (k.as_str(), v.as_str()))
+            .collect();
+        assert_eq!(
+            tail,
+            [("CATALY_CRED", "1"), ("PI_PY", "0"), ("PI_JS", "0")],
+            "{env:?}"
+        );
+        assert!(
+            env.iter()
+                .all(|(k, _)| k != "CATALY_SOCKET" && k != "CATALY_LAUNCH"),
+            "{env:?}"
+        );
+        assert_eq!(
+            env.iter()
+                .filter(|(k, _)| k == "PI_PY" || k == "PI_JS")
+                .count(),
+            2,
+            "the hub's own PI_PY/PI_JS never reach the reviewer: {env:?}"
+        );
+    }
 
     #[test]
     fn verdicts_prs_and_templates() {

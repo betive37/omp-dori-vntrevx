@@ -107,7 +107,7 @@ The hide column gives the corresponding setting in **both 19.1.1 and 19.2.1**, u
 | `glob` | O: search | Remote/internal URL traversal can reach network | `glob.enabled: false` |
 | `ast_grep` | O: optional structural search | Native parser; URL/SSH filesystem may reach network | `astGrep.enabled: false` |
 | `ast_edit` | O: structural edits | Writes after resolve; no general execution parameter | `astEdit.enabled: false` |
-| `eval` | H: decision 19; avoid impossible instructions | Arbitrary Python/JS, subprocesses, imports, network, runtime helpers | **Both** `eval.py: false`, `eval.js: false`; `archive.enabled: false` explicitly disables its eval prelude without disabling `read history://…` |
+| `eval` | H: decision 19; avoid impossible instructions | Arbitrary Python/JS, subprocesses, imports, network, runtime helpers | **Both** `eval.py: false`, `eval.js: false`, plus `PI_PY=0` and `PI_JS=0` set last in every launch environment: these variables outrank `--config`, and stock refills unset or empty ones from project, agent and home `.env` files; `archive.enabled: false` explicitly disables its eval prelude without disabling `read history://…` |
 | `debug` | O: owner-enabled debugging, not containment | Arbitrary adapter/debuggee launch, evaluate, memory mutation, remote attach | `debug.enabled: false` |
 | `lsp` | O: essential code intelligence, trusted executable config | Configured servers; `cargo check`, `npx tsc`, `go build`, `pyright`; executeCommand | `lsp.enabled: false` / `--no-lsp` (also disables edit/write hooks) |
 | `find` | O: optional semantic search | Judge/provider requests; not arbitrary shell source | `find.enabled: off` (enum `auto`, `on`, `off`; boolean `false` is rejected by stock 19.2.1) |

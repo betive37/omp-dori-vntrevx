@@ -202,15 +202,7 @@ impl Headless {
         .argv();
         // The worker's own OMP profile and logins: nothing of this machine's environment goes along,
         // and the role's policy pins outrank the worker's own `.env` files (DESIGN 12.2 A13).
-        let mut env = vec![
-            ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
-            ("CATALY_LAUNCH".to_string(), token.to_string()),
-        ];
-        env.extend(
-            crate::omp::launch::policy_env(spec.tool_role())
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v)),
-        );
+        let env = worker_env(token, spec.tool_role());
         let cwd = spec.cwd.display().to_string();
         let (channel, stream, hold) = link.spawn(&argv, &cwd, &env).await.map_err(refused)?;
         let (read, write) = tokio::io::split(stream);
@@ -1499,10 +1491,38 @@ fn note_cancelled(cancelled: &mut VecDeque<String>, id: &str) -> bool {
     false
 }
 
+/// A remote worker's launch environment: nothing of this machine's, then the role's policy pins
+/// last so they outrank the worker's own `.env` files (DESIGN 12.2 A13).
+fn worker_env(token: &str, role: crate::omp::tools::Role) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
+        ("CATALY_LAUNCH".to_string(), token.to_string()),
+    ];
+    env.extend(
+        crate::omp::launch::policy_env(role)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
+    );
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::testing::{Fake, spec};
+
+    #[test]
+    fn worker_env_ends_with_the_policy_pins() {
+        use crate::omp::tools::Role as ToolRole;
+        for role in [ToolRole::Lead, ToolRole::Lane, ToolRole::LookOnly] {
+            let env = worker_env("PI_PY=1", role);
+            let tail: Vec<(&str, &str)> = env[env.len() - 2..]
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(tail, [("PI_PY", "0"), ("PI_JS", "0")], "{role:?}");
+        }
+    }
 
     #[test]
     fn cancelled_offers_are_bounded_and_repeats_known() {

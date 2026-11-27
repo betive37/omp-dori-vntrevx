@@ -290,8 +290,20 @@ fn candidates(exe: &Path) -> BTreeSet<String> {
         "OMP_PROFILE",
         "PI_PROFILE",
     ];
+    // Each prefix belongs to a reader other than OMP's settings resolver, and setting every such
+    // name to a probe value ("0", "yes", ...) would change or break the probe process itself rather
+    // than one setting's value:
     const PREFIXES: [&str; 9] = [
-        "LD_", "DYLD_", "BUN_", "NODE_", "XDG_", "MALLOC", "NPM_", "UV_", "PYTHON",
+        // the dynamic loader (Linux, macOS): preload and library paths
+        "LD_", "DYLD_",
+        // the Bun runtime the executable embeds, and Node-compatible options it honours
+        "BUN_", "NODE_",
+        // base directories: they relocate the profile like PI_CODING_AGENT_DIR above
+        "XDG_",   // the allocator (glibc and macOS malloc tuning)
+        "MALLOC", // package managers OMP runs for plugins and Python tooling
+        "NPM_", "UV_",
+        // the interpreter OMP spawns (PYTHONPATH, PYTHONHOME, ...); `eval.py` is bound by PI_PY
+        "PYTHON",
     ];
     let bytes = std::fs::read(exe).unwrap();
     let mut out = BTreeSet::new();
@@ -385,8 +397,11 @@ fn provenance(
     }) {
         return Err(format!("unknown report field {key}: {report}"));
     }
-    match fields.get("overriddenBy") {
-        None | Some(Value::Null) => Ok(None),
+    // A fallback variable that still supplies the effective value beats a pin as surely as an
+    // override does.
+    let given = |field| fields.get(field).filter(|value| !value.is_null());
+    match given("overriddenBy").or_else(|| given("fallbackEnv")) {
+        None => Ok(None),
         Some(Value::String(name)) if names.contains(name) => Ok(Some(name.clone())),
         Some(other) => Err(format!("unclassified override {other}")),
     }
@@ -442,12 +457,10 @@ fn stock_bindings(host: &Hosted) -> BTreeSet<(String, String)> {
     let mut jobs: Vec<(String, String, String)> = Vec::new();
     for (id, value) in &pinned {
         let value = text(value);
-        let mut probes = vec![
-            "0".to_owned(),
-            "1".to_owned(),
-            "yes".to_owned(),
-            value.clone(),
-        ];
+        let mut probes: Vec<String> = ["0", "1", "yes", "no", "on", "off", "true", "false"]
+            .map(str::to_owned)
+            .into();
+        probes.push(value.clone());
         probes.sort();
         probes.dedup();
         for probe in probes {
@@ -574,6 +587,11 @@ fn provenance_accepts_omitted_overrides_and_rejects_wrong_bindings() {
     }
     let bound = json!({ "key": id, "value": false, "overriddenBy": "PI_PY" });
     assert_eq!(provenance(&bound, &names, id), Ok(Some("PI_PY".to_owned())));
+    let fallback = json!({ "key": id, "value": "", "overriddenBy": null, "fallbackEnv": "PI_JS" });
+    assert_eq!(
+        provenance(&fallback, &names, id),
+        Ok(Some("PI_JS".to_owned()))
+    );
     // Incomplete discovery fails closed.
     for report in [
         json!({ "key": id, "value": false, "overriddenBy": "PI_UNKNOWN" }),

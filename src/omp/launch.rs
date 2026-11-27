@@ -103,6 +103,20 @@ pub(crate) fn session_env(
     token: &str,
     role: Role,
 ) -> Vec<(String, String)> {
+    session_env_with(credentials, socket, token, role, |name| {
+        std::env::var(name).ok()
+    })
+}
+
+/// [`session_env`] with the hub's own variables read through `lookup`, so tests can supply a
+/// hostile value for a pinned name.
+pub(crate) fn session_env_with(
+    credentials: &[String],
+    socket: &Path,
+    token: &str,
+    role: Role,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> Vec<(String, String)> {
     let pins = policy_env(role);
     let mut env: Vec<(String, String)> = super::child_env()
         .into_iter()
@@ -112,7 +126,7 @@ pub(crate) fn session_env(
         if pins.iter().any(|(pinned, _)| pinned == name) {
             continue;
         }
-        if let Ok(value) = std::env::var(name) {
+        if let Some(value) = lookup(name) {
             env.push((name.clone(), value));
         }
     }
@@ -383,11 +397,18 @@ mod tests {
                     .fold(&o, |value, segment| &value[segment]);
                 assert_eq!(value, &json!(false), "{} {role:?}", binding.name);
             }
-            let env = session_env(
-                &["PI_PY".into(), "PI_JS".into(), "CATALY_NOT_SET".into()],
+            // The hub itself has every listed name set to "1": the skip, not an empty environment,
+            // keeps a pinned name from being passed on.
+            let env = session_env_with(
+                &["PI_PY".into(), "PI_JS".into(), "CATALY_CRED".into()],
                 Path::new("/s.sock"),
                 "t",
                 role,
+                |_| Some("1".into()),
+            );
+            assert!(
+                env.contains(&("CATALY_CRED".into(), "1".into())),
+                "an unpinned credential passes: {env:?}"
             );
             let bound = env
                 .iter()
