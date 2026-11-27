@@ -263,12 +263,11 @@ impl<T: Runtime> Intake<T> {
             let full = page.len() == UNTOLD_PAGE;
             for q in page {
                 let outcome = q.outcome.clone().unwrap_or_default();
-                match pressed_option(&q, &outcome) {
-                    Some(n) => self.tell_pressed(&q, picked(&q, n), &shown(&q, n)),
-                    None => {
-                        let raw = outcome.strip_prefix(PRESS).unwrap_or(&outcome).to_string();
-                        self.tell_pressed(&q, raw, "");
-                    }
+                if let Some(n) = pressed_option(&q, &outcome) {
+                    self.tell_pressed(&q, picked(&q, n), &shown(&q, n));
+                } else {
+                    let raw = outcome.strip_prefix(PRESS).unwrap_or(&outcome).to_string();
+                    self.tell_pressed(&q, raw, "");
                 }
             }
             if !full {
