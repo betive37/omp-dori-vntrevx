@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use serde::Deserialize as _;
 use serde_json::{Value, json};
 
 use super::client::Client;
@@ -56,6 +57,13 @@ fn print_view(v: &Value) {
             out::line(&format!("dialogs  {dialogs} pending"));
         }
     }
+    if let Some(reports) = v.get("tools").and_then(Value::as_array) {
+        for report in reports {
+            if let Ok(report) = crate::proto::ToolCapabilities::deserialize(report) {
+                print_tools(&report);
+            }
+        }
+    }
     out::line(&format!(
         "inbox    {} waiting, {} notes for the next wake, {} sent, {} in doubt",
         text(v, "waiting"),
@@ -63,6 +71,13 @@ fn print_view(v: &Value) {
         text(v, "sent"),
         text(v, "in_doubt")
     ));
+}
+
+/// The same session inventory line in both `status` and `lead status`.
+pub(super) fn print_tools(report: &crate::proto::ToolCapabilities) {
+    let names = report.nonstock.join(", ");
+    let names = if names.is_empty() { "none" } else { &names };
+    out::line(&format!("tools    {}: non-stock {names}", report.session));
 }
 
 fn simple(hub: &mut Client, name: &str, params: Value, as_json: bool) -> Result<(), Failure> {

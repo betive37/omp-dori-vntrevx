@@ -300,7 +300,33 @@ pub(crate) async fn serve<R, W>(
         let method = request.method.clone();
         match method.as_str() {
             "bridge.ping" | "bridge.reply" => {}
-            "bridge.event" => event(hub, &handle, role, &request.params),
+            "bridge.event" => {
+                if let Some(current) = request.params.get("session").and_then(Value::as_str) {
+                    current.clone_into(&mut session);
+                }
+                event(hub, &handle, role, &request.params);
+            }
+            "bridge.capabilities" => {
+                let report =
+                    serde_json::from_value::<crate::proto::ToolCapabilities>(request.params);
+                let reply = match report {
+                    Ok(mut report) if report.session == session => {
+                        report.nonstock.sort_unstable();
+                        report.nonstock.dedup();
+                        hub.links.report_tools(&key, &handle, report);
+                        Response::ok(request.id, json!({}))
+                    }
+                    Ok(_) => Response::err(
+                        request.id,
+                        code::BAD_REQUEST,
+                        "capability session does not match the connection",
+                    ),
+                    Err(error) => Response::err(request.id, code::BAD_REQUEST, error.to_string()),
+                };
+                if tx.send(reply).await.is_err() {
+                    break;
+                }
+            }
             "bridge.form" => {
                 let reply = form.unwrap_or_else(|| json!({ "mirrored": false }));
                 let _ = tx.send(Response::ok(request.id, reply)).await;

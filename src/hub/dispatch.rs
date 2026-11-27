@@ -590,6 +590,14 @@ async fn lead_method(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure
                     "bridge".into(),
                     serde_json::to_value(bridge).unwrap_or(Value::Null),
                 );
+                let reports = view
+                    .session
+                    .as_ref()
+                    .map_or_else(Vec::new, |s| hub.links.tool_reports(Some(&s.handle)));
+                map.insert(
+                    "tools".into(),
+                    serde_json::to_value(reports).map_err(|e| refused(e.to_string()))?,
+                );
             }
             Ok(value)
         }

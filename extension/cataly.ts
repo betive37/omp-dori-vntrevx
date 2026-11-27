@@ -142,6 +142,7 @@ export class Bridge {
 	delivered = new Map<string, { key: string; out: Json }>();
 	forms = new Map<string, (answer: unknown) => void>();
 	token: string | undefined; parent = "";
+	private reportedCapabilities: string | undefined;
 
 	constructor(readonly pi: Pi, readonly deps: Deps) {
 		this.token = deps.env.CATALY_LAUNCH || undefined;
@@ -163,6 +164,7 @@ export class Bridge {
 				owners.set(String(ctx.agent?.id), id);
 				const answer = await this.request("bridge.switch", { session: id, file: this.file(), ...transition }, TOOL_MS);
 				this.apply(answer);
+				this.capabilities();
 			}
 			return;
 		}
@@ -217,6 +219,8 @@ export class Bridge {
 		this.apply(answer);
 		if (!this.wired) this.wire_up(answer);
 		else this.resend();
+		this.reportedCapabilities = undefined; // A new connection needs its own snapshot, including after a hub restart.
+		this.capabilities();
 		if (this.warned) this.status(answer.status as string | undefined);
 		this.warned = false;
 	}
@@ -324,6 +328,21 @@ export class Bridge {
 		if (this.ctx && !marked(this.ctx)) safe(() => this.pi.appendEntry(MARKER, { v: PROTOCOL }));
 	}
 
+	/** Public OMP provenance avoids a second stock catalog. Report live integrations, not disabled registrations. */
+	private capabilities(): void {
+		if (!this.wire || !this.key) return;
+		const active = new Set(this.pi.getActiveTools());
+		const nonstock = [...new Set(this.pi.getAllTools()
+			.filter(tool => active.has(tool.name) && tool.sourceInfo.source !== "builtin"
+				&& tool.name !== "cataly_lead" && tool.name !== "cataly_lane")
+			.map(tool => tool.name))].sort();
+		const params = { session: this.session, nonstock };
+		const snapshot = JSON.stringify(params);
+		if (snapshot === this.reportedCapabilities) return;
+		this.send("bridge.capabilities", params);
+		this.reportedCapabilities = snapshot;
+	}
+
 	/** After the first acceptance: handlers, tools and the heartbeat (EXT req. 4, 15, 17). */
 	wire_up(answer: Json): void {
 		this.wired = true;
@@ -356,7 +375,7 @@ export class Bridge {
 		pi.on("session_shutdown", (_e, ctx) => this.shutdown(ctx));
 		pi.on("session_branch", (e, ctx) => this.transition("session_branch", e.reason, ctx));
 		pi.on("session_tree", (_e, ctx) => this.transition("session_tree", undefined, ctx));
-		pi.on("turn_start", async (_e, ctx) => void (await this.barrier(ctx), this.main(ctx) && this.event("turn_start")));
+		pi.on("turn_start", async (_e, ctx) => void (this.capabilities(), await this.barrier(ctx), this.main(ctx) && this.event("turn_start")));
 		pi.on("message_end", (e, ctx) => this.message(e, ctx));
 		pi.on("tool_execution_start", (e, ctx) => this.toolStart(e, ctx));
 		pi.on("tool_execution_end", (e, ctx) => this.toolEnd(e, ctx));
@@ -380,6 +399,7 @@ export class Bridge {
 	beat(): void {
 		if (!this.wire) return;
 		if (Date.now() - this.lastRx > SILENT_MS) return this.wire.close();
+		this.capabilities(); // Delayed MCP registration has no public tools-changed event.
 		this.send("bridge.ping", {});
 	}
 
@@ -389,6 +409,7 @@ export class Bridge {
 		this.calls.clear();
 		this.session = String(ctx.sessionManager?.getSessionId?.() ?? this.session);
 		this.event(kind, { file: this.file(), reason });
+		this.capabilities();
 	}
 
 	/** A user's switch, branch or tree move (EXT req. 31; PATCH-01 rules 6-7): cancelled while a hub command is

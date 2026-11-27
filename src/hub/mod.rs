@@ -123,6 +123,7 @@ impl Hub {
             lead,
             resumed: self.resumed(),
             workers: self.workers.list(),
+            tools: self.links.tool_reports(None),
         })
     }
 

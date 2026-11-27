@@ -481,6 +481,9 @@ fn print_status(s: &Status) {
             "lead     no lead configured: messages wait; set one with cataly setup --lead-model provider/id",
         ),
     }
+    for report in &s.tools {
+        lead::print_tools(report);
+    }
     if s.task_restarts > 0 || s.panics > 0 {
         out::line(&format!(
             "tasks    {} restarts, {} panics",

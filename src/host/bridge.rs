@@ -9,6 +9,7 @@ use serde::Serialize;
 
 use super::Role;
 use crate::sys::now_ms;
+use crate::{log, proto::ToolCapabilities};
 
 /// A launch token is good for one hello within this time of the launch.
 const TOKEN_LIFE_MS: i64 = 10 * 60 * 1000;
@@ -54,6 +55,8 @@ struct Inner {
     ports: HashMap<String, Arc<super::tern::Port>>,
     /// The OMP process of each session: the hub's own child, or the peer of its accepted bridge.
     pids: VecDeque<(u32, String, Role)>,
+    /// Reports belong to connections, so subagents cannot replace their parent's inventory.
+    capabilities: HashMap<String, (String, ToolCapabilities)>,
 }
 
 /// Launch tokens and accepted bridge connections of this hub run.
@@ -127,6 +130,9 @@ impl Links {
     /// An accepted connection; replaces an earlier one of the same session.
     pub(crate) fn connect(&self, handle: &str, role: Role, key: &str, session: &str) {
         let mut inner = self.lock();
+        if let Some(previous) = inner.links.remove(handle) {
+            inner.capabilities.remove(&previous.key);
+        }
         inner.links.insert(
             handle.to_string(),
             Link {
@@ -162,7 +168,9 @@ impl Links {
 
     /// The connection with `key` closed; a newer connection of the session is left alone.
     pub(crate) fn disconnect(&self, handle: &str, key: &str) {
-        if let Some(link) = self.lock().links.get_mut(handle)
+        let mut inner = self.lock();
+        inner.capabilities.remove(key);
+        if let Some(link) = inner.links.get_mut(handle)
             && link.key == key
         {
             link.view.connected = false;
@@ -186,6 +194,44 @@ impl Links {
             .links
             .get(handle)
             .map_or_default(|l| l.view.clone())
+    }
+
+    /// Records a changed inventory from an accepted connection, including an empty inventory.
+    pub(crate) fn report_tools(&self, key: &str, handle: &str, report: ToolCapabilities) {
+        let mut inner = self.lock();
+        let previous = inner.capabilities.get_mut(key);
+        if previous.as_ref().is_some_and(|(_, old)| *old == report) {
+            return;
+        }
+        log::info(
+            "session non-stock tools changed",
+            &[
+                ("session", &report.session),
+                ("handle", &handle),
+                ("nonstock", &report.nonstock.join(", ")),
+            ],
+        );
+        match previous {
+            Some((_, stored)) => *stored = report,
+            None => {
+                inner
+                    .capabilities
+                    .insert(key.to_string(), (handle.to_string(), report));
+            }
+        }
+    }
+
+    /// Current reports, optionally restricted to one lead or lane and its subagents.
+    pub(crate) fn tool_reports(&self, handle: Option<&str>) -> Vec<ToolCapabilities> {
+        let mut reports: Vec<_> = self
+            .lock()
+            .capabilities
+            .values()
+            .filter(|(owner, _)| handle.is_none_or(|h| h == owner))
+            .map(|(_, report)| report.clone())
+            .collect();
+        reports.sort_unstable_by(|a, b| a.session.cmp(&b.session));
+        reports
     }
 
     /// The answer already given to a tool call ID, so a retry does nothing twice (EXT req. 18).
