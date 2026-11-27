@@ -2197,3 +2197,43 @@ fn review_an_uncertain_first_part_keeps_its_destination_after_restart() {
     assert_eq!(fake.bot_messages(source).len(), 1);
     assert!(hub.stop().success());
 }
+
+#[test]
+fn review_a_moved_part_restores_its_reply_link_after_restart() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000304";
+    fake.script_in(source, &[0, 403]);
+    let mut channel = vec![0];
+    channel.extend([400; 64]);
+    fake.script_in(CH, &channel);
+    ask_with_thread(
+        &fake,
+        800_000_000_000_000_304,
+        "move then restart before confirmation",
+    );
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() >= 2).then_some(())
+    });
+    assert!(hub.stop().success());
+    fake.unscript_in(CH);
+    hub.start();
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    let messages = fake.bot_messages(CH);
+    assert_eq!(
+        messages.len(),
+        2,
+        "one continuation note and one moved part"
+    );
+    assert_eq!(messages[1]["message_reference"]["message_id"], source);
+    assert!(hub.stop().success());
+}

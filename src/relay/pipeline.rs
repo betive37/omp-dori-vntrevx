@@ -1148,9 +1148,23 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             Some(room) => (room != h.room).then(|| room.to_string()),
             None => self.answer_room(&h.room, &h.message).await?,
         };
+        // A pending part pinned to the channel after a confirmed thread part is the first moved
+        // reply. The note was attempted before its destination was committed.
+        let moved_from = if room.is_none() {
+            parts
+                .iter()
+                .rev()
+                .find(|part| part.state == "confirmed")
+                .and_then(|part| part.destination.as_ref())
+                .filter(|previous| previous.as_str() != h.room)
+                .cloned()
+        } else {
+            None
+        };
         let target = Target {
             room,
-            ..Target::default()
+            noted: moved_from.is_some(),
+            moved_from,
         };
         if let Some(room) = &target.room {
             log::info(
