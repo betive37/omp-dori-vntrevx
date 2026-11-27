@@ -348,7 +348,11 @@ impl<R: Runtime> Lanes<R> {
     /// session file. A delivery the drop left unconfirmed is then found in that file or ends in
     /// doubt; it is never resent (DESIGN 9.3).
     pub(super) async fn reattach(self: &Arc<Self>) {
-        if self.stopping.load(std::sync::atomic::Ordering::Acquire) {
+        if self
+            .starts
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
             return;
         }
         let Ok(rows) = self.env.store.read(|r| r.lanes(false)).await else {
@@ -367,6 +371,7 @@ impl<R: Runtime> Lanes<R> {
                 || rec.state == State::Starting
                 || rec.session_id.is_none()
                 || self.session(&rec.key).is_some()
+                || rec.start_note.as_deref() == Some("start failed; work retained")
                 || self.worker_up(&worker).await.is_err()
             {
                 continue;
@@ -384,6 +389,7 @@ impl<R: Runtime> Lanes<R> {
                     true,
                     &rec.key,
                 )
+                .for_owner()
                 .with("lane", &rec.key)
                 .with("detail", format!("{worker} is back: {line}")),
             );

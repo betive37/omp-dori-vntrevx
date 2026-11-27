@@ -2,7 +2,7 @@
 //! implementation, the session actor, the per-target inbox with delivery confirmation from session
 //! files, and the standing lead.
 //!
-//! `Runtime::start` returns a session handle implementing [`Control`]; the terminal runtime of
+//! `Runtime::start_supervised` returns a session handle implementing [`Control`]; the terminal runtime of
 //! milestone 6 implements the same two traits over the bridge connection instead of rpc-ui.
 
 pub(crate) mod bridge;
@@ -288,12 +288,6 @@ pub(crate) trait Runtime: Send + Sync + 'static {
 
     /// The runtime's name as stored with each session (`headless`, `tern`).
     fn kind(&self) -> &'static str;
-
-    /// Spawns and binds a session; returns only after the handshake completed or failed (HOST req. 28).
-    fn start(
-        &self,
-        spec: StartSpec,
-    ) -> impl Future<Output = Result<(Arc<Self::Session>, Started), StartError>> + Send;
 
     /// Cooperative startup cancellation: ownership cleanup finishes before this returns.
     fn start_supervised(

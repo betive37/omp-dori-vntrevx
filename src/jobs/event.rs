@@ -69,6 +69,10 @@ pub(crate) enum EventKind {
     PressureBusy,
     LeadStarted,
     LeadNotStarted,
+    /// The lead's start passed the 15 s notice; told to the owner directly, never only the lead.
+    LeadSlow,
+    /// The lead is held until the owner acts; told to the owner directly, once per hold.
+    LeadHeld,
     SessionStopped,
     SessionFenced,
     SpendOffer,
@@ -115,6 +119,8 @@ pub(crate) enum EventKind {
     UpdateDone,
     /// The hub runs an older version than its previous run.
     UpdateRolledBack,
+    /// The final state of the sessions after an update whose first message said they recover.
+    UpdateSessions,
 }
 
 /// Kind, wire name, template fields and default wording.
@@ -125,7 +131,7 @@ type KindRow = (
     &'static str,
 );
 
-const KINDS: [KindRow; 68] = [
+const KINDS: [KindRow; 71] = [
     (
         EventKind::HubStarted,
         "hub.started",
@@ -354,6 +360,18 @@ const KINDS: [KindRow; 68] = [
         "lead not started: {reason}",
     ),
     (
+        EventKind::LeadSlow,
+        "lead.slow",
+        &["notice", "session"],
+        "{notice}",
+    ),
+    (
+        EventKind::LeadHeld,
+        "lead.held",
+        &["notice", "reason", "session"],
+        "{notice}",
+    ),
+    (
         EventKind::SessionStopped,
         "session.stopped",
         &["role", "how", "detail"],
@@ -545,6 +563,12 @@ const KINDS: [KindRow; 68] = [
         &["previous", "latest", "sessions"],
         "Rolled back to {latest}. {previous} -> {latest} {sessions}",
     ),
+    (
+        EventKind::UpdateSessions,
+        "update.sessions",
+        &["latest", "sessions"],
+        "After the update to {latest}: {sessions}",
+    ),
 ];
 
 impl EventKind {
@@ -568,6 +592,12 @@ impl EventKind {
 
     fn default_template(self) -> &'static str {
         self.row().3
+    }
+
+    /// The default wording, parsed; the table test proves every default parses.
+    pub(crate) fn default_wording(self) -> Template {
+        Template::parse(self.default_template(), self)
+            .unwrap_or_else(|_| Template(vec![Part::Text(self.default_template().into())]))
     }
 }
 
@@ -653,6 +683,8 @@ pub(crate) struct Emit {
     pub(crate) values: Vec<(&'static str, String)>,
     pub(crate) body: Option<String>,
     pub(crate) body_path: Option<String>,
+    /// A hub event that also goes to the owner's home room, line breaks kept.
+    pub(crate) owner: bool,
 }
 
 impl Emit {
@@ -665,7 +697,14 @@ impl Emit {
             values: Vec::new(),
             body: None,
             body_path: None,
+            owner: false,
         }
+    }
+
+    /// Sends a hub event to the owner's home room too ([`owner_post`]).
+    pub(crate) fn for_owner(mut self) -> Self {
+        self.owner = true;
+        self
     }
 
     /// Adds a template field. Taking the value by value lets callers pass numbers and strings alike.
@@ -710,6 +749,32 @@ pub(crate) fn build(
             destinations.to_vec()
         },
     }
+}
+
+/// A hub event for the owner in `template`'s wording, to `destinations`, else the owner's home
+/// room when a relay has one. The wording keeps its line breaks; each line is cleaned and bounded
+/// like any event text.
+pub(crate) fn owner_post(
+    emit: Emit,
+    template: &Template,
+    destinations: Option<Vec<String>>,
+    config: &crate::config::Config,
+    at_ms: i64,
+) -> NewEvent {
+    use crate::config::HOME_DESTINATION;
+    let text = template.render(&emit.values);
+    let destinations = destinations.unwrap_or_else(|| {
+        config
+            .destination(HOME_DESTINATION)
+            .map_or_else(Vec::new, |_| vec![HOME_DESTINATION.to_string()])
+    });
+    let mut event = build("hub", emit, &[], false, &destinations, at_ms);
+    event.text = text
+        .lines()
+        .map(|line| one_line(line, TEXT_MAX))
+        .collect::<Vec<_>>()
+        .join("\n");
+    event
 }
 
 /// The named fields as one JSON object, `None` when there are none.

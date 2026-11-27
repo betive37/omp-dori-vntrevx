@@ -12,6 +12,7 @@
 mod support;
 
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,6 +43,15 @@ fn lane_hub(extra: &str) -> (TestHub, PathBuf) {
         work.display()
     ));
     (hub, work)
+}
+
+fn owner_room(hub: &TestHub) -> FakeDiscord {
+    let fake = FakeDiscord::start();
+    fake.channel(CH, 0, None);
+    let token = hub.private_file("owner-token", "fake-token");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!("{config}{}", fake.config(&token, OWNER, &[CH])));
+    fake
 }
 
 fn data(hub: &TestHub) -> PathBuf {
@@ -242,6 +252,7 @@ fn open_preview_refusals_and_dedupe() {
 #[test]
 fn model_mismatch_holds_the_start() {
     let (mut hub, _) = lane_hub("");
+    let owner = owner_room(&hub);
     hub.fixture("omp", "model", Some("fake/other"));
     start(&mut hub);
     let out = open(&hub, "m-1", &json!({}));
@@ -269,6 +280,15 @@ fn model_mismatch_holds_the_start() {
             .unwrap()
             .contains("start held: model")
     );
+    owner.wait(WAIT, |fake| {
+        fake.bot_messages(CH)
+            .iter()
+            .any(|message| {
+                let text = message["content"].as_str().unwrap();
+                text.contains("m-1") && text.contains("start held: model")
+            })
+            .then_some(())
+    });
     hub.stop();
 }
 
@@ -367,10 +387,7 @@ fn reopen_leaves_the_claim_notice_behind(hub: &TestHub, closed: &Value) {
     let note = json!({ "key": "c-ok", "note": "one more thing" });
     let reopened = lane(hub, "reopen", &note).unwrap();
     assert!(
-        reopened
-            .as_str()
-            .unwrap()
-            .starts_with("reopened on session"),
+        reopened.as_str().unwrap().starts_with("resumed on session"),
         "{reopened}"
     );
     let file = record(hub, "c-ok")["session_file"]
@@ -597,8 +614,16 @@ fn park_and_reopen_on_the_exact_session() {
         1,
     );
     std::fs::write(path, forged).unwrap();
-    let refused = lane(&hub, "reopen", &json!({ "key": "k-2" })).unwrap_err();
-    assert!(refused.contains("another session"), "{refused}");
+    let refused = lane(&hub, "reopen", &json!({ "key": "k-2" })).unwrap();
+    let refused = refused.as_str().unwrap();
+    assert!(
+        refused.starts_with("held:") && refused.contains("another session"),
+        "{refused}"
+    );
+    let held = record(&hub, "k-2");
+    assert_eq!(held["state"], "held");
+    assert_eq!(held["session_id"], k2["session_id"]);
+    assert_eq!(held["run_id"], k2["run_id"]);
     hub.stop();
 }
 
@@ -870,6 +895,7 @@ fn reports_reach_the_thread_by_policy() {
 #[test]
 fn hub_restart_brings_lanes_back_on_their_files() {
     let (mut hub, _) = lane_hub("");
+    let owner = owner_room(&hub);
     start(&mut hub);
     for key in ["a-1", "a-2", "a-3"] {
         open(&hub, key, &json!({}));
@@ -910,6 +936,15 @@ fn hub_restart_brings_lanes_back_on_their_files() {
     let text = recap[0]["text"].as_str().unwrap();
     assert!(text.contains("a-3: restarted; stays held"), "{text}");
     assert!(text.contains("a-1: restarted; goal active"), "{text}");
+    owner.wait(WAIT, |fake| {
+        fake.bot_messages(CH)
+            .iter()
+            .any(|message| {
+                let text = message["content"].as_str().unwrap();
+                text.contains("a-1: restarted") && text.contains("a-3: restarted")
+            })
+            .then_some(())
+    });
     hub.stop();
 }
 
@@ -1309,5 +1344,372 @@ fn a_lane_report_wakes_the_sleeping_lead_on_its_session() {
         (text.contains("stuck-mark-9") && text.contains("progress-mark-7")).then_some(())
     });
     drop(b);
+    hub.stop();
+}
+
+/// Withhold ready only on resume; probes and fresh launches remain real fake-OMP exchanges.
+fn stall_resumes(hub: &TestHub) {
+    let bin = hub.root.join("bin");
+    std::fs::rename(bin.join("omp"), bin.join("omp-real")).unwrap();
+    std::fs::write(
+        bin.join("omp"),
+        "#!/bin/sh\nfor arg do\n case \"$arg\" in --resume=*) printf 'attempt\\n' >> \"$(dirname \"$0\")/omp-data/resume-started\"; cat >/dev/null; exit 1;; esac\ndone\nexec \"$(dirname \"$0\")/omp-real\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("omp"), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn pushed_repo(work: &Path) -> PathBuf {
+    let repo = work.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("a.txt"), "original").unwrap();
+    std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let origin = work.join("origin.git");
+    git(work, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "HEAD:main"]);
+    repo
+}
+
+fn resume_preserves_work(kind: &str, reopen: bool) {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "preserve",
+        &json!({
+            "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
+        }),
+    );
+    if kind == "dirty" {
+        lane(
+            &hub,
+            "pause",
+            &json!({"key":"preserve","reason":"owner pause"}),
+        )
+        .unwrap();
+    }
+    let before = record(&hub, "preserve");
+    let files: &[(&str, &str)] = match kind {
+        "dirty" => &[("a.txt", "tracked work"), ("new.txt", "untracked work")],
+        "commit" => &[("a.txt", "unpushed work")],
+        "ignored" => &[("ignored.txt", "unique ignored work")],
+        _ => panic!("unknown case"),
+    };
+    for (file, text) in files {
+        std::fs::write(tree.join(file), text).unwrap();
+    }
+    if kind == "commit" {
+        git(&tree, &["add", "a.txt"]);
+        git(&tree, &["commit", "-qm", "unpublished"]);
+    }
+    if reopen {
+        lane(
+            &hub,
+            "park",
+            &json!({"key":"preserve", "reason":"wait", "condition":"owner"}),
+        )
+        .unwrap();
+        stall_resumes(&hub);
+        assert_recovering_reopen(&hub, "preserve");
+    } else {
+        hub.stop();
+        stall_resumes(&hub);
+        start(&mut hub);
+        hub.until(Duration::from_secs(400), || {
+            hub.events()
+                .iter()
+                .any(|e| e["kind"] == "lane.recap")
+                .then_some(())
+        });
+    }
+    let after = record(&hub, "preserve");
+    assert_eq!(after["state"], "held", "{after}");
+    assert!(
+        after["lost"].as_str().unwrap().contains("Timeout"),
+        "{after}"
+    );
+    assert_eq!(after["worktrees"], json!([tree]));
+    for field in [
+        "session_id",
+        "session_file",
+        "cwd",
+        "worktrees",
+        "thread",
+        "run_id",
+    ] {
+        assert_eq!(after[field], before[field], "{field}: {after}");
+    }
+    assert_eq!(after["live"], false);
+    for (file, text) in files {
+        assert_eq!(std::fs::read_to_string(tree.join(file)).unwrap(), *text);
+    }
+    assert_eq!(
+        goal(&hub, &before["session_id"]),
+        if kind == "dirty" || reopen {
+            "paused"
+        } else {
+            "active"
+        }
+    );
+    hub.stop();
+}
+
+fn assert_recovering_reopen(hub: &TestHub, key: &str) {
+    let asked = Instant::now();
+    let response = lane(hub, "reopen", &json!({"key":key})).unwrap();
+    assert!(
+        response.as_str().unwrap().starts_with("recovering:"),
+        "{response}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(120),
+        "the response must not wait for the whole episode"
+    );
+    hub.until(WAIT, || {
+        (std::fs::read_to_string(data(hub).join("resume-started"))
+            .unwrap()
+            .lines()
+            .count()
+            == 2)
+            .then_some(())
+    });
+    hub.until(Duration::from_secs(400), || {
+        record(hub, key)["status"]
+            .as_str()
+            .is_some_and(|status| status.contains("start failed; work retained"))
+            .then_some(())
+    });
+}
+
+#[test]
+fn resume_timeout_keeps_dirty_worktree() {
+    resume_preserves_work("dirty", false);
+}
+
+#[test]
+fn resume_timeout_keeps_unpushed_worktree() {
+    resume_preserves_work("commit", false);
+}
+
+#[test]
+fn resume_timeout_keeps_ignored_worktree() {
+    resume_preserves_work("ignored", false);
+}
+
+#[test]
+fn reopen_timeout_keeps_identity_and_worktree() {
+    resume_preserves_work("ignored", true);
+}
+
+#[test]
+fn completed_close_preserves_ignored_files() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "ignored-close",
+        &json!({
+            "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
+        }),
+    );
+    std::fs::write(tree.join("ignored.txt"), "irreplaceable").unwrap();
+    lane(
+        &hub,
+        "close",
+        &json!({"key":"ignored-close", "note":"done"}),
+    )
+    .unwrap();
+    let rec = record(&hub, "ignored-close");
+    assert_eq!(rec["state"], "closed");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("ignored.txt")).unwrap(),
+        "irreplaceable"
+    );
+    assert!(rec["receipt"].to_string().contains("kept"), "{rec}");
+    hub.stop();
+}
+
+#[test]
+fn completed_close_removes_clean_worktree() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "clean-close",
+        &json!({
+            "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
+        }),
+    );
+    lane(&hub, "close", &json!({"key":"clean-close", "note":"done"})).unwrap();
+    assert!(!tree.exists());
+    let rec = record(&hub, "clean-close");
+    assert_eq!(rec["state"], "closed");
+    assert!(rec["receipt"].to_string().contains("removed"), "{rec}");
+    hub.stop();
+}
+
+/// A pre-spawn failure proves no writer existed. Git locking is an actual removal refusal.
+#[test]
+fn failed_fresh_worktree_removal_keeps_record() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    let git_bin = Command::new("which").arg("git").output().unwrap();
+    let git_bin = String::from_utf8(git_bin.stdout).unwrap();
+    let wrapper = hub.root.join("bin/git");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\n\"{}\" \"$@\" || exit $?\nif [ \"$1 $2\" = 'worktree add' ]; then \"{}\" worktree lock '{}'; fi\n",
+        git_bin.trim(), git_bin.trim(), tree.display()
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(hub.root.join("bin"))
+            .chain(std::env::split_paths(&support::path_without_omp())),
+    )
+    .unwrap();
+    hub.env.push(("PATH".into(), PathBuf::from(path)));
+    start(&mut hub);
+    std::fs::create_dir_all(hub.state().join("sessions/lanes")).unwrap();
+    std::fs::write(
+        hub.state().join("sessions/lanes/refused"),
+        "not a directory",
+    )
+    .unwrap();
+    let result = lane(
+        &hub,
+        "open",
+        &json!({
+            "key":"refused", "title":"Refused allocation", "brief":"Work.",
+            "checks":[{"kind":"command","argv":["true"]}], "cwd":repo,
+            "worktree":{"path":tree,"branch":"refused","base":"HEAD"}
+        }),
+    );
+    assert!(result.is_err());
+    let rec = record(&hub, "refused");
+    assert_eq!(rec["state"], "held", "{rec}");
+    assert!(
+        rec["receipt"]
+            .to_string()
+            .contains("git worktree remove refused"),
+        "{rec}"
+    );
+    assert!(tree.is_dir());
+    hub.stop();
+}
+
+#[test]
+fn queued_fresh_failure_removes_only_its_unused_worktree() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let owned = work.join("owned");
+    let fresh = work.join("fresh");
+    start(&mut hub);
+    open(
+        &hub,
+        "existing",
+        &json!({"cwd":repo,
+        "worktree":{"path":owned,"branch":"owned","base":"HEAD"}}),
+    );
+    let before = record(&hub, "existing");
+    std::fs::write(owned.join("ignored.txt"), "another run's work").unwrap();
+    open(&hub, "predecessor", &json!({}));
+    open(
+        &hub,
+        "queued-fail",
+        &json!({"cwd":repo, "after":["predecessor"],
+        "worktree":{"path":fresh,"branch":"fresh","base":"HEAD"}}),
+    );
+    std::fs::write(
+        hub.state().join("sessions/lanes/queued-fail"),
+        "not a directory",
+    )
+    .unwrap();
+    lane(&hub, "close", &json!({"key":"predecessor","note":"done"})).unwrap();
+    assert!(lane(&hub, "start", &json!({"key":"queued-fail"})).is_err());
+    let queued = lane(&hub, "queued", &json!({})).unwrap();
+    assert!(queued.to_string().contains("failed"), "{queued}");
+    assert!(
+        !fresh.exists(),
+        "only the newly allocated unused worktree is removed"
+    );
+    assert_eq!(record(&hub, "existing")["run_id"], before["run_id"]);
+    assert_eq!(
+        std::fs::read_to_string(owned.join("ignored.txt")).unwrap(),
+        "another run's work"
+    );
+    hub.stop();
+}
+
+#[test]
+fn parking_cancels_an_existing_session_start_without_losing_work() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "cancel-resume",
+        &json!({
+            "cwd":repo, "worktree":{"path":tree,"branch":"cancel-resume","base":"HEAD"}
+        }),
+    );
+    std::fs::write(tree.join("ignored.txt"), "retained on cancellation").unwrap();
+    let before = record(&hub, "cancel-resume");
+    hub.stop();
+    stall_resumes(&hub);
+    start(&mut hub);
+    hub.until(WAIT, || {
+        data(&hub).join("resume-started").exists().then_some(())
+    });
+    let parked = lane(
+        &hub,
+        "park",
+        &json!({
+            "key":"cancel-resume", "reason":"owner stopped recovery", "condition":"explicit retry"
+        }),
+    )
+    .unwrap();
+    assert_eq!(parked, "closed parked");
+    let after = record(&hub, "cancel-resume");
+    assert_eq!(after["session_id"], before["session_id"]);
+    assert_eq!(after["run_id"], before["run_id"]);
+    assert_eq!(after["live"], false);
+    assert_eq!(
+        std::fs::read_to_string(tree.join("ignored.txt")).unwrap(),
+        "retained on cancellation"
+    );
+    hub.stop();
+}
+
+#[test]
+fn lane_status_selects_the_positional_key() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "cli-one", &json!({}));
+    open(&hub, "cli-two", &json!({}));
+    let status = hub.cli(&["lane", "status", "cli-one"]);
+    assert!(status.status.success(), "{status:?}");
+    let text = String::from_utf8(status.stdout).unwrap();
+    assert!(text.contains("cli-one"), "{text}");
+    assert!(!text.contains("cli-two"), "{text}");
+    let json_status = hub.json(&["lane", "status", "cli-two", "--json"]);
+    let text = json_status.as_str().unwrap();
+    assert!(
+        text.contains("cli-two") && !text.contains("cli-one"),
+        "{text}"
+    );
     hub.stop();
 }

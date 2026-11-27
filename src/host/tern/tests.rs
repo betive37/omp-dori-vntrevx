@@ -86,7 +86,9 @@ async fn missing_tern_is_refused_with_an_install_hint() {
         agent_start: Latency::default(),
         links: Arc::default(),
     };
-    let Err(StartError::Refused(reason)) = tern.start(spec("t0", None)).await else {
+    let (_keep, cancel) = tokio::sync::watch::channel(false);
+    let Err(StartError::Refused(reason)) = tern.start_supervised(spec("t0", None), cancel).await
+    else {
         panic!("a start without Tern must be refused");
     };
     assert!(reason.contains("install Tern"), "{reason}");

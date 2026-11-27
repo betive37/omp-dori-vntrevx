@@ -221,7 +221,7 @@ Present means the hub keeps one standing lead session. Absent means no lead.
 | `model` | string | **required** | `provider/id` | The lead's model. |
 | `thinking` | string | OMP's default | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto` | Thinking level. |
 | `cwd` | string | your home folder | absolute path | Working folder of a new lead session. A resumed lead keeps the folder its session recorded (a real folder you own), even when this setting or the default changed since. |
-| `session_id` | string | none | any non-blank | The lead resumes exactly this OMP session. |
+| `session_id` | string | none | any non-blank | The lead resumes exactly this earlier conversation, even behind newer ones; if it cannot, the lead is held, never replaced. `cataly lead start --fresh` is refused while it is set. |
 | `instructions` | string | none | absolute path to an owner-only file | Role instructions appended to the lead's system prompt. |
 | `autostart` | boolean | `true` | | Start the lead when the hub starts. |
 | `idle_sleep` | duration | `"2h"` | `"0s"` (off), or `"5m"` to `"720h"` | Put the lead to sleep after it has been fully idle this long: no turn running, no message waiting for it or in doubt, no open question or approval card, no open owner question and no open lane. Quiet notes that wait for its next turn do not keep it awake; they go with its first turn after it wakes. The hub then stops the lead's OMP the orderly way (never during a turn) and keeps its session. A message that would start a turn (yours, an urgent event, a lane report, `cataly lead send`) resumes the same session and is delivered once it is accepted. `cataly lead stop` and `cataly lead start` work as usual on a sleeping lead, and an update keeps it asleep. |
@@ -233,6 +233,31 @@ thinking = "medium"
 cwd = "/home/me/work"
 idle_sleep = "2h"
 ```
+
+Starting and resuming the lead. These limits are fixed, not settings:
+
+- One start attempt has 60 seconds from launching OMP until its conversation is confirmed (ready,
+  protocol and two matching identity readbacks), plus up to 30 seconds to close an attempt that
+  failed. At 15 seconds a still-starting lead is not a failure yet: you get one message saying so.
+- Only an attempt that ran out of time, whose OMP was proven gone, is tried again, on the same
+  conversation, after 1, 2, 4, 8 and 16 seconds, within one 5-minute recovery that a hub restart
+  continues rather than restarts.
+- Anything else holds the lead: an OMP that exits or answers wrongly before it is ready, a
+  conversation file that is missing or does not pass the resume check, an earlier OMP that may
+  still run, or the 5 minutes spent. The conversation, its work and your waiting messages are
+  kept; nothing is replaced or deleted, and a hold stays over hub restarts and updates. You get
+  one message in your home room, in `[hub] language`, with the reason. After fixing the cause run
+  `cataly lead start` to resume the same conversation; `cataly lead start --fresh` starts a new
+  one only if that is what you want. `cataly lead status` and `cataly health` show the target,
+  the attempt, the last cleanup and lease answer, the inbox counts and, while held, the same text.
+- The lead starts a new conversation by itself only the very first time. After a fresh start you
+  asked for fails, the old conversation stays recorded and held until you choose
+  `cataly lead start --fresh` (try fresh again) or `cataly lead start` (resume the old one).
+- Messages wait, untouched, until the conversation is confirmed, and then go once. A message
+  written to the lead just before its OMP stopped is looked up in the whole conversation file.
+  It is written again, once at most and under its original ID, only when the complete file proves
+  it never arrived; a file that ends mid-entry or cannot be read proves nothing, so the message is
+  reported in doubt instead (`cataly lead inbox` lists it, and you decide).
 
 ## `[fallback]`
 
@@ -436,6 +461,19 @@ Defaults for lanes (worker sessions the lead opens) and the rules they run under
 | `thread_member` | boolean | `true` | | Add you to lane threads the hub creates. |
 | `identities.<owner/name>` | string | none | an email address | The commit identity the policy check expects in that repository. |
 
+A lane that was running comes back on its own conversation after a hub restart, an update or
+its worker reconnecting, with the lead's fixed limits: 60 seconds per start attempt, a notice at
+15 seconds, and retries of a timed-out attempt within 5 minutes. A lane that cannot come back is
+held with the reason, and keeps its record, conversation, messages and worktrees; nothing is
+rolled back. `cataly lane reopen` answers `resumed`, `recovering` (the final result follows in the
+lane's thread) or `held`.
+
+Closing a lane removes a worktree only when nothing in it would be lost. A worktree with
+uncommitted or untracked changes, commits on no remote, or ignored files (build caches and other
+ignored output included) is kept and named in the close receipt, as is one whose check fails.
+Cataly never deletes kept files or caches by itself: disposing of them is your explicit action,
+for example removing the worktree with git once you have looked at it.
+
 `[lanes.oversight]`: when the hub nudges a lane. The reminders and the stall alert must come in
 order: `first_reminder` < `second_reminder` < `stall`.
 
@@ -625,8 +663,14 @@ A new version is out, boss. Run `cataly update` in a terminal.
 ```
 
 After an update and after a rollback (`{sessions}` says how the lead came back and which lanes run
-again, such as `lead를 이어서 열었습니다. lane 2개를 이어서 열었습니다: a, b.`; a lead that started
-fresh says so and why, such as `lead는 이전 대화를 이어가지 못해 새로 시작했습니다(...)`; or nothing):
+again, such as `lead를 이어서 열었습니다. lane 2개를 이어서 열었습니다: a, b.`; a lead held for
+you says why and how to resume it; or nothing). The message waits up to a minute for the
+sessions. A lead or lane still recovering then is said to be recovering, never as a final result,
+such as `lead는 이전 대화를 복구하는 중입니다(대화와 작업은 보존됨). 최종 결과는 확정되면 따로
+알려드립니다.`; once it settles (at most one 5-minute recovery later) a second message to the same
+place gives the final result: `{latest} 업데이트 후 세션 최종 결과: {sessions}` (in English,
+`After the update to {latest}: {sessions}`). `cataly update` itself prints the same recovering or
+final line.
 
 ```text
 {latest} 버전으로 업데이트했습니다. 보스, 감사합니다!

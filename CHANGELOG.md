@@ -2,6 +2,19 @@
 
 ## 0.2.7 (Unreleased)
 
+- Failed lane resumes (hub restart, worker reconnect and explicit reopen) keep the exact session,
+  run, mailbox and worktree ownership, held with diagnostics rather than rolling back prior work.
+  Fresh launch rollback is limited to the attempt's own proven unused allocation.
+- Worktree removal now requires a durable close/rollback intent, confirmed writer exit and a fresh
+  preservation check. Tracked, untracked and ignored files, unpushed commits, uncertain input,
+  published files and unknown checks all keep the worktree; removal failures retain the record
+  and appear in its receipt. Remote EOF is not a worker reap acknowledgement. Ignored cache
+  disposal is a separate explicit owner action, not part of close or recovery.
+- Reopen answers with `resumed`, `recovering` or `held` after its first definite outcome instead
+  of blocking the caller for the whole recovery episode. Continuing recovery retains ownership,
+  reports its final result to the owner and lane thread, and is cancelled by close, park or hub stop.
+- `cataly lane status <key>` shows the named lane. Lane alerts and recovery recaps reach the
+  owner's home room directly, even while no lead is available.
 - Retain the lead's proven conversation independently of failed launch attempts and history
   retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
   hold rather than silently starting fresh. After a failed explicit fresh start, use
@@ -15,6 +28,22 @@
 - Conversation-safe stores require schema reader 11. Older hubs must not open them and bypass
   the resume anchor; retain the new version, or explicitly restore the pre-upgrade store backup
   before a compatible downgrade.
+- A written message is resent after a restart only when the whole transcript proves it absent.
+  The marker search now covers the entire file instead of its newest 8 MiB, and a partial,
+  unparsable, oversized or unreadable transcript (or a search out of time) leaves the message in
+  doubt for the owner instead of writing it again. A resend still happens at most once, under
+  the original delivery ID, into the same session; worker deliveries are never resent
+  automatically. Workers answer the hub's search with `absent` or `unknown`; an older worker's
+  "not found" now counts as unknown.
+- The owner hears directly, in `[hub] language`, when the lead is still starting at 15 s (once
+  per recovery) and once per hold, with the reason, what is kept, `cataly lead start` after the
+  fix, and that an update does not lift the hold. A hold found again after a hub restart or an
+  update is not announced again. `cataly lead status` and `cataly health` show the target, the
+  startup phase and elapsed time, attempts and next retry, the last cleanup and lease evidence,
+  the inbox counts, and the same hold text; the ops panel shows a recovering lead.
+- After an update, sessions still recovering are reported as recovering, not as a final state,
+  by the hub's message and by `cataly update`; a second `update.sessions` message gives the final
+  result once they settle.
 
 ## 0.2.6 (Unreleased)
 

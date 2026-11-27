@@ -800,12 +800,12 @@ impl Link {
         .map(|_| ())
     }
 
-    /// A delivery marker in a session file on the worker.
+    /// A delivery marker in a session file on the worker: its whole-file budget plus the round trip.
     pub(crate) async fn find(&self, path: &str, marker: &str) -> Result<Value, String> {
         self.call(
             method::FIND,
             json!({ "path": path, "marker": marker }),
-            Duration::from_secs(10),
+            crate::omp::transcript::MARKER_BUDGET + Duration::from_secs(10),
         )
         .await
     }

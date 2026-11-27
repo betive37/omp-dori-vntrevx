@@ -160,11 +160,6 @@ impl Runtime for Tern {
         "tern"
     }
 
-    async fn start(&self, spec: StartSpec) -> Result<(Arc<Session>, Started), StartError> {
-        let (_keep, cancel) = watch::channel(false);
-        self.start_supervised(spec, cancel).await
-    }
-
     async fn start_supervised(
         &self,
         spec: StartSpec,

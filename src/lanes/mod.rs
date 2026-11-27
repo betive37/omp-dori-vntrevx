@@ -9,6 +9,7 @@
 
 pub(crate) mod board;
 pub(crate) mod checks;
+mod cleanup;
 pub(crate) mod docs;
 pub(crate) mod evidence;
 mod git;
@@ -19,9 +20,13 @@ mod publish;
 mod queue;
 pub(crate) mod record;
 mod remote;
+mod replies;
 mod review;
 pub(crate) mod shell;
 pub(crate) mod slots;
+mod starts;
+mod startup;
+mod supervisor;
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -36,11 +41,10 @@ use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
 use crate::config::Config;
 use crate::host::inbox::{HUB_SENDER, Mailbox, Message, Note, ReceiptState};
 use crate::host::lead::{Events, Factory};
-use crate::host::{Control, Role, Runtime, StartSpec, Status};
+use crate::host::{Control, Runtime, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::omp::Omp;
-use crate::omp::launch::Target;
 use crate::params as p;
 use crate::store::Store;
 use crate::store::lanes::{LaneDone, LaneRow, LaneWrite, Revision};
@@ -138,7 +142,7 @@ pub(crate) struct Lanes<R: Runtime> {
     /// The lanes live once start-up recovery finished, by name (DESIGN decision 9); unset before.
     pub(crate) resumed: OnceLock<Vec<String>>,
     /// Set at hub stop: no lane is reattached or started by itself any more.
-    stopping: std::sync::atomic::AtomicBool,
+    starts: starts::Starts,
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -179,7 +183,7 @@ impl<R: Runtime> Lanes<R> {
             slots,
             planning: AsyncMutex::new(()),
             resumed: OnceLock::new(),
-            stopping: std::sync::atomic::AtomicBool::new(false),
+            starts: starts::Starts::default(),
         })
     }
 
@@ -228,6 +232,7 @@ impl<R: Runtime> Lanes<R> {
     fn alert(&self, key: &str, what: &str, detail: &str, urgent: bool) {
         self.emit(
             Emit::new(EventKind::LaneAlert, Severity::Warning, urgent, key)
+                .for_owner()
                 .with("lane", key)
                 .with("what", what)
                 .with("detail", detail),
@@ -1049,6 +1054,7 @@ impl<R: Runtime> Lanes<R> {
             earlier_ids: Vec::new(),
             pid: None,
             start_note: None,
+            startup_cleanup: crate::host::startup::Cleanup::Unknown,
             held_by: None,
             hold_reason: None,
             claim: None,
@@ -1116,10 +1122,11 @@ impl<R: Runtime> Lanes<R> {
         let rev = match self.save(&rec, None, Some("opened".into())).await {
             Ok(rev) => rev,
             Err(e) => {
-                for w in &rec.worktrees {
-                    let _ = git::remove_worktree(&rec.place(), w).await;
-                }
-                return Err(e);
+                // No durable authority exists: retain the allocation, never guess it disposable.
+                return Err(format!(
+                    "{e}; worktrees retained: {}",
+                    rec.worktrees.join(", ")
+                ));
             }
         };
         if let Some(rid) = &request_id {
@@ -1134,7 +1141,16 @@ impl<R: Runtime> Lanes<R> {
                 .await;
         }
         let (key, thread) = (rec.key.clone(), rec.thread.clone());
-        let outcome = self.start(rec, rev, exe, &config, None).await;
+        let outcome = self
+            .start(
+                rec,
+                rev,
+                exe,
+                &config,
+                startup::Ownership::FreshAttempt,
+                &mut replies::Reply::default(),
+            )
+            .await;
         if let Some(rid) = request_id
             && outcome != "unconfirmed"
         {
@@ -1263,198 +1279,14 @@ impl<R: Runtime> Lanes<R> {
         }
     }
 
-    /// The session directory, made private, and the start spec for a fresh or resumed session.
-    fn start_spec(
-        &self,
-        rec: &Record,
-        handle: String,
-        resume: Option<&(String, PathBuf)>,
-    ) -> Result<StartSpec, crate::sys::fs::FsError> {
-        let sessions = self.env.state_dir.join("sessions");
-        let dir = sessions.join("lanes").join(&rec.key);
-        crate::sys::fs::ensure_private_dir(&sessions)?;
-        crate::sys::fs::ensure_private_dir(&sessions.join("lanes"))?;
-        crate::sys::fs::ensure_private_dir(&dir)?;
-        let (target, expected) = match resume {
-            Some((id, file)) => (Target::Resume(file.clone()), Some(id.clone())),
-            None => (Target::Fresh(dir), None),
-        };
-        Ok(StartSpec {
-            handle,
-            role: Role::Lane,
-            cwd: PathBuf::from(&rec.cwd),
-            model: rec.model.clone(),
-            thinking: rec.thinking.clone(),
-            target,
-            expected_id: expected,
-            instructions: None,
-            max_cost: rec.ceilings.cost,
-            tools: rec.look_only.then(|| LOOK_ONLY.to_string()),
-            worker: rec.worker.clone(),
-        })
-    }
-
-    /// The kickoff with the learned rules; the lead hears which eligible rules were left out
-    /// (EVR req. 47).
-    async fn kickoff_text(&self, rec: &Record) -> String {
-        let (rules, left) = self.rules_for(rec).await;
-        if !left.is_empty() {
-            self.alert(
-                &rec.key,
-                "learned rules left out",
-                &format!("over the limit at launch: {}", left.join(", ")),
-                false,
-            );
-        }
-        record::kickoff(rec, &rules, &[])
-    }
-
-    /// The start sequence after the record exists (LANE req. 15-16; HOST-19). Returns the outcome
-    /// line: `started`, `start held: model`, `unconfirmed: ...` or `failed: ...`.
-    async fn start(
-        self: &Arc<Self>,
-        mut rec: Record,
-        mut rev: Revision,
-        exe: PathBuf,
-        config: &Config,
-        resume: Option<(String, PathBuf)>,
-    ) -> String {
-        let began = Instant::now();
-        let handle = crate::host::random_hex(8);
-        rec.handle = Some(handle.clone());
-        let spec = match self.start_spec(&rec, handle, resume.as_ref()) {
-            Ok(spec) => spec,
-            Err(e) => return self.start_failed(rec, rev, None, &e.to_string()).await,
-        };
-        // The bridge says hello while OMP starts; its handle must already name this lane.
-        match self.save(&rec, Some(rev), None).await {
-            Ok(r) => rev = r,
-            Err(e) => return self.start_failed(rec, rev, None, &e).await,
-        }
-        let runtime = (self.env.make)(config, &exe, rec.runtime);
-        let budget = config.lanes.start_budget;
-        let started = tokio::time::timeout(budget, runtime.start(spec)).await;
-        let (session, started) = match started {
-            Ok(Ok(pair)) => pair,
-            Ok(Err(e)) => return self.start_failed(rec, rev, None, &e.to_string()).await,
-            Err(_) => {
-                return self
-                    .start_failed(rec, rev, None, "the start deadline passed")
-                    .await;
-            }
-        };
-        self.live_map()
-            .insert(rec.key.clone(), Arc::clone(&session));
-        rec.session_id = Some(started.session_id.clone());
-        rec.session_file = Some(started.file.clone());
-        rec.pid = started.pid;
-        tokio::spawn(Arc::clone(self).watch(rec.key.clone(), Arc::clone(&session)));
-        if let Some(reason) = started.held {
-            // Never substitute a model; keep the process for inspection (LANE req. 15f).
-            rec.state = State::Held;
-            rec.held_by = Some("hub".into());
-            rec.hold_reason = Some(reason.clone());
-            rec.start_note = Some("start held: model".into());
-            let _ = self
-                .save(&rec, Some(rev), Some(format!("start held: {reason}")))
-                .await;
-            self.alert(&rec.key, "start held: model", &reason, true);
-            return "start held: model".into();
-        }
-        match self.save(&rec, Some(rev), None).await {
-            Ok(r) => rev = r,
-            Err(e) => return self.start_failed(rec, rev, Some(&session), &e).await,
-        }
-        if resume.is_some() {
-            return "started".into();
-        }
-        // OMP's TUI (tern) takes a goal only between turns and starts no turn for it, so a tern
-        // lane's goal comes before the kickoff; over rpc (headless) a goal set while idle starts a
-        // turn of its own, so it follows the kickoff, whose turn is then running.
-        let goal_first = rec.runtime == crate::config::session::RuntimeKind::Tern;
-        if goal_first && let Err(why) = Self::set_goal(&rec, &session).await {
-            return self.unconfirmed(rec, rev, &why).await;
-        }
-        let deadline = began + budget;
-        let kickoff = self.kickoff_text(&rec).await;
-        let delivered = self
-            .deliver_wait(
-                &rec.key,
-                &session,
-                &kickoff,
-                &format!("kickoff:{}", rec.run_id),
-                deadline,
-            )
-            .await;
-        if delivered != ReceiptState::Delivered {
-            return self
-                .unconfirmed(
-                    rec,
-                    rev,
-                    "the kickoff was not confirmed in the session file",
-                )
-                .await;
-        }
-        self.start_latency.record(began.elapsed());
-        if !goal_first && let Err(why) = Self::set_goal(&rec, &session).await {
-            return self.unconfirmed(rec, rev, &why).await;
-        }
-        rec.state = State::Running;
-        let note = "started".to_string();
-        if let Err(e) = self.save(&rec, Some(rev), Some(note)).await {
-            return self.unconfirmed(rec, rev, &e).await;
-        }
-        self.status_word(&rec).await;
-        self.emit(
-            Emit::new(EventKind::LaneStarted, Severity::Info, false, &rec.key)
-                .with("lane", &rec.key)
-                .with("detail", format!("started on {} in {}", rec.model, rec.cwd)),
-        );
-        self.nudge.notify_one();
-        "started".into()
-    }
-
-    /// Nothing reached the agent: stop the process, remove a created worktree, delete the record
-    /// (LANE req. 16).
-    async fn start_failed(
-        &self,
-        rec: Record,
-        rev: Revision,
-        session: Option<&Arc<R::Session>>,
-        why: &str,
-    ) -> String {
-        if let Some(s) = session {
-            let _ = s.close(true).await;
-        }
-        self.drop_session(&rec.key);
-        for w in &rec.worktrees {
-            let _ = git::remove_worktree(&rec.place(), w).await;
-        }
-        if let Err(e) = self
-            .env
-            .store
-            .lanes(LaneWrite::Delete {
-                key: rec.key.clone(),
-                expect: rev,
-            })
-            .await
-        {
-            log::warn(
-                "failed lane record not deleted",
-                &[("lane", &rec.key), ("error", &e)],
-            );
-        }
-        format!("failed: {why}")
-    }
-
     /// The kickoff may have reached the agent: keep record and process, mark it for inspection.
-    async fn unconfirmed(&self, mut rec: Record, rev: Revision, why: &str) -> String {
+    async fn unconfirmed(&self, rec: &mut Record, rev: Revision, why: &str) -> String {
         rec.state = State::Held;
         rec.held_by = Some("hub".into());
         rec.hold_reason = Some(why.to_string());
         rec.start_note = Some("unconfirmed".into());
         let _ = self
-            .save(&rec, Some(rev), Some(format!("start unconfirmed: {why}")))
+            .save(rec, Some(rev), Some(format!("start unconfirmed: {why}")))
             .await;
         self.alert(&rec.key, "start unconfirmed", why, true);
         format!("unconfirmed: {why}")
@@ -1722,6 +1554,7 @@ impl<R: Runtime> Lanes<R> {
                 "thread": rec.thread,
                 "worker": rec.worker,
                 "cwd": rec.cwd,
+                "worktrees": rec.worktrees,
                 "state": rec.state.name(),
                 "status": rec.status(),
                 "outcome": rec.outcome,
@@ -1736,6 +1569,7 @@ impl<R: Runtime> Lanes<R> {
                 "reason": rec.hold_reason.as_ref().or(rec.intent.as_ref().map(|i| &i.note)),
                 "resume_condition": rec.intent.as_ref().and_then(|i| i.condition.clone()),
                 "continue_with": match (rec.state, &rec.intent) {
+                    (State::Held, None) if rec.lost.is_some() => Some("reopen"),
                     (State::Held, None) => Some("resume"),
                     (State::Closed, _) | (State::Held, Some(_)) => Some("reopen"),
                     _ => None,

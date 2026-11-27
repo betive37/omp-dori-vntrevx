@@ -6,6 +6,7 @@
 //! back version, go to `[update] destinations`, else to the owner's home room through the normal
 //! outgoing path; they are never work for the lead.
 
+use std::collections::BTreeSet;
 use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -13,9 +14,9 @@ use std::time::{Duration, Instant};
 use tokio::sync::watch;
 
 use super::Jobs;
-use super::event::{self, Emit, EventKind, Severity, TEXT_MAX, Template, one_line};
+use super::event::{self, Emit, EventKind, Severity, Template};
 use super::memory::Memory;
-use crate::config::{Config, HOME_DESTINATION, Language};
+use crate::config::{Config, Language};
 use crate::log;
 use crate::proto::{LeadStart, Resumed};
 use crate::store::{Apply, NewEvent};
@@ -33,15 +34,28 @@ const EVERY_MS: i64 = 24 * 60 * 60 * 1000;
 /// How often the task looks at the config and the clock while it waits.
 const LOOK: Duration = Duration::from_secs(30);
 
-/// The sessions the hub brought back at start; `None` while it is still bringing them back.
+/// The sessions the hub brought back at start; `None` while it is still bringing them back. A
+/// lead still recovering is said as such, never as final.
 pub(crate) type ResumedView = Arc<dyn Fn() -> Option<Resumed> + Send + Sync>;
 
 /// How long the message after an update waits for the sessions to come back.
 const RESUME_WAIT: Duration = Duration::from_mins(1);
+/// How long the final result may still take after that: one whole recovery episode with its last
+/// attempt and cleanup, and a margin.
+const FINAL_WAIT: Duration = Duration::from_secs(
+    crate::host::startup::EPISODE_BUDGET.as_secs()
+        + crate::host::startup::STARTUP_BUDGET.as_secs()
+        + crate::host::startup::STARTUP_CLEANUP_BUDGET.as_secs()
+        + 30,
+);
+/// The episode target prefix of a lane.
+const LANE_TARGET: &str = "lane:";
 
 /// Runs until the hub stops. `layout` is the program folder holding the silenced version and the
 /// install records. First, once per version change, the owner hears that the hub now runs a newer
 /// (or, after a rollback, an older) version than its previous run, and which sessions it resumed.
+/// Sessions still recovering after a minute are said to be recovering, never as final, and the
+/// final result follows in a second message.
 pub(crate) async fn run(
     jobs: Jobs,
     layout: Option<Layout>,
@@ -50,30 +64,41 @@ pub(crate) async fn run(
 ) -> Result<(), String> {
     let started = Instant::now();
     let mut memory = load(&jobs).await?;
+    let mut watched = BTreeSet::new();
+    let mut pending = None;
     if let Some(previous) = changed(&mut memory, layout.as_ref()) {
-        let deadline = Instant::now() + RESUME_WAIT;
-        let sessions = loop {
-            match resumed() {
-                Some(r) => break Some(r),
-                None if Instant::now() >= deadline => break None,
-                None => {}
-            }
-            tokio::select! {
-                () = tokio::time::sleep(Duration::from_millis(500)) => {}
-                // Unsaved, so the next start says it.
-                _ = stop.changed() => return Ok(()),
-            }
+        // Unsaved when the hub stops meanwhile, so the next start says it.
+        let Some(sessions) = settle(&jobs, &resumed, &mut watched, RESUME_WAIT, &mut stop).await
+        else {
+            return Ok(());
         };
         let config = Arc::clone(&jobs.ctx().config.borrow());
-        if let Some(event) = updated(&previous, sessions, &config) {
+        let text = sessions_text(config.hub.language, sessions.as_ref());
+        if let Some(event) = updated(&previous, &text, &config) {
             jobs.ctx()
                 .stream
                 .append(vec![event])
                 .await
                 .map_err(|e| e.to_string())?;
         }
+        if !sessions.as_ref().is_some_and(Resumed::settled) {
+            pending = Some(previous);
+        }
     }
     save(&jobs, memory).await?;
+    if pending.is_some() {
+        let Some(sessions) = settle(&jobs, &resumed, &mut watched, FINAL_WAIT, &mut stop).await
+        else {
+            return Ok(());
+        };
+        let config = Arc::clone(&jobs.ctx().config.borrow());
+        let text = sessions_text(config.hub.language, sessions.as_ref());
+        jobs.ctx()
+            .stream
+            .append(vec![final_result(&text, &config)])
+            .await
+            .map_err(|e| e.to_string())?;
+    }
     let silenced_file = layout.map(|l| l.silenced());
     loop {
         let config = Arc::clone(&jobs.ctx().config.borrow());
@@ -170,8 +195,92 @@ fn changed(memory: &mut Memory, layout: Option<&Layout>) -> Option<String> {
     (previous != latest).then_some(previous)
 }
 
-/// The message after an update or a rollback from `previous`, with the sessions resumed.
-fn updated(previous: &str, resumed: Option<Resumed>, config: &Config) -> Option<NewEvent> {
+/// Polls the sessions until nothing is still recovering, or `wait` passes: `None` when the hub
+/// stops meanwhile, else the sessions as last seen (`None` inside while the hub has not said).
+/// Lanes whose recovery episode was seen active are followed to their end.
+async fn settle(
+    jobs: &Jobs,
+    resumed: &ResumedView,
+    watched: &mut BTreeSet<String>,
+    wait: Duration,
+    stop: &mut watch::Receiver<bool>,
+) -> Option<Option<Resumed>> {
+    let deadline = tokio::time::Instant::now() + wait;
+    loop {
+        let now = sessions(jobs, resumed, watched).await;
+        if now.as_ref().is_some_and(Resumed::settled) || tokio::time::Instant::now() >= deadline {
+            return Some(now);
+        }
+        tokio::select! {
+            () = tokio::time::sleep(Duration::from_millis(500)) => {}
+            _ = stop.changed() => return None,
+        }
+    }
+}
+
+/// The hub's view of its sessions, with the lanes whose resume is recovering or ended held.
+async fn sessions(
+    jobs: &Jobs,
+    resumed: &ResumedView,
+    watched: &mut BTreeSet<String>,
+) -> Option<Resumed> {
+    let mut r = resumed()?;
+    let episodes = match jobs
+        .ctx()
+        .store
+        .read(crate::store::Reads::startup_episodes)
+        .await
+    {
+        Ok(episodes) => episodes,
+        Err(e) => {
+            log::warn("lane recovery not read", &[("error", &e)]);
+            Vec::new()
+        }
+    };
+    let now = now_ms();
+    for e in &episodes {
+        let Some(key) = e.target.strip_prefix(LANE_TARGET) else {
+            continue;
+        };
+        let active = e.state == "active" && e.deadline_ms > now;
+        if active {
+            watched.insert(key.to_string());
+        }
+        if !watched.contains(key) {
+            continue;
+        }
+        if active {
+            r.lanes_recovering.push(key.to_string());
+        } else if e.state == "bound" {
+            if !r.lane_names.iter().any(|n| n == key) {
+                r.lane_names.push(key.to_string());
+            }
+        } else {
+            r.lanes_held.push(key.to_string());
+        }
+    }
+    r.lanes = r.lanes.max(r.lane_names.len());
+    Some(r)
+}
+
+/// The sessions part of the update messages; while the hub has not said, that they are still
+/// coming back.
+fn sessions_text(language: Language, sessions: Option<&Resumed>) -> String {
+    match (sessions, language) {
+        (Some(r), _) => resumed_text(language, Some(r.clone())),
+        (None, Language::Korean) => {
+            "세션을 아직 되살리는 중입니다(대화와 작업은 보존됨). 최종 결과는 확정되면 따로 알려드립니다."
+                .into()
+        }
+        (None, Language::English) => {
+            "The sessions are still coming back (conversations and work are kept). The final result follows when it is known."
+                .into()
+        }
+    }
+}
+
+/// The message after an update or a rollback from `previous`, with the sessions text.
+fn updated(previous: &str, sessions: &str, config: &Config) -> Option<NewEvent> {
     let latest = release::VERSION;
     let (old, new) = (Version::parse(previous)?, Version::parse(latest)?);
     if old == new {
@@ -192,8 +301,22 @@ fn updated(previous: &str, resumed: Option<Resumed>, config: &Config) -> Option<
     let emit = Emit::new(kind, Severity::Info, false, "hub")
         .with("previous", previous)
         .with("latest", latest)
-        .with("sessions", resumed_text(language, resumed));
+        .with("sessions", sessions);
     Some(post(emit, &template, config))
+}
+
+/// The second message, once the sessions the first one said were recovering settled.
+fn final_result(sessions: &str, config: &Config) -> NewEvent {
+    let kind = EventKind::UpdateSessions;
+    let wording = match config.hub.language {
+        Language::Korean => "{latest} 업데이트 후 세션 최종 결과: {sessions}",
+        Language::English => "After the update to {latest}: {sessions}",
+    };
+    let template = Template::parse(wording, kind).unwrap_or_else(|_| kind.default_wording());
+    let emit = Emit::new(kind, Severity::Info, false, "hub")
+        .with("latest", release::VERSION)
+        .with("sessions", sessions);
+    post(emit, &template, config)
 }
 
 /// What the hub brought back after an update, in the owner's language: how the lead came back (a
@@ -204,6 +327,7 @@ pub(crate) fn resumed_text(language: Language, resumed: Option<Resumed>) -> Stri
     let Some(resumed) = resumed else {
         return String::new();
     };
+    let settled = resumed.settled();
     let korean = language == Language::Korean;
     let lead = match resumed.lead_start {
         None if resumed.lead && korean => Some("lead가 실행 중입니다.".to_string()),
@@ -252,11 +376,56 @@ pub(crate) fn resumed_text(language: Language, resumed: Option<Resumed>) -> Stri
         (n, true, false) => Some(format!("Resumed {n} lanes.")),
         (n, false, false) => Some(format!("Resumed {n} lanes: {names}.")),
     };
-    lead.into_iter().chain(lanes).collect::<Vec<_>>().join(" ")
+    let list = |names: &[String]| names.join(", ");
+    let recovering = match (resumed.lanes_recovering.len(), korean) {
+        (0, _) => None,
+        (n, true) => Some(format!(
+            "lane {n}개를 복구하는 중입니다(작업과 worktree는 보존됨): {}.",
+            list(&resumed.lanes_recovering)
+        )),
+        (n, false) => Some(format!(
+            "Recovering {n} lane(s), work and worktrees kept: {}.",
+            list(&resumed.lanes_recovering)
+        )),
+    };
+    let held = match (resumed.lanes_held.len(), korean) {
+        (0, _) => None,
+        (n, true) => Some(format!(
+            "lane {n}개가 보류되었습니다(작업과 worktree는 보존됨): {}. `cataly lane list`로 확인하세요.",
+            list(&resumed.lanes_held)
+        )),
+        (n, false) => Some(format!(
+            "{n} lane(s) held, work and worktrees kept: {}; see `cataly lane list`.",
+            list(&resumed.lanes_held)
+        )),
+    };
+    let follows = (!settled).then(|| {
+        if korean {
+            "최종 결과는 확정되면 따로 알려드립니다.".to_string()
+        } else {
+            "The final result follows when it is known.".to_string()
+        }
+    });
+    lead.into_iter()
+        .chain(lanes)
+        .chain(recovering)
+        .chain(held)
+        .chain(follows)
+        .collect::<Vec<_>>()
+        .join(" ")
 }
 
-/// The lead is not running: asleep (a normal state), or why, when the hub knows.
+/// The lead is not running: still recovering (not final), held for the owner, asleep (a normal
+/// state), or why, when the hub knows.
 fn not_running(korean: bool, resumed: &Resumed) -> String {
+    if resumed.lead_recovering {
+        return if korean {
+            "lead는 이전 대화를 복구하는 중입니다(대화와 작업은 보존됨).".into()
+        } else {
+            "The lead is still recovering its earlier conversation, which is kept with its work."
+                .into()
+        };
+    }
     if let Some(since) = resumed.lead_asleep_ms {
         let since = super::instant_text(since);
         return if korean {
@@ -264,6 +433,18 @@ fn not_running(korean: bool, resumed: &Resumed) -> String {
         } else {
             format!(
                 "The lead is asleep (since {since}) and wakes on the same conversation when it is needed."
+            )
+        };
+    }
+    if resumed.lead_held {
+        let reason = resumed.lead_reason.as_deref().unwrap_or("-");
+        return if korean {
+            format!(
+                "lead가 보류되었습니다: {reason}. 대화와 작업은 보존되어 있습니다. 원인을 해결한 뒤 `cataly lead start`로 이어서 시작하세요. 업데이트만으로는 보류가 풀리지 않습니다."
+            )
+        } else {
+            format!(
+                "The lead is held: {reason}. Its conversation and work are kept; after fixing the cause, run `cataly lead start` to resume it. An update does not lift the hold by itself."
             )
         };
     }
@@ -316,27 +497,29 @@ fn notice(
 
 /// The event in `template`'s wording, to `[update] destinations`, else the owner's home room.
 fn post(emit: Emit, template: &Template, config: &Config) -> NewEvent {
-    let text = template.render(&emit.values);
-    let destinations = config.update.destinations.clone().unwrap_or_else(|| {
-        config
-            .destination(HOME_DESTINATION)
-            .map_or_else(Vec::new, |_| vec![HOME_DESTINATION.to_string()])
-    });
-    let mut event = event::build("hub", emit, &[], false, &destinations, now_ms());
-    // The wording keeps its line breaks; each line is cleaned and bounded like any event text.
-    event.text = text
-        .lines()
-        .map(|line| one_line(line, TEXT_MAX))
-        .collect::<Vec<_>>()
-        .join("\n");
-    event
+    event::owner_post(
+        emit,
+        template,
+        config.update.destinations.clone(),
+        config,
+        now_ms(),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::config::{self, Destination};
+    use crate::config::{self, Destination, HOME_DESTINATION};
     use crate::relay::discord::ChannelRef;
+
+    /// The first message with the sessions as the hub reported them.
+    fn updated(previous: &str, resumed: Option<Resumed>, config: &Config) -> Option<NewEvent> {
+        super::updated(
+            previous,
+            &resumed_text(config.hub.language, resumed),
+            config,
+        )
+    }
 
     fn release(tag: &str) -> Release {
         Release {
@@ -602,5 +785,120 @@ mod tests {
         assert!(accepted.is_err(), "a request was made");
         stop_tx.send(true).unwrap();
         task.await.unwrap().unwrap();
+    }
+
+    /// After an update the lead is still recovering at the one-minute mark: the first message
+    /// says so and that the result follows, never a final word; once it settles (here held) a
+    /// second message gives the final result, with what is kept and how to go on.
+    #[tokio::test(start_paused = true)]
+    async fn an_update_says_recovering_and_then_the_final_result() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (ctx, _stop, _dir) = crate::jobs::tests::ctx_with(
+            &format!("{DISCORD}[update]\ncheck = false\n"),
+            "update-recovering",
+        );
+        ctx.store
+            .apply(Apply {
+                memory: vec![crate::store::MemoryWrite {
+                    job: JOB.into(),
+                    subject: HUB.into(),
+                    condition: "version".into(),
+                    dry: false,
+                    value: Some("0.0.1".into()),
+                }],
+                ..Apply::default()
+            })
+            .await
+            .unwrap();
+        let polls = Arc::new(AtomicUsize::new(0));
+        let seen = Arc::clone(&polls);
+        // Recovering for 200 polls of 500 ms, past the one-minute wait; then held.
+        let view: ResumedView = Arc::new(move || {
+            let held = seen.fetch_add(1, Ordering::SeqCst) >= 200;
+            Some(Resumed {
+                lead_start: Some(LeadStart::NotRunning),
+                lead_reason: Some(if held {
+                    "startup Ready Rejected: bad protocol".into()
+                } else {
+                    "it is still recovering".into()
+                }),
+                lead_recovering: !held,
+                lead_held: held,
+                ..Resumed::default()
+            })
+        });
+        let (stop_tx, stop_rx) = watch::channel(false);
+        let task = tokio::spawn(run(
+            Jobs {
+                ctx: Arc::clone(&ctx),
+            },
+            None,
+            view,
+            stop_rx,
+        ));
+        let mut events = Vec::new();
+        for _ in 0..2000 {
+            events = ctx.store.read(|r| r.events_after(0, 100)).await.unwrap();
+            if events.iter().any(|e| e.kind == "update.sessions") {
+                break;
+            }
+            tokio::time::sleep(Duration::from_secs(1)).await;
+        }
+        stop_tx.send(true).unwrap();
+        task.await.unwrap().unwrap();
+        let done = events.iter().find(|e| e.kind == "update.done").unwrap();
+        assert!(
+            done.text.contains("복구하는 중") && done.text.contains("최종 결과는 확정되면"),
+            "{}",
+            done.text
+        );
+        assert!(!done.text.contains("보류"), "{}", done.text);
+        let last = events
+            .iter()
+            .find(|e| e.kind == "update.sessions")
+            .unwrap_or_else(|| panic!("no final result: {events:?}"));
+        assert!(done.id < last.id);
+        for part in [
+            "최종 결과",
+            "보류",
+            "startup Ready Rejected: bad protocol",
+            "보존",
+            "`cataly lead start`",
+            "업데이트만으로는",
+        ] {
+            assert!(last.text.contains(part), "{part}: {}", last.text);
+        }
+        assert!(!last.text.contains("확정되면 따로"), "{}", last.text);
+        assert!(polls.load(Ordering::SeqCst) > 200);
+    }
+
+    #[test]
+    fn update_summary_preserves_recovery_and_hold_guidance() {
+        let english = |r: Resumed| resumed_text(Language::English, Some(r));
+        let recovering = english(Resumed {
+            lead_start: Some(LeadStart::NotRunning),
+            lead_recovering: true,
+            lanes_recovering: vec!["build".into()],
+            ..Resumed::default()
+        });
+        assert_eq!(
+            recovering,
+            "The lead is still recovering its earlier conversation, which is kept with its work. \
+             Recovering 1 lane(s), work and worktrees kept: build. The final result follows when it is known."
+        );
+        let held = english(Resumed {
+            lead_start: Some(LeadStart::NotRunning),
+            lead_held: true,
+            lead_reason: Some("r".into()),
+            lanes_held: vec!["docs".into()],
+            ..Resumed::default()
+        });
+        assert!(held.starts_with("The lead is held: r. Its conversation and work are kept"));
+        assert!(held.contains("An update does not lift the hold by itself."));
+        assert!(
+            held.ends_with(
+                "1 lane(s) held, work and worktrees kept: docs; see `cataly lane list`."
+            )
+        );
     }
 }

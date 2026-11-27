@@ -1181,3 +1181,135 @@ fn an_offline_worker_is_tried_again_each_minute() {
     assert_eq!(count("worker.online"), 1, "{kinds:?}");
     hub.stop();
 }
+
+fn worker_resume_preserves_work(kind: &str) {
+    let (mut hub, repo) = lane_hub("");
+    std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+    git(&repo, &["add", ".gitignore"]);
+    git(&repo, &["commit", "-qm", "ignore fixture"]);
+    git(&repo, &["push", "-q", "origin", "HEAD:main"]);
+    let w = WorkerBox::new(&hub, "box", 22);
+    let hub_id = enrol(&hub, &w, "dev@box", &[]);
+    start(&mut hub);
+    lane(
+        &hub,
+        "open",
+        &json!({
+            "key":"preserve", "title":"Preserve worker work", "brief":"Work.",
+            "checks":[{"kind":"command","argv":["true"]}], "cwd":repo, "worker":"box"
+        }),
+    )
+    .unwrap();
+    if kind == "dirty" {
+        lane(
+            &hub,
+            "pause",
+            &json!({"key":"preserve","reason":"owner pause"}),
+        )
+        .unwrap();
+    }
+    let before = record(&hub, "preserve");
+    let tree = PathBuf::from(before["cwd"].as_str().unwrap());
+    let files: &[(&str, &str)] = match kind {
+        "dirty" => &[("a.txt", "tracked work"), ("new.txt", "untracked work")],
+        "commit" => &[("a.txt", "unpushed work")],
+        "ignored" => &[("ignored.txt", "unique ignored work")],
+        _ => panic!("unknown case"),
+    };
+    for (file, text) in files {
+        std::fs::write(tree.join(file), text).unwrap();
+    }
+    if kind == "commit" {
+        git(&tree, &["add", "a.txt"]);
+        git(&tree, &["commit", "-qm", "unpublished"]);
+    }
+    let bin = w.root.join("bin");
+    std::fs::rename(bin.join("omp"), bin.join("omp-real")).unwrap();
+    std::fs::write(bin.join("omp"),
+        "#!/bin/sh\nfor arg do\n case \"$arg\" in --resume=*) cat >/dev/null; exit 1;; esac\ndone\nexec \"$(dirname \"$0\")/omp-real\" \"$@\"\n").unwrap();
+    std::fs::set_permissions(bin.join("omp"), std::fs::Permissions::from_mode(0o700)).unwrap();
+    rustix_kill(w.serve_pid(&hub_id).unwrap());
+    hub.until(Duration::from_secs(400), || {
+        hub.events()
+            .iter()
+            .any(|e| e["kind"] == "lane.recap" && e.to_string().contains("not restarted"))
+            .then_some(())
+    });
+    let after = record(&hub, "preserve");
+    assert_eq!(after["state"], "held", "{after}");
+    assert!(
+        after["lost"].as_str().unwrap().contains("Timeout"),
+        "{after}"
+    );
+    assert_eq!(after["worktrees"], json!([tree]));
+    for field in [
+        "session_id",
+        "session_file",
+        "cwd",
+        "worktrees",
+        "thread",
+        "run_id",
+    ] {
+        assert_eq!(after[field], before[field], "{field}: {after}");
+    }
+    assert_eq!(after["live"], false);
+    for (file, text) in files {
+        assert_eq!(std::fs::read_to_string(tree.join(file)).unwrap(), *text);
+    }
+    hub.stop();
+}
+
+#[test]
+fn worker_resume_timeout_keeps_dirty_worktree() {
+    worker_resume_preserves_work("dirty");
+}
+
+#[test]
+fn worker_resume_timeout_keeps_unpushed_worktree() {
+    worker_resume_preserves_work("commit");
+}
+
+#[test]
+fn worker_resume_timeout_keeps_ignored_worktree() {
+    worker_resume_preserves_work("ignored");
+}
+
+#[test]
+fn worker_close_without_durable_reap_keeps_worktree() {
+    let (mut hub, repo) = lane_hub("");
+    let w = WorkerBox::new(&hub, "box", 22);
+    enrol(&hub, &w, "dev@box", &[]);
+    hub.env.push((
+        "CATALY_FAULT".into(),
+        PathBuf::from("lane_after_close_intent"),
+    ));
+    start(&mut hub);
+    lane(
+        &hub,
+        "open",
+        &json!({
+            "key":"close-crash", "title":"Keep unknown writers", "brief":"Work.",
+            "checks":[{"kind":"command","argv":["true"]}], "cwd":repo, "worker":"box"
+        }),
+    )
+    .unwrap();
+    let before = record(&hub, "close-crash");
+    let tree = PathBuf::from(before["cwd"].as_str().unwrap());
+    let _ = lane(&hub, "close", &json!({"key":"close-crash","note":"done"}));
+    hub.wait_exit(WAIT);
+    hub.env.retain(|(key, _)| key != "CATALY_FAULT");
+    start(&mut hub);
+    let after = hub.until(WAIT, || {
+        let rec = record(&hub, "close-crash");
+        (rec["state"] == "closed").then_some(rec)
+    });
+    assert!(tree.is_dir(), "{after}");
+    assert_eq!(after["run_id"], before["run_id"]);
+    assert!(
+        after["receipt"]
+            .to_string()
+            .contains("writer exit is unconfirmed"),
+        "{after}"
+    );
+    hub.stop();
+}

@@ -742,6 +742,10 @@ impl Mailbox {
         })
     }
 
+    /// What became of a written batch. A resend needs proof: the whole session file read with no
+    /// entry carrying the batch, the process that took it gone, and the same session (ID and file)
+    /// bound again in a new process, which a resume admits only after the old one let go of it.
+    /// Anything less (a partial, unreadable or unsearched file) keeps the batch in doubt.
     async fn check<S: Control>(&self, d: &DeliveryRow, session: Option<&S>) -> Check {
         let age = now_ms() - d.sent_ms;
         let found = transcript::search(d.session_file.clone().into(), marker(&d.id)).await;
@@ -777,8 +781,20 @@ impl Mailbox {
         }
         // The process that held the batch is gone, so its file is final. On a worker it ended with
         // the connection, where the hub cannot see whether it took the batch: never resent there.
+        let absent = match found {
+            Ok(Found::Absent) => Ok(()),
+            Ok(Found::Yes) => return Check::Delivered(age),
+            Ok(Found::Missing) => Err("its session file is missing".to_string()),
+            Ok(Found::Unknown(why)) => Err(why),
+            Err(e) => Err(format!("its session file could not be read: {e}")),
+        };
         if d.resent {
-            return Check::Failed("resent once and still not in the session file".into());
+            return match absent {
+                Ok(()) => Check::Failed("resent once and still not in the session file".into()),
+                Err(why) => Check::InDoubt(format!(
+                    "resent once, and the session file does not prove it absent ({why}); not resent again"
+                )),
+            };
         }
         match snapshot {
             None => Check::Wait,
@@ -791,7 +807,19 @@ impl Mailbox {
                         .into(),
                 )
             }
-            Some(s) if s.session_id.as_deref() == Some(d.session_id.as_str()) => Check::Resend,
+            Some(s)
+                if s.session_id.as_deref() == Some(d.session_id.as_str())
+                    && s.session_file
+                        .as_deref()
+                        .is_some_and(|f| same_file(f, &d.session_file)) =>
+            {
+                match absent {
+                    Ok(()) => Check::Resend,
+                    Err(why) => Check::InDoubt(format!(
+                        "the session file does not prove it absent ({why}); not resent"
+                    )),
+                }
+            }
             Some(_) => Check::InDoubt(
                 "its session is gone and the new one is another session; not resent there".into(),
             ),
@@ -970,6 +998,11 @@ impl Mailbox {
             DeliverOutcome::InDoubt(reason) => self.in_doubt(id, reason).await.map(Some),
         }
     }
+}
+
+/// Whether two recorded paths name the same session file: equal, or the same file once resolved.
+fn same_file(a: &str, b: &str) -> bool {
+    a == b || std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
 }
 
 impl Receipt {
@@ -1213,9 +1246,11 @@ mod tests {
         );
         assert_eq!(fake2.seen("prompt").len(), 0);
 
-        // Process gone, no entry: resent once with the same ID into the same session.
+        // Process gone, a complete file without the entry: resent once with the same ID into the
+        // same session.
         let (mailbox, fake, session, _dir) = box_and_session("inbox-resend").await;
         fake.set(|s| s.write_entries = false);
+        std::fs::write(fake.file(), "{\"type\":\"session\"}\n").unwrap();
         mailbox.admit(&owner("b", None)).await.unwrap();
         mailbox.flush(Some(&*session), false).await.unwrap();
         let first = fake.seen("prompt").pop().unwrap()["message"].clone();
@@ -1278,6 +1313,164 @@ mod tests {
             fake.seen("prompt").len(),
             2,
             "released entries go out again"
+        );
+    }
+
+    /// The session's file after its process ended: a complete header, plus `tail` as written.
+    fn transcript(fake: &Fake, tail: &str) {
+        std::fs::write(fake.file(), format!("{{\"type\":\"session\"}}\n{tail}")).unwrap();
+    }
+
+    /// A new process bound to the same session and file, as an exact resume binds it.
+    async fn resumed(fake: &Fake, handle: &str, write: bool) -> (Fake, Arc<Session>) {
+        let next = Fake::start();
+        next.set(|s| {
+            s.file = fake.file();
+            s.write_entries = write;
+        });
+        let (session, _) = next.bind(spec(handle, None)).await.unwrap();
+        (next, session)
+    }
+
+    /// A batch whose entry is older than the newest 8 MiB of a long transcript is delivered, not
+    /// written a second time after a resume.
+    #[tokio::test]
+    async fn a_batch_outside_the_newest_8_mib_is_confirmed_not_resent() {
+        let (mailbox, fake, session, _dir) = box_and_session("inbox-old-entry").await;
+        mailbox.admit(&owner("early", None)).await.unwrap();
+        mailbox.flush(Some(&*session), false).await.unwrap();
+        session.close(false).await.unwrap();
+        let filler = serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "x".repeat(64 * 1024)}]}}).to_string();
+        let mut more = String::new();
+        while more.len() < 9 * 1024 * 1024 {
+            more.push_str(&filler);
+            more.push('\n');
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            .open(fake.file())
+            .unwrap();
+        std::io::Write::write_all(&mut file, more.as_bytes()).unwrap();
+        let (next, after) = resumed(&fake, "h2", true).await;
+        let notes = mailbox.flush(Some(&*after), false).await.unwrap();
+        assert!(
+            matches!(notes.as_slice(), [Note::Confirmed { .. }]),
+            "{notes:?}"
+        );
+        assert_eq!(next.seen("prompt").len(), 0, "never written twice");
+    }
+
+    /// After the process that took a batch ended, a transcript that ends inside an entry, or one
+    /// that cannot be read, does not prove the batch absent: it is in doubt and not resent.
+    #[tokio::test]
+    async fn a_partial_or_unreadable_transcript_keeps_the_batch_in_doubt() {
+        for case in ["partial", "unreadable"] {
+            let (mailbox, fake, session, _dir) = box_and_session(&format!("inbox-{case}")).await;
+            fake.set(|s| s.write_entries = false);
+            transcript(&fake, "");
+            mailbox.admit(&owner("maybe", None)).await.unwrap();
+            mailbox.flush(Some(&*session), false).await.unwrap();
+            session.close(false).await.unwrap();
+            if case == "partial" {
+                transcript(
+                    &fake,
+                    "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"cont",
+                );
+            } else {
+                std::fs::remove_file(fake.file()).unwrap();
+                std::fs::create_dir(fake.file()).unwrap();
+            }
+            let (next, after) = resumed(&fake, "h2", true).await;
+            let notes = mailbox.flush(Some(&*after), false).await.unwrap();
+            assert!(
+                matches!(notes.as_slice(), [Note::InDoubt { notify: true, .. }]),
+                "{case}: {notes:?}"
+            );
+            assert_eq!(next.seen("prompt").len(), 0, "{case}: not resent");
+            assert_eq!(
+                mailbox.list().await.unwrap()[0].0.state,
+                "in_doubt",
+                "{case}"
+            );
+            mailbox.flush(Some(&*after), false).await.unwrap();
+            assert_eq!(next.seen("prompt").len(), 0, "{case}: still not resent");
+        }
+    }
+
+    /// Pending, quiet, sent and in-doubt deliveries across a failed start and then a successful
+    /// one: nothing moves while no session is bound; then the sent batch is resent once under its
+    /// own ID, the pending message and the quiet note go once together, and the in-doubt batch is
+    /// never written again.
+    #[tokio::test]
+    async fn deliveries_across_a_failed_start_each_go_once() {
+        let (mailbox, fake, session, _dir) = box_and_session("inbox-failed-start").await;
+        fake.set(|s| s.write_entries = false);
+        transcript(&fake, "");
+        mailbox.admit(&owner("IN-DOUBT", None)).await.unwrap();
+        mailbox.flush(Some(&*session), false).await.unwrap();
+        mailbox
+            .store
+            .host(HostWrite::Age {
+                target: LEAD.into(),
+                by_ms: CONFIRM_WITHIN_MS + 1,
+            })
+            .await
+            .unwrap();
+        mailbox.flush(Some(&*session), false).await.unwrap();
+        mailbox.admit(&owner("SENT", None)).await.unwrap();
+        mailbox.flush(Some(&*session), false).await.unwrap();
+        let sent = fake.seen("prompt").pop().unwrap()["message"].clone();
+        assert_eq!(fake.seen("prompt").len(), 2);
+        session.close(false).await.unwrap();
+        mailbox.admit(&owner("PENDING", None)).await.unwrap();
+        let quiet = Message {
+            sender: HUB_SENDER.into(),
+            text: "QUIET".into(),
+            urgent: false,
+            owner: false,
+            identity: Some("note:q".into()),
+            request_id: None,
+        };
+        mailbox.admit(&quiet).await.unwrap();
+        let states = |list: Vec<(Listed, InboxRow)>| {
+            list.into_iter()
+                .map(|(l, r)| (r.text, l.state))
+                .collect::<Vec<_>>()
+        };
+        let before = states(mailbox.list().await.unwrap());
+        // The failed start: no session is bound, the ended one is still the current record.
+        assert!(
+            mailbox
+                .flush(None::<&Session>, false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert!(
+            mailbox
+                .flush(Some(&*session), false)
+                .await
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(states(mailbox.list().await.unwrap()), before, "untouched");
+        let (next, after) = resumed(&fake, "h2", true).await;
+        for _ in 0..4 {
+            mailbox.flush(Some(&*after), false).await.unwrap();
+        }
+        let prompts = next.seen("prompt");
+        assert_eq!(prompts.len(), 2, "{prompts:?}");
+        assert_eq!(prompts[0]["message"], sent, "the same batch, the same ID");
+        let text = prompts[1]["message"].as_str().unwrap();
+        assert!(text.contains("PENDING") && text.contains("QUIET"), "{text}");
+        let file = std::fs::read_to_string(fake.file()).unwrap();
+        for (word, n) in [("SENT", 1), ("PENDING", 1), ("QUIET", 1), ("IN-DOUBT", 0)] {
+            assert_eq!(file.matches(word).count(), n, "{word}: {file}");
+        }
+        let after_list = states(mailbox.list().await.unwrap());
+        assert_eq!(
+            after_list,
+            vec![("IN-DOUBT".to_string(), "in_doubt".to_string())]
         );
     }
 

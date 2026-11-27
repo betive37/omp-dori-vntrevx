@@ -20,6 +20,7 @@ pub(crate) const RETRY_DELAYS: [Duration; 5] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartupStage {
+    Prepare,
     Spawn,
     Ready,
     Protocol,
@@ -98,8 +99,13 @@ impl Recovery<'_> {
             .await?
             .ok_or("recovery episode was not recorded")?;
         if episode.session_id != session_id || episode.state != "active" {
+            // The first cause stays visible after a hub restart or an update finds the hold.
+            let cause = episode
+                .detail
+                .as_deref()
+                .map_or_else(String::new, |d| format!(" ({d})"));
             return Err(format!(
-                "recovery is {}; explicit owner retry required",
+                "recovery is {}{cause}; explicit owner retry required",
                 episode.state
             ));
         }
