@@ -93,6 +93,15 @@
   `cataly stats` (`*_wake_latency`) and left its read time in the hub's memory for good. The
   round now waits for the arrival, and no read time outlives its message, also when the message
   leaves the queue without a hand-off (a reset, a channel leaving scope).
+- When a Discord thread was started from your message (by you, by the lead through the bot, or by
+  a lane), the lead's answer to it goes into that thread instead of a reply in the channel: every
+  part of a long answer, with the same once-only posting, and the owed reply counts as answered.
+  Typing shows there while the lead works. If a lane owns the thread, your later messages there
+  still go to the lane. With no such thread, a locked one, a thread that refuses the first part,
+  a lookup that failed three times (logged; one failure only delays the answer a few seconds) or
+  `[discord] follow_threads = false`, the answer is the reply in the channel as before; a thread
+  locked or deleted in the middle of an answer gets nothing more, and the rest goes to the
+  channel as a reply, after a short note pointing back to the thread.
 
 ## 0.2.4 (2026-11-27)
 

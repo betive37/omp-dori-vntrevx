@@ -124,6 +124,40 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     message ID and part index, so a crash-and-retry cannot duplicate a part.
 25. Parts are posted in order; the first is a reply to the source message (rule 15). Each confirmed
     part is acknowledged in the outbox with its remote ID before the next is posted.
+    When the source message is in a text or announcement channel, thread following is on (intake
+    spec req. 6) and a thread was started from it, by anyone (the owner, the lead through the bot,
+    or a lane), the whole answer goes into that thread instead. The message's `thread` must name
+    one under the same channel that is not locked. Every part is a plain post there with its own
+    nonce, none carries a message reference, and the confirmed first part counts as the confirmed
+    linked reply (rules 16, 33). When a lane owns that thread, the answer lands there all the same,
+    and the owner's later messages in the thread go to the lane as thread routing already does
+    (intake spec req. 41).
+    The daemon reads the source message just before the first part, within 5 s, and keeps what a
+    read found for the request. A failed or late read is logged and kept for nothing: the first
+    part waits and a later round reads again, up to three reads per request in all; after the
+    third failure the answer is the reply in the channel. If the thread
+    rejects the first part (rule 6) and no earlier attempt there was uncertain, the first part goes
+    as the reply in the channel with the same nonce; once a part there was uncertain, or a later
+    part is rejected for its own sake, the answer stays in the thread and is retried there. A
+    thread that refuses the bot as such (403, unknown channel, archived thread) takes nothing more:
+    that part and the rest go to the channel, the first of them as the reply to the source
+    message, so a thread locked or deleted mid-answer holds up no later answer. When a part was
+    already out in the thread, a note `-# continued from <#thread>` is posted in the channel just
+    before that first moved part, as its own message with its own nonce, tried once per delivery;
+    a note that fails is logged and holds nothing up. The parts keep their stored text.
+    The lookup is shared with typing, so both use one result per request (typing's failed reads
+    count toward the three). The choice lives in daemon memory for
+    that delivery. After a restart with the first part already confirmed, the rest follows that
+    part: the daemon reads that part back, from the channel, else from the thread (it has the
+    source message's ID), and posts the rest where it was read. When the channel definitely lacks
+    it (unknown message) and the thread definitely takes nothing from the bot (403, unknown
+    channel, archived) or lacks it too, the rest moves to the channel, its first part as the reply
+    to the source message, as when the thread closes mid-answer. While a read only fails for now
+    (timeout, 5xx, rate limit), posting waits. A first part still pending at a restart is decided
+    again, so if it ended uncertain in the thread and the new lookup fails or finds no thread, it
+    may be posted a second time in the channel. While the lead works, typing shows where the
+    answer would go: in a followed thread with the source message's ID once the shared lookup (run
+    off the handling round) says so, else in the channel.
 26. If Discord reports the source message unknown (error 10008, on the post or on a follow-up check
     after a 400/404), the remaining parts for that request are discarded and logged; nothing is
     posted unlinked.
@@ -147,7 +181,7 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 
 32. Every owner request admitted to the lead creates an obligation keyed by channel and message,
     holding the admission time and the first 500 UTF-16 units of the text. Duplicates are ignored.
-33. An obligation is settled when both a read mark (30/31) and a confirmed linked reply (16 or 29)
+33. An obligation is settled when both a read mark (30/31) and a confirmed linked reply (16, 25 or 29)
     for that exact message exist, each no earlier than its admission. Posting in the channel, a
     reaction on another message, or an unlinked post do not settle it.
 34. Obligations admitted more than 30 minutes ago are no longer reported, so a restart after a long
@@ -322,7 +356,8 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 ## Third-party interfaces used
 
 - Discord REST v10: create message (content, message_reference with fail_if_not_exists,
-  allowed_mentions, nonce, enforce_nonce, components), edit message, get message, get channel, list
+  allowed_mentions, nonce, enforce_nonce, components), edit message, get message (with its `thread`
+  field), get channel, list
   guild channels, the bot's own reactions (PUT/DELETE, URL-encoded emoji), start thread without
   message, start thread from message, forum/media post with starter message and applied_tags,
   modify channel (name, archived, applied_tags), modify current user (avatar), get current
@@ -333,7 +368,8 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
   "require tag" flag; buttons: 5 per action row, 5 rows, label 80, custom ID 100; interaction
   responses due within 3 s; components arrive over the Gateway only without an interactions endpoint
   URL; 429 bodies carry retry_after, responses carry X-RateLimit headers and a global flag; enforced
-  nonces deduplicate recent creates.
+  nonces deduplicate recent creates; a thread started from a message takes that message's ID, and
+  the message names it in its `thread` field.
 - Discord Gateway v10: presence in identify and presence update (op 3); INTERACTION_CREATE
   dispatches (connection lifecycle is in the intake spec).
 - OMP: rpc-ui form and confirm requests and their cancellation; session events for turn start/end

@@ -1330,15 +1330,17 @@ impl<T: Runtime> Intake<T> {
     /// Replies to the owner's message about a typed answer (not taken, or one part taken).
     async fn correct(&self, card: &Card, row: &QueueRow, text: &str) {
         let seed = format!("correction:{}:{}", self.bot, row.message);
-        if let crate::relay::PartOutcome::Rejected(e) | crate::relay::PartOutcome::Uncertain(e) =
-            self.rest
-                .reply_part(
-                    card.channel,
-                    Snowflake::parse(&row.message),
-                    text,
-                    &nonce(&seed, 0),
-                )
-                .await
+        if let crate::relay::PartOutcome::Rejected(e)
+        | crate::relay::PartOutcome::Closed(e)
+        | crate::relay::PartOutcome::Uncertain(e) = self
+            .rest
+            .reply_part(
+                card.channel,
+                Snowflake::parse(&row.message),
+                text,
+                &nonce(&seed, 0),
+            )
+            .await
         {
             log::info("correction not posted", &[("error", &e)]);
         }

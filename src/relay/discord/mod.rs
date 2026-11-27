@@ -41,6 +41,10 @@ const CHANNEL_TYPES_MAX: usize = 512;
 
 /// Discord's unknown-message error code (DISC-OUT req. 26).
 const UNKNOWN_MESSAGE: u64 = 10_008;
+/// Discord's unknown-channel error code (a deleted thread).
+const UNKNOWN_CHANNEL: u64 = 10_003;
+/// Discord's "operation cannot be performed on an archived thread" error code.
+const ARCHIVED_THREAD: u64 = 50_083;
 /// Discord's epoch, in Unix milliseconds.
 const EPOCH_MS: u64 = 1_420_070_400_000;
 
@@ -134,6 +138,17 @@ impl RestError {
     /// 404 with Discord's unknown-message code.
     pub(crate) fn unknown_message(&self) -> bool {
         self.status == Some(404) && self.code == Some(UNKNOWN_MESSAGE)
+    }
+
+    /// 404 with Discord's unknown-channel code: the channel or thread is gone.
+    pub(crate) fn unknown_channel(&self) -> bool {
+        self.status == Some(404) && self.code == Some(UNKNOWN_CHANNEL)
+    }
+
+    /// A definite refusal of the channel itself: no access (403), unknown channel, or an archived
+    /// thread the bot may not reopen.
+    pub(crate) fn closed(&self) -> bool {
+        self.status == Some(403) || self.unknown_channel() || self.code == Some(ARCHIVED_THREAD)
     }
 }
 
@@ -732,6 +747,24 @@ impl Rest {
         .await
     }
 
+    /// The thread started from `message` in the text or announcement channel `channel` that may take
+    /// the answer to it (DISC-OUT req. 25); `None` when there is none.
+    pub(crate) async fn started_thread(
+        &self,
+        channel: Snowflake,
+        message: Snowflake,
+    ) -> Result<Option<Snowflake>, String> {
+        // Only messages of text and announcement channels start threads.
+        if !matches!(self.channel_type(channel).await?, 0 | 5) {
+            return Ok(None);
+        }
+        let source = self
+            .message(channel, message)
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(thread_of(&source, channel))
+    }
+
     /// Active threads of a guild (DISC-IN req. 8).
     pub(crate) async fn active_threads(&self, guild: Snowflake) -> Result<Value, RestError> {
         self.call(
@@ -1009,15 +1042,24 @@ impl Rest {
                 PartOutcome::Posted { id, linked }
             }
             Err(e) if e.unknown_message() => PartOutcome::SourceGone,
-            Err(e) if matches!(e.status, Some(400 | 404)) => match reply_to {
-                Some(source) => match self.message(channel, source).await {
-                    Err(check) if check.unknown_message() => PartOutcome::SourceGone,
-                    _ => PartOutcome::Rejected(e.why),
-                },
-                None => PartOutcome::Rejected(e.why),
-            },
-            Err(e) if e.uncertain => PartOutcome::Uncertain(e.why),
-            Err(e) => PartOutcome::Rejected(e.why),
+            Err(e) => {
+                let source_gone = match reply_to {
+                    Some(source) if matches!(e.status, Some(400 | 404)) => matches!(
+                        self.message(channel, source).await,
+                        Err(check) if check.unknown_message()
+                    ),
+                    _ => false,
+                };
+                if source_gone {
+                    PartOutcome::SourceGone
+                } else if e.closed() {
+                    PartOutcome::Closed(e.why)
+                } else if e.uncertain {
+                    PartOutcome::Uncertain(e.why)
+                } else {
+                    PartOutcome::Rejected(e.why)
+                }
+            }
         }
     }
 }
@@ -1115,6 +1157,26 @@ fn confirmed(resp: &Response, channel: Snowflake) -> Result<Snowflake, Sent> {
     }
 }
 
+/// The thread a message names as started from it, when that thread is under `channel` and not
+/// locked (a locked thread takes posts only from members who may manage threads).
+fn thread_of(message: &Value, channel: Snowflake) -> Option<Snowflake> {
+    let thread = message.get("thread")?;
+    let field = |key| {
+        thread
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(Snowflake::parse)
+    };
+    let kind = thread.get("type").and_then(Value::as_u64);
+    let locked = thread
+        .pointer("/thread_metadata/locked")
+        .and_then(Value::as_bool)
+        == Some(true);
+    (matches!(kind, Some(10..=12)) && field("parent_id") == Some(channel) && !locked)
+        .then(|| field("id"))
+        .flatten()
+}
+
 /// Caches a channel's type; a full cache starts over (`CHANNEL_TYPES_MAX`).
 fn cache_type(cache: &mut HashMap<Snowflake, u64>, id: Snowflake, kind: u64) {
     if cache.len() >= CHANNEL_TYPES_MAX {
@@ -1167,6 +1229,36 @@ mod tests {
         assert!(!e(404, Some(10_003)).unknown_message());
         assert_eq!(Snowflake::at_ms(1_420_070_400_000), 0);
         assert_eq!(Snowflake::at_ms(1_420_070_400_001), 1 << 22);
+    }
+
+    #[test]
+    fn a_thread_started_from_a_message_is_under_its_channel_and_open() {
+        let channel = Snowflake::parse("10").unwrap();
+        let message = |thread: Value| json!({ "id": "20", "channel_id": "10", "thread": thread });
+        let open = json!({ "id": "20", "type": 11, "parent_id": "10",
+            "thread_metadata": { "archived": true, "locked": false } });
+        assert_eq!(
+            thread_of(&message(open.clone()), channel),
+            Snowflake::parse("20")
+        );
+        assert_eq!(
+            thread_of(&json!({ "id": "20" }), channel),
+            None,
+            "no thread"
+        );
+        let mut other = open.clone();
+        other["parent_id"] = json!("11");
+        assert_eq!(thread_of(&message(other), channel), None, "another parent");
+        let mut locked = open.clone();
+        locked["thread_metadata"]["locked"] = json!(true);
+        assert_eq!(thread_of(&message(locked), channel), None, "locked");
+        let mut not_thread = open;
+        not_thread["type"] = json!(0);
+        assert_eq!(
+            thread_of(&message(not_thread), channel),
+            None,
+            "not a thread"
+        );
     }
 
     #[tokio::test]

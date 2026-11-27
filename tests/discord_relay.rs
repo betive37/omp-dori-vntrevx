@@ -137,11 +137,20 @@ fn owner_message_is_answered_in_linked_parts() {
         "only the first part is a reply"
     );
     for c in &creates {
+        assert_eq!(
+            c.path,
+            format!("/channels/{CH}/messages"),
+            "no thread: the channel"
+        );
         assert_eq!(c.body["enforce_nonce"], true);
         assert_eq!(c.body["nonce"].as_str().unwrap().len(), 25);
         assert_eq!(c.body["allowed_mentions"]["parse"], json!([]));
     }
     assert_ne!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    // Split at Discord's full limit, as every earlier version stored its parts: a repeated
+    // answer is matched against those stored parts.
+    let first = creates[0].body["content"].as_str().unwrap();
+    assert!(first.encode_utf16().count() > 1958, "{}", first.len());
     let seen = fake.calls("PUT", "/messages/800000000000000001/reactions/");
     assert_eq!(seen.len(), 1, "one seen mark");
     let s = hub.until(WAIT, || {
@@ -201,6 +210,616 @@ fn busy_lead_answers_in_order() {
     let asked = requests(&hub);
     assert_eq!(asked.len(), 2, "{asked:?}");
     assert!(asked[0].contains("> first") && asked[1].contains("> second"));
+    assert!(hub.stop().success());
+}
+
+/// Sends an owner message from which the owner has already started a thread (the thread takes the
+/// message's ID); `THREAD_CREATE` goes first, so intake follows the thread before the request.
+fn ask_with_thread(fake: &FakeDiscord, message: u64, text: &str) -> String {
+    let msg = FakeDiscord::message(CH, message, OWNER, text);
+    fake.put(msg.clone());
+    fake.start_thread(CH, &message.to_string(), OWNER);
+    fake.gw(Gw::Dispatch("MESSAGE_CREATE", msg));
+    message.to_string()
+}
+
+/// Waits until the owed reply of the one request settled and nothing is queued.
+fn settled(hub: &TestHub) -> Value {
+    hub.until(WAIT, || {
+        let s = status(hub);
+        (s["counts"]["owed_settled"] == 1 && s["counts"]["queued"] == 0).then_some(s)
+    })
+}
+
+/// A thread started from the owner's message takes the whole answer: every part is posted in the
+/// thread with its enforced nonce, none carries a message reference, nothing reaches the channel,
+/// typing shows in the thread, and the owed reply settles (DISC-OUT req. 25).
+#[test]
+fn an_answer_goes_into_the_thread_started_from_the_request() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &["slow"], "");
+    let long = "word ".repeat(600);
+    hub.fixture("omp", "answer.json", Some(&json!(long).to_string()));
+    hub.start();
+    ready(&hub);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_101, "in the thread, please");
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(creates.len(), 2, "two parts, posted once each");
+    for c in &creates {
+        assert_eq!(
+            c.path,
+            format!("/channels/{thread}/messages"),
+            "{creates:?}"
+        );
+        assert!(c.body.get("message_reference").is_none(), "{:?}", c.body);
+        assert_eq!(c.body["enforce_nonce"], true);
+        assert_eq!(c.body["nonce"].as_str().unwrap().len(), 25);
+    }
+    assert_ne!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    let s = settled(&hub);
+    assert_eq!(s["counts"]["owed_open"], 0, "{s}");
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing in the channel"
+    );
+    assert!(
+        !fake
+            .calls("POST", &format!("/channels/{thread}/typing"))
+            .is_empty()
+    );
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/typing"))
+            .is_empty()
+    );
+    let seen = fake.calls("PUT", &format!("/messages/{thread}/reactions/"));
+    assert_eq!(seen.len(), 1, "one seen mark");
+    assert_eq!(
+        seen[0].path,
+        format!("/channels/{CH}/messages/{thread}/reactions/%F0%9F%91%80/@me")
+    );
+    assert!(hub.stop().success());
+}
+
+/// When the thread lookup keeps failing, the answer is the linked reply in the channel, as without
+/// a thread; the bounded lookups (three, 5 s each) do not hold the answer back for long.
+#[test]
+fn a_failed_thread_lookup_replies_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000111";
+    fake.fail_reads(&format!("/channels/{CH}/messages/{source}"), 500);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_111, "lookup fails");
+    let creates = fake.wait_creates(1, Duration::from_secs(60));
+    assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    assert!(
+        !fake.calls("GET", &format!("/messages/{source}")).is_empty(),
+        "looked up"
+    );
+    settled(&hub);
+    assert!(
+        fake.calls("POST", &format!("/channels/{thread}/messages"))
+            .is_empty()
+    );
+    assert!(hub.stop().success());
+}
+
+/// A thread lookup that fails for now is not kept for the request: the first part waits and a
+/// later round looks again, so one slow read does not send the whole answer to the channel.
+#[test]
+fn a_thread_lookup_that_failed_once_is_tried_again() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000112";
+    let read = format!("/channels/{CH}/messages/{source}");
+    // One lookup's reads all fail: three tries (1 s, then 2 s apart) within its 5 s.
+    fake.fail_reads_times(&read, 500, 3);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_112, "lookup fails once");
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(
+        creates[0].path,
+        format!("/channels/{thread}/messages"),
+        "{creates:?}"
+    );
+    assert!(creates[0].body.get("message_reference").is_none());
+    settled(&hub);
+    assert!(fake.calls("GET", &read).len() > 3, "looked up again");
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing in the channel"
+    );
+    assert!(hub.stop().success());
+}
+
+/// A thread that refuses the bot's post (no permission, locked, gone) takes nothing: the answer
+/// falls back to the linked reply in the channel, with the same nonce.
+#[test]
+fn a_thread_that_refuses_the_post_falls_back_to_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000121";
+    fake.script_in(source, &[403]);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_121, "refused");
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(creates[0].path, format!("/channels/{thread}/messages"));
+    assert_eq!(creates[1].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[1]).as_deref(), Some(source));
+    assert_eq!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    settled(&hub);
+    assert_eq!(fake.creates().len(), 2);
+    assert!(
+        fake.bot_messages(&thread).is_empty(),
+        "nothing in the thread"
+    );
+    let posted = fake.bot_messages(CH);
+    assert_eq!(posted.len(), 1, "one reply in the channel: {posted:?}");
+    assert_eq!(posted[0]["message_reference"]["message_id"], source);
+    assert!(hub.stop().success());
+}
+
+/// Once a post in the thread ended uncertain, the answer stays in the thread: a later refusal there
+/// is retried with the same nonce, never moved to the channel, and the part exists once.
+#[test]
+fn an_uncertain_post_in_the_thread_keeps_the_answer_there() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000141";
+    // One call's four attempts end uncertain (the message may exist), then one refusal of the
+    // part itself (400, not the thread's).
+    fake.script_in(source, &[500, 500, 500, 500, 400]);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_141, "held");
+    settled(&hub);
+    let creates = fake.creates();
+    assert!(creates.len() >= 6, "{creates:?}");
+    assert!(
+        creates
+            .iter()
+            .all(|c| c.path == format!("/channels/{thread}/messages")),
+        "{creates:?}"
+    );
+    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
+    assert_eq!(fake.bot_messages(&thread).len(), 1, "the part exists once");
+    assert!(hub.stop().success());
+}
+
+/// A thread that closes in the middle of an answer (locked or no access: 403; deleted: unknown
+/// channel) takes nothing more: the rest goes to the channel, its first part as the reply to the
+/// request, after a short note pointing back to the thread. The parts themselves are posted as
+/// stored (a full part stays a full part), and later answers are not held up.
+#[test]
+fn a_thread_closed_mid_answer_moves_the_rest_to_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    // Three parts split at the full limit: the moved second one is a full one.
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(1000)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    for (n, (message, refusal)) in [
+        (800_000_000_000_000_201_u64, 403),
+        (800_000_000_000_000_202, 404),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let source = message.to_string();
+        fake.script_in(&source, &[0, refusal]);
+        ask_with_thread(&fake, message, "closes mid-answer");
+        hub.until(WAIT, || {
+            let s = status(&hub);
+            (s["counts"]["owed_settled"] == n + 1 && s["counts"]["queued"] == 0).then_some(())
+        });
+        let posted = fake.wait(WAIT, |f| {
+            let posted = f.bot_messages(CH);
+            posted
+                .iter()
+                .any(|m| m["message_reference"]["message_id"] == source.as_str())
+                .then_some(posted)
+        });
+        let at = posted
+            .iter()
+            .position(|m| m["message_reference"]["message_id"] == source.as_str())
+            .unwrap();
+        let note = &posted[at - 1];
+        assert_eq!(note["content"], format!("-# continued from <#{source}>"));
+        assert!(note.get("message_reference").is_none_or(Value::is_null));
+        let text = posted[at]["content"].as_str().unwrap();
+        assert!(text.starts_with("word"), "the part as stored: {text}");
+        assert!(text.encode_utf16().count() > 1958, "a full part");
+        assert_eq!(
+            fake.bot_messages(&source).len(),
+            1,
+            "only the first part in the thread"
+        );
+    }
+    // A note and two moved parts per answer.
+    let posted = fake.wait(WAIT, |f| {
+        let posted = f.bot_messages(CH);
+        (posted.len() == 6).then_some(posted)
+    });
+    let notes = posted
+        .iter()
+        .filter(|m| m["content"].as_str().unwrap().contains("continued from"))
+        .count();
+    assert_eq!(notes, 2, "one note per answer");
+    assert!(hub.stop().success());
+}
+
+/// A later part refused for its own sake (not the thread's: a 400) is retried in the thread: only
+/// the first part may fall back, so such a refusal never splits an answer.
+#[test]
+fn a_refused_second_part_stays_in_the_thread() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000151";
+    fake.script_in(source, &[0, 400]);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_151, "two parts");
+    settled(&hub);
+    hub.until(WAIT, || {
+        (fake.bot_messages(&thread).len() == 2).then_some(())
+    });
+    let creates = fake.creates();
+    assert_eq!(creates.len(), 3, "{creates:?}");
+    assert!(
+        creates
+            .iter()
+            .all(|c| c.path == format!("/channels/{thread}/messages"))
+    );
+    assert_eq!(creates[1].body["nonce"], creates[2].body["nonce"]);
+    assert_eq!(
+        fake.bot_messages(CH),
+        Vec::<Value>::new(),
+        "nothing in the channel"
+    );
+    assert!(hub.stop().success());
+}
+
+/// A locked thread takes no answer: it is the linked reply in the channel, and typing shows there.
+#[test]
+fn a_locked_thread_leaves_the_answer_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &["slow"], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000161";
+    let msg = FakeDiscord::message(CH, 800_000_000_000_000_161, OWNER, "locked");
+    fake.put(msg.clone());
+    fake.start_thread(CH, source, OWNER);
+    fake.lock_thread(CH, source);
+    fake.gw(Gw::Dispatch("MESSAGE_CREATE", msg));
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    settled(&hub);
+    assert_eq!(
+        fake.bot_messages(source),
+        Vec::<Value>::new(),
+        "nothing in the thread"
+    );
+    assert!(
+        !fake
+            .calls("POST", &format!("/channels/{CH}/typing"))
+            .is_empty()
+    );
+    assert!(
+        fake.calls("POST", &format!("/channels/{source}/typing"))
+            .is_empty()
+    );
+    assert!(hub.stop().success());
+}
+
+/// A restart in the middle of an answer whose first part fell back to the channel (the thread
+/// refuses the bot) sends the rest after it, to the channel, though the thread still exists.
+#[test]
+fn a_restart_mid_answer_keeps_the_rest_with_its_first_part() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000171";
+    fake.script_in(source, &[403; 64]);
+    // The first part is confirmed in the channel, the second ends uncertain until the restart.
+    let mut channel = vec![0];
+    channel.extend([500; 64]);
+    fake.script_in(CH, &channel);
+    ask_with_thread(&fake, 800_000_000_000_000_171, "restart");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() >= 3).then_some(())
+    });
+    assert!(hub.stop().success());
+    fake.unscript_in(CH);
+    let before = fake
+        .calls("POST", &format!("/channels/{CH}/messages"))
+        .len();
+    hub.start();
+    // The second part was stored by its uncertain try: the repeat with its nonce confirms it.
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() > before).then_some(())
+    });
+    settled(&hub);
+    std::thread::sleep(Duration::from_secs(2));
+    let posted = fake.bot_messages(CH);
+    assert_eq!(
+        posted.len(),
+        2,
+        "both parts in the channel, once: {posted:?}"
+    );
+    assert_eq!(posted[0]["message_reference"]["message_id"], source);
+    assert!(
+        fake.bot_messages(source).is_empty(),
+        "nothing in the thread"
+    );
+    let in_thread = fake
+        .calls("POST", &format!("/channels/{source}/messages"))
+        .len();
+    assert_eq!(
+        in_thread, 1,
+        "only the first part's refused try went to the thread"
+    );
+    assert!(hub.stop().success());
+}
+
+/// After a restart in the middle of an answer whose first part is in the thread, a read of that
+/// part that fails for now (5xx) says nothing about where it is: the rest waits, nothing goes to
+/// the channel, and once the part can be read the rest follows it into the thread.
+#[test]
+fn a_failing_read_back_after_a_restart_holds_the_rest() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000191";
+    // The first part is confirmed in the thread, the second ends uncertain until the restart.
+    let mut thread = vec![0];
+    thread.extend([500; 64]);
+    fake.script_in(source, &thread);
+    ask_with_thread(&fake, 800_000_000_000_000_191, "read back");
+    let in_thread = || {
+        fake.calls("POST", &format!("/channels/{source}/messages"))
+            .len()
+    };
+    fake.wait(WAIT, |_| (in_thread() >= 3).then_some(()));
+    assert!(hub.stop().success());
+    fake.unscript_in(source);
+    let first = fake.bot_messages(source)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let read_back = format!("/channels/{source}/messages/{first}");
+    fake.fail_reads(&read_back, 503);
+    let before = in_thread();
+    hub.start();
+    fake.wait(WAIT, |f| {
+        (!f.calls("GET", &read_back).is_empty()).then_some(())
+    });
+    // Several handling rounds (3 s each) go by with the read failing.
+    std::thread::sleep(Duration::from_secs(8));
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing in the channel"
+    );
+    assert_eq!(in_thread(), before, "held while the part cannot be read");
+    fake.pass_reads(&read_back);
+    fake.wait(WAIT, |_| (in_thread() > before).then_some(()));
+    settled(&hub);
+    assert_eq!(
+        fake.bot_messages(source).len(),
+        2,
+        "both parts in the thread"
+    );
+    assert_eq!(
+        fake.bot_messages(CH),
+        Vec::<Value>::new(),
+        "nothing in the channel"
+    );
+    assert!(hub.stop().success());
+}
+
+/// After a restart in the middle of an answer whose first part is in a thread that has since been
+/// deleted (404, unknown channel) or shut to the bot (403), while the channel definitely lacks the
+/// part, the rest moves to the channel, its first part as the reply to the request, as when the
+/// thread closes while the hub runs; later answers are not held up.
+#[test]
+fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
+    for (message, refusal) in [
+        (800_000_000_000_000_211_u64, 404),
+        (800_000_000_000_000_221, 403),
+    ] {
+        let fake = FakeDiscord::start();
+        let mut hub = relay_hub(&fake, &[], "");
+        hub.fixture(
+            "omp",
+            "answer.json",
+            Some(&json!("word ".repeat(600)).to_string()),
+        );
+        hub.start();
+        ready(&hub);
+        let source = message.to_string();
+        // The first part is confirmed in the thread; the second is refused for its own sake
+        // (nothing stored) until the restart.
+        let mut thread = vec![0];
+        thread.extend([400; 64]);
+        fake.script_in(&source, &thread);
+        ask_with_thread(&fake, message, "gone");
+        let in_thread = || {
+            fake.calls("POST", &format!("/channels/{source}/messages"))
+                .len()
+        };
+        fake.wait(WAIT, |_| (in_thread() >= 2).then_some(()));
+        assert!(hub.stop().success());
+        // While the hub is down the thread goes: reads and posts there are refused.
+        fake.unscript_in(&source);
+        fake.script_in(&source, &[refusal; 64]);
+        let first = fake.bot_messages(&source)[0]["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        fake.fail_reads(&format!("/channels/{source}/messages/{first}"), refusal);
+        let before = in_thread();
+        hub.start();
+        let moved = fake.wait(WAIT, |f| {
+            let posted = f.bot_messages(CH);
+            (posted.len() >= 2).then_some(posted)
+        });
+        assert_eq!(moved.len(), 2, "{refusal}: a note and the part: {moved:?}");
+        assert_eq!(
+            moved[0]["content"],
+            format!("-# continued from <#{source}>"),
+            "{refusal}: the note points back to the thread"
+        );
+        assert_eq!(
+            moved[1]["message_reference"]["message_id"],
+            source.as_str(),
+            "{refusal}: the moved part is the reply to the request"
+        );
+        let text = moved[1]["content"].as_str().unwrap();
+        assert!(
+            text.starts_with("word"),
+            "{refusal}: the part as stored: {text}"
+        );
+        assert_eq!(
+            in_thread(),
+            before,
+            "{refusal}: nothing more tried in the thread"
+        );
+        settled(&hub);
+        assert!(hub.stop().success());
+    }
+}
+
+/// A thread the lead started from the request with the bot (the work thread), here claimed by a
+/// lane, takes the answer like any thread started from it; the owner's next message in that
+/// thread goes to the lane, as lane-thread routing does, not to the lead.
+#[test]
+fn an_answer_goes_into_a_lane_thread_started_from_the_request() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    let work = hub.root.join("work");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}[lanes]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("lead answer").to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000181";
+    let msg = FakeDiscord::message(CH, 800_000_000_000_000_181, OWNER, "start the work");
+    fake.put(msg.clone());
+    fake.start_thread(CH, source, support::discord::BOT);
+    let params = json!({
+        "key": "w-1",
+        "title": "Work w-1",
+        "brief": "Do the work.",
+        "checks": [{ "kind": "command", "argv": ["true"] }],
+        "thread": format!("discord:{source}"),
+        "cwd": work,
+    });
+    let out = hub.cli(&["lane", "open", "--json", "--params", &params.to_string()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    fake.gw(Gw::Dispatch("MESSAGE_CREATE", msg));
+    settled(&hub);
+    let answers = |channel: &str| {
+        fake.bot_messages(channel)
+            .into_iter()
+            .filter(|m| m["content"] == "lead answer")
+            .collect::<Vec<_>>()
+    };
+    let answer = answers(source);
+    assert_eq!(
+        answer.len(),
+        1,
+        "the answer is in the lane's thread: {answer:?}"
+    );
+    assert!(answer[0].get("message_reference").is_none());
+    assert!(answers(CH).is_empty(), "nothing in the channel");
+    // The owner follows up in the thread: the lane takes it, the lead does not. A thread that
+    // appears while the hub runs is read from the hub's start on, so the message is made now.
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let now = u64::try_from(since_epoch).unwrap() - 1_420_070_400_000;
+    fake.say(FakeDiscord::message(
+        source,
+        (now << 22) + 1,
+        OWNER,
+        "follow-up for the lane",
+    ));
+    let lanes = hub.json(&["lane", "list", "--json", "--params", "{\"all\":true}"]);
+    let file = lanes[0]["session_file"].as_str().unwrap().to_string();
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .contains("follow-up for the lane")
+            .then_some(())
+    });
+    assert_eq!(requests(&hub).len(), 1, "the lead got only the request");
+    assert!(hub.stop().success());
+}
+
+/// With `follow_threads = false` the hub reads no threads, so the answer stays in the channel and
+/// the source message is not even read.
+#[test]
+fn without_thread_following_the_answer_stays_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "follow_threads = false\n");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000131";
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_131, "not followed");
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    settled(&hub);
+    assert!(
+        fake.calls("POST", &format!("/channels/{thread}/messages"))
+            .is_empty()
+    );
+    assert!(
+        fake.calls("GET", &format!("/channels/{CH}/messages/{source}"))
+            .is_empty(),
+        "no lookup"
+    );
     assert!(hub.stop().success());
 }
 

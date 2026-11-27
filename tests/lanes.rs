@@ -1275,10 +1275,11 @@ fn holds(file: &Value, text: &str) -> bool {
 }
 
 /// The lead delegates: an owner message in a watched channel, the lead's `lane.open` with
-/// `thread_from` that message and a worktree, the thread under it with its kickoff line, the lane's
-/// session in its worktree, a report in the thread under the status word, owner thread messages to
-/// the lane and not the lead, a split asked for in the thread opening a second lane in a thread of
-/// its own while the first keeps its scope, and `lane.close` marking the thread done.
+/// `thread_from` that message and a worktree, the thread under it with its kickoff line and then the
+/// lead's answer to the message (not in the channel), the lane's session in its worktree, a report
+/// in the thread under the status word, owner thread messages to the lane and not the lead, a split
+/// asked for in the thread opening a second lane in a thread of its own while the first keeps its
+/// scope, and `lane.close` marking the thread done.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
@@ -1312,7 +1313,9 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
     let (mut b, meta) = lead_bridge(&hub);
     let s = meta["session"].clone();
     let lead_file = hub.json(&["lead", "status", "--json"])["session"]["session_file"].clone();
-    // The owner asks in the channel; the request reaches the lead.
+    // The owner asks in the channel; the request reaches the lead. Its turn ends only after the
+    // lane is open, as a lead's turn that calls `lane.open` does.
+    std::fs::write(data(&hub).join("hold"), "fix the login bug").unwrap();
     let asked = 800_000_000_000_000_101u64;
     fake.say(FakeDiscord::message(CH, asked, OWNER, "fix the login bug"));
     hub.until(WAIT, || {
@@ -1348,6 +1351,19 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
         kickoff[0]["content"], "Fixing the login bug; done when the check true passes.",
         "the kickoff line comes first"
     );
+    // The lead's answer to the request goes into the lane's thread, started from that message,
+    // not into the channel.
+    std::fs::write(data(&hub).join("release"), "").unwrap();
+    let answer = hub.until(WAIT, || {
+        fake.bot_messages(&thread_a)
+            .into_iter()
+            .find(|m| m["content"] == "ok")
+    });
+    assert!(answer.get("message_reference").is_none(), "{answer}");
+    assert!(
+        fake.bot_messages(CH).iter().all(|m| m["content"] != "ok"),
+        "the answer is not in the channel"
+    );
     // A lane report reaches the thread.
     let (mut lb, _) = hello(&hub, &a);
     lb.lane_tool(
@@ -1357,10 +1373,10 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
     );
     let posts = hub.until(WAIT, || {
         let p = fake.bot_messages(&thread_a);
-        (p.len() >= 2).then_some(p)
+        (p.len() >= 3).then_some(p)
     });
     assert_eq!(
-        posts[1]["content"],
+        posts[2]["content"],
         "Lane update: the login test needs a fixture"
     );
     // An owner message in the thread reaches the lane, not the lead.
