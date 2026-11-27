@@ -1143,6 +1143,26 @@ fn question_ask_posts_in_its_thread() {
         json!({ "message_id": "700000000000000001", "channel_id": THREAD });
     fake.say(other);
     hub.until(WAIT, || lane_file().contains("lane reply").then_some(()));
+    // A second question in the same lane thread is answered by button, not handed to the lane.
+    let (said, err) = lead_tool(&mut b, &s, "q-button", ask(in_thread(), None));
+    assert!(!err, "{said}");
+    let id = said.split_whitespace().nth(1).unwrap();
+    let message = said.split_whitespace().last().unwrap();
+    fake.press(OWNER, THREAD, message, &format!("cy:{id}:1"));
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&lead_file)
+            .unwrap()
+            .contains(&format!("question {id}"))
+            .then_some(())
+    });
+    let edited = fake.wait(WAIT, |f| {
+        f.bot_messages(THREAD).into_iter().find(|m| {
+            m["id"] == message
+                && m["components"].as_array().is_some_and(Vec::is_empty)
+        })
+    });
+    assert!(edited["content"].as_str().unwrap().contains("2. b"), "{edited}");
+    assert!(!lane_file().contains(id), "the button answer belongs to the lead");
     drop(b);
     hub.stop();
 }

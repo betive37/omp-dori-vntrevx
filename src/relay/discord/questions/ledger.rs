@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use super::super::intake::Intake;
 use super::super::types::Press;
 use super::super::{Rest, Snowflake};
-use super::{EDIT_BUDGET, LABEL_MAX, neutral};
+use super::{LABEL_MAX, neutral};
 use crate::host::Runtime;
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
@@ -149,13 +149,8 @@ pub(crate) fn close(rest: Arc<Rest>, q: &QuestionRow, status: &str) {
         return;
     };
     let content = closed(&body(&q.id, &q.text, &q.options, q.recommended), status);
-    let edit = json!({ "content": content, "components": [] });
     tokio::spawn(async move {
-        match tokio::time::timeout(EDIT_BUDGET, rest.edit(room, message, edit)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::info("recorded question not updated", &[("error", &e)]),
-            Err(_) => log::info("recorded question not updated within 3 s", &[]),
-        }
+        super::edit_closed(&rest, (room, message), &content).await;
     });
 }
 

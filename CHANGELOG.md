@@ -13,9 +13,10 @@
   even after asking the lead to make them.
 - The lead's `question.ask` posts in the Discord thread it names (`thread: "discord:<id>"`) when
   no `room` is given, instead of the home channel. A `room` that is not a Discord channel ID is
-  refused instead of silently posting in the home channel, and so is a `room` the post fails in
-  (nothing is recorded). The owner's reply to the lead's open question goes to the lead even in a
-  thread an open lane owns.
+  refused instead of silently posting in the home channel, and so is a definitely rejected post.
+  An uncertain post stays in the ledger and is reported as in doubt, never as a reason to post
+  again. The owner's reply to the lead's open question goes to the lead even in a thread an open
+  lane owns (#281, @betive37).
 - A question the lead records (`cataly_lead` op `question.ask`) now has one button per option
   on Discord, labelled with its number; the recommended one is highlighted but never chosen by
   itself. Your press answers the question exactly like a reply with that number: the ledger
@@ -24,7 +25,7 @@
   However the question is settled (button, reply, or the lead's `question.answer`, `choose` or
   `withdraw`), its message then says so and loses its buttons. Replying with a number or free
   text works as before. Buttons come only when presses reach Cataly over the Gateway (the same
-  condition as for OMP's questions); otherwise the question is text only, as before.
+  condition as for OMP's questions); otherwise the question is text only, as before (#292, @betive37).
 
 ## 0.2.5 (2026-11-27)
 

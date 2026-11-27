@@ -57,6 +57,7 @@ struct State {
     scripted: VecDeque<u16>,
     /// Channel -> statuses for its next message creates, used before `scripted`.
     scripted_in: HashMap<String, VecDeque<u16>>,
+    callbacks: VecDeque<u16>,
     nonces: HashMap<String, u64>,
     next_id: u64,
     created: usize,
@@ -173,6 +174,11 @@ impl FakeDiscord {
             .entry(channel.to_string())
             .or_default()
             .extend(statuses);
+    }
+
+    /// Statuses for interaction acknowledgements; unlike creates these never retry.
+    pub fn script_callbacks(&self, statuses: &[u16]) {
+        self.state.lock().unwrap().callbacks.extend(statuses);
     }
 
     pub fn seen(&self) -> Vec<Seen> {
@@ -717,8 +723,9 @@ async fn answer(
             ["channels", _, "messages", _, "reactions", _, "@me"]
             | ["channels", _, "messages", "pins", _],
         ) => reply(204, &Value::Null),
-        ("POST", ["channels", _, "typing"] | ["interactions", _, _, "callback"]) => {
-            reply(204, &Value::Null)
+        ("POST", ["channels", _, "typing"]) => reply(204, &Value::Null),
+        ("POST", ["interactions", _, _, "callback"]) => {
+            reply(s.callbacks.pop_front().unwrap_or(204), &Value::Null)
         }
         _ => reply(404, &json!({ "message": "Unknown", "code": 0 })),
     };

@@ -1232,6 +1232,22 @@ fn settling_a_question_by_tool_closes_its_buttons() {
     fake.press(OWNER, CH, &first_message, &format!("cy:{first}:0"));
     assert_eq!(callback(&fake, 0).body["type"], 4);
     assert_eq!(ledger(&hub, &first).0, "withdrawn");
+    let (third, third_message) = record_question(
+        &mut lead,
+        &json!({ "text": "Three?", "options": ["e", "f"],
+            "settle": "lead", "thread": format!("discord:{CH}") }),
+    );
+    let (said, error) = lead.tool(&json!({
+        "op": "question.choose", "id": third, "option": 2,
+        "reason": "the agreed default", "message": "800000000000000422"
+    }));
+    assert!(!error, "{said}");
+    let edited = closed(&fake, &third_message);
+    assert!(
+        edited["content"].as_str().unwrap().contains("Chosen by the lead: 2. f"),
+        "{edited}"
+    );
+    assert_eq!(ledger(&hub, &third).0, "chosen");
     assert!(hub.stop().success());
 }
 
@@ -1376,5 +1392,56 @@ fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
     ready(&hub);
     std::thread::sleep(Duration::from_secs(1));
     assert_eq!(answered(&hub).len(), 62, "told once");
+    assert!(hub.stop().success());
+}
+
+/// A failed callback cannot settle a question; a later acknowledged choice wins instead.
+#[test]
+fn a_failed_question_acknowledgement_keeps_the_question_open() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) =
+        record_question(&mut lead, &json!({ "text": "Ack?", "options": ["a", "b"] }));
+    fake.script_callbacks(&[500]);
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
+    callback(&fake, 0);
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
+    callback(&fake, 1);
+    let edited = closed(&fake, &message);
+    assert!(edited["content"].as_str().unwrap().contains("2. b"), "{edited}");
+    let (state, outcome) = ledger(&hub, &id);
+    assert_eq!(state, "answered");
+    assert!(outcome.unwrap().ends_with("option 2 (b)"));
+    assert_eq!(fake.calls("POST", "/callback").len(), 2, "no callback retry");
+    assert!(hub.stop().success());
+}
+
+/// An accepted POST with lost acknowledgements is retained, not offered for another post.
+#[test]
+fn an_unacknowledged_question_post_remains_in_the_ledger() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    fake.script_in(CH, &[500; 4]);
+    let (said, error) = lead.tool(&json!({
+        "op": "question.ask", "text": "Uncertain?", "options": ["a", "b"],
+        "source": "discord:1/2", "room": CH
+    }));
+    assert!(!error && said.contains("in doubt"), "{said}");
+    assert!(!said.contains("ask it yourself"), "{said}");
+    let id = said.split_whitespace().nth(1).unwrap();
+    assert_eq!(ledger(&hub, id), ("open".into(), None));
+    assert_eq!(fake.bot_messages(CH).len(), 1, "one nonce, one visible question");
+    let (said, error) = lead.tool(&json!({
+        "op": "question.withdraw", "id": id, "reason": "resolve the uncertain question"
+    }));
+    assert!(!error, "{said}");
+    assert_eq!(ledger(&hub, id).0, "withdrawn");
+    assert_eq!(fake.bot_messages(CH).len(), 1, "settlement never posts again");
     assert!(hub.stop().success());
 }

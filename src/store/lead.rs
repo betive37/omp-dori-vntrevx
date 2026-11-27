@@ -571,7 +571,25 @@ mod tests {
             state: "answered".into(),
             outcome: "owner message 51: option 2".into(),
         };
-        assert_eq!(store.lead(settle.clone()).await.unwrap(), LeadDone::Done);
+        let competing = LeadWrite::QuestionSettle {
+            id: "0000abcd".into(),
+            state: "chosen".into(),
+            outcome: "option 1 by the lead".into(),
+        };
+        let (first, second) = tokio::join!(
+            biased;
+            store.lead(settle.clone()),
+            store.lead(competing)
+        );
+        assert_eq!(first.unwrap(), LeadDone::Done);
+        assert!(matches!(second.unwrap(), LeadDone::Refused(_)));
+        let recorded = store
+            .read(|r| r.question("0000abcd"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(recorded.state, "answered");
+        assert_eq!(recorded.outcome.as_deref(), Some("owner message 51: option 2"));
         // Settled: only the reply recorded as its answer, not a later one or a longer ID.
         assert!(reply("51").await);
         assert!(!reply("52").await && !reply("5").await);

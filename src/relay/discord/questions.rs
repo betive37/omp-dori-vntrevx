@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use super::form::{Field, FieldKind, Form};
 use super::intake::{Intake, NAME};
 use super::types::Press;
-use super::{Snowflake, nonce};
+use super::{Rest, Snowflake, nonce};
 use crate::config::Language;
 use crate::host::dialogs::DialogKind;
 use crate::host::dialogs::Question;
@@ -614,14 +614,19 @@ fn duration_words(d: Duration) -> String {
     }
 }
 
+/// Best-effort closing transport shared by dialogs and recorded questions.
+async fn edit_closed(rest: &Rest, at: (Snowflake, Snowflake), content: &str) {
+    let body = json!({ "content": content, "components": [] });
+    match tokio::time::timeout(EDIT_BUDGET, rest.edit(at.0, at.1, body)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::info("question not updated", &[("error", &e)]),
+        Err(_) => log::info("question not updated within 3 s", &[]),
+    }
+}
+
 impl<T: Runtime> Intake<T> {
     async fn edit_closing(&self, channel: Snowflake, message: Snowflake, content: &str) {
-        let body = json!({ "content": content, "components": [] });
-        match tokio::time::timeout(EDIT_BUDGET, self.rest.edit(channel, message, body)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::info("question not updated", &[("error", &e)]),
-            Err(_) => log::info("question not updated within 3 s", &[]),
-        }
+        edit_closed(&self.rest, (channel, message), content).await;
         self.mark_question(channel, message, false).await;
     }
 

@@ -177,7 +177,8 @@ lane lifecycle area consumes the completion checker, the step records and the pu
     number, a request-log item, and the posted message reference. The daemon assigns an 8-hex-digit ID.
     It posts the question in the Discord channel the lead names, else in the Discord thread the
     question belongs to (`discord:<id>`), else in the home channel. A named channel that is not a
-    Discord channel ID, or one the post fails in, is refused: nothing is recorded.
+    Discord channel ID, or one whose post is definitely rejected, is refused: nothing is recorded.
+    An uncertain POST remains recorded and is reported as in doubt; it must not prompt another post.
 35. Who settles: owner-only (the default) or lead-may-choose. Lead-may-choose needs at least 2 options and a thread;
     when a lane with a thread is given, it must be that thread. Cost, access, outside commitments, irreversible work
     and changes of scope stay owner-only; the lead's instructions say so, the daemon cannot judge content.

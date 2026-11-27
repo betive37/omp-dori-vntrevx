@@ -278,6 +278,7 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
             .and_then(snowflake)
             .or_else(|| config.discord.home()),
     };
+    let mut uncertain = false;
     let posted = match (room, hub.discord_rest()) {
         (Some(room), Some(rest)) => {
             let nonce = crate::relay::discord::nonce(&format!("ledger:{id}"), 0);
@@ -289,17 +290,21 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
                 json!({ "content": body, "nonce": nonce })
             };
             let created = rest.create(room, create).await;
-            created.ok().and_then(|v| {
-                v.get("id")
+            match created {
+                Ok(v) => v
+                    .get("id")
                     .and_then(Value::as_str)
-                    .map(|m| (room.to_string(), m.to_string()))
-            })
+                    .map(|m| (room.to_string(), m.to_string())),
+                Err(e) => {
+                    uncertain = e.uncertain;
+                    None
+                }
+            }
         }
         _ => None,
     };
-    // A room the lead named but that could not take the post is refused like an unreadable one:
-    // nothing is recorded (EVR req. 34).
-    if let (Some(r), None) = (named, &posted) {
+    // Only a definite rejection permits treating the post as absent (EVR req. 34).
+    if !uncertain && let (Some(r), None) = (named, &posted) {
         return Err(format!("room: could not post in {r}; nothing recorded"));
     }
     let row = QuestionRow {
@@ -311,7 +316,9 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         recommended,
         lead_may,
         request: p::REQUEST.int(input),
-        room: posted.as_ref().map(|(room, _)| room.clone()),
+        room: room
+            .filter(|_| posted.is_some() || uncertain)
+            .map(|room| room.to_string()),
         message: posted.as_ref().map(|(_, message)| message.clone()),
         state: "open".into(),
         outcome: None,
@@ -326,6 +333,9 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         Some((room, message)) => {
             format!("question {id} recorded and posted in {room} as message {message}")
         }
+        None if uncertain => format!(
+            "question {id} recorded; its post is in doubt. Do not post it again."
+        ),
         None => format!(
             "question {id} recorded; it could not be posted, so ask it yourself and quote its ID"
         ),
