@@ -1,4 +1,5 @@
-//! Pre-bind process ownership. An absent or incomplete journal is unknown, never proof of exit.
+//! Pre-bind process ownership. An absent or incomplete journal is unknown, never proof of exit. A
+//! start on a worker is reconciled by its attempt token there; a disconnect alone proves nothing.
 
 use std::path::{Path, PathBuf};
 
@@ -6,6 +7,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::host::startup::Cleanup;
 use crate::sys::fs;
+use crate::worker::attempt::{AttemptState, Reaped, birth};
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Evidence {
@@ -86,60 +88,40 @@ pub(crate) async fn reconcile(state: &Path, handle: &str) -> Result<Cleanup, Str
     }
 }
 
-#[cfg(target_os = "linux")]
-async fn birth(pid: u32) -> Result<Option<String>, String> {
-    tokio::task::spawn_blocking(move || {
-        match std::fs::read_to_string(format!("/proc/{pid}/stat")) {
-            Ok(stat) => {
-                let (_, fields) = stat.rsplit_once(')').ok_or("invalid process identity")?;
-                let born = fields
-                    .split_whitespace()
-                    .nth(19)
-                    .ok_or("missing process birth identity")?;
-                let boot = std::fs::read_to_string("/proc/sys/kernel/random/boot_id")
-                    .map_err(|e| e.to_string())?;
-                Ok(Some(format!("{}:{born}", boot.trim())))
-            }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
-            Err(error) => Err(error.to_string()),
-        }
-    })
-    .await
-    .map_err(|e| e.to_string())?
+/// Reconciles attempt `handle`: from its journal here when `worker` is `None`, else by asking the
+/// worker for its token after a reconnect. Only proof of exit is confirmed. A process of the attempt
+/// that still runs is reported in the error, never killed or adopted; unknown ownership is an error
+/// too, and both hold.
+pub(crate) async fn reconcile_attempt(
+    state: &Path,
+    handle: &str,
+    worker: Option<&str>,
+) -> Result<Cleanup, String> {
+    let Some(worker) = worker else {
+        return reconcile(state, handle).await;
+    };
+    match crate::worker::link::reconcile(worker, handle).await {
+        AttemptState::Running { pid } => Err(format!(
+            "attempt {handle} still runs on {worker} as process {pid}; it is reported, never killed \
+             or adopted"
+        )),
+        AttemptState::Unknown { reason } => Err(format!(
+            "ownership of attempt {handle} on {worker} is unknown: {reason}"
+        )),
+        reaped @ AttemptState::Reaped { .. } => Ok(worker_cleanup(&reaped)),
+    }
 }
 
-#[cfg(not(target_os = "linux"))]
-async fn birth(pid: u32) -> Result<Option<String>, String> {
-    use crate::sys::command::{self, Exit, Output, Spec};
-    let argv = [
-        "ps".into(),
-        "-p".into(),
-        pid.to_string(),
-        "-o".into(),
-        "lstart=".into(),
-    ];
-    let result = command::run(&Spec {
-        argv: &argv,
-        cwd: None,
-        env: &[],
-        timeout: std::time::Duration::from_secs(2),
-        kill_grace: std::time::Duration::from_secs(1),
-        output_cap: 4096,
-        output: Output::Capture,
-    })
-    .await
-    .map_err(|e| e.to_string())?;
-    match result.exit {
-        Exit::Code(0) => Ok(Some(
-            String::from_utf8(result.stdout)
-                .map_err(|e| e.to_string())?
-                .trim()
-                .to_string(),
-        )),
-        Exit::Code(1) => Ok(None),
-        Exit::Code(_) | Exit::Signal(_) | Exit::Unknown => {
-            Err("process identity query failed".into())
-        }
+/// The cleanup a worker's state for an attempt proves: an exit acknowledgement or an `attempts`
+/// answer. Only a reap on the worker confirms; running and unknown do not.
+pub(crate) fn worker_cleanup(state: &AttemptState) -> Cleanup {
+    match state {
+        AttemptState::Reaped {
+            exit: Reaped::NotSpawned,
+            ..
+        } => Cleanup::NotSpawned,
+        AttemptState::Reaped { .. } => Cleanup::WorkerReaped,
+        AttemptState::Running { .. } | AttemptState::Unknown { .. } => Cleanup::Unknown,
     }
 }
 
@@ -166,6 +148,43 @@ mod tests {
         assert_eq!(
             reconcile(&dir, "attempt").await.unwrap(),
             Cleanup::LocalReaped
+        );
+    }
+
+    #[tokio::test]
+    async fn only_a_worker_reap_confirms_a_remote_attempt() {
+        use crate::host::lead::Lease;
+        let reaped = |exit| AttemptState::Reaped {
+            exit,
+            lease: Lease::Unknown,
+        };
+        for exit in [Reaped::Code(0), Reaped::Signal(9), Reaped::Gone] {
+            assert_eq!(worker_cleanup(&reaped(exit)), Cleanup::WorkerReaped);
+        }
+        assert_eq!(
+            worker_cleanup(&reaped(Reaped::NotSpawned)),
+            Cleanup::NotSpawned
+        );
+        assert_eq!(
+            worker_cleanup(&AttemptState::Running { pid: 7 }),
+            Cleanup::Unknown
+        );
+        let unknown = AttemptState::Unknown {
+            reason: "the worker connection ended before the exit acknowledgement".into(),
+        };
+        assert_eq!(worker_cleanup(&unknown), Cleanup::Unknown);
+        // A worker that cannot be asked is unknown ownership, never an exit.
+        let dir = crate::sys::fs::tests::scratch("startup-owner-remote");
+        let asked = reconcile_attempt(&dir, "attempt", Some("box")).await;
+        assert!(
+            asked
+                .as_ref()
+                .is_err_and(|e| e.contains("ownership of attempt attempt on box is unknown")),
+            "{asked:?}"
+        );
+        assert_eq!(
+            reconcile_attempt(&dir, "missing", None).await.unwrap(),
+            Cleanup::Unknown
         );
     }
 }

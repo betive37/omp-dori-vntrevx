@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader, DuplexStream};
 use tokio::sync::{mpsc, oneshot, watch};
 
+use super::attempt::{AttemptState, QUERY_MAX, Report};
 use super::enrol::{self, Destination};
 use super::mux::{Accepted, Mux, Timing};
 use super::{Hello, LINE_MAX, method};
@@ -268,7 +269,7 @@ impl Client {
         name: &str,
         params: Value,
         limit: Duration,
-    ) -> Result<Value, String> {
+    ) -> Result<Value, CallError> {
         let id = self.next.fetch_add(1, Ordering::Relaxed);
         let mut line = serde_json::to_string(&Request {
             v: crate::proto::VERSION,
@@ -277,10 +278,10 @@ impl Client {
             params,
             launch: None,
         })
-        .map_err(|e| e.to_string())?;
+        .map_err(|e| CallError::Refused(e.to_string()))?;
         line.push('\n');
         if line.len() > LINE_MAX {
-            return Err("request too large".into());
+            return Err(CallError::Refused("request too large".into()));
         }
         let (tx, rx) = oneshot::channel();
         self.pending
@@ -290,20 +291,23 @@ impl Client {
         let ended = || "the worker connection ended".to_string();
         if self.lines.send(line).await.is_err() {
             self.forget(id);
-            return Err(ended());
+            return Err(CallError::Refused(ended()));
         }
         let reply = match tokio::time::timeout(limit, rx).await {
             Ok(Ok(reply)) => reply,
-            Ok(Err(_)) => return Err(ended()),
+            Ok(Err(_)) => return Err(CallError::Unanswered(ended())),
             Err(_) => {
                 self.forget(id);
-                return Err(format!("{name} took longer than {} s", limit.as_secs()));
+                return Err(CallError::Unanswered(format!(
+                    "{name} took longer than {} s",
+                    limit.as_secs()
+                )));
             }
         };
         match (reply.ok, reply.err) {
             (Some(v), _) => Ok(v),
-            (None, Some(e)) => Err(e.message),
-            (None, None) => Err("an empty answer".into()),
+            (None, Some(e)) => Err(CallError::Refused(e.message)),
+            (None, None) => Err(CallError::Unanswered("an empty answer".into())),
         }
     }
 
@@ -312,6 +316,24 @@ impl Client {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(&id);
+    }
+}
+
+/// Why a channel-0 call has no result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum CallError {
+    /// Never sent, or answered with an error: the worker did not carry it out.
+    Refused(String),
+    /// Sent and not answered (the connection ended, or the limit passed): the worker may have
+    /// carried it out.
+    Unanswered(String),
+}
+
+impl std::fmt::Display for CallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Unanswered(why) => f.write_str(why),
+        }
     }
 }
 
@@ -355,9 +377,90 @@ pub(crate) struct Link {
     pending: AtomicUsize,
     /// Remote lanes running on it; a [`LaneHold`] counts one.
     pub(crate) lanes: AtomicUsize,
-    /// Channels of spawned OMP children the worker opened, until their `spawn` answer takes them.
-    spawned: Mutex<HashMap<u32, DuplexStream>>,
+    /// Channels of spawned OMP children the worker opened, with their exit acknowledgements, until
+    /// their `spawn` answer takes them.
+    spawned: Mutex<HashMap<u32, (DuplexStream, oneshot::Receiver<Value>)>>,
     spawned_ready: tokio::sync::Notify,
+}
+
+/// One OMP attempt the worker started: its channel, the stream to its stdin and from its stdout,
+/// the hold on the connection, and the wait for its exit acknowledgement.
+pub(crate) struct Spawned {
+    pub(crate) channel: u32,
+    pub(crate) stream: DuplexStream,
+    pub(crate) hold: LaneHold,
+    pub(crate) exit: ExitWait,
+}
+
+/// Why a `spawn` gave no attempt to talk to, and what that proves about a process for its token.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum SpawnError {
+    /// Not sent, or refused before the worker recorded the attempt: no process was started.
+    Refused(String),
+    /// Recorded, then failed: the state the worker recorded (never started, or how it ended).
+    Ended { detail: String, state: AttemptState },
+    /// No usable answer: a process may run for the token; only reconciling it can tell.
+    Unanswered(String),
+}
+
+impl std::fmt::Display for SpawnError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Refused(why) | Self::Unanswered(why) | Self::Ended { detail: why, .. } => {
+                f.write_str(why)
+            }
+        }
+    }
+}
+
+/// The wait for one attempt's exit acknowledgement: the worker sends it once it reaped the OMP and
+/// recorded how it ended. The end of the channel's output, or of the connection, is no such proof.
+pub(crate) struct ExitWait {
+    attempt: String,
+    rx: oneshot::Receiver<Value>,
+    got: Option<AttemptState>,
+}
+
+impl ExitWait {
+    /// The attempt token it waits for.
+    pub(crate) fn attempt(&self) -> &str {
+        &self.attempt
+    }
+
+    /// The acknowledged state: [`AttemptState::Reaped`] with the exit, or
+    /// [`AttemptState::Unknown`] when the worker could not reap it. A connection that ended first
+    /// (an SSH drop, EOF) gives [`AttemptState::Unknown`]: the attempt is then reconciled with
+    /// [`Link::attempts`] after a reconnect. Cancel-safe; once answered it answers the same again.
+    pub(crate) async fn wait(&mut self) -> AttemptState {
+        if let Some(got) = &self.got {
+            return got.clone();
+        }
+        let state = match (&mut self.rx).await {
+            Ok(value) => acknowledged(&self.attempt, value),
+            Err(_) => AttemptState::Unknown {
+                reason: "the worker connection ended before the exit acknowledgement".into(),
+            },
+        };
+        self.got = Some(state.clone());
+        state
+    }
+}
+
+/// The state an `exit` frame's payload acknowledges for `attempt`; anything that is not this
+/// attempt's well-formed report is unknown.
+fn acknowledged(attempt: &str, value: Value) -> AttemptState {
+    match serde_json::from_value::<Report>(value) {
+        Ok(report) if report.attempt == attempt => report.state,
+        Ok(report) => AttemptState::Unknown {
+            reason: format!(
+                "the exit acknowledgement names attempt {}, not {attempt}",
+                report.attempt
+            ),
+        },
+        Err(e) => AttemptState::Unknown {
+            reason: format!("a malformed exit acknowledgement: {e}"),
+        },
+    }
 }
 
 /// One remote lane's hold on its connection: it is not idle while a lane runs on it.
@@ -399,6 +502,7 @@ impl Link {
         let hello = client
             .call(method::HELLO, json!({}), CONNECT + HELLO)
             .await
+            .map_err(|e| e.to_string())
             .and_then(|v| serde_json::from_value::<Hello>(v).map_err(|e| e.to_string()));
         let hello = match hello {
             Ok(h) => h,
@@ -424,19 +528,46 @@ impl Link {
                 .await;
             return Err(ConnectError::Incompatible(why));
         }
-        let link = Arc::new(Self {
-            name: target.name.clone(),
+        Ok((
+            Self::assemble(&target.name, hello, mux, client, Some(child)),
+            accepted,
+        ))
+    }
+
+    /// A connection whose `hello` was answered and found compatible.
+    fn assemble(
+        name: &str,
+        hello: Hello,
+        mux: Mux,
+        client: Client,
+        child: Option<Attached>,
+    ) -> Arc<Self> {
+        Arc::new(Self {
+            name: name.to_string(),
             hello,
             mux,
             client,
-            child: tokio::sync::Mutex::new(Some(child)),
+            child: tokio::sync::Mutex::new(child),
             used: Mutex::new(Instant::now()),
             pending: AtomicUsize::new(0),
             lanes: AtomicUsize::new(0),
             spawned: Mutex::new(HashMap::new()),
             spawned_ready: tokio::sync::Notify::new(),
-        });
-        Ok((link, accepted))
+        })
+    }
+
+    /// Takes a channel the worker opened: a spawned OMP's waits, with its exit acknowledgement, for
+    /// its `spawn` answer; any other is handed back.
+    fn accept(&self, channel: Accepted) -> Option<Accepted> {
+        if channel.header.get("kind").and_then(Value::as_str) != Some("spawn") {
+            return Some(channel);
+        }
+        self.spawned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .insert(channel.channel, (channel.stream, channel.exit));
+        self.spawned_ready.notify_waiters();
+        None
     }
 
     /// One worker-protocol call; counts as use.
@@ -446,6 +577,18 @@ impl Link {
         params: Value,
         limit: Duration,
     ) -> Result<Value, String> {
+        self.request(name, params, limit)
+            .await
+            .map_err(|e| e.to_string())
+    }
+
+    /// [`Link::call`], telling a refusal from a call the worker may have carried out.
+    async fn request(
+        &self,
+        name: &str,
+        params: Value,
+        limit: Duration,
+    ) -> Result<Value, CallError> {
         self.pending.fetch_add(1, Ordering::AcqRel);
         let out = self.client.call(name, params, limit).await;
         self.pending.fetch_sub(1, Ordering::AcqRel);
@@ -517,44 +660,133 @@ impl Link {
         .map(|_| ())
     }
 
-    /// Starts the worker's OMP with `argv` (the first word `omp`); returns its channel and stream:
-    /// the child's stdout to read, its stdin to write. Ending the stream's input closes the child.
+    /// Starts the worker's OMP with `argv` (the first word `omp`) for the hub's attempt token
+    /// (protocol 2); `session` names the OMP session it is to bind, for the worker's lease check once
+    /// it ended. The worker records the attempt before the process exists and refuses a token it
+    /// already recorded. Ending the stream's input closes the child. A failure says what it proves
+    /// about a process for the token.
     pub(crate) async fn spawn(
         self: &Arc<Self>,
         argv: &[String],
         cwd: &str,
         env: &[(String, String)],
-    ) -> Result<(u32, DuplexStream, LaneHold), String> {
+        attempt: &str,
+        session: Option<&str>,
+    ) -> Result<Spawned, SpawnError> {
         let env: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let reply = self
-            .call(
+            .request(
                 method::SPAWN,
-                json!({ "argv": argv, "cwd": cwd, "env": env }),
+                json!({
+                    "argv": argv,
+                    "cwd": cwd,
+                    "env": env,
+                    "attempt": attempt,
+                    "session": session,
+                }),
                 Duration::from_secs(30),
             )
-            .await?;
-        let channel = reply
+            .await
+            .map_err(|e| match e {
+                CallError::Refused(why) => SpawnError::Refused(why),
+                CallError::Unanswered(why) => SpawnError::Unanswered(why),
+            })?;
+        if reply.get("attempt").and_then(Value::as_str) != Some(attempt) {
+            return Err(SpawnError::Unanswered(format!(
+                "the spawn answer does not name attempt {attempt}"
+            )));
+        }
+        if let Some(why) = reply.get("failed") {
+            let state = reply
+                .get("state")
+                .cloned()
+                .and_then(|s| serde_json::from_value(s).ok())
+                .unwrap_or_else(|| AttemptState::Unknown {
+                    reason: "the failed spawn answer has no attempt state".into(),
+                });
+            return Err(SpawnError::Ended {
+                detail: why.as_str().unwrap_or_default().to_string(),
+                state,
+            });
+        }
+        let Some(channel) = reply
             .get("channel")
             .and_then(Value::as_u64)
             .and_then(|c| u32::try_from(c).ok())
-            .ok_or("spawn answer without a channel")?;
+        else {
+            return Err(SpawnError::Unanswered(
+                "spawn answer without a channel".into(),
+            ));
+        };
         // The open frame came first on the stream; its hand-over may still be on its way.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let ready = self.spawned_ready.notified();
-            if let Some(stream) = self
+            if let Some((stream, rx)) = self
                 .spawned
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
                 .remove(&channel)
             {
                 self.lanes.fetch_add(1, Ordering::AcqRel);
-                return Ok((channel, stream, LaneHold(Arc::clone(self))));
+                return Ok(Spawned {
+                    channel,
+                    stream,
+                    hold: LaneHold(Arc::clone(self)),
+                    exit: ExitWait {
+                        attempt: attempt.to_string(),
+                        rx,
+                        got: None,
+                    },
+                });
             }
             if tokio::time::timeout_at(deadline, ready).await.is_err() {
-                return Err("the spawned OMP's channel did not arrive".into());
+                // The process runs with nobody to talk to it: end it; its token answers for it.
+                let killed = self.signal(channel, "KILL").await;
+                return Err(SpawnError::Unanswered(format!(
+                    "the spawned OMP's channel did not arrive (KILL: {killed:?})"
+                )));
             }
         }
+    }
+
+    /// What the worker knows of each attempt token, answered within its 10 s bound: running (the
+    /// recorded process still lives; it is never killed or adopted), reaped with its exit, or
+    /// unknown. A token the answer leaves out is unknown.
+    pub(crate) async fn attempts(
+        &self,
+        tokens: &[&str],
+    ) -> Result<HashMap<String, AttemptState>, String> {
+        if tokens.len() > QUERY_MAX {
+            return Err(format!("at most {QUERY_MAX} attempt tokens per question"));
+        }
+        let reply = self
+            .call(
+                method::ATTEMPTS,
+                json!({ "attempts": tokens }),
+                Duration::from_secs(15),
+            )
+            .await?;
+        let answered = reply
+            .get("attempts")
+            .and_then(Value::as_object)
+            .ok_or("attempts answer without attempts")?;
+        Ok(tokens
+            .iter()
+            .map(|token| {
+                let state = match answered.get(*token) {
+                    Some(value) => serde_json::from_value(value.clone()).unwrap_or_else(|e| {
+                        AttemptState::Unknown {
+                            reason: format!("a malformed attempt state: {e}"),
+                        }
+                    }),
+                    None => AttemptState::Unknown {
+                        reason: "the worker did not answer for it".into(),
+                    },
+                };
+                ((*token).to_string(), state)
+            })
+            .collect())
     }
 
     /// TERM or KILL to a spawned child.
@@ -672,6 +904,25 @@ pub(crate) async fn connect(name: &str) -> Result<Arc<Link>, String> {
         .get()
         .ok_or("no worker table: workers run only under the hub")?;
     workers.connect(name).await
+}
+
+/// What worker `name` knows of attempt `token`, connecting when needed: running, reaped with its
+/// exit, or unknown. A connection or answer that fails is unknown: never taken for an exit.
+pub(crate) async fn reconcile(name: &str, token: &str) -> AttemptState {
+    let answered = match connect(name).await {
+        Ok(link) => link.attempts(&[token]).await,
+        Err(e) => Err(e),
+    };
+    match answered {
+        Ok(mut states) => states
+            .remove(token)
+            .unwrap_or_else(|| AttemptState::Unknown {
+                reason: "the worker did not answer for it".into(),
+            }),
+        Err(e) => AttemptState::Unknown {
+            reason: format!("{name}: {e}"),
+        },
+    }
 }
 
 /// The hub's worker table.
@@ -952,18 +1203,10 @@ impl Workers {
         loop {
             tokio::select! {
                 got = accepted.recv() => match got {
-                    Some(channel) => match channel.header.get("kind").and_then(Value::as_str) {
-                        Some("spawn") => {
-                            link.spawned
-                                .lock()
-                                .unwrap_or_else(PoisonError::into_inner)
-                                .insert(channel.channel, channel.stream);
-                            link.spawned_ready.notify_waiters();
-                        }
-                        _ => match self.hook.get() {
-                            Some(hook) => hook(link.name.clone(), channel),
-                            None => drop(channel),
-                        },
+                    Some(channel) => match (link.accept(channel), self.hook.get()) {
+                        (Some(other), Some(hook)) => hook(link.name.clone(), other),
+                        (Some(other), None) => drop(other),
+                        (None, _) => {}
                     },
                     None => break,
                 },
@@ -1251,7 +1494,7 @@ impl Check {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     #[test]
@@ -1358,8 +1601,19 @@ mod tests {
             ..Hello::default()
         };
         assert_eq!(hello.incompatible("box"), None);
+        // A worker on protocol 1 has no attempt tokens or exit acknowledgements: refused, never
+        // misread.
+        let older = Hello {
+            protocol: 1,
+            ..hello.clone()
+        };
+        assert_eq!(
+            older.incompatible("box").unwrap(),
+            "incompatible: the cataly on box speaks worker protocol 1 where this hub speaks 2; run \
+             cataly update on box"
+        );
         let newer = Hello {
-            protocol: 2,
+            protocol: 3,
             ..hello.clone()
         };
         assert!(
@@ -1375,5 +1629,122 @@ mod tests {
                 .unwrap()
                 .contains("bridge protocol 2")
         );
+    }
+
+    /// The real `serve` in this process over an in-memory stream, with `/bin/sh` as its OMP, and
+    /// the hub's link to it.
+    pub(crate) fn served(root: &Path) -> (Arc<Link>, tokio::task::JoinHandle<u8>) {
+        let worker = Arc::new(super::super::serve::Worker {
+            hub: "123456".into(),
+            root: root.to_path_buf(),
+            socket: root.join("w.sock"),
+            omp: "/bin/sh".into(),
+            path: None,
+            attempts: super::super::attempt::Attempts::new(root),
+            children: Mutex::new(HashMap::new()),
+        });
+        crate::sys::fs::ensure_private_dir(worker.attempts.dir()).unwrap();
+        crate::sys::fs::ensure_private_dir(&root.join("logs")).unwrap();
+        let (hub_end, worker_end) = tokio::io::duplex(256 * 1024);
+        let (wr, ww) = tokio::io::split(worker_end);
+        let serving = tokio::spawn(super::super::serve::serve(
+            worker,
+            wr,
+            ww,
+            Timing::STANDARD,
+            std::future::pending(),
+        ));
+        let (hr, hw) = tokio::io::split(hub_end);
+        let (mux, control, mut accepted) = Mux::start(hr, hw, Timing::STANDARD);
+        let hello = Hello {
+            protocol: super::super::PROTOCOL,
+            bridge: crate::hub::bridge::PROTOCOL,
+            ..Hello::default()
+        };
+        let link = Link::assemble("box", hello, mux, Client::start(control), None);
+        let router = Arc::clone(&link);
+        tokio::spawn(async move {
+            while let Some(channel) = accepted.recv().await {
+                drop(router.accept(channel));
+            }
+        });
+        (link, serving)
+    }
+
+    /// Each attempt is acknowledged once its OMP is reaped, with its exit code or signal; a drop
+    /// before the acknowledgement is unknown until the reconnected worker answers for the token.
+    #[tokio::test]
+    async fn attempts_are_acknowledged_once_reaped_and_reconciled_after_a_drop() {
+        use crate::host::lead::Lease;
+        use crate::worker::attempt::Reaped;
+        use tokio::io::AsyncReadExt as _;
+        let root = crate::sys::fs::tests::scratch("worker-ack");
+        let cwd = root.display().to_string();
+        let sh = |script: &str| vec!["omp".to_string(), "-c".into(), script.into()];
+        let reaped = |exit| AttemptState::Reaped {
+            exit,
+            lease: Lease::Unknown,
+        };
+        let (link, serving) = served(&root);
+
+        let mut normal = link
+            .spawn(
+                &sh("echo ready; exec cat >/dev/null"),
+                &cwd,
+                &[],
+                "a1",
+                None,
+            )
+            .await
+            .unwrap();
+        let mut first = [0u8; 6];
+        normal.stream.read_exact(&mut first).await.unwrap();
+        assert_eq!(&first, b"ready\n");
+        normal.stream.shutdown().await.unwrap();
+        assert_eq!(normal.exit.attempt(), "a1");
+        assert_eq!(normal.exit.wait().await, reaped(Reaped::Code(0)));
+        assert_eq!(normal.exit.wait().await, reaped(Reaped::Code(0)));
+        let reused = link.spawn(&sh("true"), &cwd, &[], "a1", None).await;
+        assert!(
+            matches!(&reused, Err(SpawnError::Refused(e)) if e.contains("already recorded")),
+            "{:?}",
+            reused.err()
+        );
+        let tokenless = link.spawn(&sh("true"), &cwd, &[], "", None).await;
+        assert!(matches!(tokenless, Err(SpawnError::Refused(_))));
+
+        let mut killed = link
+            .spawn(&sh("exec sleep 30"), &cwd, &[], "a2", None)
+            .await
+            .unwrap();
+        link.signal(killed.channel, "KILL").await.unwrap();
+        assert_eq!(killed.exit.wait().await, reaped(Reaped::Signal(9)));
+
+        let mut dropped = link
+            .spawn(&sh("exec cat >/dev/null"), &cwd, &[], "a3", None)
+            .await
+            .unwrap();
+        let live = link.attempts(&["a3"]).await.unwrap();
+        assert!(
+            matches!(live["a3"], AttemptState::Running { .. }),
+            "{live:?}"
+        );
+        link.mux.close();
+        assert!(matches!(
+            dropped.exit.wait().await,
+            AttemptState::Unknown { reason } if reason.contains("ended before")
+        ));
+        // The worker closed the child by the HOST-20 rule and recorded how it ended.
+        assert_eq!(serving.await.unwrap(), crate::cli::exit::OK);
+        let (again, _serving) = served(&root);
+        let states = again.attempts(&["a1", "a2", "a3", "never"]).await.unwrap();
+        assert_eq!(states["a1"], reaped(Reaped::Code(0)));
+        assert_eq!(states["a2"], reaped(Reaped::Signal(9)));
+        assert_eq!(states["a3"], reaped(Reaped::Code(0)));
+        assert!(matches!(
+            &states["never"],
+            AttemptState::Unknown { reason } if reason.contains("no record")
+        ));
+        again.mux.close();
     }
 }

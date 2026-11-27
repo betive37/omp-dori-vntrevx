@@ -76,8 +76,6 @@ pub(crate) struct Started {
 pub(crate) enum StartError {
     /// Refused before anything was spawned.
     Refused(String),
-    /// The child was spawned and closed again.
-    Failed(String),
     /// Startup failed with phase and process-ownership evidence.
     Startup {
         stage: startup::StartupStage,
@@ -91,7 +89,6 @@ impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(r) => write!(f, "refused: {r}"),
-            Self::Failed(r) => write!(f, "failed: {r}"),
             Self::Startup {
                 stage,
                 outcome,

@@ -1251,3 +1251,70 @@ fn a_slow_resume_tells_the_owner_at_15_s_once() {
     assert!(w.hub.stop().success());
     w.no_orphans();
 }
+
+/// Stock OMP factories run before ready; `session_start` hooks run after ready but before RPC.
+/// Both must share the same startup budget and resume without issuing inference.
+#[test]
+fn stock_omp_delayed_factory_and_session_start_resume_the_exact_anchor() {
+    if std::env::var("CATALY_CONTRACT_OMP").as_deref() != Ok("1") {
+        return;
+    }
+    let executable = std::env::var_os("CATALY_CONTRACT_OMP_PATH")
+        .map(std::path::PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("PATH").and_then(|path| {
+                std::env::split_paths(&path)
+                    .map(|dir| dir.join("omp"))
+                    .find(|path| path.is_file())
+            })
+        })
+        .expect("stock OMP executable");
+    for delayed in [
+        "await delay();",
+        "pi.on('session_start', async () => { await delay(); });",
+    ] {
+        let mut hub = TestHub::new("");
+        let agent = hub.root.join("stock-agent");
+        let work = hub.root.join("stock-work");
+        std::fs::create_dir_all(&agent).unwrap();
+        std::fs::create_dir_all(&work).unwrap();
+        let model = support::model::FakeModel::start();
+        std::fs::write(
+            agent.join("models.yml"),
+            support::model::models_yml(model.port, &["primary"]),
+        )
+        .unwrap();
+        let extension = hub.root.join("delayed-start.ts");
+        std::fs::write(&extension, format!(
+            "export default async function(pi) {{ if (!process.argv.some(a => a.startsWith('--resume'))) return; const delay = () => new Promise(resolve => setTimeout(resolve, 16000)); {delayed} }}\n"
+        )).unwrap();
+        hub.env.push(("PI_CODING_AGENT_DIR".into(), agent));
+        hub.write_config(&format!(
+            "[omp]\npath = \"{}\"\n[sessions]\nextra_flags = [\"--no-skills\", \"--no-rules\", \"--no-context-files\", \"--no-extensions\", \"--no-title\", \"--extension={}\"]\n[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+            executable.display(), extension.display(), work.display()
+        ));
+        hub.start();
+        let first = live(&hub, &Value::Null);
+        assert!(hub.stop().success());
+        let requests = model.seen().len();
+        hub.start();
+        let resumed = hub.until(Duration::from_secs(50), || {
+            let view = lead_view(&hub);
+            (view["phase"] == "live").then_some(view)
+        });
+        assert_eq!(
+            resumed["session"]["session_id"],
+            first["session"]["session_id"]
+        );
+        assert_eq!(
+            resumed["session"]["session_file"],
+            first["session"]["session_file"]
+        );
+        assert_eq!(
+            model.seen().len(),
+            requests,
+            "resume invoked model inference"
+        );
+        assert!(hub.stop().success());
+    }
+}
