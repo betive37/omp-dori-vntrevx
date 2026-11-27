@@ -1146,17 +1146,27 @@ fn stock_omp_delayed_factory_and_session_start_resume_the_exact_anchor() {
             support::model::models_yml(model.port, &["primary"]),
         )
         .unwrap();
-        let extension = hub.root.join("delayed-start.ts");
+        let extension = agent.join("extensions/delayed-start.ts");
+        std::fs::create_dir_all(extension.parent().unwrap()).unwrap();
         std::fs::write(&extension, format!(
             "export default async function(pi) {{ if (!process.argv.some(a => a.startsWith('--resume'))) return; const delay = () => new Promise(resolve => setTimeout(resolve, 16000)); {delayed} }}\n"
         )).unwrap();
         hub.env.push(("PI_CODING_AGENT_DIR".into(), agent));
         hub.write_config(&format!(
-            "[omp]\npath = \"{}\"\n[sessions]\nextra_flags = [\"--no-skills\", \"--no-rules\", \"--no-context-files\", \"--no-extensions\", \"--no-title\", \"--extension={}\"]\n[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
-            executable.display(), extension.display(), work.display()
+            "[omp]\npath = \"{}\"\n[sessions]\nextra_flags = [\"--no-skills\", \"--no-rules\", \"--no-context-files\", \"--no-title\"]\n[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+            executable.display(), work.display()
         ));
         hub.start();
         let first = live(&hub, &Value::Null);
+        assert!(
+            hub.cli(&["lead", "send", "STOCK-ORIGINAL"])
+                .status
+                .success()
+        );
+        hub.until(Duration::from_secs(30), || {
+            let view = lead_view(&hub);
+            (view["sent"] == 0 && view["waiting"] == 0 && !model.seen().is_empty()).then_some(())
+        });
         assert!(hub.stop().success());
         let requests = model.seen().len();
         hub.start();

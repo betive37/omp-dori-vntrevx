@@ -240,6 +240,28 @@ fn lead_spec(
     }
 }
 
+/// Canonical binding path, including OMP's not-yet-created fresh transcript.
+fn binding_file(file: &Path, how: LeadStart) -> Result<PathBuf, String> {
+    // Stock OMP creates a fresh transcript on its first write, after reporting the binding.
+    // Resolve its existing parent, never create a substitute transcript or relax resume checks.
+    match std::fs::canonicalize(file) {
+        Ok(path) => Ok(path),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(how, LeadStart::First | LeadStart::Asked) =>
+        {
+            let parent = file.parent().ok_or("binding transcript has no parent")?;
+            let name = file
+                .file_name()
+                .ok_or("binding transcript has no filename")?;
+            std::fs::canonicalize(parent)
+                .map(|parent| parent.join(name))
+                .map_err(|error| format!("binding transcript parent: {error}"))
+        }
+        Err(error) => Err(format!("binding transcript: {error}")),
+    }
+}
+
 /// The note for a resume after anything but a clean close; a sleep records how its close went.
 fn unclean(row: &SessionRow) -> Option<String> {
     match (
@@ -866,8 +888,7 @@ impl<R: Runtime> Lead<R> {
             if let Some(reason) = &started.held {
                 return Err(reason.clone());
             }
-            let canonical = std::fs::canonicalize(&started.file)
-                .map_err(|e| format!("binding transcript: {e}"))?;
+            let canonical = binding_file(Path::new(&started.file), how)?;
             let update = SessionUpdate {
                 handle: handle.clone(),
                 state: Some("live".into()),
