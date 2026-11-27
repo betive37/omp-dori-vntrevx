@@ -57,7 +57,7 @@ async fn save(hub: &Hub, memory: Memory) -> Result<(), String> {
 }
 
 /// Whether onboarding runs; an unreadable record counts as running (fail closed).
-async fn running(hub: &Hub) -> bool {
+pub(crate) async fn running(hub: &Hub) -> bool {
     load(hub)
         .await
         .map_or(true, |m| m.get(PHASE, "value") == Some("running"))

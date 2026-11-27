@@ -4,12 +4,13 @@
 //! its live source (Gateway, long poll, Socket Mode) and its start-up checks; one stalled relay never
 //! delays another, since each runs in its own task with its own queue (MSG req. 2).
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::collections::VecDeque;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde::Serialize;
-use tokio::sync::{Notify, broadcast, watch};
+use tokio::sync::{Notify, broadcast, oneshot, watch};
 
 use super::Relay;
 use super::pipeline::{Arrival, Pipeline, Step};
@@ -63,7 +64,29 @@ pub(crate) struct Shared {
     /// Presses recorded but not told before the last stop were looked for: once per process,
     /// since a later intake start could tell a press whose event is still on its way.
     pub(crate) presses_recovered: AtomicBool,
+    /// Answers the lead gave with its tool, for the next handling round (DISC-OUT req. 21).
+    answers: Mutex<VecDeque<LeadAnswer>>,
+    /// Wakes the handling round for a new answer.
+    pub(crate) answer_wake: Notify,
+    answer_ids: AtomicU64,
 }
+
+/// An answer the lead gave with its tool's `answer` operation, waiting for the relay's round.
+pub(crate) struct LeadAnswer {
+    id: u64,
+    pub(crate) room: String,
+    pub(crate) message: String,
+    pub(crate) text: String,
+    /// Another room to post in, such as a thread the lead opened.
+    pub(crate) to: Option<String>,
+    /// Only the request's own room or the thread started from it may take it (onboarding).
+    pub(crate) in_place: bool,
+    pub(crate) done: oneshot::Sender<Result<String, String>>,
+}
+
+/// How long the lead's `answer` call waits for the relay's round to take and post it; the lead's
+/// tool definition gives the bridge longer (`hub::tool`).
+pub(crate) const ANSWER_WAIT: Duration = Duration::from_secs(120);
 
 impl Shared {
     pub(crate) fn health(&self) -> Health {
@@ -76,6 +99,64 @@ impl Shared {
 
     pub(crate) fn set(&self, f: impl FnOnce(&mut Health)) {
         f(&mut self.lock());
+    }
+
+    fn queue(&self) -> MutexGuard<'_, VecDeque<LeadAnswer>> {
+        self.answers.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Hands the lead's answer to `message` in `room` to the relay's handling round and waits for
+    /// its outcome. One the round has not taken within [`ANSWER_WAIT`] is taken back unposted.
+    pub(crate) async fn answer(
+        &self,
+        room: &str,
+        message: &str,
+        text: &str,
+        to: Option<&str>,
+        in_place: bool,
+    ) -> Result<String, String> {
+        if self.health().state == "off" {
+            return Err("this messenger's intake is off: nothing can be posted there".into());
+        }
+        let id = self.answer_ids.fetch_add(1, Ordering::Relaxed);
+        let (done, outcome) = oneshot::channel();
+        self.queue().push_back(LeadAnswer {
+            id,
+            room: room.into(),
+            message: message.into(),
+            text: text.into(),
+            to: to.map(str::to_string),
+            in_place,
+            done,
+        });
+        self.answer_wake.notify_one();
+        match tokio::time::timeout(ANSWER_WAIT, outcome).await {
+            Ok(Ok(result)) => result,
+            Ok(Err(_)) => {
+                Err("the messenger stopped while posting: check before answering again".into())
+            }
+            Err(_) => {
+                let mut queue = self.queue();
+                match queue.iter().position(|a| a.id == id) {
+                    Some(at) => {
+                        queue.remove(at);
+                        Err(format!(
+                            "the messenger did not take the answer within {} s (not connected?): nothing was posted",
+                            ANSWER_WAIT.as_secs()
+                        ))
+                    }
+                    None => Err(
+                        "the answer is still being posted: calling again with the same text only reports it"
+                            .into(),
+                    ),
+                }
+            }
+        }
+    }
+
+    /// The answers waiting for the handling round, oldest first.
+    pub(crate) fn take_answers(&self) -> Vec<LeadAnswer> {
+        self.queue().drain(..).collect()
     }
 }
 
@@ -251,16 +332,17 @@ impl<R: Relay, T: Runtime> Round<R, T> {
         mut source: tokio::sync::oneshot::Receiver<Stop>,
         mut config: watch::Receiver<Arc<Config>>,
         settings: impl Fn(&Config) -> S,
-        kick: &Notify,
+        shared: &Shared,
         mut shutdown: watch::Receiver<bool>,
     ) -> Stop {
         let mut events = self.lead.follow();
         let current = settings(&config.borrow());
         loop {
-            self.round().await;
+            self.round(shared).await;
             let tick = if self.busy().await { TICK } else { IDLE_TICK };
             tokio::select! {
                 () = self.wake.notified() => {}
+                () = shared.answer_wake.notified() => {}
                 event = events.recv() => match event {
                     Ok(event) => self.on_event(&event),
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -273,7 +355,7 @@ impl<R: Relay, T: Runtime> Round<R, T> {
                         return Stop::Again;
                     }
                 }
-                () = kick.notified() => return Stop::Again,
+                () = shared.kick.notified() => return Stop::Again,
                 _ = shutdown.changed() => return Stop::Shutdown,
             }
         }
@@ -309,7 +391,8 @@ impl<R: Relay, T: Runtime> Round<R, T> {
         }
     }
 
-    async fn round(self: &Arc<Self>) {
+    async fn round(self: &Arc<Self>, shared: &Shared) {
+        self.pipeline.lead_answers(shared).await;
         let me = Arc::clone(self);
         let drained = self
             .pipeline

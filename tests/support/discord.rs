@@ -167,9 +167,9 @@ impl FakeDiscord {
         self.state.lock().unwrap().scripted.extend(statuses);
     }
 
-    /// Statuses for the next message creates in one channel: a 4xx refuses before anything is
-    /// stored; any other status is answered after the message is stored (the create may have
-    /// happened); `0` answers as usual.
+    /// Statuses for the next message creates in one channel: a 4xx, and a 502 (a proxy that never
+    /// reached Discord), answer before anything is stored; any other status is answered after the
+    /// message is stored (the create may have happened); `0` answers as usual.
     pub fn script_in(&self, channel: &str, statuses: &[u16]) {
         self.state
             .lock()
@@ -987,7 +987,7 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
         .and_then(VecDeque::pop_front)
         .or_else(|| s.scripted.pop_front())
         .filter(|status| *status != 0);
-    if let Some(status) = scripted.filter(|s| (400..500).contains(s)) {
+    if let Some(status) = scripted.filter(|s| (400..500).contains(s) || *s == 502) {
         return scripted_failure(status);
     }
     // As on Discord, content over 2000 UTF-16 units is an invalid body.

@@ -627,6 +627,7 @@ impl<T: Runtime> Intake<T> {
             let tick = if self.busy().await { TICK } else { IDLE_TICK };
             tokio::select! {
                 () = self.wake.notified() => {}
+                () = self.shared.answer_wake.notified() => {}
                 event = events.recv() => match event {
                     Ok(event) => self.on_event(&event).await,
                     Err(broadcast::error::RecvError::Lagged(_)) => {}
@@ -709,6 +710,7 @@ impl<T: Runtime> Intake<T> {
         if let Err(e) = self.drain().await {
             log::warn("Discord queue not drained", &[("error", &e)]);
         }
+        self.pipeline.lead_answers(&self.shared).await;
         let turn_over =
             !self.turn_running.load(Ordering::Acquire) && self.turn_ended.load(Ordering::Acquire);
         if let Err(e) = self.pipeline.answers(turn_over).await {

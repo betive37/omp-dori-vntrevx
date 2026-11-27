@@ -174,11 +174,14 @@ pub(crate) enum RelayWrite {
         message: String,
     },
     /// Stores the parts of an answer before the first post; nothing when parts already exist.
+    /// `to` names the room the parts go to, stored as the first part's destination until a post
+    /// pins one.
     Outbox {
         relay: String,
         room: String,
         source: String,
         parts: Vec<(String, String)>,
+        to: Option<String>,
     },
     /// Pins a pending part's destination and whether an attempt may already have taken effect.
     PartState {
@@ -198,7 +201,8 @@ pub(crate) enum RelayWrite {
         remote: String,
         linked: bool,
     },
-    /// The answer of a hand-off: `abandoned`, or `dropped` with its pending parts discarded.
+    /// The answer of a hand-off: `abandoned`, `posted` (a follow-up answered a request let go), or
+    /// `dropped` with its pending parts discarded.
     Answer {
         relay: String,
         room: String,
@@ -682,6 +686,7 @@ fn write_replies(
             room,
             source,
             parts,
+            to,
         } => {
             let existing: i64 = tx.query_row(
                 "SELECT COUNT(*) FROM outbox_parts WHERE relay = ?1 AND room = ?2 AND source = ?3",
@@ -691,8 +696,8 @@ fn write_replies(
             if existing == 0 {
                 for (idx, (nonce, text)) in parts.iter().enumerate() {
                     tx.execute(
-                        "INSERT INTO outbox_parts (relay, room, source, idx, text, nonce, state, created_ms, \
-                         updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?7)",
+                        "INSERT INTO outbox_parts (relay, room, source, idx, text, nonce, destination, \
+                         state, created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?8, 'pending', ?7, ?7)",
                         params![
                             relay,
                             room,
@@ -700,15 +705,19 @@ fn write_replies(
                             i64::try_from(idx).unwrap_or(i64::MAX),
                             text,
                             nonce,
-                            now
+                            now,
+                            // Only the first part: the rest follow it, so an untried later part
+                            // never names a room over one where an earlier part was pinned.
+                            to.as_ref().filter(|_| idx == 0)
                         ],
                     )?;
                 }
             }
+            // A late answer to a request let go with nothing stored is its answer all the same.
             tx.execute(
                 "UPDATE handoffs SET answer = 'posting', updated_ms = ?4 WHERE relay = ?1 AND room = ?2 \
-                 AND message = ?3 AND answer = 'waiting'",
-                params![relay, room, source, now],
+                 AND message = ?3 AND (answer = 'waiting' OR (answer = 'abandoned' AND ?5 = 0))",
+                params![relay, room, source, now, existing],
             )?;
             Ok(RelayDone::Done)
         }
@@ -768,6 +777,15 @@ fn write_marks(tx: &Transaction<'_>, change: &RelayWrite, now: i64) -> rusqlite:
                 tx.execute(
                     "UPDATE outbox_parts SET state = 'dropped', updated_ms = ?4 WHERE relay = ?1 \
                      AND room = ?2 AND source = ?3 AND state = 'pending'",
+                    params![relay, room, message, now],
+                )?;
+            }
+            // A follow-up answered a request let go: its owed reply is settled with it, though no
+            // linked first part of the request's own answer is confirmed.
+            if answer == "posted" {
+                tx.execute(
+                    "UPDATE owed_replies SET settled_ms = ?4 WHERE relay = ?1 AND room = ?2 \
+                     AND message = ?3 AND settled_ms IS NULL",
                     params![relay, room, message, now],
                 )?;
             }
@@ -1141,6 +1159,7 @@ mod tests {
             room: "c".into(),
             source: "12".into(),
             parts: vec![("n0".into(), "a".into()), ("n1".into(), "b".into())],
+            to: None,
         })
         .await
         .unwrap();

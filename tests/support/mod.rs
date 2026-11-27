@@ -17,6 +17,8 @@ use std::process::{Child, Command, Output, Stdio};
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::time::{Duration, Instant};
 
+use serde_json::{Value, json};
+
 pub mod discord;
 pub mod github;
 pub mod model;
@@ -70,6 +72,12 @@ pub struct TestHub {
 }
 
 impl TestHub {
+    /// Makes the lead answer only with its tool (`[lead] answers = "tool"`) in the written config.
+    pub fn tool_answers(&self) {
+        let config = std::fs::read_to_string(self.config_path()).unwrap();
+        self.write_config(&config.replace("[lead]\n", "[lead]\nanswers = \"tool\"\n"));
+    }
+
     pub fn new(config: &str) -> Self {
         static N: AtomicU32 = AtomicU32::new(0);
         let root = PathBuf::from(format!(
@@ -604,4 +612,74 @@ pub fn probe(name: &str, argv: &str, extra: &str) -> String {
 
 pub fn exists(path: &Path) -> bool {
     std::fs::symlink_metadata(path).is_ok()
+}
+
+/// The lead's side of the bridge, as its OMP extension speaks it, for calls of its tool.
+pub struct LeadBridge {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+    session: Value,
+    next: u64,
+}
+
+impl LeadBridge {
+    /// Connects as the live lead with its launch token; also returns the hello answer.
+    pub fn connect(hub: &TestHub) -> (Self, Value) {
+        let session = hub.until(Duration::from_secs(30), || {
+            let v = hub.json(&["lead", "status", "--json"]);
+            (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
+        });
+        let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
+        let token = launch
+            .lines()
+            .rfind(|l| l.split(' ').nth(1) == session.as_str())
+            .and_then(|l| l.split(' ').next())
+            .unwrap()
+            .to_string();
+        let writer = UnixStream::connect(hub.socket()).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(180)))
+            .unwrap();
+        let reader = BufReader::new(writer.try_clone().unwrap());
+        let mut bridge = Self {
+            reader,
+            writer,
+            session: session.clone(),
+            next: 1,
+        };
+        let hello = bridge.call(
+            "bridge.hello",
+            &json!({ "ext": 1, "token": token, "session": session, "agent": "main" }),
+        );
+        (bridge, hello)
+    }
+
+    pub fn call(&mut self, method: &str, params: &Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        let line = json!({ "v": 1, "id": id, "method": method, "params": params });
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        loop {
+            let mut reply = String::new();
+            self.reader.read_line(&mut reply).unwrap();
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            if v["id"] == id {
+                return v["ok"].clone();
+            }
+        }
+    }
+
+    /// One `cataly_lead` call: its text and whether it is an error.
+    pub fn tool(&mut self, input: &Value) -> (String, bool) {
+        let call = format!("call-{}", self.next);
+        let params =
+            json!({ "call": call, "tool": "cataly_lead", "session": self.session, "input": input });
+        let v = self.call("bridge.tool", &params);
+        (
+            v["text"].as_str().unwrap_or_default().to_string(),
+            v["error"] == true,
+        )
+    }
 }

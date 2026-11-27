@@ -888,7 +888,7 @@ async fn start<T: Runtime>(
             rx,
             env.config.clone(),
             |c| c.slack.clone(),
-            &shared.kick,
+            &shared,
             shutdown,
         )
         .await
