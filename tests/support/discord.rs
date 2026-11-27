@@ -60,7 +60,7 @@ struct State {
     callbacks: VecDeque<u16>,
     /// Path -> the status a GET of it gets, and for how many GETs more (`None`: every one).
     failing_reads: HashMap<String, (u16, Option<usize>)>,
-    nonces: HashMap<String, u64>,
+    nonces: HashMap<(String, String), u64>,
     next_id: u64,
     created: usize,
     /// Channel -> messages, oldest first.
@@ -327,11 +327,6 @@ impl FakeDiscord {
             .unwrap()
             .failing_reads
             .insert(path.into(), (status, Some(times)));
-    }
-
-    /// Reads of `path` are answered as usual again.
-    pub fn pass_reads(&self, path: &str) {
-        self.state.lock().unwrap().failing_reads.remove(path);
     }
 
     /// A message object.
@@ -860,8 +855,8 @@ async fn answer(
             "PUT",
             ["channels", _, "messages", _, "reactions", _, "@me"]
             | ["channels", _, "messages", "pins", _],
-        ) => reply(204, &Value::Null),
-        ("POST", ["channels", _, "typing"]) => reply(204, &Value::Null),
+        )
+        | ("POST", ["channels", _, "typing"]) => reply(204, &Value::Null),
         ("POST", ["interactions", _, _, "callback"]) => {
             reply(s.callbacks.pop_front().unwrap_or(204), &Value::Null)
         }
@@ -1015,7 +1010,9 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
     if !source_exists && body["message_reference"]["fail_if_not_exists"] == true {
         return reply(400, &json!({"message": "Invalid Form Body", "code": 50035}));
     }
-    let existing = s.nonces.get(&nonce).copied().filter(|_| enforced);
+    // A nonce in another destination cannot confirm this post.
+    let nonce_key = (id.to_string(), nonce.clone());
+    let existing = s.nonces.get(&nonce_key).copied().filter(|_| enforced);
     let message = if let Some(m) = existing {
         m
     } else {
@@ -1031,7 +1028,7 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
         s.next_id
     };
     if enforced && !nonce.is_empty() {
-        s.nonces.insert(nonce, message);
+        s.nonces.insert(nonce_key, message);
     }
     let mut created = json!({ "id": message.to_string(), "channel_id": id, "content": body["content"],
                 "author": {"id": BOT, "bot": true}, "type": 0, "components": body["components"],

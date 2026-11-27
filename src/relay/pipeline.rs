@@ -17,7 +17,7 @@ use std::time::Instant;
 use tokio::sync::{Notify, watch};
 
 use super::context::{self, Context};
-use super::{Inbound, PartOutcome, Relay, Resume};
+use super::{Inbound, PartOutcome, Relay};
 use crate::config::Config;
 use crate::host::inbox::{self, Message, ReceiptState};
 use crate::host::lead::{Events, Lead};
@@ -205,9 +205,6 @@ struct Target {
     /// The room bound to the request that takes the whole answer ([`Relay::answer_room`]); `None`
     /// for the linked reply in the request's room.
     room: Option<String>,
-    /// A part posted to `room` ended uncertain: the answer stays there, where its nonces keep each
-    /// part single, instead of falling back to the request's room.
-    held: bool,
     /// The rest moved to the request's room from this room after a part was out there: the next
     /// part posted in the request's room is the reply to the request, after a note pointing back
     /// here ([`Relay::moved_note`]).
@@ -1132,11 +1129,8 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
-    /// Where the answer to `h` goes: decided once per delivery, before its first post, so a retry
-    /// goes where the earlier attempt went. After a restart in the middle of an answer the rest
-    /// follows its first part, wherever that is (DISC-OUT req. 25). `Err` when that cannot be read
-    /// now, or the answer room lookup failed and is tried again.
-    async fn target(&self, h: &HandoffRow, posted: Option<&str>) -> Result<Target, String> {
+    /// Resume from the last attempted or confirmed destination, never a fresh lookup after a post.
+    async fn target(&self, h: &HandoffRow, parts: &[PartRow]) -> Result<Target, String> {
         let known = self
             .targets
             .lock()
@@ -1146,37 +1140,17 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         if let Some(target) = known {
             return Ok(target);
         }
-        // Parts already out stay where they are: no fallback for the rest.
-        let target = match posted {
-            Some(posted) => match self.relay.resume_room(&h.room, &h.message, posted).await? {
-                Resume::Here => Target {
-                    room: None,
-                    held: true,
-                    ..Target::default()
-                },
-                Resume::Bound(room) => Target {
-                    room: Some(room),
-                    held: true,
-                    ..Target::default()
-                },
-                Resume::Moved(from) => {
-                    log::warn(
-                        "answer room gone; the rest of the answer goes to the request's room",
-                        &[("message", &h.message)],
-                    );
-                    Target {
-                        room: None,
-                        held: true,
-                        moved_from: Some(from),
-                        noted: false,
-                    }
-                }
-            },
-            // A failed lookup holds the first part until a later round looks again.
-            None => Target {
-                room: self.answer_room(&h.room, &h.message).await?,
-                ..Target::default()
-            },
+        let saved = parts
+            .iter()
+            .rev()
+            .find_map(|part| part.destination.as_deref());
+        let room = match saved {
+            Some(room) => (room != h.room).then(|| room.to_string()),
+            None => self.answer_room(&h.room, &h.message).await?,
+        };
+        let target = Target {
+            room,
+            ..Target::default()
         };
         if let Some(room) = &target.room {
             log::info(
@@ -1209,36 +1183,41 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     ) -> Result<Option<String>, String> {
         let lookup = self.lookup(source);
         let mut state = lookup.lock().await;
-        if state.settled {
-            return Ok(state.room.clone());
-        }
-        match self.relay.answer_room(room, source).await {
-            Ok(found) => {
-                state.settled = true;
-                state.room.clone_from(&found);
-                Ok(found)
-            }
-            Err(why) => {
-                state.failed += 1;
-                if state.failed < LOOKUP_TRIES {
-                    log::warn(
-                        "answer room lookup failed; looking again on a later round",
-                        &[("message", &source), ("reason", &why)],
-                    );
-                    return Err(why);
+        if !state.settled {
+            match self.relay.answer_room(room, source).await {
+                Ok(found) => {
+                    state.settled = true;
+                    state.room = found;
                 }
-                log::warn(
-                    "answer room lookup failed again; the answer is a reply in the request's room",
-                    &[
-                        ("message", &source),
-                        ("tries", &state.failed),
-                        ("reason", &why),
-                    ],
-                );
-                state.settled = true;
-                Ok(None)
+                Err(why) => {
+                    state.failed += 1;
+                    if state.failed < LOOKUP_TRIES {
+                        log::warn(
+                            "answer room lookup failed; looking again on a later round",
+                            &[("message", &source), ("reason", &why)],
+                        );
+                        return Err(why);
+                    }
+                    log::warn(
+                        "answer room lookup failed again; the answer is a reply in the request's room",
+                        &[
+                            ("message", &source),
+                            ("tries", &state.failed),
+                            ("reason", &why),
+                        ],
+                    );
+                    state.settled = true;
+                }
             }
         }
+        // Typing can find the thread before lane.open claims it. The kickoff stays first there
+        // and the lead's pointer stays visible in the channel.
+        if let Some(thread) = &state.room
+            && self.lanes.route(R::NAME, thread).await.is_some()
+        {
+            state.room = None;
+        }
+        Ok(state.room.clone())
     }
 
     /// Where the answer to `source` in `room` goes when that was looked up already (the room bound
@@ -1269,7 +1248,15 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     /// Posts one part where the answer goes: in the room bound to the request without a reply, else
     /// in the request's room with the first part (or the first part moved there, after a note
     /// pointing back to where the answer began) as the reply.
-    async fn post_part(&self, h: &HandoffRow, part: &PartRow, target: &mut Target) -> PartOutcome {
+    async fn post_part(
+        &self,
+        h: &HandoffRow,
+        part: &PartRow,
+        target: &mut Target,
+    ) -> Result<PartOutcome, String> {
+        if part.uncertain && !R::REPEATABLE {
+            return Ok(PartOutcome::Uncertain("earlier attempt is in doubt".into()));
+        }
         loop {
             let moved = target.room.is_none() && target.moved_from.is_some();
             if moved && !target.noted {
@@ -1282,12 +1269,48 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 },
                 |room| (room, None),
             );
+            let state = |uncertain| RelayWrite::PartState {
+                relay: R::NAME.into(),
+                room: h.room.clone(),
+                source: h.message.clone(),
+                idx: part.idx,
+                destination: room.to_string(),
+                uncertain,
+            };
+            // Commit before the external effect. A crash at any later point keeps this pin.
+            if !part.uncertain || part.destination.as_deref() != Some(room) {
+                self.store
+                    .relay(state(true))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             let outcome = self
                 .relay
                 .post(room, reply_to, &part.text, &part.nonce)
                 .await;
+            if !part.uncertain
+                && matches!(
+                    outcome,
+                    PartOutcome::Rejected(_) | PartOutcome::Closed(_) | PartOutcome::SourceGone
+                )
+            {
+                self.store
+                    .relay(state(false))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
             let bound = target.room.is_some();
             match outcome {
+                PartOutcome::Closed(why) | PartOutcome::Rejected(why) if part.uncertain => {
+                    return Ok(PartOutcome::Uncertain(format!(
+                        "earlier attempt in {room} remains in doubt: {why}"
+                    )));
+                }
+                PartOutcome::SourceGone if part.uncertain => {
+                    return Ok(PartOutcome::Uncertain(
+                        "the source is gone but the earlier attempt remains in doubt".into(),
+                    ));
+                }
                 // The room bound to the request takes no posts at all (gone, locked, no access):
                 // this part and the rest go to the request's room, this part as the reply.
                 PartOutcome::Closed(why) if bound => {
@@ -1302,7 +1325,6 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     let from = target.room.take().filter(|_| part.idx > 0);
                     *target = Target {
                         room: None,
-                        held: true,
                         moved_from: from,
                         noted: false,
                     };
@@ -1310,18 +1332,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 }
                 // Nothing was created there and nothing is in doubt: the first part goes as the
                 // linked reply in the request's room after all, with the same nonce.
-                PartOutcome::Rejected(why) if bound && part.idx == 0 && !target.held => {
+                PartOutcome::Rejected(why) if bound && part.idx == 0 => {
                     log::warn(
                         "answer room refused the answer; replying in the request's room",
                         &[("message", &h.message), ("reason", &why)],
                     );
                     *target = Target::default();
                     self.set_target(&h.message, target);
-                }
-                PartOutcome::Uncertain(why) if bound => {
-                    target.held = true;
-                    self.set_target(&h.message, target);
-                    return PartOutcome::Uncertain(why);
                 }
                 PartOutcome::Posted { id, linked } => {
                     // In the room bound to the request the first part answers it as a linked
@@ -1331,9 +1348,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         target.moved_from = None;
                         self.set_target(&h.message, target);
                     }
-                    return PartOutcome::Posted { id, linked };
+                    return Ok(PartOutcome::Posted { id, linked });
                 }
-                other => return other,
+                other => return Ok(other),
             }
         }
     }
@@ -1376,11 +1393,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         if !parts.iter().any(|p| p.state == "pending") {
             return Ok(true);
         }
-        let posted = parts
-            .iter()
-            .find(|p| p.idx == 0 && p.state == "confirmed")
-            .and_then(|p| p.remote.as_deref());
-        let mut target = match self.target(h, posted).await {
+        let mut target = match self.target(h, &parts).await {
             Ok(target) => target,
             Err(why) => {
                 if self.first_stuck(&h.message) {
@@ -1393,7 +1406,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             }
         };
         for part in parts.iter().filter(|p| p.state == "pending") {
-            match self.post_part(h, part, &mut target).await {
+            match self.post_part(h, part, &mut target).await? {
                 PartOutcome::Posted { id, linked } => {
                     self.store
                         .relay(RelayWrite::PartDone {

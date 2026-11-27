@@ -121,17 +121,18 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     transient event.
 24. The answer is table-rendered (DISC-OUT-04), then split (DISC-OUT-03), and each part is stored in
     a durable outbox before the first post. Each part's nonce is derived from bot ID, channel, source
-    message ID and part index, so a crash-and-retry cannot duplicate a part.
+    message ID and part index. Its destination and in-flight uncertainty are committed before posting;
+    confirmation clears uncertainty, while a definite rejection clears it only if no earlier attempt
+    was already uncertain. A crash-and-retry uses the saved destination and nonce.
 25. Parts are posted in order; the first is a reply to the source message (rule 15). Each confirmed
     part is acknowledged in the outbox with its remote ID before the next is posted.
     When the source message is in a text or announcement channel, thread following is on (intake
-    spec req. 6) and a thread was started from it, by anyone (the owner, the lead through the bot,
-    or a lane), the whole answer goes into that thread instead. The message's `thread` must name
-    one under the same channel that is not locked. Every part is a plain post there with its own
-    nonce, none carries a message reference, and the confirmed first part counts as the confirmed
-    linked reply (rules 16, 33). When a lane owns that thread, the answer lands there all the same,
-    and the owner's later messages in the thread go to the lane as thread routing already does
-    (intake spec req. 41).
+    spec req. 6) and a thread was started from it outside a lane, the whole answer goes into that
+    thread instead. The message's `thread` must name one under the same channel that is not locked.
+    Every part is a plain post there with its own nonce, none carries a message reference, and the
+    confirmed first part counts as the confirmed linked reply (rules 16, 33). A lane-owned thread
+    keeps its kickoff first and the lead's one-line pointer in the channel. The owner's later
+    messages in that thread still go to the lane (intake spec req. 41).
     The daemon reads the source message just before the first part, within 5 s, and keeps what a
     read found for the request. A failed or late read is logged and kept for nothing: the first
     part waits and a later round reads again, up to three reads per request in all; after the
@@ -139,28 +140,20 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     rejects the first part (rule 6) and no earlier attempt there was uncertain, the first part goes
     as the reply in the channel with the same nonce; once a part there was uncertain, or a later
     part is rejected for its own sake, the answer stays in the thread and is retried there. A
-    thread that refuses the bot as such (403, unknown channel, archived thread) takes nothing more:
-    that part and the rest go to the channel, the first of them as the reply to the source
-    message, so a thread locked or deleted mid-answer holds up no later answer. When a part was
-    already out in the thread, a note `-# continued from <#thread>` is posted in the channel just
+    thread that refuses the bot as such (403, unknown channel, archived thread) permits moving
+    that part and the rest to the channel only if the part has no uncertain earlier attempt.
+    An uncertain part stays in doubt at its saved destination, even after closure or restart.
+    When a part was already out in the thread, a note `-# continued from <#thread>` is posted in the channel just
     before that first moved part, as its own message with its own nonce, tried once per delivery;
     a note that fails is logged and holds nothing up. The parts keep their stored text.
     The lookup is shared with typing, so both use one result per request (typing's failed reads
-    count toward the three). The choice lives in daemon memory for
-    that delivery. After a restart with the first part already confirmed, the rest follows that
-    part: the daemon reads that part back, from the channel, else from the thread (it has the
-    source message's ID), and posts the rest where it was read. When the channel definitely lacks
-    it (unknown message) and the thread definitely takes nothing from the bot (403, unknown
-    channel, archived) or lacks it too, the rest moves to the channel, its first part as the reply
-    to the source message, as when the thread closes mid-answer. While a read only fails for now
-    (timeout, 5xx, rate limit), posting waits. A first part still pending at a restart is decided
-    again, so if it ended uncertain in the thread and the new lookup fails or finds no thread, it
-    may be posted a second time in the channel. While the lead works, typing shows where the
-    answer would go: in a followed thread with the source message's ID once the shared lookup (run
-    off the handling round) says so, else in the channel.
+    count toward the three). Lane ownership is checked again before posting. After a restart,
+    the last attempted part's saved destination is used, or the last confirmed part's destination
+    if the next part has not been attempted. A new lookup never overrides a persisted destination.
+    While the lead works, typing shows where the answer would go.
 26. If Discord reports the source message unknown (error 10008, on the post or on a follow-up check
-    after a 400/404), the remaining parts for that request are discarded and logged; nothing is
-    posted unlinked.
+    after a 400/404), remaining parts without uncertain earlier attempts are discarded and logged;
+    uncertain parts stay in doubt. Nothing is posted unlinked.
 27. Any other failure leaves the part pending. The daemon retries pending parts on its next service
     tick (at most every 3 s) with the same nonce, under the backoff of rule 8, and logs a stuck
     delivery once per request, not on every tick.

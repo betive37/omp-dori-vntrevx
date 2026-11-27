@@ -54,18 +54,6 @@ pub(crate) enum PartOutcome {
     Uncertain(String),
 }
 
-/// Where the rest of a half-posted answer goes after a restart ([`Relay::resume_room`]).
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub(crate) enum Resume {
-    /// The request's room, where the first part is.
-    Here,
-    /// The room bound to the request, where the first part is.
-    Bound(String),
-    /// The request's room, because the bound room holding the first part (named here) is gone:
-    /// the next part posted there is the reply to the request.
-    Moved(String),
-}
-
 /// What a relay knows about one room, for the channel facts line (DISC-IN req. 53).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(crate) struct Facts {
@@ -115,17 +103,6 @@ pub(crate) trait Relay: Send + Sync + 'static {
     /// own message, so no part's text ever changes with where it goes.
     fn moved_note(&self, _from: &str) -> Option<String> {
         None
-    }
-
-    /// Where the rest of an answer goes after a restart in the middle of it, its first part
-    /// `posted` being out: where that part is read back; `Err` while it cannot be read anywhere.
-    fn resume_room(
-        &self,
-        _room: &str,
-        _source: &str,
-        _posted: &str,
-    ) -> impl Future<Output = Result<Resume, String>> + Send {
-        async { Ok(Resume::Here) }
     }
 
     /// Posts one part; the first part of an answer replies to `reply_to`.

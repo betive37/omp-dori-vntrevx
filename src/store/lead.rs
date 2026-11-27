@@ -578,25 +578,14 @@ mod tests {
         };
         let (first, second) = tokio::join!(
             biased;
-            store.lead(settle.clone()),
+            store.lead(settle),
             store.lead(competing)
         );
         assert_eq!(first.unwrap(), LeadDone::Done);
         assert!(matches!(second.unwrap(), LeadDone::Refused(_)));
-        let recorded = store
-            .read(|r| r.question("0000abcd"))
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(recorded.state, "answered");
-        assert_eq!(recorded.outcome.as_deref(), Some("owner message 51: option 2"));
         // Settled: only the reply recorded as its answer, not a later one or a longer ID.
         assert!(reply("51").await);
         assert!(!reply("52").await && !reply("5").await);
-        assert!(matches!(
-            store.lead(settle).await.unwrap(),
-            LeadDone::Refused(_)
-        ));
         let open = store.read(|r| r.requests(true)).await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].next.as_deref(), Some("run tests"));

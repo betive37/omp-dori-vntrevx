@@ -219,7 +219,8 @@ fn notes(hub: &Hub, op: &str, input: &Value) -> Result<String, String> {
         "profile.read" => notes.show(),
         // Only on the owner's direct request, named by its message (COORD req. 47).
         "profile.create" => {
-            let message = p::MESSAGE.need(input, 400, true)
+            let message = p::MESSAGE
+                .need(input, 400, true)
                 .map_err(|_| "message: the owner's message asking for the owner notes")?;
             notes.create(Some(message))
         }
@@ -289,8 +290,7 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
             } else {
                 json!({ "content": body, "nonce": nonce })
             };
-            let created = rest.create(room, create).await;
-            match created {
+            match rest.create(room, create).await {
                 Ok(v) => v
                     .get("id")
                     .and_then(Value::as_str)
@@ -333,9 +333,9 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         Some((room, message)) => {
             format!("question {id} recorded and posted in {room} as message {message}")
         }
-        None if uncertain => format!(
-            "question {id} recorded; its post is in doubt. Do not post it again."
-        ),
+        None if uncertain => {
+            format!("question {id} recorded; its post is in doubt. Do not post it again.")
+        }
         None => format!(
             "question {id} recorded; it could not be posted, so ask it yourself and quote its ID"
         ),

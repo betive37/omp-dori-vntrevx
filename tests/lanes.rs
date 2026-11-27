@@ -1032,11 +1032,7 @@ fn lead_creates_owner_notes_on_the_owners_request() {
     assert!(!err, "{why}");
 }
 
-/// `question.ask` posts in the room it names, else in its `discord:<id>` thread, else in the home
-/// channel; a room it cannot read is refused, posted nowhere and not recorded. The owner's reply
-/// to a lead question in a lane's thread goes to the lead, not the lane (EVR req. 34, 37).
-#[test]
-fn question_ask_posts_in_its_thread() {
+fn question_hub() -> (FakeDiscord, TestHub, PathBuf) {
     let fake = FakeDiscord::start();
     let (mut hub, work) = lane_hub("");
     let token = hub.private_file("token", "fake-token");
@@ -1052,6 +1048,68 @@ fn question_ask_posts_in_its_thread() {
     hub.until(WAIT, || {
         (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
     });
+    (fake, hub, work)
+}
+
+fn question_input(thread: Option<String>, room: Option<&str>) -> Value {
+    let mut v = json!({ "op": "question.ask", "text": "Which?", "source": "discord:1:2",
+        "options": ["a", "b"] });
+    if let Some(t) = thread {
+        v["thread"] = json!(t);
+    }
+    if let Some(r) = room {
+        v["room"] = json!(r);
+    }
+    v
+}
+
+/// Destination precedence and explicit refusals use the same posting path as lane questions.
+#[test]
+fn question_destinations_follow_parameters_and_refuse_invalid_rooms() {
+    let (fake, mut hub, _work) = question_hub();
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    for (n, (thread, room, expected)) in [
+        (Some(format!("discord:{THREAD}")), Some(CH), CH),
+        (Some(format!("discord:{THREAD}")), Some(" "), THREAD),
+        (Some("telegram:5".into()), None, CH),
+        (None, None, CH),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (said, err) = lead_tool(&mut b, &s, &format!("q{n}"), question_input(thread, room));
+        assert!(
+            !err && said.contains(&format!("posted in {expected}")),
+            "{said}"
+        );
+    }
+    assert_eq!(
+        (fake.bot_messages(THREAD).len(), fake.bot_messages(CH).len()),
+        (1, 3)
+    );
+    let (before, _) = lead_tool(&mut b, &s, "before", json!({ "op": "questions" }));
+    let denied = "123456789012345678";
+    fake.script_in(denied, &[403]);
+    for (n, room) in [format!("discord:{CH}"), denied.into()].iter().enumerate() {
+        let input = question_input(Some(format!("discord:{THREAD}")), Some(room));
+        let (why, err) = lead_tool(&mut b, &s, &format!("bad{n}"), input);
+        assert!(err && why.contains("room"), "{why}");
+    }
+    let (after, _) = lead_tool(&mut b, &s, "after", json!({ "op": "questions" }));
+    assert_eq!(before, after, "nothing recorded");
+    assert_eq!(
+        (fake.bot_messages(THREAD).len(), fake.bot_messages(CH).len()),
+        (1, 3)
+    );
+    drop(b);
+    hub.stop();
+}
+
+/// Both typed and button answers in a lane's thread reach the lead; later ordinary replies do not.
+#[test]
+fn question_ask_posts_in_its_thread() {
+    let (fake, mut hub, work) = question_hub();
     open(
         &hub,
         "q-1",
@@ -1063,21 +1121,10 @@ fn question_ask_posts_in_its_thread() {
     let s = meta["session"].clone();
     let lead = hub.json(&["lead", "status", "--json"]);
     let lead_file = PathBuf::from(lead["session"]["session_file"].as_str().unwrap());
-    let ask = |thread: Option<String>, room: Option<&str>| {
-        let mut v = json!({ "op": "question.ask", "text": "Which?", "source": "discord:1:2",
-            "options": ["a", "b"] });
-        if let Some(t) = thread {
-            v["thread"] = json!(t);
-        }
-        if let Some(r) = room {
-            v["room"] = json!(r);
-        }
-        v
-    };
     let in_thread = || Some(format!("discord:{THREAD}"));
     let posts = |room: &str| fake.bot_messages(room).len();
     // The thread, when no room is given.
-    let (said, err) = lead_tool(&mut b, &s, "q1", ask(in_thread(), None));
+    let (said, err) = lead_tool(&mut b, &s, "q1", question_input(in_thread(), None));
     assert!(
         !err && said.contains(&format!("posted in {THREAD}")),
         "{said}"
@@ -1087,35 +1134,6 @@ fn question_ask_posts_in_its_thread() {
         .as_str()
         .unwrap()
         .to_string();
-    // A room wins over the thread; an empty room counts as none.
-    let (said, err) = lead_tool(&mut b, &s, "q2", ask(in_thread(), Some(CH)));
-    assert!(!err && said.contains(&format!("posted in {CH}")), "{said}");
-    let (said, err) = lead_tool(&mut b, &s, "q3", ask(in_thread(), Some(" ")));
-    assert!(
-        !err && said.contains(&format!("posted in {THREAD}")),
-        "{said}"
-    );
-    // Another messenger's thread, or none: the home channel, as before.
-    let (said, err) = lead_tool(&mut b, &s, "q4", ask(Some("telegram:5".into()), None));
-    assert!(!err && said.contains(&format!("posted in {CH}")), "{said}");
-    let (said, err) = lead_tool(&mut b, &s, "q5", ask(None, None));
-    assert!(!err && said.contains(&format!("posted in {CH}")), "{said}");
-    assert_eq!((posts(THREAD), posts(CH)), (2, 3));
-    // An unreadable room is refused: posted nowhere and not recorded.
-    let (before, _) = lead_tool(&mut b, &s, "q6", json!({ "op": "questions" }));
-    let bad = ask(in_thread(), Some(&format!("discord:{CH}")));
-    let (why, err) = lead_tool(&mut b, &s, "q7", bad);
-    assert!(err && why.contains("room"), "{why}");
-    assert_eq!((posts(THREAD), posts(CH)), (2, 3));
-    let (after, _) = lead_tool(&mut b, &s, "q8", json!({ "op": "questions" }));
-    assert_eq!(before, after, "nothing recorded");
-    // A named room that cannot take the post is refused the same way.
-    let denied = "123456789012345678";
-    fake.script_in(denied, &[403]);
-    let (why, err) = lead_tool(&mut b, &s, "q9", ask(in_thread(), Some(denied)));
-    assert!(err && why.contains("could not post"), "{why}");
-    let (after, _) = lead_tool(&mut b, &s, "q10", json!({ "op": "questions" }));
-    assert_eq!(before, after, "nothing recorded");
     // The owner answers the lead's question in the lane's thread: the lead gets it, the lane not.
     let mut reply = FakeDiscord::message(THREAD, 700_000_000_000_000_001, OWNER, "1");
     reply["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
@@ -1144,7 +1162,7 @@ fn question_ask_posts_in_its_thread() {
     fake.say(other);
     hub.until(WAIT, || lane_file().contains("lane reply").then_some(()));
     // A second question in the same lane thread is answered by button, not handed to the lane.
-    let (said, err) = lead_tool(&mut b, &s, "q-button", ask(in_thread(), None));
+    let (said, err) = lead_tool(&mut b, &s, "q-button", question_input(in_thread(), None));
     assert!(!err, "{said}");
     let id = said.split_whitespace().nth(1).unwrap();
     let message = said.split_whitespace().last().unwrap();
@@ -1156,13 +1174,18 @@ fn question_ask_posts_in_its_thread() {
             .then_some(())
     });
     let edited = fake.wait(WAIT, |f| {
-        f.bot_messages(THREAD).into_iter().find(|m| {
-            m["id"] == message
-                && m["components"].as_array().is_some_and(Vec::is_empty)
-        })
+        f.bot_messages(THREAD)
+            .into_iter()
+            .find(|m| m["id"] == message && m["components"].as_array().is_some_and(Vec::is_empty))
     });
-    assert!(edited["content"].as_str().unwrap().contains("2. b"), "{edited}");
-    assert!(!lane_file().contains(id), "the button answer belongs to the lead");
+    assert!(
+        edited["content"].as_str().unwrap().contains("2. b"),
+        "{edited}"
+    );
+    assert!(
+        !lane_file().contains(id),
+        "the button answer belongs to the lead"
+    );
     drop(b);
     hub.stop();
 }
@@ -1275,11 +1298,9 @@ fn holds(file: &Value, text: &str) -> bool {
 }
 
 /// The lead delegates: an owner message in a watched channel, the lead's `lane.open` with
-/// `thread_from` that message and a worktree, the thread under it with its kickoff line and then the
-/// lead's answer to the message (not in the channel), the lane's session in its worktree, a report
-/// in the thread under the status word, owner thread messages to the lane and not the lead, a split
-/// asked for in the thread opening a second lane in a thread of its own while the first keeps its
-/// scope, and `lane.close` marking the thread done.
+/// `thread_from` that message and a worktree, the kickoff first in the thread and the lead's pointer
+/// in the channel, the lane's session in its worktree, reports and later owner messages in its
+/// thread, and a split opening a separate lane without changing the first lane's scope.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
@@ -1351,18 +1372,19 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
         kickoff[0]["content"], "Fixing the login bug; done when the check true passes.",
         "the kickoff line comes first"
     );
-    // The lead's answer to the request goes into the lane's thread, started from that message,
-    // not into the channel.
+    // The lane owns the thread, so the lead's pointer stays visible in the channel.
     std::fs::write(data(&hub).join("release"), "").unwrap();
     let answer = hub.until(WAIT, || {
-        fake.bot_messages(&thread_a)
+        fake.bot_messages(CH)
             .into_iter()
             .find(|m| m["content"] == "ok")
     });
-    assert!(answer.get("message_reference").is_none(), "{answer}");
+    assert_eq!(answer["message_reference"]["message_id"], asked.to_string());
     assert!(
-        fake.bot_messages(CH).iter().all(|m| m["content"] != "ok"),
-        "the answer is not in the channel"
+        fake.bot_messages(&thread_a)
+            .iter()
+            .all(|m| m["content"] != "ok"),
+        "the thread keeps only its kickoff until the lane reports"
     );
     // A lane report reaches the thread.
     let (mut lb, _) = hello(&hub, &a);
@@ -1373,10 +1395,10 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
     );
     let posts = hub.until(WAIT, || {
         let p = fake.bot_messages(&thread_a);
-        (p.len() >= 3).then_some(p)
+        (p.len() >= 2).then_some(p)
     });
     assert_eq!(
-        posts[2]["content"],
+        posts[1]["content"],
         "Lane update: the login test needs a fixture"
     );
     // An owner message in the thread reaches the lane, not the lead.

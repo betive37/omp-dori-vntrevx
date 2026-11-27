@@ -584,11 +584,9 @@ fn a_restart_mid_answer_keeps_the_rest_with_its_first_part() {
     assert!(hub.stop().success());
 }
 
-/// After a restart in the middle of an answer whose first part is in the thread, a read of that
-/// part that fails for now (5xx) says nothing about where it is: the rest waits, nothing goes to
-/// the channel, and once the part can be read the rest follows it into the thread.
+/// Restart uses the durable destination even when remote message reads are unavailable.
 #[test]
-fn a_failing_read_back_after_a_restart_holds_the_rest() {
+fn a_saved_destination_survives_failed_reads_after_restart() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     hub.fixture(
@@ -619,20 +617,17 @@ fn a_failing_read_back_after_a_restart_holds_the_rest() {
     fake.fail_reads(&read_back, 503);
     let before = in_thread();
     hub.start();
-    fake.wait(WAIT, |f| {
-        (!f.calls("GET", &read_back).is_empty()).then_some(())
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
     });
-    // Several handling rounds (3 s each) go by with the read failing.
-    std::thread::sleep(Duration::from_secs(8));
     assert!(
-        fake.calls("POST", &format!("/channels/{CH}/messages"))
-            .is_empty(),
-        "nothing in the channel"
+        in_thread() > before,
+        "the pending part resumes at its saved destination"
     );
-    assert_eq!(in_thread(), before, "held while the part cannot be read");
-    fake.pass_reads(&read_back);
-    fake.wait(WAIT, |_| (in_thread() > before).then_some(()));
-    settled(&hub);
+    assert!(
+        fake.calls("GET", &read_back).is_empty(),
+        "no destination rediscovery"
+    );
     assert_eq!(
         fake.bot_messages(source).len(),
         2,
@@ -646,10 +641,7 @@ fn a_failing_read_back_after_a_restart_holds_the_rest() {
     assert!(hub.stop().success());
 }
 
-/// After a restart in the middle of an answer whose first part is in a thread that has since been
-/// deleted (404, unknown channel) or shut to the bot (403), while the channel definitely lacks the
-/// part, the rest moves to the channel, its first part as the reply to the request, as when the
-/// thread closes while the hub runs; later answers are not held up.
+/// A definitely rejected pending part may move after restart when its saved thread refuses it.
 #[test]
 fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
     for (message, refusal) in [
@@ -710,19 +702,17 @@ fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
         );
         assert_eq!(
             in_thread(),
-            before,
-            "{refusal}: nothing more tried in the thread"
+            before + 1,
+            "{refusal}: the saved destination is tried once before the definite fallback"
         );
         settled(&hub);
         assert!(hub.stop().success());
     }
 }
 
-/// A thread the lead started from the request with the bot (the work thread), here claimed by a
-/// lane, takes the answer like any thread started from it; the owner's next message in that
-/// thread goes to the lane, as lane-thread routing does, not to the lead.
+/// A lane-owned thread keeps the lead's pointer in the channel; later thread messages go to the lane.
 #[test]
-fn an_answer_goes_into_a_lane_thread_started_from_the_request() {
+fn a_lane_thread_keeps_the_leads_answer_in_the_channel() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     let work = hub.root.join("work");
@@ -764,14 +754,17 @@ fn an_answer_goes_into_a_lane_thread_started_from_the_request() {
             .filter(|m| m["content"] == "lead answer")
             .collect::<Vec<_>>()
     };
-    let answer = answers(source);
+    let answer = answers(CH);
     assert_eq!(
         answer.len(),
         1,
-        "the answer is in the lane's thread: {answer:?}"
+        "the owner sees the lead's pointer in the channel"
     );
-    assert!(answer[0].get("message_reference").is_none());
-    assert!(answers(CH).is_empty(), "nothing in the channel");
+    assert_eq!(answer[0]["message_reference"]["message_id"], source);
+    assert!(
+        answers(source).is_empty(),
+        "no duplicate pointer in the lane thread"
+    );
     // The owner follows up in the thread: the lane takes it, the lead does not. A thread that
     // appears while the hub runs is read from the hub's start on, so the message is made now.
     let since_epoch = std::time::SystemTime::now()
@@ -1863,7 +1856,10 @@ fn settling_a_question_by_tool_closes_its_buttons() {
     assert!(!error, "{said}");
     let edited = closed(&fake, &third_message);
     assert!(
-        edited["content"].as_str().unwrap().contains("Chosen by the lead: 2. f"),
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("Chosen by the lead: 2. f"),
         "{edited}"
     );
     assert_eq!(ledger(&hub, &third).0, "chosen");
@@ -2030,11 +2026,18 @@ fn a_failed_question_acknowledgement_keeps_the_question_open() {
     fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
     callback(&fake, 1);
     let edited = closed(&fake, &message);
-    assert!(edited["content"].as_str().unwrap().contains("2. b"), "{edited}");
+    assert!(
+        edited["content"].as_str().unwrap().contains("2. b"),
+        "{edited}"
+    );
     let (state, outcome) = ledger(&hub, &id);
     assert_eq!(state, "answered");
     assert!(outcome.unwrap().ends_with("option 2 (b)"));
-    assert_eq!(fake.calls("POST", "/callback").len(), 2, "no callback retry");
+    assert_eq!(
+        fake.calls("POST", "/callback").len(),
+        2,
+        "no callback retry"
+    );
     assert!(hub.stop().success());
 }
 
@@ -2055,12 +2058,142 @@ fn an_unacknowledged_question_post_remains_in_the_ledger() {
     assert!(!said.contains("ask it yourself"), "{said}");
     let id = said.split_whitespace().nth(1).unwrap();
     assert_eq!(ledger(&hub, id), ("open".into(), None));
-    assert_eq!(fake.bot_messages(CH).len(), 1, "one nonce, one visible question");
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        1,
+        "one nonce, one visible question"
+    );
     let (said, error) = lead.tool(&json!({
         "op": "question.withdraw", "id": id, "reason": "resolve the uncertain question"
     }));
     assert!(!error, "{said}");
     assert_eq!(ledger(&hub, id).0, "withdrawn");
-    assert_eq!(fake.bot_messages(CH).len(), 1, "settlement never posts again");
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        1,
+        "settlement never posts again"
+    );
+    assert!(hub.stop().success());
+}
+
+fn answer_state(hub: &TestHub, source: &str) -> String {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT answer FROM handoffs WHERE relay = 'discord' AND message = ?1",
+        [source],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn review_restart_follows_the_last_confirmed_parts_destination() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(1000)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000301";
+    fake.script_in(source, &[0, 403]);
+    let mut channel = vec![0, 0]; // continuation note, confirmed second part
+    channel.extend([400; 64]); // third part definitely not accepted yet
+    fake.script_in(CH, &channel);
+    ask_with_thread(&fake, 800_000_000_000_000_301, "three parts, then restart");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() >= 3).then_some(())
+    });
+    assert!(hub.stop().success());
+    fake.unscript_in(CH);
+    hub.start();
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    assert_eq!(
+        fake.bot_messages(source).len(),
+        1,
+        "never return to part one's room"
+    );
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        3,
+        "note and parts two and three"
+    );
+    assert!(hub.stop().success());
+}
+
+#[test]
+fn review_an_uncertain_part_is_not_moved_when_its_thread_closes() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000302";
+    let mut thread = vec![0];
+    thread.extend([500; 4]); // accepted part, no acknowledgement
+    thread.extend([403; 64]);
+    fake.script_in(source, &thread);
+    ask_with_thread(&fake, 800_000_000_000_000_302, "uncertain then closed");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{source}/messages"))
+            .len()
+            >= 6)
+            .then_some(())
+    });
+    assert!(hub.stop().success());
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "no cross-destination resend after uncertainty"
+    );
+    assert_eq!(fake.bot_messages(source).len(), 2);
+    assert_eq!(
+        answer_state(&hub, source),
+        "posting",
+        "the answer stays in doubt"
+    );
+}
+
+#[test]
+fn review_an_uncertain_first_part_keeps_its_destination_after_restart() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000303";
+    fake.script_in(source, &[500; 64]);
+    ask_with_thread(&fake, 800_000_000_000_000_303, "uncertain first part");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{source}/messages"))
+            .len()
+            >= 2)
+            .then_some(())
+    });
+    assert!(hub.stop().success());
+    // A fresh lookup would now select the channel, but the accepted part is already in the thread.
+    fake.lock_thread(CH, source);
+    fake.unscript_in(source);
+    hub.start();
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "a changed lookup must not duplicate an uncertain first part"
+    );
+    assert_eq!(fake.bot_messages(source).len(), 1);
     assert!(hub.stop().success());
 }
