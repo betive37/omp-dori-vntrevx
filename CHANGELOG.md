@@ -56,7 +56,8 @@
   own). An `install.sh` or binary already published cannot be taught this check: going back with one
   of them leaves the older hub refusing to open the store, with nothing lost; installing the current
   version again brings it back.
-
+  An unreadable candidate report also refuses an install over retained state; an empty home
+  remains installable without a store-reader capability.
 - Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the
   lead's existing backoff after verifying the child exited and the session lease is free. Failed
   resume attempts keep their diagnostics without superseding the last bound session.

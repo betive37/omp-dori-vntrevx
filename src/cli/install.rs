@@ -29,9 +29,9 @@ const STOP_WAIT: Duration = Duration::from_mins(1);
 const START_WAIT: Duration = Duration::from_secs(30);
 /// `omp --version`: 5 s (IR req. 25).
 const OMP_TIMEOUT: Duration = Duration::from_secs(5);
-/// The store floor assumed readable by a binary whose report carries no store reader capability
-/// (every release up to 0.2.6): the schema of main before 0.2.7. No earlier release raised a
-/// store's floor above 1, and 0.2.7's lead anchor raises it above this.
+/// The conservative store floor for a report without a reader capability (through 0.2.6).
+/// Schema 10 first raised the floor for pinned destinations; schema 11 raises it for lead anchors.
+/// An unknown reader is admitted only below both safety boundaries.
 const CAPABILITY_LESS_READER: i64 = 9;
 
 /// The four outcomes (IR req. 34).
@@ -327,7 +327,22 @@ async fn from_folder(
 
 /// A first install here. State a removed install left behind is kept, so its store is checked too.
 async fn first_install(l: &Layout, paths: &Paths, staged: Staged) -> Outcome {
-    let report = release::candidate_report(&staged.binary()).await.ok();
+    let report = match release::candidate_report(&staged.binary()).await {
+        Ok(report) => Some(report),
+        Err(error) => match layout_ops::store_floor(&paths.db_file()) {
+            Ok(None) => None,
+            Ok(Some(_)) => {
+                staged.discard();
+                return Outcome::Held(format!(
+                    "{error}; the retained store cannot be checked; nothing was installed"
+                ));
+            }
+            Err(error) => {
+                staged.discard();
+                return Outcome::Held(format!("{error}; nothing was installed"));
+            }
+        },
+    };
     if let Some(r) = &report
         && let Err(why) = store_preflight(paths, r, release::VERSION)
     {
@@ -1587,5 +1602,72 @@ mod tests {
         raise_floor(&paths.db_file(), 40);
         let held = store_preflight(&paths, &candidate(None), "0.2.7").unwrap_err();
         assert!(!held.contains("cataly-v10.db"), "{held}");
+    }
+
+    #[tokio::test]
+    async fn first_install_protects_retained_state_without_blocking_an_empty_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut report = candidate(None);
+        report.omp_minimum.clear();
+        for retained in [true, false] {
+            for text in ["unreadable".into(), serde_json::to_string(&report).unwrap()] {
+                let dir = scratch("first-install-floor");
+                let paths = paths_in(&dir);
+                if retained {
+                    store_at(&paths, 11);
+                }
+                let layout = Layout {
+                    root: dir.join("program"),
+                    command: dir.join("bin/cataly"),
+                    extension: dir.join("extensions/cataly.ts"),
+                    package: None,
+                };
+                layout_ops::prepare_root(&layout).unwrap();
+                let staging = layout_ops::fresh_staging(&layout, "test").unwrap();
+                let binary = format!("#!/bin/sh\nprintf '%s\\n' '{text}'\n");
+                std::fs::write(staging.join("cataly"), &binary).unwrap();
+                std::fs::set_permissions(
+                    staging.join("cataly"),
+                    std::fs::Permissions::from_mode(0o500),
+                )
+                .unwrap();
+                std::fs::write(staging.join("cataly.ts"), "bridge").unwrap();
+                let staged = Staged {
+                    dir: staging,
+                    record: layout_ops::Record {
+                        version: report.version.clone(),
+                        commit: report.commit.clone(),
+                        target: report.target.clone(),
+                        binary_sha256: release::sha256(binary.as_bytes()),
+                        extension_sha256: release::sha256(b"bridge"),
+                        source: "test".into(),
+                        installed_ms: 0,
+                        role: "kept".into(),
+                    },
+                };
+                let before = std::fs::read(paths.db_file()).ok();
+                let outcome = first_install(&layout, &paths, staged).await;
+                if retained {
+                    let Outcome::Held(reason) = outcome else {
+                        panic!("unverified candidate installed over retained state: {text}");
+                    };
+                    assert!(
+                        reason.contains("unreadable")
+                            || reason.contains("cannot read")
+                            || reason.contains("읽을 수"),
+                        "{reason}"
+                    );
+                    assert!(!layout.version_dir(&report.version).exists());
+                    assert_eq!(layout.current_version(), None);
+                } else {
+                    let Outcome::Done(_) = outcome else {
+                        panic!("an empty home has no store compatibility constraint");
+                    };
+                    assert_eq!(layout.current_version(), Some(report.version.clone()));
+                }
+                assert_eq!(std::fs::read(paths.db_file()).ok(), before);
+            }
+        }
     }
 }
