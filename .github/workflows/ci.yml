@@ -5,7 +5,7 @@ on:
     branches: [main]
   pull_request:
   schedule:
-    # Nightly: the contract tests against the latest stock OMP release (IR-38).
+    # Nightly: the same minimum/latest stock OMP contract gate as PRs and releases (IR-38).
     - cron: "17 3 * * *"
   workflow_dispatch:
     inputs:
@@ -43,6 +43,7 @@ jobs:
     timeout-minutes: 5
     outputs:
       matrix: ${{ steps.pick.outputs.matrix }}
+      contract_matrix: ${{ steps.pick.outputs.contract_matrix }}
     steps:
       - id: pick
         shell: bash
@@ -59,6 +60,10 @@ jobs:
           matrix=$(echo "$all" | jq -c --arg os "$OS" '{include: map(select($os == "all" or .family == $os))}')
           echo "$matrix"
           echo "matrix=$matrix" >> "$GITHUB_OUTPUT"
+          contract_matrix=$(echo "$matrix" | jq -c '{include: [.include[] |
+            . + {omp: "minimum", omp_name: "OMP"},
+            . + {omp: "latest", omp_name: "latest OMP"}]}')
+          echo "contract_matrix=$contract_matrix" >> "$GITHUB_OUTPUT"
 
   build:
     name: build (${{ matrix.target }})
@@ -142,14 +147,14 @@ jobs:
         with:
           command: check
 
-  # Every contract binary against stock OMP: pull requests, pushes and release calls use the pinned
-  # OMP 19.1.1; the nightly run (and a manual dispatch) uses the latest OMP release (IR-38).
+  # Every contract binary against both minimum and latest stock OMP on every event, including
+  # workflow_call: release.yml requires this reusable workflow before building or publishing.
   contract:
-    name: contract against OMP (${{ matrix.target }})
+    name: contract against ${{ matrix.omp_name }} (${{ matrix.target }})
     needs: targets
     strategy:
       fail-fast: false
-      matrix: ${{ fromJSON(needs.targets.outputs.matrix) }}
+      matrix: ${{ fromJSON(needs.targets.outputs.contract_matrix) }}
     runs-on: ${{ matrix.os }}
     timeout-minutes: 90
     env:
@@ -163,7 +168,7 @@ jobs:
         shell: bash
         env:
           GH_TOKEN: ${{ github.token }}
-          LATEST: ${{ github.event_name == 'schedule' || github.event_name == 'workflow_dispatch' }}
+          LATEST: ${{ matrix.omp == 'latest' }}
         run: |
           set -euo pipefail
           asset="omp-${{ matrix.target }}"

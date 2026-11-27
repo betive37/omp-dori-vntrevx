@@ -2,8 +2,11 @@
 
 ## 0.2.7 (Unreleased)
 
-- Hosted OMP sessions hide `eval` and its commit instructions from the model by disabling both
-  eval kernels. Cataly's existing eval denial and shell rules still apply.
+- One hosted-tool policy hides and denies `eval` and its unavailable helper instructions, keeps
+  debug/LSP offered, and reports trusted owner-installed MCP/extension tools at startup. Stock-OMP
+  contracts gate PRs and releases against both the minimum and latest versions; the documented shell
+  and reset guards prevent accidents, not arbitrary spending. Thanks to @Momentum96 in
+  [PR #300](https://github.com/vntrevx/Cataly/pull/300) for finding the eval mismatch.
 
 ## 0.2.6 (2026-11-27)
 

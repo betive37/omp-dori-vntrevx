@@ -144,7 +144,7 @@ command name for all six commands; `get_state` fields including `model`, `sessio
 | `--mode rpc-ui`, `--approval-mode always-ask`, `--config <overlay>`, `--model provider/id`, `--thinking`, `--session-dir`, `--resume=<path>`, `--append-system-prompt`, `--tools`, `--max-cost`, `--no-session`, `--no-extensions`, `--no-skills`, `--no-rules`, `--no-context-files`, `--no-tools`, `--offline`, `--profile`, `-e` | Launch (section 4), probe, tests | help (rpc-ui, approval-mode, no-* and offline also live) |
 | `omp usage --json` | Quota job, limits view | help (JSON schema unverified: parsed defensively, unknown shape = "unavailable") |
 | `omp session lease --json -- <ids>` → `{held, unknown}` | Crash recovery (HOST-28) | help, docs; rpc `get_session_lease` live |
-| `omp usage reset` | Never run; the shell veto blocks it (9.2) | help |
+| `omp usage reset` | Never run by the hub; recognizable submitted commands are refused by the shell veto (9.2), not sandboxed | help |
 | rpc `ready`, `negotiate_protocol`, `rpc_chunk` reassembly, 1 MiB frame cap | Transport | live (chunk rules docs) |
 | rpc `get_state` (`model`, `thinkingLevel`, `sessionId`, `sessionFile`, `isStreaming`, `isCompacting`, `queuedMessageCount`, `isSettled`, `hasPendingAsyncWork`, `goal`, `usageLimit`) | Status, identity, readback | live (`sessionFile`, `usageLimit` docs) |
 | rpc `prompt` with `streamingBehavior`, `follow_up`, `steer`, `abort` | Delivery, interrupt | docs |
@@ -247,6 +247,10 @@ time with immediate "busy" refusal; delivery receipts keyed by request ID (HOST-
   `rpc`; all five saved-reset keys `no`; `retry.modelFallback: true` and `retry.fallbackRevertPolicy:
   cooldown-expiry` (both OMP's defaults, pinned so an owner config cannot silently differ); `retry.fallbackOn`
   and `retry.fallbackChains` only when set in Cataly's `[fallback]` config (9.2).
+- One hosted-tool policy table generates hiding settings and execution denial across hosted roles:
+  `eval.py: false`, `eval.js: false` and `tools.approval.eval: deny`, without unavailable eval-helper
+  guidance. Debug and LSP remain offered when owner-enabled; offered tools retain owner approvals.
+  Owner-installed MCP and extensions are trusted, and their live non-stock tools are reported at startup.
 - Child environment starts empty: `PATH`, `HOME`, `TMPDIR`, `LANG`, listed provider credentials,
   `PI_NOTIFICATIONS=off`, `CATALY_LAUNCH=<single-use token>`, `CATALY_SOCKET=<path>`. No relay token, no
   Cataly secret, nothing secret in argv (HOST-06, req. 21).
@@ -493,13 +497,25 @@ relay destinations, or kept locally. Messenger posts never mention anyone and pa
 - The lead's goal tool may not create goals (the lead idles without one, OPC-36); lane goals are set by the hub
   from the brief and done checks. OMP itself refuses a second goal (docs).
 
-### 9.2 Never spend (fallback allowed)
+The shell veto is an accidental-command guard, not a sandbox. It inspects submitted shell lines,
+including recognizable Cataly mutations and spend commands, but cannot contain arbitrary scripts,
+decoded commands, inherited variables or later subprocesses. Debug adapters and language servers can
+execute without a bash call. Owner-installed MCP and extensions are trusted executable integrations,
+not isolated plugins. The hub's role checks remain necessary, but same-UID code and external brokers
+are outside this accidental-command threat model (section 8).
 
-Owner decision 7: a session may fall back to another configured model when a quota runs out. Redeeming saved
-resets, buying credits and paid overage stay refused, in code:
+### 9.2 Accidental-spend guards (fallback allowed)
 
-- Overlay sets every saved-reset key to `no`; the hub never runs `omp usage reset` and the bridge's shell veto
-  blocks it in every session as a non-overridable rule (OJ-13, OJ requirement 38).
+Owner decision 7 permits fallback to another configured model when a quota runs out. Cataly guards
+against accidental reset redemption, credit purchases and enabling paid overage; these controls do
+not establish a hard no-spend guarantee:
+
+- `NO_REDEEM` pins all five OMP auto-redeem keys to `no`: `codexResets.autoRedeem5h`,
+  `codexResets.autoRedeemWeekly`, `claudeResets.autoRedeem5h`, `claudeResets.autoRedeemWeekly` and
+  `claudeResets.autoRedeemFable`. This stops only OMP's automatic redemption in the configured session.
+  An explicit CLI/API request with usable credentials need not consult those settings. The hub never
+  runs `omp usage reset`; the bridge refuses recognizable submitted reset commands as a non-overridable
+  shell rule (OJ-13, OJ requirement 38), not as containment of other execution paths.
 - Spend-offer dialogs (built-in phrases plus owner phrases) are answered with cancel within 1 s, never with
   "no" or a remembered choice; a dialog that stays is cancelled again, the session is fenced, and the owner is
   alerted. Three offers in 10 minutes fence the session.
@@ -512,8 +528,8 @@ resets, buying credits and paid overage stay refused, in code:
   "on" changes nothing and health shows that as INFO.
 - The hub itself changes a session's model only back to that session's requested model, with readback; it has
   no code path that picks another provider, account or model.
-- A fallback to a metered (API-key) model bills per token. That is ordinary model spend, not credits or
-  overage, and it is bounded by the lane's cost ceiling, which also goes to OMP as `--max-cost` (WS-18).
+- A fallback to a metered (API-key) model bills per token. The lane's cost ceiling also goes to OMP as
+  `--max-cost` (WS-18); it is a session backstop, not a provider billing firewall.
 - Quota exhausted for good (a turn ends with a usage-limit error in `prompt_result`, meaning the chain is
   exhausted or absent) marks the session quota-blocked: no nudges, reminders or deliveries other than owner
   requests; the lead is told once (OPC-58, OPC-64).
@@ -526,8 +542,18 @@ resets, buying credits and paid overage stay refused, in code:
   start, keeping `config.toml.before-0.2.4`), and the status reply keeps an always-open `quota_gate` value
   for `cataly update` of 0.2.3 and older, which requires it; the field is removable once no 0.2.3 hub or CLI
   can still be updating.
-- Voice is the one paid feature: explicit opt-in, owner-entered prices, daily, total and spending caps checked
-  before every call starts, hold after any failure, never a paid retry (VOICE-19, VOICE-20).
+- Voice has its own paid budget: explicit opt-in, owner-entered prices, daily, total and spending caps
+  checked before every call starts, hold after any failure, never a paid retry (VOICE-19, VOICE-20).
+
+`NO_REDEEM` does not disable already-enabled overage, metered fallback, auxiliary model tools or cloud
+scans. Not passing relay secrets is not credential isolation: owner-listed provider variables and
+same-user stored OMP authentication can still authorize requests outside these guards.
+
+A hard no-spend guarantee would require hosted code to have neither readable account credentials nor
+a broad broker token: use a separately protected, endpoint-restricted inference gateway with server-side
+budgets, no reset/billing/account mutations, and provider-side overage disabled. Separate OS identity
+or equivalent filesystem/process isolation must protect owner state and the hub's owner-only control
+path, including remote workers and shared MCP/LSP brokers. This credential isolation is not built.
 
 ### 9.3 Fail closed on uncertain delivery
 
@@ -693,9 +719,9 @@ OMP version under test, `biome` for lint and format.
 
 | Workflow | Runners | Contents |
 | --- | --- | --- |
-| On every pull request and push to `main` | `ubuntu-latest` (x64), `macos-latest` (arm64) | fmt, clippy `-D warnings`, tests with `--locked`, `cargo deny`, bridge type check and tests, release build, contract suite against OMP 19.1.1 (the minimum) and the newest OMP known when the change was made, each downloaded from OMP's official release assets and checked against its published `SHA256SUMS.txt`, memory and latency benchmarks compared with `main` |
-| Nightly | same two | Contract suite and e2e against the latest OMP release resolved at run time; failure notifies the owner through GitHub (IR-38) |
-| Release (tag `v*`) | same two, then publish | Section 11.4 |
+| On every pull request and push to `main` | `ubuntu-latest` (x64), `ubuntu-24.04-arm`, `macos-latest` (arm64), `macos-15-intel` | fmt, clippy `-D warnings`, tests with `--locked`, `cargo deny`, bridge type check and tests, release build, binary size and idle memory; every `contract*` suite against both OMP 19.1.1 (the minimum) and the latest stock release resolved at run time, each verified against its published `SHA256SUMS.txt` |
+| Nightly | same four | The same minimum/latest stock-OMP contract jobs (IR-38) |
+| Release (tag `v*`) | same four, then publish | Full reusable CI, including both stock-OMP contract versions, must succeed before release builds and publication (section 11.4) |
 
 Third-party actions are pinned by commit hash; workflow permissions are read-only except the publish job.
 
@@ -855,7 +881,7 @@ numbers are kept from the first draft so references stay stable; decided rows mo
 | A10 | Queued launches (LANE Q4), auto close after 5 min (LANE Q7) | Kept; 5-minute window kept | Config. |
 | A11 | systemd scopes per lane (LANE Q5) | Not in the first release | Linux-only addition in the `sys` module. |
 | A12 | Worktrees without a list (LANE Q6) | No migration exists (IR-43), so unrecorded worktrees are always kept | — |
-| A13 | Approval mode for headless sessions (HOST-05) | Owner decision 19 (`docs/decisions.md`): approvals follow the owner's own OMP settings. Sessions start without `--approval-mode` and the overlay sets no `bash.patterns`, so OMP applies the owner's global configuration or its default. Cataly's tools are registered `loadMode: essential` with `policy: allow`, so OMP offers them only as direct calls that never ask; the hub's shell veto refuses a `bash` line naming them, before OMP's approval, with a pointer to the direct call, and rule 0 still refuses `cataly` CLI mutations and spend commands; the overlay denies `eval`. Every dialog OMP does open goes to the lead (LANE-31) and, if enabled, to the owner as a card in the owner's language with owner-only buttons. Review lanes in print mode keep `always-ask`: nobody can answer there, so it fails closed. | Forcing `always-ask` overrode the owner's own OMP choice and made every write ask in Discord; a Cataly read-only list duplicated OMP's own approval configuration. |
+| A13 | Hosted tools and approval mode (HOST-05) | Owner decision 19 (`docs/decisions.md`): approvals follow the owner's OMP settings, with no forced `--approval-mode` or `bash.patterns`. One hosted-tool policy table hides and denies `eval` (both kernels disabled), removing unavailable helper guidance; debug and LSP remain offered when owner-enabled, without overriding approvals. Owner-installed MCP and extensions are trusted and their live non-stock tools reported at startup. Cataly's tools remain `loadMode: essential`, `policy: allow`; shell misuse points to direct calls. The shell veto is an accidental-command guard, not a sandbox; `NO_REDEEM` stops only OMP's automatic redemption. Hard no-spend needs credential isolation, which is not built (9.2). Dialogs go to the lead (LANE-31) and, when enabled, owner-only approval cards. Print reviewers keep `always-ask`. Latest-stock-OMP contracts gate PRs and releases alongside the minimum. | Forcing approvals duplicates the owner's OMP configuration; hostile-code containment requires a separate credential and OS boundary, not more tool bans. |
 | A14 | OMP's automatic rotation between the owner's own logged-in accounts | Not controlled by Cataly (no documented switch); allowed like a configured fallback | If the owner counts it as "switching account", keep one login per provider. |
 | A15 | Discord: all-channels mode, lookup, auto resend, busy lead, rejected intents (DISC-IN Q1-5) | Dropped; lookup opt-in and off; auto resend when the file is final; follow-up while busy; intake stays down | Each is a small switch except REST polling, which stays out. |
 | A16 | Hub posts final answers (DISC-OUT Q1) | Yes, lead and lanes | Model-driven replies need the stop-gate machinery as the main path. |
@@ -864,7 +890,7 @@ numbers are kept from the first draft so references stay stable; decided rows mo
 | A19 | Owner language, table rendering (DISC-OUT Q4, Q5) | One configured language; tables always rendered | Config. |
 | A20 | Slack member mode, Telegram send scope (TSV Q1, Q4) | Member via the app's user token; Telegram sends limited to the owner's DM and configured group/topic | Config. |
 | A22 | Voice-note transcription (TSV Q5) | On request; automatic is a config switch | Automatic transcription adds a call per voice note. |
-| A23 | Ceilings hold the lane (WS Q1) | Yes, plus `--max-cost` as OMP-side backstop; also bounds metered fallback spend | Advisory only. |
+| A23 | Ceilings hold the lane (WS Q1) | Yes, plus `--max-cost` as an OMP-session backstop for metered fallback; not a provider billing firewall (9.2) | Advisory only. |
 | A24 | Auto report posting, PR events to threads, limit alerts, broken-off cron (WS Q2, Q4-6) | As C7; PR events to the lead only; quota job alerts on bands; broken-off jobs stay held until acknowledged | Config. |
 | A25 | Personal watch scripts (WS Q3) | Covered by the job kinds of 6.1 plus `probe` and `stream` | A new kind if a script needs carried state. |
 | A26 | Coordination questions (COORD Q2-5) | No usage counts or telemetry at all (owner, 2026-11-26); event commands kept; planner defaults kept; profile kept | Each of the rest is one feature. |
