@@ -605,6 +605,19 @@ out like any job post (no mentions) and are not sent to the lead as work. Withou
 they go to your home room: the `[discord]` home channel, else the `[telegram]` group (and topic)
 or your DM. With neither, they stay in the event log; for Slack, name a destination.
 
+**Going back a version.** Some releases upgrade the store so a conversation cannot be lost (0.2.7
+keeps the lead's resume anchor there), and a binary older than that upgrade cannot open it.
+`cataly rollback`, an update or install that switches versions, and `install.sh` over an existing
+install check this first, before the hub is stopped or any file switched: a version that cannot
+read the store, or one too old to say what it reads while the store needs more than those
+releases knew, is refused (exit status 6). The message says which version cannot read the store
+and the way out: stay on the current version, or restore the store copy the hub made in
+`<state>/backup/` before that upgrade (its path is named when one exists; conversation since then
+is not in it). Updates keep no store copy of their own; when the hub made none, the message says
+so. An `install.sh` or a binary already published (0.2.6 and earlier) does not have this check. If
+one of them is used to go back, the older hub refuses to open the store and does not start: nothing
+in the store is lost. Install the current version again to get the hub and the conversation back.
+
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `update.check` | boolean | `true` | | Daily check for a newer stable release; off means no request is ever made. |
