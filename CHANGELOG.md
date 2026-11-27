@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.6 (Unreleased)
+## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
   stop signal sent right after the start (as a service manager or a terminal's Ctrl-C may do) could
