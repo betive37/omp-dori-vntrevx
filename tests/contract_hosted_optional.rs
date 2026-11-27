@@ -45,15 +45,18 @@ fn optional_stock_features_are_classified_and_owner_disables_survive() {
         "manage_skill",
         "security_scan",
         "think",
+        "find",
+        "learn",
     ];
-    for on in [true, false] {
+    for backend in ["off", "local", "mnemopi"] {
+        let on = backend != "off";
         let settings = json!({
             "startup": {"setupWizard": false},
             "tools": {"commands": false}, "astGrep": {"enabled": on}, "github": {"enabled": on},
             "checkpoint": {"enabled": on}, "compaction": {"experimentalContextManagement": on},
             "autolearn": {"enabled": on}, "security": {"enabled": on}, "externalThinking": on,
-            "debug": {"enabled": on}, "lsp": {"enabled": on}, "find": {"enabled": "off"},
-            "memory": {"backend": "off"},
+            "debug": {"enabled": on}, "lsp": {"enabled": on}, "find": {"enabled": if on { "on" } else { "off" }},
+            "memory": {"backend": backend},
             "modelRoles": {"default":"fake/primary", "smol":"fake/primary", "slow":"fake/primary", "tiny":"fake/primary", "memory":"fake/primary"},
         });
         let host = Hosted::new("headless", "");
@@ -74,12 +77,14 @@ fn optional_stock_features_are_classified_and_owner_disables_survive() {
                 "{name}, enabled={on}: {surface:?}"
             );
         }
+        for name in ["retain", "recall", "reflect", "memory_edit"] {
+            assert_eq!(
+                surface.tools.contains(name),
+                backend == "mnemopi",
+                "{backend}: {surface:?}"
+            );
+        }
     }
-    // These backends are not installed in the offline harness. Their names still participate in
-    // the public CLI catalog and schema checks; calling them would test provider credentials.
-    eprintln!(
-        "optional feature exclusions: find requires a native judge; retain/recall/reflect/memory_edit require a configured memory backend; learn requires that backend. No backend/network calls are made."
-    );
 }
 
 #[test]
@@ -116,6 +121,20 @@ fn browser_replacement_and_delayed_mcp_inventory_reach_real_status() {
             .union(&before.commands)
             .any(|name| name.starts_with("mcp__browser"))
     );
+    let session = &before.agent.as_ref().unwrap().session;
+    let initial = hosted.hub.until(WAIT, || {
+        let status = hosted.hub.json(&["lead", "status", "--json"]);
+        status["tools"]
+            .as_array()?
+            .iter()
+            .find(|report| report["session"] == *session)
+            .map(|report| report["nonstock"].clone())
+    });
+    assert_eq!(
+        initial,
+        json!([]),
+        "stock tools misreported as integrations"
+    );
     hosted.hub.until(WAIT, || {
         hosted
             .hub
@@ -127,15 +146,21 @@ fn browser_replacement_and_delayed_mcp_inventory_reach_real_status() {
     std::fs::write(gate, "release tools/list").unwrap();
     let name = hosted.hub.until(WAIT, || {
         let status = hosted.hub.json(&["lead", "status", "--json"]);
-        let names: Vec<_> = status["tools"]
+        let report = status["tools"]
             .as_array()?
             .iter()
-            .flat_map(|report| report["nonstock"].as_array().into_iter().flatten())
+            .find(|report| report["session"] == *session)?;
+        let names = report["nonstock"].as_array()?;
+        let name = names
+            .iter()
             .filter_map(serde_json::Value::as_str)
-            .filter(|name| name.starts_with("mcp__browser") && name.ends_with("inspect"))
-            .map(str::to_owned)
-            .collect();
-        (names.len() == 1).then(|| names[0].clone())
+            .find(|name| name.starts_with("mcp__browser") && name.ends_with("inspect"))?;
+        assert_eq!(
+            names.as_slice(),
+            [json!(name)],
+            "unexpected non-stock inventory"
+        );
+        Some(name.to_owned())
     });
     let from = hosted.lead("After delayed MCP discovery");
     let mut after = main_surface(&hosted, from);

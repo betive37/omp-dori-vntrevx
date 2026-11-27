@@ -235,6 +235,12 @@ fn protocol_cross_references_do_not_advertise_eval_but_calls_and_preludes_do() {
         ),
         ("- history://<id>: call archive.transcript('session')", true),
         ("- history://<id>: read help://eval/archive", true),
+        (
+            "- history://<id>: use `commit.draft` before committing",
+            true,
+        ),
+        ("- skill://commit: commit with commit.draft", true),
+        ("- agent://<id>: drive pages with `browser.open`", true),
     ];
     for (instruction, forbidden) in cases {
         let body = serde_json::json!({

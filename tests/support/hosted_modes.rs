@@ -1,24 +1,63 @@
 //! Inspection and interactive planning are distinct stock launch surfaces.
 use std::io::Write;
 
-use serde_json::Value;
+use serde_json::{Value, json};
 
 use crate::hosted_harness::{Hosted, WAIT, enabled};
-use crate::optional::{main_surface, print_profile};
+use crate::optional::main_surface;
 use crate::policy::{self, Role};
 
 #[test]
-fn reviewer_and_plan_surfaces_follow_the_generated_policy() {
+fn builtin_reviewer_uses_the_generated_policy() {
     if !enabled() {
         return;
     }
-    let reviewer = Hosted::new("headless", "");
-    let surface = print_profile(&reviewer, Role::Reviewer, &[]);
+    let mut reviewer = Hosted::new("headless", "");
+    reviewer.hub.install_fake("gh");
+    let mut path = reviewer.hub.root.join("bin").into_os_string();
+    path.push(":");
+    path.push(crate::support::path_without_omp());
+    reviewer.hub.env.push(("PATH".into(), path.into()));
+    std::fs::write(
+        reviewer.hub.root.join("agent/models.yml"),
+        crate::support::model::models_yml(reviewer.model.port, &["primary", "reviewer"]),
+    )
+    .unwrap();
+    let head = "a".repeat(40);
+    reviewer.hub.fixture("gh", "repos_o_r_pulls_7.json",
+        Some(&json!({"head":{"sha":head},"title":"Policy review","body":"Surface fixture","changed_files":0}).to_string()));
+    reviewer
+        .hub
+        .fixture("gh", "repos_o_r_pulls_7_files.json", Some("[]"));
+    reviewer.start();
+    let from = reviewer.model.bodies().len();
+    let result = reviewer.lane("review", &json!({"pr":"o/r#7","model":"fake/reviewer"}));
+    assert!(result.as_str().unwrap().contains("approve"), "{result}");
+    let surface = main_surface(&reviewer, from);
     surface.witness(Role::Reviewer, "print/no-session reviewer");
     for name in policy::selection(Role::Reviewer).unwrap().split(',') {
         assert!(surface.tools.contains(name), "{surface:?}");
     }
     assert!(!surface.tools.contains("bash"), "{surface:?}");
+    let metadata = reviewer
+        .model
+        .bodies()
+        .iter()
+        .filter_map(|body| serde_json::from_str::<Value>(body["user"].as_str()?).ok())
+        .find(|meta| meta["session"] == surface.agent.as_ref().unwrap().session)
+        .unwrap();
+    assert_eq!(
+        metadata["hostedGoalEnabled"], false,
+        "reviewer used the wrong effective policy"
+    );
+    assert!(reviewer.hub.stop().success());
+}
+
+#[test]
+fn active_plan_mode_keeps_the_hosted_policy() {
+    if !enabled() {
+        return;
+    }
 
     let mut plan = Hosted::new(
         "tern",

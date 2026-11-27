@@ -10,10 +10,12 @@ use crate::support::model::{FakeModel, models_yml};
 pub(crate) const WAIT: Duration = Duration::from_secs(120);
 pub(crate) const OBSERVER: &str = r"
 import type { ExtensionAPI } from '@oh-my-pi/pi-coding-agent';
+import { lookup } from '@oh-my-pi/pi-coding-agent/config/registry';
 export default function (pi: ExtensionAPI) {
   pi.on('before_provider_request', (event, ctx) => {
     if (typeof event.payload !== 'object' || event.payload === null) return;
-    return { ...event.payload, user: JSON.stringify({ ...ctx.agent, session: ctx.sessionManager.getSessionId() }) };
+    return { ...event.payload, user: JSON.stringify({ ...ctx.agent, session: ctx.sessionManager.getSessionId(),
+      hostedGoalEnabled: lookup('goal.enabled')?.get(pi.pi.settings) }) };
   });
 }
 ";

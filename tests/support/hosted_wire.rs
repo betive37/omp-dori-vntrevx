@@ -59,19 +59,14 @@ fn text(value: &Value, visit: &mut impl FnMut(&str)) {
 
 fn references(text: &str, out: &mut BTreeSet<String>) {
     for line in text.lines() {
-        // A URI declaration documents the offered read protocol, not an eval namespace.
-        // Still reject actual calls or eval documentation even inside such a declaration.
+        // Stock's history URI docs cross-reference archive.transcript's query format.
+        // This exact pair is not an eval advertisement; other helpers remain forbidden.
         let declaration = line
             .trim()
             .strip_prefix("- ")
             .unwrap_or(line.trim())
             .trim_start_matches('`');
-        let protocol = declaration.split_once("://").is_some_and(|(scheme, _)| {
-            !scheme.is_empty()
-                && scheme
-                    .bytes()
-                    .all(|byte| byte.is_ascii_lowercase() || byte == b'_')
-        });
+        let history = declaration.starts_with("history://");
         for token in line.split(|c: char| !(c.is_ascii_alphanumeric() || "_./:-".contains(c))) {
             let token = token.trim_end_matches('.');
             let helper = token.split_once('.').is_some_and(|(namespace, _)| {
@@ -87,7 +82,7 @@ fn references(text: &str, out: &mut BTreeSet<String>) {
                         | "completion"
                 )
             });
-            let callable = !protocol
+            let callable = !(history && token == "archive.transcript")
                 || line.match_indices(token).any(|(at, _)| {
                     line.get(at + token.len()..)
                         .is_some_and(|tail| tail.trim_start().starts_with('('))

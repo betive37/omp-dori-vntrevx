@@ -252,7 +252,11 @@ async fn answer(
             let response = text
                 .lines()
                 .find_map(|line| line.strip_prefix("RETURN "))
-                .unwrap_or("ok");
+                .unwrap_or(if model == "reviewer" {
+                    "VERDICT: approve"
+                } else {
+                    "ok"
+                });
             for n in 0..steps {
                 if n > 0 {
                     tokio::time::sleep(Duration::from_millis(500)).await;
