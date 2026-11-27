@@ -35,19 +35,6 @@ impl Runtime for Hosted {
         }
     }
 
-    async fn start(&self, spec: StartSpec) -> Result<(Arc<Hosting>, Started), StartError> {
-        match self {
-            Self::Headless(r) => r
-                .start(spec)
-                .await
-                .map(|(s, started)| (Arc::new(Hosting::Headless(s)), started)),
-            Self::Tern(r) => r
-                .start(spec)
-                .await
-                .map(|(s, started)| (Arc::new(Hosting::Tern(s)), started)),
-        }
-    }
-
     async fn start_supervised(
         &self,
         spec: StartSpec,
