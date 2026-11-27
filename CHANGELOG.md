@@ -2,6 +2,17 @@
 
 ## 0.2.7 (Unreleased)
 
+- Failed lane resumes (hub restart, worker reconnect and explicit reopen) keep the exact session,
+  run, mailbox and worktree ownership, held with diagnostics rather than rolling back prior work.
+  Fresh launch rollback is limited to the attempt's own proven unused allocation.
+- Worktree removal now requires a durable close/rollback intent, confirmed writer exit and a fresh
+  preservation check. Tracked, untracked and ignored files, unpushed commits, uncertain input,
+  published files and unknown checks all keep the worktree; removal failures retain the record
+  and appear in its receipt. Remote EOF is not a worker reap acknowledgement. Ignored cache
+  disposal is a separate explicit owner action, not part of close or recovery.
+- Reopen answers with `resumed`, `recovering` or `held` after its first definite outcome instead
+  of blocking the caller for the whole recovery episode. Continuing recovery retains ownership,
+  reports its final result to the owner and lane thread, and is cancelled by close, park or hub stop.
 - Retain the lead's proven conversation independently of failed launch attempts and history
   retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
   hold rather than silently starting fresh. After a failed explicit fresh start, use
