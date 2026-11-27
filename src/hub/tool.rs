@@ -8,6 +8,7 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::Hub;
+use crate::relay::discord::questions::ledger;
 use crate::store::lead::{LeadDone, LeadWrite, QuestionRow, RequestRow};
 use crate::sys::now_ms;
 
@@ -332,17 +333,7 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         return Err("a question the lead may settle needs at least 2 options and a thread".into());
     }
     let id = crate::host::random_hex(4);
-    let neutral = crate::relay::discord::questions::neutral;
-    let mut body = format!("**Question {id}**\n{}", neutral(text));
-    for (n, o) in options.iter().enumerate() {
-        let mark = if recommended == i64::try_from(n + 1).ok() {
-            " (recommended)"
-        } else {
-            ""
-        };
-        let _ = write!(body, "\n{}. {}{mark}", n + 1, neutral(o));
-    }
-    body.push_str("\nReply to this message with a number or your answer.");
+    let body = ledger::body(&id, text, &options, recommended);
     let config = hub.config();
     let room = s(input, "room")
         .and_then(crate::relay::discord::Snowflake::parse)
@@ -350,9 +341,14 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     let posted = match (room, hub.discord_rest()) {
         (Some(room), Some(rest)) => {
             let nonce = crate::relay::discord::nonce(&format!("ledger:{id}"), 0);
-            let created = rest
-                .create(room, json!({ "content": body, "nonce": nonce }))
-                .await;
+            // One button per option when presses reach intake (DISC-OUT req. 67-68).
+            let create = if ledger::buttons_ready(&hub.discord.health()) {
+                let components = ledger::buttons(&id, &options, recommended);
+                json!({ "content": body, "nonce": nonce, "components": components })
+            } else {
+                json!({ "content": body, "nonce": nonce })
+            };
+            let created = rest.create(room, create).await;
             created.ok().and_then(|v| {
                 v.get("id")
                     .and_then(Value::as_str)
@@ -403,21 +399,26 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
             .map_err(|e| e.to_string())?
     }
     .ok_or(format!("no question {id}"))?;
-    let (state, outcome) = match op {
+    let (state, outcome, status) = match op {
         "question.answer" => {
             let message = need(input, "message", 64, true)?;
             let text = need(input, "text", 1000, false)?;
-            ("answered", format!("owner message {message}: {text}"))
+            (
+                "answered",
+                format!("owner message {message}: {text}"),
+                "Answered by the owner.".to_string(),
+            )
         }
         "question.choose" => {
             if !q.lead_may {
                 return Err(format!("question {id} is the owner's to settle"));
             }
             let option = i(input, "option").ok_or("option is required")?;
-            let picked = usize::try_from(option - 1)
+            let n = usize::try_from(option)
                 .ok()
-                .and_then(|n| q.options.get(n))
+                .filter(|n| (1..=q.options.len()).contains(n))
                 .ok_or(format!("option must be 1 to {}", q.options.len()))?;
+            let picked = ledger::picked(&q, n);
             let reason = need(input, "reason", 1000, false)?;
             let message = need(input, "message", 64, true)?;
             if s(input, "thread").is_some_and(|t| Some(t) != q.thread.as_deref()) {
@@ -425,10 +426,15 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
             }
             (
                 "chosen",
-                format!("option {option} ({picked}) by the lead, announced in {message}: {reason}"),
+                format!("{picked} by the lead, announced in {message}: {reason}"),
+                format!("Chosen by the lead: {}", ledger::shown(&q, n)),
             )
         }
-        _ => ("withdrawn", need(input, "reason", 1000, false)?.to_string()),
+        _ => (
+            "withdrawn",
+            need(input, "reason", 1000, false)?.to_string(),
+            "Withdrawn.".to_string(),
+        ),
     };
     let d = hub
         .store
@@ -439,6 +445,11 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
         })
         .await
         .map_err(|e| e.to_string())?;
+    if matches!(d, LeadDone::Done)
+        && let Some(rest) = hub.discord_rest()
+    {
+        ledger::close(rest, &q, &status);
+    }
     done(d, format!("question {id} {state}"))
 }
 
