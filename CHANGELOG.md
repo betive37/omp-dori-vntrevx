@@ -16,6 +16,15 @@
   refused instead of silently posting in the home channel, and so is a `room` the post fails in
   (nothing is recorded). The owner's reply to the lead's open question goes to the lead even in a
   thread an open lane owns.
+- A question the lead records (`cataly_lead` op `question.ask`) now has one button per option
+  on Discord, labelled with its number; the recommended one is highlighted but never chosen by
+  itself. Your press answers the question exactly like a reply with that number: the ledger
+  records it and the lead is told which question and option (event `question.answered`). Anyone
+  else's press, and a press on a question already answered or withdrawn, gets a private refusal.
+  However the question is settled (button, reply, or the lead's `question.answer`, `choose` or
+  `withdraw`), its message then says so and loses its buttons. Replying with a number or free
+  text works as before. Buttons come only when presses reach Cataly over the Gateway (the same
+  condition as for OMP's questions); otherwise the question is text only, as before.
 
 ## 0.2.5 (2026-11-27)
 

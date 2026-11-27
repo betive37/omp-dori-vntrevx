@@ -921,6 +921,35 @@ impl Rest {
         }
     }
 
+    /// Sends a follow-up message to an acknowledged interaction with its token (valid 15 minutes);
+    /// `flags` 64 in `body` keeps it private to the user who pressed.
+    pub(crate) async fn follow_up(
+        &self,
+        application: Snowflake,
+        token: &str,
+        body: Value,
+    ) -> Result<(), RestError> {
+        let path = format!("/webhooks/{application}/{token}");
+        let call = self.request_as(
+            "POST webhooks",
+            Method::POST,
+            &path,
+            Some(Body::Json(body)),
+            Kind::Once,
+            false,
+        );
+        match tokio::time::timeout(Duration::from_secs(5), call).await {
+            Ok(Outcome::Done(_)) => Ok(()),
+            Ok(other) => Err(RestError::from_outcome(other)),
+            Err(_) => Err(RestError {
+                status: None,
+                code: None,
+                why: "no answer within 5 s".into(),
+                uncertain: true,
+            }),
+        }
+    }
+
     /// Sets the bot's avatar and banner (`fields`: `avatar` and/or `banner` as image data URIs);
     /// returns the bot account as Discord answers it, with the new image hashes.
     pub(crate) async fn set_profile(&self, fields: Value) -> Result<Value, RestError> {

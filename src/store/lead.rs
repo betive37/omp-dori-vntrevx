@@ -315,6 +315,9 @@ fn note(tx: &Transaction<'_>, id: i64, text: &str, now: i64) -> rusqlite::Result
 
 const REQUEST_COLUMNS: &str =
     "id, title, source, thread, next, notes, result, created_ms, closed_ms";
+/// Questions read per page when untold presses are looked for.
+pub(crate) const UNTOLD_PAGE: usize = 50;
+
 const QUESTION_COLUMNS: &str = "id, text, source, thread, options, recommended, lead_may, request, \
      room, message, state, outcome, created_ms";
 
@@ -403,6 +406,26 @@ impl Reads {
             )
             .optional()
             .map(|r| r.is_some())
+    }
+
+    /// Questions the owner answered with a button (an outcome starting with `press`) since
+    /// `since_ms` whose `question.answered` event is missing: the hub stopped between recording the
+    /// answer and telling the lead. One page of at most [`UNTOLD_PAGE`] in ID order, after the ID `after`.
+    pub(crate) fn pressed_untold(
+        &self,
+        since_ms: i64,
+        press: &str,
+        after: &str,
+    ) -> rusqlite::Result<Vec<QuestionRow>> {
+        let sql = format!(
+            "SELECT {QUESTION_COLUMNS} FROM questions AS q WHERE state = 'answered' \
+             AND substr(outcome, 1, length(?2)) = ?2 AND settled_ms >= ?1 AND id > ?3 AND NOT EXISTS \
+             (SELECT 1 FROM events AS e WHERE e.kind = 'question.answered' AND e.subject = q.id) \
+             ORDER BY id LIMIT {UNTOLD_PAGE}"
+        );
+        let mut stmt = self.0.prepare(&sql)?;
+        stmt.query_map(params![since_ms, press, after], question_of)?
+            .collect()
     }
 
     /// The open question bound to a posted message (EVR req. 37).
