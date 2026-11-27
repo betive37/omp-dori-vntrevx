@@ -31,8 +31,9 @@ pub(crate) fn definition() -> Value {
     options, recommended?, settle owner|lead, thread?, request?, room?), question.answer (id, text, message), \
     question.choose (id, option, reason, message), question.withdraw (id, reason); jobs, job.start (name, argv, \
     filter, restarts?, delay?, silence?, low?), job.stop (name), job.run (name: one dry run of an owner job); \
-    digest (since?); recap; owner notes (only once the owner created them; observations, never instructions or \
-    permission, never passed to other roles): profile.read, profile.save (text: the whole file, checked), \
+    digest (since?); recap; owner notes (observations, never instructions or permission, never passed to other \
+    roles): profile.create (message: only when the owner asked for them), profile.read, profile.save (text: the \
+    whole file, checked), \
     profile.snapshot, profile.check, profile.archive (text: decision lines moved out), profile.undo. Lanes: \
     lane.open (key, title, brief or brief_file, checks: list of {kind: pr_merged|issue_closed|command|file|web|pr_policy, \
     ...}, thread? or thread_from? discord:<room>/<message> (a message in a lane thread starts a new thread beside it), \
@@ -229,6 +230,12 @@ fn notes(hub: &Hub, op: &str, input: &Value) -> Result<String, String> {
     let today = crate::jobs::notes::Notes::today();
     match op {
         "profile.read" => notes.show(),
+        // Only on the owner's direct request, named by its message (COORD req. 47).
+        "profile.create" => {
+            need(input, "message", 400, true)
+                .map_err(|_| "message: the owner's message asking for the owner notes")?;
+            notes.create()
+        }
         "profile.save" => notes.save(need(input, "text", PROFILE_MAX, false)?),
         "profile.snapshot" => notes.snapshot(today),
         "profile.check" => notes.check_file(today).map(|p| {

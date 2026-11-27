@@ -2,6 +2,10 @@
 
 ## 0.2.5 (Unreleased)
 
+- The lead can create the owner notes with `profile.create` when the owner asks for them. The op
+  takes the owner's message and is refused without one; creating them twice is still refused.
+  Before, `profile.save` refused until the owner ran `cataly lane profile-create` in a terminal,
+  even after asking the lead to make them.
 - A Telegram, Slack or Discord message read live is no longer handed to the lead by a round that
   finds it queued before its arrival finished. Such a hand-off lost the message's wake from
   `cataly stats` (`*_wake_latency`) and left its read time in the hub's memory for good. The

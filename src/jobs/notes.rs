@@ -279,7 +279,9 @@ impl Notes {
     pub(crate) fn save(&self, text: &str) -> Result<String, String> {
         if !self.exists() {
             return Err(
-                "the owner has not created the owner notes (cataly lane profile-create)".into(),
+                "the owner notes do not exist yet: profile.create on the owner's request, or the \
+                 owner runs cataly lane profile-create"
+                    .into(),
             );
         }
         let today = Self::today();

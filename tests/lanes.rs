@@ -966,6 +966,47 @@ fn lead_tool(bridge: &mut Bridge, session: &Value, call: &str, input: Value) -> 
     )
 }
 
+/// COORD req. 47: the lead creates the owner notes only with the owner's message, once; a save
+/// before that is refused and one after it passes the check.
+#[test]
+fn lead_creates_owner_notes_on_the_owners_request() {
+    let (mut hub, work) = lane_hub("");
+    let text = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{text}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    start(&mut hub);
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    let save = json!({ "op": "profile.save", "text": "# Owner notes\n" });
+    let (why, err) = lead_tool(&mut b, &s, "p1", save);
+    assert!(err && why.contains("profile.create"), "{why}");
+    let (why, err) = lead_tool(&mut b, &s, "p2", json!({ "op": "profile.create" }));
+    assert!(err && why.contains("message"), "{why}");
+    assert!(!hub.state().join("profile.md").exists());
+    let create = json!({ "op": "profile.create", "message": "discord:1/2" });
+    let (why, err) = lead_tool(&mut b, &s, "p3", create.clone());
+    assert!(!err, "{why}");
+    let (why, err) = lead_tool(&mut b, &s, "p4", create);
+    assert!(err && why.contains("already exist"), "{why}");
+    let (shown, err) = lead_tool(&mut b, &s, "p5", json!({ "op": "profile.read" }));
+    assert!(!err, "{shown}");
+    let mut notes = shown.trim_end().to_string();
+    notes = notes.replacen(
+        "## Standing decisions",
+        "## Standing decisions\n\n- (2026-01-01) All pull requests come from one account.",
+        1,
+    );
+    let (why, err) = lead_tool(
+        &mut b,
+        &s,
+        "p6",
+        json!({ "op": "profile.save", "text": format!("{notes}\n") }),
+    );
+    assert!(!err, "{why}");
+}
+
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
 /// recorded before it), a "no" is stored and not asked again (also after a restart), and messenger
 /// writes from the lead (tool posts and `cataly` commands in its shell) are refused while it runs.
