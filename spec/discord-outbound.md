@@ -156,16 +156,21 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     linked reply (rules 16, 33). When a lane owns that thread, the answer lands there all the same,
     and the owner's later messages in the thread go to the lane as thread routing already does
     (intake spec req. 41).
-    The daemon reads the source message once per delivery, just before the first part, within
-    5 s; a failed or late read is logged and the answer is the reply in the channel. If the thread
+    The daemon reads the source message just before the first part, within 5 s, and keeps what a
+    read found for the request. A failed or late read is logged and kept for nothing: the first
+    part waits and a later round reads again, up to three reads per request in all; after the
+    third failure the answer is the reply in the channel. If the thread
     rejects the first part (rule 6) and no earlier attempt there was uncertain, the first part goes
     as the reply in the channel with the same nonce; once a part there was uncertain, or a later
     part is rejected for its own sake, the answer stays in the thread and is retried there. A
     thread that refuses the bot as such (403, unknown channel, archived thread) takes nothing more:
     that part and the rest go to the channel, the first of them as the reply to the source
-    message, so a thread locked or deleted mid-answer holds up no later answer. The lookup is
-    shared with typing, so both use one result per request. The choice lives in daemon memory for
-    that delivery. A part posted outside the request's room is stored with that room
+    message, so a thread locked or deleted mid-answer holds up no later answer. When a part was
+    already out in the thread, that first moved part opens with the line
+    `-# continued from <#thread>`; an answer of more than one part is split with room for it.
+    The lookup is shared with typing, so both use one result per request (typing's failed reads
+    count toward the three). The choice lives in daemon memory for that delivery. A part posted
+    outside the request's room is stored with that room
     (`<room>/<id>`), and a part stored for another room keeps it while pending (`<room>/`); an
     earlier version reads such a value as a message ID, so roll back only when no answer is
     being posted. After a

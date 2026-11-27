@@ -57,8 +57,8 @@ struct State {
     scripted: VecDeque<u16>,
     /// Channel -> statuses for its next message creates, used before `scripted`.
     scripted_in: HashMap<String, VecDeque<u16>>,
-    /// Path -> the status every GET of it gets.
-    failing_reads: HashMap<String, u16>,
+    /// Path -> the status a GET of it gets, and for how many GETs more (`None`: every one).
+    failing_reads: HashMap<String, (u16, Option<usize>)>,
     nonces: HashMap<String, u64>,
     next_id: u64,
     created: usize,
@@ -309,7 +309,16 @@ impl FakeDiscord {
             .lock()
             .unwrap()
             .failing_reads
-            .insert(path.into(), status);
+            .insert(path.into(), (status, None));
+    }
+
+    /// The next `times` GETs of `path` get `status`; later ones are answered as usual.
+    pub fn fail_reads_times(&self, path: &str, status: u16, times: usize) {
+        self.state
+            .lock()
+            .unwrap()
+            .failing_reads
+            .insert(path.into(), (status, Some(times)));
     }
 
     /// Reads of `path` are answered as usual again.
@@ -691,9 +700,19 @@ fn setup_route(
 }
 
 /// The scripted failure of a read (`FakeDiscord::fail_reads`).
-fn failed_read(s: &State, method: &str, path: &str) -> Option<Response<Full<Bytes>>> {
-    let status = s.failing_reads.get(path).filter(|_| method == "GET")?;
-    Some(scripted_failure(*status))
+fn failed_read(s: &mut State, method: &str, path: &str) -> Option<Response<Full<Bytes>>> {
+    if method != "GET" {
+        return None;
+    }
+    let (status, left) = s.failing_reads.get_mut(path)?;
+    let status = *status;
+    if let Some(left) = left {
+        *left -= 1;
+        if *left == 0 {
+            s.failing_reads.remove(path);
+        }
+    }
+    Some(scripted_failure(status))
 }
 
 /// A scripted failure with Discord's code for it: no access, unknown channel (a deleted thread),
@@ -743,7 +762,7 @@ async fn answer(
             &json!({ "message": "401: Unauthorized", "code": 0 }),
         ));
     }
-    let failed = failed_read(&s, &method, &path);
+    let failed = failed_read(&mut s, &method, &path);
     if let Some(r) = failed
         .or_else(|| setup_route(&mut s, &method, &parts, &body))
         .or_else(|| access(&s, &method, &parts))
@@ -925,6 +944,13 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
         .filter(|status| *status != 0);
     if let Some(status) = scripted.filter(|s| (400..500).contains(s) || *s == 502) {
         return scripted_failure(status);
+    }
+    // As on Discord, content over 2000 UTF-16 units is an invalid body.
+    if body["content"]
+        .as_str()
+        .is_some_and(|c| c.encode_utf16().count() > 2000)
+    {
+        return reply(400, &json!({"message": "Invalid Form Body", "code": 50035}));
     }
     let nonce = body["nonce"].as_str().unwrap_or_default().to_string();
     let enforced = body["enforce_nonce"] == true;
