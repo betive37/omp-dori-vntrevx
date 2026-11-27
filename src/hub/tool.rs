@@ -268,14 +268,15 @@ async fn answer(hub: &Hub, input: &Value) -> Result<String, String> {
     // Onboarding is read-only, but the lead's replies to the owner still go out (its guidance): an
     // answer in place, as the reply to the owner's message, carries its questions; nothing goes
     // elsewhere.
-    if to.is_some() && super::onboarding::running(hub).await {
+    let in_place = super::onboarding::running(hub).await;
+    if to.is_some() && in_place {
         return Err(
             "answer with room is refused while onboarding runs: onboarding is read-only; answer \
              in place, as the reply to the owner's message"
                 .into(),
         );
     }
-    shared.answer(room, message, text, to).await
+    shared.answer(room, message, text, to, in_place).await
 }
 
 /// The lead's owner-notes operations (COORD-34 to COORD-37, OPC-79).

@@ -987,7 +987,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     pub(crate) async fn lead_answers(&self, shared: &super::intake::Shared) {
         for a in shared.take_answers() {
             let outcome = self
-                .lead_answer(&a.room, &a.message, &a.text, a.to.as_deref())
+                .lead_answer(&a.room, &a.message, &a.text, a.to.as_deref(), a.in_place)
                 .await;
             // The lead stopped waiting (its call timed out): the outcome is only logged.
             if let Err(Err(why) | Ok(why)) = a.done.send(outcome) {
@@ -1008,6 +1008,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         message: &str,
         text: &str,
         to: Option<&str>,
+        in_place: bool,
     ) -> Result<String, String> {
         let tag = Self::tag(room, message);
         let h = self
@@ -1048,7 +1049,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 "the answer to {tag} is still being posted: call again for a follow-up once it is out"
             ));
         }
-        self.follow_up(h, &first, &parts, text, to).await
+        self.follow_up(h, &first, &parts, text, to, in_place).await
     }
 
     async fn handoff(&self, room: &str, message: &str) -> Result<Option<HandoffRow>, String> {
@@ -1126,6 +1127,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         parts: &[String],
         text: &str,
         to: Option<&str>,
+        in_place: bool,
     ) -> Result<String, String> {
         let tag = Self::tag(&h.room, &h.message);
         let digest = ring::digest::digest(&ring::digest::SHA256, text.as_bytes());
@@ -1135,13 +1137,25 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             crate::sys::hex(digest.as_ref().get(..6).unwrap_or_default())
         );
         let stored = self.parts_of(&h.room, &source).await?;
+        let dest = match (stored.first(), to) {
+            (Some(part), _) => placed(part.remote.as_deref()).map(str::to_string),
+            (None, Some(to)) => Some(to.to_string()),
+            (None, None) => self.answer_went(&h, first).await.map_err(|why| {
+                format!("where the answer to {tag} went cannot be read now ({why}): try again, or name the room")
+            })?,
+        };
+        // Read-only onboarding lets only the reply in place through: the request's room or the
+        // thread started from it, wherever an earlier answer went.
+        if in_place
+            && let Some(dest) = &dest
+            && Some(dest) != self.answer_room(&h.room, &h.message).await.as_ref()
+        {
+            return Err(format!(
+                "this follow-up to {tag} would go to {dest}, which onboarding (read-only) refuses: \
+                 only the request's room or its thread take answers while it runs"
+            ));
+        }
         if stored.is_empty() {
-            let dest = match to {
-                Some(to) => Some(to.to_string()),
-                None => self.answer_went(&h, first).await.map_err(|why| {
-                    format!("where the answer to {tag} went cannot be read now ({why}): try again, or name the room")
-                })?,
-            };
             let parts = parts
                 .iter()
                 .enumerate()

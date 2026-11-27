@@ -133,8 +133,8 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     120 s. A request the lead never answers is let go after the obligation window (34);
     reminders and the stop notice (35) name the operation, and a final message never counts as an
     answer for the stop gate. While onboarding runs (read-only) an answer in place, as the reply
-    to the owner's message, still goes out (it carries onboarding's questions); one naming
-    another room is refused. The
+    to the owner's message, still goes out (it carries onboarding's questions); one that would go
+    to another room, named now or inherited from an earlier answer, is refused. The
     request text the lead receives says that its final message is not posted. The operation is
     also available with the default `"final"`; an answer posted with it replaces the automatic
     one. It works for Discord, Telegram and Slack alike.

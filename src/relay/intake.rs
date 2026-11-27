@@ -76,6 +76,8 @@ pub(crate) struct LeadAnswer {
     pub(crate) text: String,
     /// Another room to post in, such as a thread the lead opened.
     pub(crate) to: Option<String>,
+    /// Only the request's own room or the thread started from it may take it (onboarding).
+    pub(crate) in_place: bool,
     pub(crate) done: oneshot::Sender<Result<String, String>>,
 }
 
@@ -108,6 +110,7 @@ impl Shared {
         message: &str,
         text: &str,
         to: Option<&str>,
+        in_place: bool,
     ) -> Result<String, String> {
         if self.health().state == "off" {
             return Err("this messenger's intake is off: nothing can be posted there".into());
@@ -120,6 +123,7 @@ impl Shared {
             message: message.into(),
             text: text.into(),
             to: to.map(str::to_string),
+            in_place,
             done,
         });
         self.answer_wake.notify_one();

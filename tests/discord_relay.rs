@@ -1826,3 +1826,33 @@ fn an_answer_in_another_room_refused_after_a_restart_replies_in_the_channel() {
     settled(&hub);
     assert!(hub.stop().success());
 }
+
+/// A follow-up during onboarding may not inherit another room from an answer posted there before
+/// onboarding started: read-only onboarding lets only the reply in place through.
+#[test]
+fn onboarding_refuses_a_follow_up_that_would_go_to_another_room() {
+    const ROOM: &str = "600000000000000080";
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    fake.channel(ROOM, 0, None);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_381, "before onboarding");
+    let message = format!("discord:{CH}/{source}");
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) = lead.tool(&json!({
+        "op": "answer", "message": message, "text": "elsewhere", "room": ROOM
+    }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    let (said, error) = lead.tool(&json!({ "op": "onboarding.start" }));
+    assert!(!error, "{said}");
+    let (said, error) = lead.tool(&json!({ "op": "answer", "message": message, "text": "more" }));
+    assert!(error && said.contains("onboarding"), "{said}");
+    assert_eq!(
+        fake.bot_messages(ROOM).len(),
+        1,
+        "nothing more in the other room"
+    );
+    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
+    assert!(hub.stop().success());
+}
