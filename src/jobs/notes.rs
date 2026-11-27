@@ -200,6 +200,10 @@ impl Notes {
                 Self::today()
             );
         }
+        let problems = check(&text, Self::today(), None, "");
+        if !problems.is_empty() {
+            return Err(problems.join("\n"));
+        }
         fs::create_atomic(&self.file, text.as_bytes()).map_err(|e| err(&e))?;
         Ok(format!("owner notes created at {}", self.file.display()))
     }

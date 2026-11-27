@@ -985,6 +985,27 @@ fn lead_creates_owner_notes_on_the_owners_request() {
     let (why, err) = lead_tool(&mut b, &s, "p2", json!({ "op": "profile.create" }));
     assert!(err && why.contains("message"), "{why}");
     assert!(!hub.state().join("profile.md").exists());
+    for (n, message) in [
+        json!(null),
+        json!(42),
+        json!(" "),
+        json!("first\nsecond"),
+        json!("x".repeat(401)),
+        json!("someone@example.org"),
+        json!(format!("ghp_{}", "a1".repeat(18))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (why, err) = lead_tool(
+            &mut b,
+            &s,
+            &format!("invalid-{n}"),
+            json!({ "op": "profile.create", "message": message }),
+        );
+        assert!(err, "invalid citation {n} was accepted: {why}");
+        assert!(!hub.state().join("profile.md").exists());
+    }
     let create = json!({ "op": "profile.create", "message": "discord:1/2" });
     let (why, err) = lead_tool(&mut b, &s, "p3", create.clone());
     assert!(!err, "{why}");

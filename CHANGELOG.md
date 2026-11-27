@@ -7,7 +7,8 @@
   end the launcher by default, leaving the binary running without its parent (#297, @betive37).
 - The lead can create the owner notes with `profile.create` when the owner asks for them. The op
   takes the owner's message and is refused without one; the message becomes the first change-log
-  line of the new file. Creating them twice is still refused.
+  line of the new file. The notes check refuses email or token-shaped citations before any file
+  is created. Creating them twice is still refused (#295, @tknmaxxer).
   Before, `profile.save` refused until the owner ran `cataly lane profile-create` in a terminal,
   even after asking the lead to make them.
 
