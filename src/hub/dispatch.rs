@@ -57,7 +57,7 @@ struct Method {
     mutating: bool,
 }
 
-const METHODS: [Method; 44] = [
+const METHODS: [Method; 45] = [
     Method {
         name: method::STATUS,
         needs: Needs::Any,
@@ -107,17 +107,6 @@ const METHODS: [Method; 44] = [
         name: method::LIMITS,
         needs: Needs::Any,
         mutating: false,
-    },
-    Method {
-        name: method::QUOTA,
-        needs: Needs::Any,
-        mutating: false,
-    },
-    // Only the owner lifts the quota gate (OJ req. 25).
-    Method {
-        name: method::QUOTA_LIFT,
-        needs: Needs::Owner,
-        mutating: true,
     },
     Method {
         name: method::PR_FOLLOW,
@@ -284,6 +273,21 @@ const METHODS: [Method; 44] = [
         name: method::WHOAMI,
         needs: Needs::Any,
         mutating: false,
+    },
+    Method {
+        name: method::WORKER_LIST,
+        needs: Needs::Any,
+        mutating: false,
+    },
+    Method {
+        name: method::WORKER_DOCTOR,
+        needs: Needs::Owner,
+        mutating: false,
+    },
+    Method {
+        name: method::WORKER_REMOVE,
+        needs: Needs::Owner,
+        mutating: true,
     },
 ];
 
@@ -461,32 +465,16 @@ async fn handle(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
         }
         method::CONFIG_RELOAD => {
             let _: Mutation = params(raw)?;
-            let jobs = hub.reload().await.map_err(|message| Failure {
+            let jobs = hub.jobs.reload().await.map_err(|message| Failure {
                 code: code::REFUSED,
                 message,
             })?;
             ok(&proto::Reloaded { jobs })
         }
-        method::HEALTH => {
-            let checks = hub.jobs.health().await?;
-            let ignored = hub.config_tx.borrow().health.ignore.clone();
-            let warn = checks
-                .iter()
-                .any(|c| c.level == "warn" && !ignored.contains(&c.name));
-            ok(&proto::Health {
-                checks,
-                ignored,
-                warn,
-            })
-        }
+        method::HEALTH => health(hub).await,
         method::LIMITS => {
             let p: LimitsParams = params(raw)?;
             ok(&limits(hub, p.refresh).await?)
-        }
-        method::QUOTA => ok(&hub.jobs.gate()),
-        method::QUOTA_LIFT => {
-            let _: Mutation = params(raw)?;
-            ok(&hub.jobs.lift().await?)
         }
         method::PR_FOLLOW | method::PR_UNFOLLOW => {
             let p: TargetParams = params(raw)?;
@@ -509,8 +497,44 @@ async fn handle(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
         {
             relay_method(hub, relay, raw).await
         }
-        method::HUB_STOP => hub.request_stop().map(|()| Value::Null).map_err(refused),
+        // The stop begins once this acceptance is written (`socket::connection`).
+        method::HUB_STOP => hub.may_stop().map(|()| Value::Null).map_err(refused),
         voice if voice.starts_with("voice.") => voice_method(hub, voice, raw).await,
+        worker if worker.starts_with("worker.") => worker_method(hub, worker, raw).await,
+        _ => Err(Failure {
+            code: code::UNKNOWN_METHOD,
+            message: format!("unknown method '{name}'"),
+        }),
+    }
+}
+
+/// `worker.list`, `worker.doctor` (one worker, or all) and `worker.remove`.
+async fn worker_method(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
+    let worker = raw.get("name").and_then(Value::as_str).map(str::to_string);
+    match name {
+        method::WORKER_LIST => ok(&serde_json::json!({ "workers": hub.workers.list() })),
+        method::WORKER_DOCTOR => {
+            let names: Vec<String> = match worker {
+                Some(n) => vec![n],
+                None => hub.config().workers.keys().cloned().collect(),
+            };
+            let mut out = serde_json::Map::new();
+            for n in names {
+                let checks = hub.workers.doctor(&n).await.map_err(refused)?;
+                out.insert(n, serde_json::to_value(checks).unwrap_or_default());
+            }
+            Ok(serde_json::json!({ "workers": out }))
+        }
+        method::WORKER_REMOVE => {
+            let n = worker.ok_or_else(|| refused("worker.remove needs a name".into()))?;
+            let todo = hub
+                .workers
+                .remove(&n, &hub.paths.config_file)
+                .await
+                .map_err(refused)?;
+            let jobs = hub.jobs.reload().await.map_err(refused)?;
+            ok(&serde_json::json!({ "removed": n, "todo": todo, "jobs": jobs }))
+        }
         _ => Err(Failure {
             code: code::UNKNOWN_METHOD,
             message: format!("unknown method '{name}'"),
@@ -771,9 +795,27 @@ async fn slack_upload(hub: &Hub, p: proto::DiscordParams) -> Result<Value, Failu
     ok(&serde_json::json!({ "file": id }))
 }
 
+/// `health`: the hub's checks, then the configured lead's line.
+async fn health(hub: &Hub) -> Result<Value, Failure> {
+    let mut checks = hub.jobs.health().await?;
+    if hub.config().lead.is_some() {
+        let view = hub.lead.view().await;
+        checks.push(crate::jobs::owner::health::lead_check(&view));
+    }
+    let ignored = hub.config().health.ignore.clone();
+    let warn = checks
+        .iter()
+        .any(|c| c.level == "warn" && !ignored.contains(&c.name));
+    ok(&proto::Health {
+        checks,
+        ignored,
+        warn,
+    })
+}
+
 /// The account-limits view (WS req. 37-39): off unless enabled; never retries or changes anything.
 async fn limits(hub: &Hub, refresh: bool) -> Result<Limits, Failure> {
-    let settings = hub.config_tx.borrow().limits.clone();
+    let settings = hub.config().limits.clone();
     if !settings.enabled {
         return Err(Failure {
             code: code::REFUSED,

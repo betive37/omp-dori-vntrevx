@@ -45,7 +45,6 @@ The specs use neutral words. Cataly uses the words below, and only these, in cod
 | Event | One typed fact in the hub's event stream, **urgent** (starts a lead turn) or **quiet** (waits). | wake line, tagged line, notice |
 | Job / job kind | One configured instance / the built-in Rust code that runs it. | watcher, timer, monitor |
 | Tick | One run of a job. Compares conditions with **transition memory** and emits events only on change. | pass, sample |
-| Quota gate | The hub-wide flag that keeps new session starts waiting while a quota is near its limit. | quota hold |
 | Oversight | The per-lane watch: reminders, stall alert, stuck verdict, ceilings. | supervisor, lane loop |
 | Planner | The hourly pass that starts backlog items and asks their questions. | planner |
 | Backlog item | A piece of later work the planner may start as a lane. | work item |
@@ -277,6 +276,19 @@ time with immediate "busy" refusal; delivery receipts keyed by request ID (HOST-
 - Tern lanes support the full lifecycle (open, pause, resume, park, abandon, claim, close, reopen); only remote
   dialog answers are missing. Losing the bridge connection (45 s without heartbeat) marks the lane lost.
 
+### 4.4 Headless on a worker
+
+- A lane may run on a worker (`docs/design/workers.md`): the headless runtime spawns the worker's own OMP over
+  the worker's SSH stream (`worker::Place`), with no hub credentials. Its session file stays on the worker and
+  is recorded as `worker:<name>:<path>`; delivery and resume checks run there with the same parsers.
+- Git (worktree, unsent work, fingerprint) and `command`/`file` checks run on the worker; GitHub and web checks
+  on the hub. The worker uses its own bare clone per origin and a worktree per lane at a pushed commit.
+- Bridge connections are channels of the worker stream, accepted only for that worker's lanes.
+- A drop ends the remote OMP; the lane is lost and comes back through the hub-restart path (decision 9) once
+  the worker answers. A delivery the drop left unconfirmed is then found in the session file or ends in doubt
+  (9.3); unlike a local process, the remote one ended out of the hub's sight, so it is never resent. A lane for
+  an offline worker is queued and starts when the worker is reachable.
+
 ## 5. Relays and voice
 
 ### 5.1 One relay trait
@@ -341,7 +353,7 @@ Every timed or watching behaviour is a row in one `jobs` table plus a built-in *
 | `cron`, `once`, `probe`, `stream` | WS-26 to WS-30, WS-02 | trigger / 30 s for probes | per WS requirements 52-75 |
 | `pr` (follower) | WS-24, WS-25 | 3 min | new item, state difference |
 | `github` (owner PRs + notifications) | OJ-05, OJ-06 | 3 min / 1 min | new item |
-| `quota` (+ limits view, quota gate) | OJ-07 to OJ-09, WS-23 | 5 min / 2 min | level crossing |
+| `quota` (+ limits view) | OJ-07, OJ-09, WS-23 | 5 min / 2 min | level crossing |
 | `model` (fallback watch) | OJ-10 to OJ-12 | on events + 60 s | state difference |
 | `spend` (spend-offer guard) | OJ-13 | on every dialog + 60 s sweep | action, reported every time; cannot be disabled or dry |
 | `backup` (git + secret scan) | OJ-15 | 30 min / 5 min | health (hit set), action |
@@ -508,9 +520,11 @@ resets, buying credits and paid overage stay refused, in code:
   account, provider or model yourself; OMP's configured fallback may change the model for you; when it is
   exhausted, stop, save progress and report. This replaces the stricter "no switching" wording in LANE req. 13
   and OPC-63/64.
-- The quota gate keeps new session starts (a fresh lead, lanes, planner starts) waiting at the hold level;
-  resuming an existing session (the lead's last one, a parked or live lane) never waits; running sessions are
-  untouched; only the owner can lift it. A held lead is said with its provider, limits, reset times and the lift.
+- Usage never holds a session start (OJ-08 dropped in 0.2.4): the `quota` job only warns once per level.
+  Leftovers, to be removed later: a quota job's `hold` key is accepted and ignored (the hub deletes its line at
+  start, keeping `config.toml.before-0.2.4`), and the status reply keeps an always-open `quota_gate` value
+  for `cataly update` of 0.2.3 and older, which requires it; the field is removable once no 0.2.3 hub or CLI
+  can still be updating.
 - Voice is the one paid feature: explicit opt-in, owner-entered prices, daily, total and spending caps checked
   before every call starts, hold after any failure, never a paid retry (VOICE-19, VOICE-20).
 
@@ -833,7 +847,7 @@ numbers are kept from the first draft so references stay stable; decided rows mo
 | C21 | Voice spends money; the spend rules of decision 7 | Those rules cover OMP resets, credits and overage; voice is a separate owner-capped budget (VOICE-19) | — |
 | C22 | Hub-driven return to the requested model (OJ-11, OJ req. 30-31) vs OMP's own `cooldown-expiry` revert | OMP's revert only; the hub reports (6.1), so one implementation per concern (decision 13) | A hub return path would be a second mechanism that can race OMP's. |
 | A2 | Personal-account Discord features (OJ Q2) | Dropped | — (DROP verdicts) |
-| A3 | Quota gate scope and level (OJ Q3) | Also holds planner and queued starts; level 85 % | Config. |
+| A3 | Quota hold scope and level (OJ Q3) | Dropped in 0.2.4 (owner decision): usage alerts only | — |
 | A6 | Lead resume after an unclean stop (HOST Q4) | Resume when the lease shows the transcript free and it exists; else fresh, saying why | Always fresh after a crash. |
 | A8 | Tern lifecycle (LANE Q2) | Full lifecycle except remote dialog answers | Restricting tern to open/observe/close shrinks the tern runtime. |
 | A9 | Per-lane shell rules (LANE Q3) | Kept, fail closed | Relying on OMP approvals alone removes the shell veto round trip. |

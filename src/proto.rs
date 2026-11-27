@@ -7,7 +7,6 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::jobs::owner::health::Check;
-use crate::jobs::owner::quota::GateView;
 use crate::omp::probe::Report;
 use crate::store::EventRecord;
 use crate::sys::host::{Disk, Load, Memory};
@@ -33,8 +32,6 @@ pub(crate) mod method {
     pub(crate) const CONFIG_RELOAD: &str = "config.reload";
     pub(crate) const HEALTH: &str = "health";
     pub(crate) const LIMITS: &str = "limits";
-    pub(crate) const QUOTA: &str = "quota";
-    pub(crate) const QUOTA_LIFT: &str = "quota.lift";
     pub(crate) const PR_FOLLOW: &str = "pr.follow";
     pub(crate) const PR_UNFOLLOW: &str = "pr.unfollow";
     pub(crate) const PR_LIST: &str = "pr.list";
@@ -71,6 +68,10 @@ pub(crate) mod method {
     /// The caller's authority as the hub assigned it (DESIGN 8): `owner`, `lead`, `lane` or
     /// `unplaced`. Commands that act locally with the owner's authority ask it first.
     pub(crate) const WHOAMI: &str = "whoami";
+    /// Workers (docs/design/workers.md 4.3): the list for anyone, doctor and remove for the owner.
+    pub(crate) const WORKER_LIST: &str = "worker.list";
+    pub(crate) const WORKER_DOCTOR: &str = "worker.doctor";
+    pub(crate) const WORKER_REMOVE: &str = "worker.remove";
 }
 
 /// Error codes besides the decision classes.
@@ -228,13 +229,25 @@ pub(crate) struct Status {
     /// Why no session may start with this OMP, if none may (PATCH-09).
     #[serde(default)]
     pub(crate) sessions_refused: Option<String>,
-    pub(crate) quota_gate: GateView,
+    /// Always [`legacy_gate`]: `cataly update` of 0.2.3 and older reads the new hub's status and
+    /// needs this field, which named a feature since removed. Removable once no 0.2.3 hub or CLI
+    /// can still be updating (DESIGN 9.2, leftovers).
+    #[serde(default = "legacy_gate")]
+    pub(crate) quota_gate: Value,
     /// The lead's model and phase; `None` when the config has no `[lead]`.
     #[serde(default)]
     pub(crate) lead: Option<String>,
     /// The sessions this hub brought back at start (DESIGN decision 9); `None` while recovering.
     #[serde(default)]
     pub(crate) resumed: Option<Resumed>,
+    /// Every configured worker (docs/design/workers.md); a hub before 0.2.5 sends none.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) workers: Vec<crate::worker::link::View>,
+}
+
+/// The `quota_gate` value older clients parse: open, nothing holding it.
+pub(crate) fn legacy_gate() -> Value {
+    serde_json::json!({ "held": false, "causes": [], "lifted_until_ms": null })
 }
 
 /// The sessions a hub brought back at start. `lead` and `lanes` keep the shape a 0.1.1 `cataly update`
@@ -249,12 +262,14 @@ pub(crate) struct Resumed {
     /// The lanes running again, by name.
     #[serde(default)]
     pub(crate) lane_names: Vec<String>,
-    /// The quota gate holds the lead: no session to resume, and a new one waits for the gate.
-    #[serde(default, skip_serializing_if = "Option::is_none")]
-    pub(crate) lead_held: Option<crate::jobs::owner::quota::Held>,
-    /// Why the hub did not start the lead, when another rule than the quota gate held it.
+    /// Why the hub did not start the lead.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lead_reason: Option<String>,
+    /// The lead sleeps, since this time (ms): it is not running and wakes when it is needed. A hub
+    /// before 0.2.4 never sends it; an older CLI reads the lead as not running with
+    /// `lead_reason`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) lead_asleep_ms: Option<i64>,
 }
 
 /// How the lead came back when the hub started.
@@ -612,6 +627,43 @@ pub(crate) struct LimitWindow {
     pub(crate) reset_ms: Option<i64>,
     /// Headroom to the configured warning percentage, when set.
     pub(crate) headroom_percent: Option<f64>,
+}
+
+/// One line read from a newline-delimited stream.
+pub(crate) enum Line {
+    /// The line without its newline.
+    Text(String),
+    /// Over the cap, or not UTF-8.
+    TooLong,
+    Closed,
+}
+
+/// Reads one line of at most `cap` bytes.
+pub(crate) async fn read_line<R: tokio::io::AsyncBufRead + Unpin>(
+    reader: &mut R,
+    cap: usize,
+) -> Line {
+    use tokio::io::AsyncBufReadExt;
+    let mut buf = Vec::new();
+    loop {
+        let chunk = match reader.fill_buf().await {
+            Ok([]) | Err(_) => return Line::Closed,
+            Ok(chunk) => chunk,
+        };
+        let (take, done) = match chunk.iter().position(|b| *b == b'\n') {
+            Some(i) => (i + 1, true),
+            None => (chunk.len(), false),
+        };
+        buf.extend_from_slice(chunk.get(..take).unwrap_or_default());
+        reader.consume(take);
+        if buf.len() > cap + 1 {
+            return Line::TooLong;
+        }
+        if done {
+            buf.pop();
+            return String::from_utf8(buf).map_or(Line::TooLong, Line::Text);
+        }
+    }
 }
 
 #[cfg(test)]

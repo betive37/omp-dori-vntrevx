@@ -8,8 +8,10 @@ mod lead;
 pub(crate) mod out;
 mod setup;
 mod setup_discord;
+mod setup_voice;
 mod slot;
 mod transcribe;
+mod worker;
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -20,7 +22,6 @@ use serde_json::{Value, json};
 
 use crate::config;
 use crate::jobs::instant_text;
-use crate::jobs::owner::quota::GateView;
 use crate::proto::{self, Events, JobList, Stats, Status, method};
 use crate::store::EventRecord;
 use crate::sys::paths::Paths;
@@ -160,15 +161,23 @@ fn execute(p: &Parsed, paths: &Paths) -> Result<(), Failure> {
     }
     if matches!(
         p.spec.path,
-        ["install" | "update" | "rollback" | "uninstall"] | ["service", _]
+        ["install" | "update" | "rollback" | "uninstall"]
+            | ["service", _]
+            | ["worker", "add" | "init"]
     ) {
         owner_only(paths)?;
+    }
+    if let Some(done) = worker::local(p, paths) {
+        return done;
     }
     if let Some(done) = install::run(p, paths) {
         return done;
     }
     let mut hub = Client::connect(&paths.socket)?;
     if let Some(done) = owner_verbs(p, &mut hub, as_json) {
+        return done;
+    }
+    if let Some(done) = worker::remote(p, &mut hub, as_json) {
         return done;
     }
     match p.spec.path {
@@ -366,7 +375,7 @@ fn since_ms(text: &str) -> Option<i64> {
 fn config_check(path: &Path, as_json: bool) -> Result<(), Failure> {
     match config::load(path) {
         Ok(c) => {
-            let soon: Vec<String> = c
+            let mut soon: Vec<String> = c
                 .jobs
                 .values()
                 .filter_map(|j| match &j.trigger {
@@ -378,6 +387,11 @@ fn config_check(path: &Path, as_json: bool) -> Result<(), Failure> {
                     _ => None,
                 })
                 .collect();
+            // Only reported: `config check` never writes the file.
+            soon.extend(c.obsolete_hold().iter().map(|p| config::obsolete_notice(p)));
+            if let config::voice::VoiceConfig::Refused(errors) = &c.voice {
+                soon.push(format!("voice stays off: {}", config::describe(errors)));
+            }
             if as_json {
                 out::json(&json!({
                     "valid": true, "file": path.display().to_string(), "jobs": c.jobs.len(),
@@ -467,37 +481,15 @@ fn print_status(s: &Status) {
             "lead     no lead configured: messages wait; set one with cataly setup --lead-model provider/id",
         ),
     }
-    print_gate(&s.quota_gate);
     if s.task_restarts > 0 || s.panics > 0 {
         out::line(&format!(
             "tasks    {} restarts, {} panics",
             s.task_restarts, s.panics
         ));
     }
-}
-
-fn print_gate(g: &GateView) {
-    let causes: Vec<String> = g
-        .causes
-        .iter()
-        .map(|c| format!("{} until {}", c.limit, instant_text(c.release_ms)))
-        .collect();
-    let line = match (g.held, causes.is_empty(), g.lifted_until_ms) {
-        (true, false, _) => format!(
-            "holding new sessions on {}; others start as usual ({})",
-            g.providers.join(", "),
-            causes.join(", ")
-        ),
-        (false, false, Some(until)) => {
-            format!(
-                "lifted by the owner until {} ({})",
-                instant_text(until),
-                causes.join(", ")
-            )
-        }
-        _ => "open".to_string(),
-    };
-    out::line(&format!("quota    {line}"));
+    for w in &s.workers {
+        out::line(&format!("worker   {}", worker::describe(w)));
+    }
 }
 
 /// `cataly lane <op> [--params <json>]`: one request per lane operation; `op` and the JSON object's
@@ -579,7 +571,7 @@ fn voice(hub: &mut Client, p: &Parsed, verb: &str, as_json: bool) -> Result<(), 
     Ok(())
 }
 
-/// `health`, `limits`, `quota`, `pr` and `lead` verbs; `None` for anything else.
+/// `health`, `limits`, `pr` and `lead` verbs; `None` for anything else.
 fn owner_verbs(p: &Parsed, hub: &mut Client, as_json: bool) -> Option<Result<(), Failure>> {
     if let Some(done) = lead::verbs(p, hub, as_json) {
         return Some(done);
@@ -593,14 +585,6 @@ fn owner_verbs(p: &Parsed, hub: &mut Client, as_json: bool) -> Option<Result<(),
         ["lane"] => lane(hub, p, as_json),
         ["voice", verb] => voice(hub, p, verb, as_json),
         ["limits"] => limits(hub, p.flag("--refresh"), as_json),
-        ["quota"] => hub
-            .call(method::QUOTA, json!({}), CALL_TIMEOUT)
-            .map_err(Failure::from)
-            .and_then(|v| show(v, as_json, |g: GateView| print_gate(&g))),
-        ["quota", "lift"] => hub
-            .call(method::QUOTA_LIFT, json!({}), CALL_TIMEOUT)
-            .map_err(Failure::from)
-            .and_then(|v| show(v, as_json, |g: GateView| print_gate(&g))),
         ["pr", verb @ ("follow" | "unfollow")] => {
             let m = if *verb == "follow" {
                 method::PR_FOLLOW

@@ -18,6 +18,7 @@ mod plan;
 mod publish;
 mod queue;
 pub(crate) mod record;
+mod remote;
 mod review;
 pub(crate) mod shell;
 pub(crate) mod slots;
@@ -33,7 +34,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
 
 use crate::config::Config;
-use crate::host::inbox::{HUB_SENDER, Mailbox, Message, ReceiptState};
+use crate::host::inbox::{HUB_SENDER, Mailbox, Message, Note, ReceiptState};
 use crate::host::lead::{Events, Factory};
 use crate::host::{Control, Role, Runtime, StartSpec, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
@@ -55,6 +56,8 @@ const READ_MAX: usize = 40;
 const ANSWER_MAX: usize = 64 * 1024;
 /// Report text in the lead's wake line (EVR req. 17).
 const WAKE_TEXT: usize = 500;
+/// The kickoff line the lead gives a new thread, in characters.
+const KICKOFF_MAX: usize = 1000;
 /// The look-only tool set (OPC-46), also the reviewer's. OMP 19.1.1 refuses `--tools` naming an
 /// unknown tool (`ls`) or one unavailable in the session (`find` needs a native judge model).
 const LOOK_ONLY: &str = "read,grep,glob";
@@ -98,7 +101,6 @@ pub(crate) struct Env<R: Runtime> {
     pub(crate) state_dir: PathBuf,
     pub(crate) events: Events,
     pub(crate) make: Factory<R>,
-    pub(crate) quota_hold: crate::jobs::owner::quota::QuotaHold,
     pub(crate) bridge_link: Arc<dyn Fn() -> Result<(), String> + Send + Sync>,
     /// Whether the lead's session is live (it counts toward the session cap).
     pub(crate) lead_live: Arc<dyn Fn() -> bool + Send + Sync>,
@@ -139,6 +141,8 @@ pub(crate) struct Lanes<R: Runtime> {
     planning: AsyncMutex<()>,
     /// The lanes live once start-up recovery finished, by name (DESIGN decision 9); unset before.
     pub(crate) resumed: OnceLock<Vec<String>>,
+    /// Set at hub stop: no lane is reattached or started by itself any more.
+    stopping: std::sync::atomic::AtomicBool,
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -185,6 +189,7 @@ impl<R: Runtime> Lanes<R> {
             slots,
             planning: AsyncMutex::new(()),
             resumed: OnceLock::new(),
+            stopping: std::sync::atomic::AtomicBool::new(false),
         })
     }
 
@@ -318,6 +323,11 @@ impl<R: Runtime> Lanes<R> {
         let Ok(_turn) = self.turn(key).await else {
             return;
         };
+        self.keep_locked(key, f).await;
+    }
+
+    /// [`Lanes::keep`] for a caller that holds the lane's turn.
+    async fn keep_locked(&self, key: &str, f: impl FnOnce(&mut Record)) {
         if let Ok((mut rec, rev)) = self.load(key).await {
             f(&mut rec);
             if let Err(e) = self.save(&rec, Some(rev), None).await {
@@ -326,6 +336,68 @@ impl<R: Runtime> Lanes<R> {
                     &[("lane", &key), ("error", &e)],
                 );
             }
+        }
+    }
+
+    /// Flushes the lane's inbox and acts on what it found ([`Lanes::noted`]). `locked`: the
+    /// caller holds the lane's turn.
+    async fn flush_inbox(&self, key: &str, session: &R::Session, locked: bool) {
+        let notes = self
+            .mailbox(key)
+            .flush(Some(session), false)
+            .await
+            .unwrap_or_default();
+        self.noted(key, notes, locked).await;
+    }
+
+    /// Acts on what a flush or a delivery of the lane's inbox found. A batch in doubt is never
+    /// resent: it fences the lane's messages until the lead releases it, and the owner and the lead
+    /// hear it once (DESIGN 9.3, EVR req. 62). `locked`: the caller holds the lane's turn.
+    async fn noted(&self, key: &str, notes: Vec<Note>, locked: bool) {
+        for note in notes {
+            let Note::InDoubt {
+                delivery,
+                rows,
+                reason,
+                ..
+            } = note
+            else {
+                continue;
+            };
+            log::warn(
+                "lane delivery in doubt",
+                &[("lane", &key), ("delivery", &delivery), ("reason", &reason)],
+            );
+            let mut fresh = false;
+            let fence = |r: &mut Record| {
+                fresh = !r.doubt.as_deref().is_some_and(|d| d.contains(&delivery));
+                if r.doubt.is_none() {
+                    r.doubt = Some(format!("{reason}; delivery {delivery}"));
+                }
+            };
+            if locked {
+                self.keep_locked(key, fence).await;
+            } else {
+                self.keep(key, fence).await;
+            }
+            if !fresh {
+                continue;
+            }
+            self.emit(
+                Emit::new(EventKind::DeliveryInDoubt, Severity::Warning, true, key)
+                    .with("target", key)
+                    .with("count", rows.len())
+                    .with("reason", &reason),
+            );
+            self.alert(
+                key,
+                "delivery in doubt",
+                &format!(
+                    "a message to the lane may or may not have reached it ({reason}); it is not \
+                     resent. Read the lane, then lane.release it; lane.send waits until then"
+                ),
+                true,
+            );
         }
     }
 
@@ -339,15 +411,17 @@ impl<R: Runtime> Lanes<R> {
         Ok(self.overlay.get_or_init(|| path).clone())
     }
 
-    /// Admission for every open, reopen and restart (LANE req. 18; OJ-08; C14). `new_model` is the
-    /// model of a new session, which the quota gate judges; a resume of an existing session passes
-    /// `None`, since the gate holds new sessions only.
+    /// Admission for every open, reopen and restart (LANE req. 18; C14). A lane on a worker is
+    /// admitted by that worker's rules (docs/design/workers.md 2.6).
     async fn admission(
         &self,
         config: &Config,
         cwd: &Path,
-        new_model: Option<&str>,
+        worker: Option<&str>,
     ) -> Result<PathBuf, String> {
+        if let Some(worker) = worker {
+            return self.remote_admission(config, worker).await;
+        }
         let report = self.env.omp.report().ok_or("OMP has not been probed yet")?;
         report.sessions()?;
         let exe = self
@@ -355,9 +429,6 @@ impl<R: Runtime> Lanes<R> {
             .omp
             .path()
             .ok_or("the OMP executable was not found")?;
-        if let Some(held) = new_model.and_then(|m| (self.env.quota_hold)(m)) {
-            return Err(held.to_string());
-        }
         (self.env.bridge_link)()?;
         let live = self.live_map().values().filter(|s| s.alive()).count();
         let sessions = live + usize::from((self.env.lead_live)());
@@ -548,13 +619,12 @@ impl<R: Runtime> Lanes<R> {
                     .map(PathBuf::from)
                     .or_else(|| config.lanes.cwd.clone())
                     .unwrap_or_else(|| PathBuf::from("/"));
-                let model = s(input, "model")
-                    .or(config.lanes.model.as_deref())
-                    .unwrap_or_default();
-                Ok(match self.admission(&config, &cwd, Some(model)).await {
-                    Ok(_) => json!({ "admit": true, "detail": "a start may go ahead now" }),
-                    Err(e) => json!({ "admit": false, "detail": e }),
-                })
+                Ok(
+                    match self.admission(&config, &cwd, s(input, "worker")).await {
+                        Ok(_) => json!({ "admit": true, "detail": "a start may go ahead now" }),
+                        Err(e) => json!({ "admit": false, "detail": e }),
+                    },
+                )
             }
             "slots" => Ok(json!({ "slots": self.slots.view(), "lines": self.slots.lines() })),
             "profile-create" | "profile-show" | "profile-check" | "profile-revert"
@@ -768,6 +838,12 @@ impl<R: Runtime> Lanes<R> {
         rec.open().then_some((key, pin))
     }
 
+    /// The worker the lane holding this session handle runs on; `None` for a lane here or none.
+    pub(crate) async fn worker_of(&self, handle: &str) -> Option<String> {
+        let key = self.key_of(handle).await?;
+        self.load(&key).await.ok()?.0.worker
+    }
+
     /// The shell veto for one command of a lane session or its subagents (LANE-30, EXT-31).
     pub(crate) async fn shell(&self, handle: &str, command: &str) -> (bool, String) {
         let Some(key) = self.key_of(handle).await else {
@@ -865,10 +941,18 @@ impl<R: Runtime> Lanes<R> {
             .as_object_mut()
             .and_then(|m| m.remove("thread_from"))
             .and_then(|v| v.as_str().map(str::to_string));
+        let kickoff = match input_value
+            .as_object_mut()
+            .and_then(|m| m.remove("kickoff"))
+        {
+            None => None,
+            Some(v) => Some(Self::kickoff_line(&v, thread_from.is_some())?),
+        };
         let open: OpenInput =
             serde_json::from_value(input_value.clone()).map_err(|e| format!("open: {e}"))?;
         let config = self.cfg();
         let valid = record::validate(&open, &config.lanes)?;
+        remote::placement(&config, &valid)?;
         let preview_rec = Self::build(&valid, &config, String::new());
         if open.preview {
             let (rules, _) = self.rules_for(&preview_rec).await;
@@ -882,7 +966,19 @@ impl<R: Runtime> Lanes<R> {
             if thread_from.is_some() {
                 return Err("a queued launch takes thread, not thread_from".into());
             }
-            return self.queue(&open, &valid, input_value).await;
+            return self.queue(&open, &valid, input_value, None).await;
+        }
+        if let Some(queued) = self
+            .wait_for_worker(
+                &open,
+                &valid,
+                &mut input_value,
+                thread_from.as_deref(),
+                kickoff.as_deref(),
+            )
+            .await?
+        {
+            return Ok(queued);
         }
         if docs::get::<queue::Queued>(&self.env.store, docs::QUEUED, &valid.key)
             .await?
@@ -922,14 +1018,17 @@ impl<R: Runtime> Lanes<R> {
             opening.push(valid.key.clone());
         }
         let result = self
-            .open_one(valid, open.request_id.clone(), digest, thread_from)
+            .open_one(valid, open.request_id.clone(), digest, thread_from, kickoff)
             .await;
         self.opening
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|k| k != &open.key);
-        let outcome = result?;
-        Ok(json!({ "key": open.key, "outcome": outcome }))
+        let (outcome, note) = result?;
+        Ok(match note {
+            Some(note) => json!({ "key": open.key, "outcome": outcome, "worker": note }),
+            None => json!({ "key": open.key, "outcome": outcome }),
+        })
     }
 
     fn build(v: &record::Validated, config: &Config, run_id: String) -> Record {
@@ -947,7 +1046,10 @@ impl<R: Runtime> Lanes<R> {
             brief: v.brief.clone(),
             checks: v.checks.clone(),
             thread: v.thread.clone(),
-            cwd: v.cwd.display().to_string(),
+            cwd: v
+                .worktree
+                .as_ref()
+                .map_or_else(|| v.cwd.display().to_string(), |w| w.path.clone()),
             model: v.model.clone(),
             thinking: v.thinking.clone(),
             origin: v.origin.clone(),
@@ -990,38 +1092,51 @@ impl<R: Runtime> Lanes<R> {
             spend: None,
             priority: v.priority,
             runtime: config.sessions.runtime,
+            worker: v.worker.clone(),
         }
     }
 
+    /// Opens one lane; the outcome and, for a lane on a worker, the line saying where it runs.
     async fn open_one(
         self: &Arc<Self>,
         valid: record::Validated,
         request_id: Option<String>,
         digest: String,
         thread_from: Option<String>,
-    ) -> Result<String, String> {
+        kickoff: Option<String>,
+    ) -> Result<(String, Option<String>), String> {
         if self.row(&valid.key).await?.is_some() {
             return Err(format!("the key {} is already used by a lane", valid.key));
         }
         let config = self.cfg();
         let exe = self
-            .admission(&config, &valid.cwd, Some(&valid.model))
+            .admission(&config, &valid.cwd, valid.worker.as_deref())
             .await?;
         let mut rec = Self::build(&valid, &config, crate::host::random_hex(8));
         self.tern_spend(&config, &rec).await?;
         if let Some(source) = thread_from {
             rec.thread = Some(self.thread_for(&rec.key, &rec.title, &source).await?);
         }
-        if let Some(w) = &valid.worktree {
+        let mut note = None;
+        if let Some(worker) = &valid.worker {
+            let prepared = self.prepare(&valid, worker).await?;
+            rec.cwd.clone_from(&prepared.cwd);
+            rec.worktrees.push(prepared.cwd.clone());
+            note = Some(prepared.note());
+        } else if let Some(w) = &valid.worktree {
             git::add_worktree(&valid.cwd, &w.path, &w.branch, &w.base).await?;
             rec.worktrees.push(w.path.clone());
+            // The lane works in its own worktree, stored canonical like any working directory.
+            if let Ok(real) = std::fs::canonicalize(&w.path) {
+                rec.cwd = real.display().to_string();
+            }
         }
         // Record first, then spawn (LANE req. 15c).
         let rev = match self.save(&rec, None, Some("opened".into())).await {
             Ok(rev) => rev,
             Err(e) => {
                 for w in &rec.worktrees {
-                    let _ = git::remove_worktree(w).await;
+                    let _ = git::remove_worktree(&rec.place(), w).await;
                 }
                 return Err(e);
             }
@@ -1037,6 +1152,7 @@ impl<R: Runtime> Lanes<R> {
                 })
                 .await;
         }
+        let (key, thread) = (rec.key.clone(), rec.thread.clone());
         let outcome = self.start(rec, rev, exe, &config, None).await;
         if let Some(rid) = request_id
             && outcome != "unconfirmed"
@@ -1053,7 +1169,47 @@ impl<R: Runtime> Lanes<R> {
         if outcome.starts_with("failed") {
             return Err(outcome);
         }
-        Ok(outcome)
+        if let (Some(text), Some(thread)) = (kickoff, thread) {
+            let text = match &note {
+                Some(n) => format!("{text}\n{n}"),
+                None => text,
+            };
+            self.post_kickoff(&key, &thread, &text).await;
+        }
+        Ok((outcome, note))
+    }
+
+    /// The lead's kickoff line for a new thread: one line, only with `thread_from`.
+    fn kickoff_line(v: &Value, new_thread: bool) -> Result<String, String> {
+        let text = v.as_str().unwrap_or_default().trim();
+        if !new_thread {
+            return Err("kickoff goes with thread_from".into());
+        }
+        if text.is_empty() || text.contains('\n') || text.chars().count() > KICKOFF_MAX {
+            return Err(format!(
+                "kickoff must be one line of 1 to {KICKOFF_MAX} characters"
+            ));
+        }
+        Ok(text.to_string())
+    }
+
+    /// Posts the kickoff line once into the lane's new thread; a failure is an alert.
+    async fn post_kickoff(&self, key: &str, thread: &str, text: &str) {
+        let Some(id) = thread.strip_prefix("discord:") else {
+            return;
+        };
+        let home = std::env::var("HOME").ok();
+        let body = evidence::thread_text(text, home.as_deref());
+        let seed = format!("lane-kickoff:{key}");
+        match self.env.threads.post(id, &body, &seed).await {
+            Posted::Confirmed => {
+                let now = now_ms();
+                self.keep(key, |r| r.watch.thread_post_ms = Some(now)).await;
+            }
+            Posted::Rejected(why) | Posted::Uncertain(why) => {
+                self.alert(key, "kickoff not posted", &why, false);
+            }
+        }
     }
 
     /// A thread for the lane from the owner's message, journaled before the request (DISC-OUT
@@ -1154,6 +1310,7 @@ impl<R: Runtime> Lanes<R> {
             instructions: None,
             max_cost: rec.ceilings.cost,
             tools: rec.look_only.then(|| LOOK_ONLY.to_string()),
+            worker: rec.worker.clone(),
         })
     }
 
@@ -1291,7 +1448,7 @@ impl<R: Runtime> Lanes<R> {
         }
         self.drop_session(&rec.key);
         for w in &rec.worktrees {
-            let _ = git::remove_worktree(w).await;
+            let _ = git::remove_worktree(&rec.place(), w).await;
         }
         if let Err(e) = self
             .env
@@ -1380,7 +1537,15 @@ impl<R: Runtime> Lanes<R> {
     }
 
     /// Puts a note or wake in the lane's inbox and flushes it now when the lane can read.
-    async fn tell(&self, key: &str, text: String, identity: Option<String>, urgent: bool) {
+    /// `locked`: the caller holds the lane's turn.
+    async fn tell(
+        &self,
+        key: &str,
+        text: String,
+        identity: Option<String>,
+        urgent: bool,
+        locked: bool,
+    ) {
         let mailbox = self.mailbox(key);
         let session = self.session(key);
         let message = Message {
@@ -1391,8 +1556,9 @@ impl<R: Runtime> Lanes<R> {
             identity,
             request_id: None,
         };
-        if let Err(e) = mailbox.deliver(&message, session.as_deref(), false).await {
-            log::warn("lane notice not stored", &[("lane", &key), ("error", &e)]);
+        match mailbox.deliver(&message, session.as_deref(), false).await {
+            Ok((_, _, notes)) => self.noted(key, notes, locked).await,
+            Err(e) => log::warn("lane notice not stored", &[("lane", &key), ("error", &e)]),
         }
     }
 
@@ -1461,14 +1627,15 @@ impl<R: Runtime> Lanes<R> {
                 .await;
             return Ok(format!("{out:?}"));
         }
-        let (receipt, _, _) = mailbox.deliver(&message, Some(&*session), false).await?;
-        if receipt.state == ReceiptState::InDoubt {
-            drop(turn);
-            let reason = receipt.reason.clone().unwrap_or_default();
-            self.keep(key, |r| r.doubt = Some(reason)).await;
-        }
+        let (receipt, _, notes) = mailbox.deliver(&message, Some(&*session), false).await?;
+        drop(turn);
+        self.noted(key, notes, false).await;
+        let state = match receipt.inbox_id {
+            Some(row) => mailbox.receipt(None, row).await.state,
+            None => receipt.state,
+        };
         self.nudge.notify_one();
-        Ok(format!("{:?}", receipt.state).to_lowercase())
+        Ok(format!("{state:?}").to_lowercase())
     }
 
     /// Lifts the in-doubt fence; never resends, never decides what happened (EVR req. 62).
@@ -1573,6 +1740,8 @@ impl<R: Runtime> Lanes<R> {
                 "key": rec.key,
                 "title": rec.title,
                 "thread": rec.thread,
+                "worker": rec.worker,
+                "cwd": rec.cwd,
                 "state": rec.state.name(),
                 "status": rec.status(),
                 "outcome": rec.outcome,
@@ -1732,7 +1901,8 @@ impl<R: Runtime> Lanes<R> {
             return Err("the lane's session identity cannot be verified".into());
         }
         let mailbox = self.mailbox(key);
-        let (receipt, _, _) = mailbox.deliver(&message, session.as_deref(), false).await?;
+        let (receipt, _, notes) = mailbox.deliver(&message, session.as_deref(), false).await?;
+        self.noted(key, notes, false).await;
         Ok(receipt)
     }
 
@@ -1813,6 +1983,9 @@ impl<R: Runtime> Lanes<R> {
     /// the totals), so closed lanes leave no reader behind.
     fn read_spend(&self, rec: &Record) -> Result<(f64, f64), String> {
         let file = rec.session_file.as_deref().ok_or("no session file")?;
+        if let Some(worker) = &rec.worker {
+            return Err(format!("the session file is on {worker}"));
+        }
         let live = self.live_map().contains_key(&rec.key);
         let mut map = self.spend.lock().unwrap_or_else(PoisonError::into_inner);
         let tree = map.entry(rec.key.clone()).or_default();

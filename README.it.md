@@ -161,6 +161,9 @@ resto: la tua stanza principale `#cataly`, la stanza di stato `#cataly-ops`, il
 modello del lead, i pulsanti di approvazione, i job predefiniti e un servizio utente
 (systemd su Linux, un agente launchd su macOS) che avvia l'hub. Poi scrivi in `#cataly`.
 
+`cataly setup --voice on` aggiunge le chiamate vocali su Discord con impostazioni predefinite
+sensate; le chiamate costano denaro sulla tua chiave OpenAI, con un limite di 30 minuti e 3 USD al giorno.
+
 ## Uso quotidiano
 
 | Comando | Cosa fa |
@@ -183,6 +186,20 @@ Linux x86_64 è il più usato; macOS e arm64 superano gli stessi test. Cataly è
 Telegram e Slack superano i loro test ma sono stati usati meno sul campo.
 
 </td></tr></table>
+
+## Più PC
+
+Un hub con un solo bot può usare altre macchine come worker via SSH (anche sopra Tailscale). Sul
+hub `cataly worker add user@host` mostra una riga `cataly worker init` da eseguire sull'altra
+macchina: consente la chiave del hub solo per la modalità worker di Cataly e mostra l'impronta
+della chiave host. Poi `cataly worker add user@host --host-key SHA256:…` la fissa e verifica la
+connessione; `cataly worker list` e `cataly worker doctor` ne mostrano lo stato. Le lane lì usano
+gli strumenti con i diritti di quell'utente, quindi è consigliato un utente di sistema dedicato.
+Chiedi una lane "su linux-box" (o nomina una piattaforma che solo quella macchina ha) e il lead la
+apre lì: il worker usa un proprio clone del repository su un commit già inviato, le modifiche non
+committate sull'hub restano indietro e la prima riga del thread lo dice. Se il worker è offline la
+lane aspetta e parte appena è raggiungibile; se la connessione cade, la lane riprende sulla stessa
+sessione quando il worker torna.
 
 ## Aiuto
 

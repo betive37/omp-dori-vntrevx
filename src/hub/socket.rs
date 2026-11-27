@@ -8,7 +8,7 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use tokio::io::{AsyncBufRead, AsyncBufReadExt, AsyncWriteExt, BufReader};
+use tokio::io::{AsyncBufRead, AsyncWriteExt, BufReader};
 use tokio::net::unix::OwnedWriteHalf;
 use tokio::net::{UnixListener, UnixStream};
 use tokio::sync::{Semaphore, broadcast};
@@ -203,34 +203,11 @@ pub(crate) async fn serve(
     }
 }
 
-pub(super) enum Line {
-    Text(String),
-    TooLong,
-    Closed,
-}
+pub(super) use crate::proto::Line;
 
 /// Reads one line of at most `MAX_LINE` bytes.
 pub(super) async fn read_line<R: AsyncBufRead + Unpin>(reader: &mut R) -> Line {
-    let mut buf = Vec::new();
-    loop {
-        let chunk = match reader.fill_buf().await {
-            Ok([]) | Err(_) => return Line::Closed,
-            Ok(chunk) => chunk,
-        };
-        let (take, done) = match chunk.iter().position(|b| *b == b'\n') {
-            Some(i) => (i + 1, true),
-            None => (chunk.len(), false),
-        };
-        buf.extend_from_slice(chunk.get(..take).unwrap_or_default());
-        reader.consume(take);
-        if buf.len() > MAX_LINE + 1 {
-            return Line::TooLong;
-        }
-        if done {
-            buf.pop();
-            return String::from_utf8(buf).map_or(Line::TooLong, Line::Text);
-        }
-    }
+    crate::proto::read_line(reader, MAX_LINE).await
 }
 
 async fn send(writer: &mut OwnedWriteHalf, response: &Response) -> bool {
@@ -313,7 +290,16 @@ async fn connection(hub: &Arc<Hub>, stream: UnixStream, pid: Option<i32>) {
             return;
         }
         if request.method == super::bridge::HELLO {
-            super::bridge::serve(hub, request.id, request.params, &mut reader, writer, pid).await;
+            super::bridge::serve(
+                hub,
+                request.id,
+                request.params,
+                &mut reader,
+                writer,
+                pid,
+                None,
+            )
+            .await;
             return;
         }
         if placement.is_none() {
@@ -323,16 +309,37 @@ async fn connection(hub: &Arc<Hub>, stream: UnixStream, pid: Option<i32>) {
             p.authority(request.launch.is_some())
         });
         let started = Instant::now();
+        let stops = request.method == method::HUB_STOP;
         let task_hub = Arc::clone(hub);
         let reply =
             tokio::spawn(async move { dispatch::dispatch(&task_hub, request, caller).await })
                 .await
                 .unwrap_or_else(|_| Response::err(0, code::INTERNAL, "request handler failed"));
         hub.control_latency.record(started.elapsed());
-        if !send(&mut writer, &reply).await {
+        let stop = stops.then_some(|| hub.stop());
+        if !answer(&mut writer, &reply, stop).await {
             return;
         }
     }
+}
+
+/// Writes `reply`, and when it accepts a stop (`stop`, given with `hub.stop`), begins that stop only
+/// then, with the acceptance on the wire: the hub may end at once, and the caller still reads it. A
+/// caller gone before the reply was written is not stopped for. Whether it was written.
+async fn answer(
+    writer: &mut OwnedWriteHalf,
+    reply: &Response,
+    stop: Option<impl FnOnce()>,
+) -> bool {
+    if !send(writer, reply).await {
+        return false;
+    }
+    if reply.err.is_none()
+        && let Some(stop) = stop
+    {
+        stop();
+    }
+    true
 }
 
 /// Streams events until the caller closes the connection: first those after `after` from the store,
@@ -473,5 +480,30 @@ mod tests {
         assert!(matches!(read_line(&mut big).await, Line::TooLong));
         let mut empty = BufReader::new(&b""[..]);
         assert!(matches!(read_line(&mut empty).await, Line::Closed));
+    }
+
+    /// The hub may end the moment an accepted stop begins (0.2.2 ended before writing the
+    /// acceptance, and `cataly update` reported the stop as held): by then the caller can already
+    /// read the whole acceptance. A refusal begins nothing.
+    #[tokio::test]
+    async fn an_accepted_stop_begins_only_once_its_answer_is_written() {
+        use std::io::Read as _;
+        let (caller, hub_end) = std::os::unix::net::UnixStream::pair().unwrap();
+        caller.set_nonblocking(true).unwrap();
+        hub_end.set_nonblocking(true).unwrap();
+        let (_read, mut writer) = UnixStream::from_std(hub_end).unwrap().into_split();
+        let accepted = Response::ok(7, serde_json::Value::Null);
+        let mut readable = Vec::new();
+        let stop = || {
+            let mut buf = [0u8; 256];
+            let n = (&caller).read(&mut buf).unwrap();
+            readable.extend_from_slice(&buf[..n]);
+        };
+        assert!(answer(&mut writer, &accepted, Some(stop)).await);
+        assert_eq!(readable, accepted.to_line().as_bytes());
+        let refused = Response::err(8, code::BUSY, "busy: the lead is working");
+        let mut began = false;
+        assert!(answer(&mut writer, &refused, Some(|| began = true)).await);
+        assert!(!began);
     }
 }

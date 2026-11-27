@@ -15,7 +15,7 @@ pub(crate) struct Spec {
     pub(crate) summary: &'static str,
 }
 
-pub(crate) const COMMANDS: [Spec; 55] = [
+pub(crate) const COMMANDS: [Spec; 59] = [
     Spec {
         path: &["slot"],
         args: &["name"],
@@ -198,13 +198,21 @@ pub(crate) const COMMANDS: [Spec; 55] = [
             "--slack-owner",
             "--fallback-on",
             "--fallback-chain",
+            "--voice",
+            "--voice-channel",
+            "--voice-daily-minutes",
+            "--voice-cap-usd",
+            "--voice-key-file",
         ],
         summary: "the whole setup in one run: asks for the Discord bot token, then fills in defaults \
                   (owner, #cataly and #cataly-ops, lead model, remote approvals, bot avatar and banner, \
                   home backup, health and pressure jobs, user service), shows a short summary and asks \
                   once; again later it changes only what a flag names. --yes answers in scripts; \
                   --owner <id|app>, --guild <id>, --lead-model <provider/id>, --approvals/--backup/--service \
-                  on|off, --backup-repo owner/name, --profile re-applies the bot's avatar and banner",
+                  on|off, --backup-repo owner/name, --profile re-applies the bot's avatar and banner; \
+                  --voice on|off turns Discord voice calls on (paid, on your OpenAI key) or off, with \
+                  --voice-channel <id|name>, --voice-daily-minutes <n>, --voice-cap-usd <usd> and \
+                  --voice-key-file <path>",
     },
     Spec {
         path: &["health"],
@@ -219,20 +227,6 @@ pub(crate) const COMMANDS: [Spec; 55] = [
         flags: &["--json", "--refresh"],
         values: &[],
         summary: "show account usage limits from OMP (cached; --refresh reads now)",
-    },
-    Spec {
-        path: &["quota"],
-        args: &[],
-        flags: &["--json"],
-        values: &[],
-        summary: "show the quota gate",
-    },
-    Spec {
-        path: &["quota", "lift"],
-        args: &[],
-        flags: &["--json"],
-        values: &[],
-        summary: "lift the quota gate until the windows that closed it reset",
     },
     Spec {
         path: &["pr", "follow"],
@@ -430,6 +424,55 @@ pub(crate) const COMMANDS: [Spec; 55] = [
         values: &["--subject"],
         summary: "queue the lead's reply to a voice request; it is read aloud at the next pause",
     },
+    Spec {
+        path: &["worker", "add"],
+        args: &["user@host[:port]"],
+        flags: &["--json", "--tailscale"],
+        values: &["--name", "--host-key", "--repo", "--lanes"],
+        summary: "enrol another machine to run lanes over SSH: first run makes its key and prints the \
+                  `worker init` line to run there; again with --host-key SHA256:… pins it, connects, \
+                  checks and writes [workers.<name>]. --tailscale resolves the host with `tailscale \
+                  ip`; --repo origin[,origin…]; --lanes 1-8",
+    },
+    Spec {
+        path: &["worker", "init"],
+        args: &[],
+        flags: &["--json", "--remove"],
+        values: &["--hub-key", "--from", "--host-key-file"],
+        summary: "on the worker: allow the hub's key only for worker mode (--hub-key '<line>', \
+                  --from <hub addresses>), check omp, git and the bridge link, and print the host-key \
+                  fingerprint for `worker add`; --remove takes the line out",
+    },
+    Spec {
+        path: &["worker", "list"],
+        args: &[],
+        flags: &["--json"],
+        values: &[],
+        summary: "list workers: destination, state, version, compatibility, lanes and last seen",
+    },
+    Spec {
+        path: &["worker", "doctor"],
+        args: &["name?"],
+        flags: &["--json"],
+        values: &[],
+        summary: "connect to a worker (or every worker) and check its pin, forced command, protocols, \
+                  omp, bridge link, git access per repository and disk",
+    },
+    Spec {
+        path: &["worker", "remove"],
+        args: &["name"],
+        flags: &["--json"],
+        values: &[],
+        summary: "remove a worker with no live lane: its line on the worker when it answers, then its \
+                  key, pin and config section",
+    },
+    Spec {
+        path: &["worker", "serve"],
+        args: &[],
+        flags: &[],
+        values: &["--hub"],
+        summary: "worker mode, started by the worker's sshd for the hub's key; never run by hand",
+    },
 ];
 
 /// A parsed command line.
@@ -520,7 +563,11 @@ pub(crate) fn parse(words: &[String]) -> Result<Invocation, String> {
             ));
         }
     }
-    if let Some(missing) = spec.args.get(parsed.args.len()) {
+    if let Some(missing) = spec
+        .args
+        .get(parsed.args.len())
+        .filter(|a| !a.ends_with('?'))
+    {
         return Err(format!("'{}' needs <{missing}>", spec.path.join(" ")));
     }
     Ok(Invocation::Run(parsed))
@@ -529,7 +576,14 @@ pub(crate) fn parse(words: &[String]) -> Result<Invocation, String> {
 fn synopsis(spec: &Spec) -> String {
     let mut s = format!("cataly {}", spec.path.join(" "));
     for a in spec.args {
-        let _ = write!(s, " <{a}>");
+        match a.strip_suffix('?') {
+            Some(optional) => {
+                let _ = write!(s, " [<{optional}>]");
+            }
+            None => {
+                let _ = write!(s, " <{a}>");
+            }
+        }
     }
     for v in spec.values {
         let _ = write!(s, " [{v} <value>]");
