@@ -1169,7 +1169,7 @@ impl<R: Runtime> Lead<R> {
                 cleanup: Some(*cleanup),
                 detail: detail.clone(),
             },
-            StartError::Refused(why) | StartError::Failed(why) => Failed {
+            StartError::Refused(why) => Failed {
                 at_ms: now_ms(),
                 stage: None,
                 outcome: None,
