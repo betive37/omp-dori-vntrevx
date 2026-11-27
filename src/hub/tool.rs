@@ -90,7 +90,8 @@ pub(crate) fn definition() -> Value {
         }
     });
     if let (Some(props), Value::Object(lane)) = (
-        def["parameters"]["properties"].as_object_mut(),
+        def.pointer_mut("/parameters/properties")
+            .and_then(Value::as_object_mut),
         lane_properties(),
     ) {
         props.extend(lane);
