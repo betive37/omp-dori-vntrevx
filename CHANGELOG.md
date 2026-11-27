@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.6 (Unreleased)
+
+- The Watched channels picker accepts readable channels again: its single bounded permission
+  check now requests two archived threads, Discord's minimum, instead of one (which Discord
+  rejects with HTTP 400 / error 50035). The fake Discord enforces archived-thread limits of
+  2–100 and message-history limits of 1–100 so invalid page sizes fail in CI.
+
 ## 0.2.5 (2026-11-27)
 
 - The lead can open lanes again: `cataly_lead` now declares every parameter its operations read,

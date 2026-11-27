@@ -703,13 +703,13 @@ impl Rest {
     }
 
     /// Whether the bot may view the channel and read its history: one listing of its public
-    /// archived threads, which needs both, for text and forum channels alike. `Err` carries the
-    /// permission that is missing when Discord names it ([`RestError::missing_permission`]).
+    /// archived threads, which needs both, for text and forum channels alike. Two is Discord's
+    /// minimum page size. `Err` names the missing permission ([`RestError::missing_permission`]).
     pub(crate) async fn readable(&self, channel: Snowflake) -> Result<(), RestError> {
         self.call(
             "GET channels/threads/archived",
             Method::GET,
-            &format!("/channels/{channel}/threads/archived/public?limit=1"),
+            &format!("/channels/{channel}/threads/archived/public?limit=2"),
             None,
             Kind::Read,
         )
