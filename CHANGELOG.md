@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- The ops panel's pictures are sharper: the banner is 1024×341 and the thumbnail (also on job
+  notifications) 512×512, cut from the same originals with the same framing, instead of 768×256
+  and 160×160 at heavy compression.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
