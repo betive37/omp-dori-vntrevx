@@ -486,6 +486,7 @@ impl Port {
             return record;
         }
         let record = StopRecord {
+            cleanup: super::startup::Cleanup::Unknown,
             how,
             detail,
             session_id: st.current.as_ref().map(|(id, _)| id.clone()),

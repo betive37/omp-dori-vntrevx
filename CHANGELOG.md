@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- Retain the lead's proven conversation independently of failed launch attempts and history
+  retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
+  hold rather than silently starting fresh. After a failed explicit fresh start, use
+  `lead start --fresh` to retry fresh or `lead start` to resume the retained old conversation.
+- Bound headless startup from spawn through exact binding by one 60-second deadline, with a
+  15-second notice, verified process cleanup, and a durable 300-second recovery episode.
+  Retain pre-binding ownership evidence across hub crashes; input stays fenced until the
+  validated identity is committed.
+
 ## 0.2.6 (Unreleased)
 
 - Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the

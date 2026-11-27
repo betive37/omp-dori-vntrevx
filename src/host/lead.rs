@@ -15,6 +15,7 @@
 //! when a message needs it ([`sleep`]).
 
 mod sleep;
+pub(crate) mod ownership;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
@@ -162,66 +163,31 @@ pub(crate) fn plan(
     fresh: bool,
     lease: Lease,
 ) -> Plan {
-    let resumable = last.and_then(|row| {
-        let id = row.session_id.clone()?;
-        let file = PathBuf::from(row.session_file.clone()?);
-        file.is_file().then_some((row, id, file))
-    });
-    if let Some(required) = required {
-        return match &resumable {
-            Some((row, id, file)) if id == required => match row.state.as_str() {
-                "orphan_held" | "held" if lease != Lease::Free => Plan::Refuse(format!(
-                    "the required lead session {required} is held by a running OMP or its lease is unknown"
-                )),
-                _ => Plan::Resume {
-                    id: id.clone(),
-                    file: file.clone(),
-                    note: unclean(row),
-                },
-            },
-            _ => Plan::Refuse(format!(
-                "the required lead session {required} is not the last lead session or its transcript is gone; a fresh lead is never substituted"
-            )),
+    if fresh {
+        return match required {
+            Some(id) => Plan::Refuse(format!("session_id={id} conflicts with --fresh; remove the pin before requesting a different conversation")),
+            None => Plan::Fresh(LeadStart::Asked, "the owner asked for a fresh lead".into()),
         };
     }
-    if fresh {
-        return Plan::Fresh(LeadStart::Asked, "the owner asked for a fresh lead".into());
-    }
-    let Some((row, id, file)) = resumable else {
-        return match last {
+    let Some(row) = last else {
+        return match required {
+            Some(id) => Plan::Refuse(format!("required lead session {id} has no proven binding")),
             None => Plan::Fresh(LeadStart::First, "no earlier lead session".into()),
-            Some(_) => Plan::Fresh(
-                LeadStart::Gone,
-                "the earlier lead has no transcript to resume".into(),
-            ),
         };
     };
-    match row.state.as_str() {
-        "stopped" | "lost" => Plan::Resume {
-            id,
-            file,
-            note: unclean(row),
-        },
-        "orphan_held" | "held" => match lease {
-            Lease::Free => Plan::Resume {
-                id,
-                file,
-                note: Some("resumed after an unclean stop; its lease is free again".into()),
-            },
-            Lease::Held => Plan::Refuse(format!(
-                "the earlier lead session {id} is still held by a running OMP; stop it or start fresh"
-            )),
-            Lease::Unknown => Plan::Refuse(format!(
-                "the lease of the earlier lead session {id} is unknown; it is held for the owner"
-            )),
-        },
-        "starting" | "live" => Plan::Refuse(format!(
-            "the earlier lead session {id} was not recovered yet"
-        )),
-        other => Plan::Fresh(
-            LeadStart::Ended,
-            format!("the earlier lead ended as {other}"),
-        ),
+    let (Some(id), Some(file)) = (&row.session_id, &row.session_file) else {
+        return Plan::Refuse("the earlier lead has no proven identity; conversation retained, held for the owner".into());
+    };
+    if required.is_some_and(|required| required != id) {
+        return Plan::Refuse(format!("required lead identity differs from {id}; held"));
+    }
+    if !Path::new(file).is_file() {
+        return Plan::Refuse(format!("the transcript for lead {id} is missing or is not a regular file: {file}; retained, never replaced"));
+    }
+    match lease {
+        Lease::Free => Plan::Resume { id: id.clone(), file: PathBuf::from(file), note: unclean(row) },
+        Lease::Held => Plan::Refuse(format!("lead session {id} is held by a running OMP; conversation retained")),
+        Lease::Unknown => Plan::Refuse(format!("lead session {id} has an unknown lease; conversation retained")),
     }
 }
 
@@ -309,6 +275,7 @@ pub(crate) struct Lead<R: Runtime> {
     current: Mutex<Option<Arc<R::Session>>>,
     status: Mutex<(Phase, Option<String>)>,
     starting: AsyncMutex<()>,
+    startup_cancel: watch::Sender<bool>,
     flushing: AsyncMutex<()>,
     wake: Notify,
     recovered: AtomicBool,
@@ -345,6 +312,7 @@ impl<R: Runtime> Lead<R> {
             current: Mutex::new(None),
             status: Mutex::new((Phase::NotStarted, None)),
             starting: AsyncMutex::new(()),
+            startup_cancel: watch::channel(false).0,
             flushing: AsyncMutex::new(()),
             wake: Notify::new(),
             recovered: AtomicBool::new(false),
@@ -502,13 +470,14 @@ impl<R: Runtime> Lead<R> {
         };
         for row in rows {
             let update = match &row.session_id {
-                None => SessionUpdate {
-                    state: Some("failed".into()),
-                    stop: Some((
-                        "failed".into(),
-                        Some("the hub stopped during the start".into()),
-                    )),
-                    ..SessionUpdate::default()
+                None => {
+                    let cleanup = ownership::reconcile(&self.env.state_dir, &row.handle).await;
+                    let confirmed = cleanup.as_ref().is_ok_and(|c| c.confirmed());
+                    SessionUpdate {
+                        state: Some(if confirmed { "failed" } else { "held" }.into()),
+                        stop: Some(("failed".into(), Some(format!("hub stopped during startup; ownership reconciliation: {cleanup:?}")))),
+                        ..SessionUpdate::default()
+                    }
                 },
                 Some(id) => match self.lease(id).await {
                     Lease::Free => SessionUpdate {
@@ -607,9 +576,23 @@ impl<R: Runtime> Lead<R> {
     /// Starts the lead (COORD req. 2): refused when a lead runs; resume or fresh by [`plan`]. Earlier
     /// automatic restarts no longer count.
     pub(crate) async fn start(self: &Arc<Self>, fresh: bool) -> Result<View, String> {
+        self.startup_cancel.send_replace(true);
         let _one = self.starting.lock().await;
+        if self.current().is_some_and(|session| session.alive()) {
+            return Err("a lead is already running".into());
+        }
+        self.recover().await;
+        if fresh && self.env.config.borrow().lead.as_ref().is_some_and(|settings| settings.session_id.is_some()) {
+            return Err("a pinned session_id conflicts with --fresh".into());
+        }
+        self.env.store.host(HostWrite::LeadIntent(if fresh {
+            crate::store::host::anchor::Intent::Fresh
+        } else {
+            crate::store::host::anchor::Intent::Resume
+        })).await.map_err(|e| e.to_string())?;
         *self.restarts() = Restarts::default();
-        self.launch(fresh, None, false).await
+        self.recovery().end("bound", None).await?;
+        self.launch(fresh, None, true).await
     }
 
     /// Under the start lock; `again` is the session an already scheduled restart resumes.
@@ -619,6 +602,7 @@ impl<R: Runtime> Lead<R> {
         again: Option<(String, PathBuf)>,
         retry_timeout: bool,
     ) -> Result<View, String> {
+        self.startup_cancel.send_replace(false);
         if self.shutting_down.load(Ordering::Acquire) {
             return Err("the hub is stopping".into());
         }
@@ -637,7 +621,6 @@ impl<R: Runtime> Lead<R> {
             .or_else(|| std::env::var_os("HOME").map(PathBuf::from))
             .ok_or("no working directory: set [lead] cwd")?;
         let default = std::fs::canonicalize(&default).map_err(|e| format!("lead cwd: {e}"))?;
-        let automatic = again.is_some();
         let Chosen {
             target,
             expected,
@@ -648,6 +631,24 @@ impl<R: Runtime> Lead<R> {
             Some((id, file)) => self.again(id, file, default).await?,
             None => self.target(&settings, fresh, default).await?,
         };
+        if let Some(id) = &expected {
+            match self.recovery().begin(id, false).await {
+                Ok(episode) => {
+                    if let Some(next) = episode.next_ms {
+                        let wait = Duration::from_millis(u64::try_from(next.saturating_sub(now_ms())).unwrap_or(0));
+                        let mut cancel = self.startup_cancel.subscribe();
+                        tokio::select! {
+                            () = tokio::time::sleep(wait) => {},
+                            () = super::startup::cancelled(&mut cancel) => return Err("startup retry cancelled".into()),
+                        }
+                    }
+                }
+                Err(reason) => {
+                    self.set_phase(Phase::Held, Some(reason.clone()));
+                    return Err(reason);
+                }
+            }
+        }
         self.overlay(&config)?;
         let (kind, mode) = match &expected {
             Some(id) => (self.stored_runtime(id).await?, "resume"),
@@ -705,14 +706,24 @@ impl<R: Runtime> Lead<R> {
         let result = if self.shutting_down.load(Ordering::Acquire) {
             Err(StartError::Refused("the hub is stopping".into()))
         } else {
-            runtime.start(spec).await
+            let start = runtime.start_supervised(spec, self.startup_cancel.subscribe());
+            tokio::pin!(start);
+            tokio::select! {
+                result = &mut start => result,
+                () = tokio::time::sleep(super::startup::STARTUP_NOTICE) => {
+                    let reason = "still starting existing session; conversation and queued input retained";
+                    self.set_phase(Phase::Starting, Some(reason.into()));
+                    self.emit(Emit::new(EventKind::LeadNotStarted, Severity::Warning, true, "lead").with("reason", reason));
+                    start.await
+                }
+            }
         };
         match result {
             Ok((session, started)) => {
-                self.bound(handle, session, &started, how, note).await;
+                self.bound(handle, session, &started, how, note).await?;
                 Ok(self.view().await)
             }
-            Err(e) => Err(self.not_started(handle, &e, automatic, retry).await),
+            Err(e) => Err(self.not_started(handle, &e, retry).await),
         }
     }
 
@@ -723,18 +734,24 @@ impl<R: Runtime> Lead<R> {
         fresh: bool,
         default: PathBuf,
     ) -> Result<Chosen, String> {
-        let (last, failed_resume) = self
-            .env
-            .store
-            .read(crate::store::Reads::lead_resume_record)
-            .await
-            .map_err(|e| e.to_string())?;
-        let check_lease = last
-            .as_ref()
-            .filter(|r| failed_resume || r.state == "orphan_held" || r.state == "held")
-            .and_then(|r| r.session_id.clone());
-        let lease = match check_lease {
-            Some(id) => self.lease(&id).await,
+        let selected = self.resolve(settings.session_id.clone()).await?;
+        if let Some(reason) = selected.hold {
+            self.set_phase(Phase::Held, Some(reason.clone()));
+            return Err(reason);
+        }
+        if !fresh && selected.intent != "resume" {
+            let reason = "a fresh lead attempt did not bind; the old conversation is retained and held. Choose `cataly lead start --fresh` to retry fresh or `cataly lead start` to resume old".to_string();
+            self.set_phase(Phase::Held, Some(reason.clone()));
+            return Err(reason);
+        }
+        if !fresh && selected.ever_started && selected.row.is_none() {
+            let reason = "no proven lead anchor; held, never automatically replaced".to_string();
+            self.set_phase(Phase::Held, Some(reason.clone()));
+            return Err(reason);
+        }
+        let last = selected.row;
+        let lease = match last.as_ref().and_then(|r| r.session_id.as_deref()) {
+            Some(id) => self.lease(id).await,
             None => Lease::Unknown,
         };
         // Both levels owner-only: the resume check tolerates OMP's group-writable files only below a
@@ -757,22 +774,15 @@ impl<R: Runtime> Lead<R> {
                 Ok(Chosen::fresh(dir, default, how))
             }
             Plan::Resume { id, file, note } => {
-                if failed_resume && lease != Lease::Free {
-                    let reason = format!(
-                        "the earlier lead session {id} is held by another OMP or its lease is unknown"
-                    );
-                    self.set_phase(Phase::Held, Some(reason.clone()));
-                    return Err(reason);
-                }
-                let verified = transcript::verify(
+                let verified = transcript::verify_exact(
                     file.clone(),
                     dir.clone(),
                     id.clone(),
-                    Folder::Recorded(default.clone()),
+                    Folder::Recorded(last.as_ref().map_or(default.clone(), |row| PathBuf::from(&row.cwd))),
                 )
                 .await;
                 let detail = match verified {
-                    Ok(Some(saved)) => {
+                    Ok(saved) => {
                         return Ok(Chosen {
                             target: Target::Resume(file),
                             expected: Some(id),
@@ -781,21 +791,13 @@ impl<R: Runtime> Lead<R> {
                             how: LeadStart::Resumed,
                         });
                     }
-                    Ok(None) => "a check refused it".to_string(),
                     Err(e) => e.to_string(),
                 };
                 let reason = format!(
-                    "the transcript of lead session {id} did not verify for an exact resume"
+                    "the transcript of lead session {id} did not verify for an exact resume: {detail}; conversation retained"
                 );
-                if settings.session_id.is_some() {
-                    self.set_phase(Phase::Held, Some(reason.clone()));
-                    return Err(reason);
-                }
-                log::warn(
-                    "lead starts fresh",
-                    &[("reason", &reason), ("detail", &detail)],
-                );
-                Ok(Chosen::fresh(dir, default, LeadStart::Unverified))
+                self.set_phase(Phase::Held, Some(reason.clone()));
+                Err(reason)
             }
         }
     }
@@ -808,8 +810,8 @@ impl<R: Runtime> Lead<R> {
         started: &super::Started,
         how: LeadStart,
         note: Option<String>,
-    ) {
-        self.update(SessionUpdate {
+    ) -> Result<(), String> {
+        let update = SessionUpdate {
             handle: handle.clone(),
             state: Some("live".into()),
             session_id: Some(started.session_id.clone()),
@@ -817,8 +819,13 @@ impl<R: Runtime> Lead<R> {
             pid: started.pid.map(i64::from),
             fault: started.held.clone(),
             stop: None,
-        })
-        .await;
+        };
+        if let Err(error) = self.env.store.host(HostWrite::BindLead(update)).await {
+            let stopped = session.close(true).await;
+            let reason = format!("binding could not be committed: {error}; input held; cleanup {stopped:?}");
+            self.set_phase(Phase::Held, Some(reason.clone()));
+            return Err(reason);
+        }
         let _ = self.came.set(how);
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&session));
         self.closing.store(false, Ordering::Release);
@@ -865,6 +872,7 @@ impl<R: Runtime> Lead<R> {
                 .await;
         }
         self.wake.notify_one();
+        Ok(())
     }
 
     /// A start that did not bind: the record says why, and the owner hears it unless the start was
@@ -873,22 +881,21 @@ impl<R: Runtime> Lead<R> {
         &self,
         handle: String,
         e: &StartError,
-        retrying: bool,
         resume: Option<(String, PathBuf)>,
     ) -> String {
         let detail = e.to_string();
         self.update(SessionUpdate {
             handle,
-            state: Some("failed".into()),
+            state: Some(if matches!(e, StartError::Startup { cleanup: super::startup::Cleanup::Unknown, .. }) { "held" } else { "failed" }.into()),
             stop: Some(("failed".into(), Some(detail.clone()))),
             ..SessionUpdate::default()
         })
         .await;
         if let Some(session) = resume
-            && matches!(e, StartError::ReadyTimeout(_))
+            && e.retryable()
             && !self.shutting_down.load(Ordering::Acquire)
         {
-            self.exited(session, &detail, None);
+            self.startup_retry(session, e).await;
             if let Some(reason) = self.refusal() {
                 self.emit(
                     Emit::new(EventKind::LeadNotStarted, Severity::Warning, true, "lead")
@@ -897,15 +904,10 @@ impl<R: Runtime> Lead<R> {
             }
             return detail;
         }
-        if retrying && !matches!(e, StartError::CleanupUnconfirmed(_)) {
-            return detail;
+        if !e.retryable() && let Err(error) = self.recovery().end("held", Some(detail.clone())).await {
+            log::warn("recovery hold not persisted", &[("error", &error)]);
         }
-        let phase = match e {
-            StartError::Refused(_) => Phase::NotStarted,
-            StartError::Failed(_)
-            | StartError::ReadyTimeout(_)
-            | StartError::CleanupUnconfirmed(_) => Phase::Held,
-        };
+        let phase = Phase::Held;
         self.set_phase(phase, Some(detail.clone()));
         self.emit(
             Emit::new(EventKind::LeadNotStarted, Severity::Warning, true, "lead")
@@ -916,33 +918,23 @@ impl<R: Runtime> Lead<R> {
 
     /// The target of an automatic restart: exactly the session that exited (HOST req. 81).
     async fn again(&self, id: String, file: PathBuf, default: PathBuf) -> Result<Chosen, String> {
-        let dir = self.env.state_dir.join("sessions").join("lead");
-        match transcript::verify(file.clone(), dir, id.clone(), Folder::Recorded(default)).await {
-            Ok(Some(saved)) => Ok(Chosen {
-                target: Target::Resume(file),
-                expected: Some(id),
-                note: Some("resumed after a lead OMP failure".into()),
-                cwd: saved.cwd,
-                how: LeadStart::Resumed,
-            }),
-            _ => Err(format!(
-                "the transcript of lead session {id} did not verify for an exact resume"
-            )),
+        let mut settings = self.env.config.borrow().lead.clone().ok_or("no lead configuration")?;
+        if settings.session_id.as_deref().is_some_and(|pin| pin != id) {
+            return Err("lead target changed during recovery; scheduled retry cancelled".into());
+        }
+        settings.session_id = Some(id);
+        let chosen = self.target(&settings, false, default).await?;
+        match &chosen.target {
+            Target::Resume(selected) if selected == &file => Ok(chosen),
+            Target::Fresh(_) | Target::Resume(_) => Err("lead anchor changed during recovery; held".into()),
         }
     }
 
     /// The runtime the lead session `id` was started with: a resume stays on it whatever the
     /// config says now (HOST req. 91). Uses the same record as resume target selection.
     async fn stored_runtime(&self, id: &str) -> Result<RuntimeKind, String> {
-        let (last, _) = self
-            .env
-            .store
-            .read(crate::store::Reads::lead_resume_record)
-            .await
-            .map_err(|e| e.to_string())?;
-        let last = last
-            .filter(|row| row.session_id.as_deref() == Some(id))
-            .ok_or_else(|| format!("no record of lead session {id} to resume"))?;
+        let last = self.resolve(Some(id.to_string())).await?.row
+            .ok_or_else(|| format!("no proven binding of lead session {id} to resume"))?;
         RuntimeKind::from_name(&last.runtime).ok_or_else(|| {
             format!(
                 "lead session {id} was started on the runtime '{}', which this Cataly does not run; \
@@ -950,6 +942,40 @@ impl<R: Runtime> Lead<R> {
                 last.runtime
             )
         })
+    }
+
+    async fn resolve(&self, pin: Option<String>) -> Result<crate::store::host::anchor::Selection, String> {
+        let mut selected = self.env.store.read(move |r| r.lead_target(pin.as_deref())).await.map_err(|e| e.to_string())?;
+        if selected.provenance.as_deref() == Some("two exact get_state identities and accepted model")
+            && let Some(row) = &selected.row
+            && row.runtime == "headless"
+        {
+            match ownership::reconcile(&self.env.state_dir, &row.handle).await {
+                Ok(cleanup) if cleanup.confirmed() => {},
+                evidence => selected.hold = Some(format!("lead process ownership is not proven terminated: {evidence:?}; conversation retained")),
+            }
+        }
+        Ok(selected)
+    }
+
+    fn recovery(&self) -> super::startup::Recovery<'_> {
+        super::startup::Recovery { store: &self.env.store, target: LEAD }
+    }
+
+    async fn startup_retry(&self, session: (String, PathBuf), error: &StartError) {
+        let retry = self.recovery().retry(error).await;
+        let reason = match retry {
+            Ok(Some(delay)) => {
+                self.restarts().due = Some((Instant::now() + delay, session));
+                self.set_phase(Phase::Stopped, Some(format!("{error}; restarting in {} s", delay.as_secs())));
+                self.wake.notify_one();
+                return;
+            }
+            Ok(None) => format!("{error}; 300 s recovery episode or five-retry ceiling exhausted; conversation retained, held"),
+            Err(error) => format!("recovery accounting failed: {error}; held"),
+        };
+        self.set_phase(Phase::Held, Some(reason.clone()));
+        self.emit(Emit::new(EventKind::LeadNotStarted, Severity::Warning, true, "lead").with("reason", reason));
     }
 
     /// How long until the planned automatic restart; zero when it is due.
@@ -1002,14 +1028,14 @@ impl<R: Runtime> Lead<R> {
             return;
         }
         match self
-            .launch(false, Some((id.clone(), file.clone())), false)
+            .launch(false, Some((id.clone(), file.clone())), true)
             .await
         {
             Ok(_) => log::info("lead restarted", &[("session", &id)]),
             Err(reason) => {
                 log::warn("lead restart failed", &[("reason", &reason)]);
-                if self.phase().0 != Phase::Held && !self.shutting_down.load(Ordering::Acquire) {
-                    self.exited((id, file), &format!("its restart failed: {reason}"), None);
+                if self.phase().0 != Phase::Stopped {
+                    self.set_phase(Phase::Held, Some(reason));
                 }
             }
         }
@@ -1541,6 +1567,8 @@ impl<R: Runtime> Lead<R> {
     /// Stops the lead; refused while it works or has a dialog unless forced (HOST req. 83). With no
     /// lead running it cancels a planned automatic restart, or keeps a sleeping lead stopped.
     pub(crate) async fn stop(&self, force: bool) -> Result<View, String> {
+        self.startup_cancel.send_replace(true);
+        self.recovery().end("cancelled", Some("owner stopped recovery".into())).await?;
         let _one = self.starting.lock().await;
         let session = match self.live() {
             Ok(session) => session,
@@ -1586,6 +1614,7 @@ impl<R: Runtime> Lead<R> {
     /// Hub shutdown: a clean close so the next start resumes the same session.
     pub(crate) async fn shutdown(&self) {
         self.shutting_down.store(true, Ordering::Release);
+        self.startup_cancel.send_replace(true);
         let _one = self.starting.lock().await;
         self.restarts().due = None;
         let Some(session) = self.current().filter(|s| s.alive()) else {
@@ -1656,7 +1685,7 @@ mod tests {
         ));
         let clean = row("stopped", Some("clean"), Some(&file));
         assert_eq!(
-            plan(Some(&clean), None, false, Lease::Unknown),
+            plan(Some(&clean), None, false, Lease::Free),
             resume(None)
         );
         assert!(matches!(
@@ -1665,12 +1694,12 @@ mod tests {
         ));
         let crashed = row("stopped", Some("exited"), Some(&file));
         assert_eq!(
-            plan(Some(&crashed), None, false, Lease::Unknown),
+            plan(Some(&crashed), None, false, Lease::Free),
             resume(Some("resumed after an unclean stop (exited)"))
         );
         let lost = row("lost", Some("lost"), Some(&file));
         assert!(matches!(
-            plan(Some(&lost), None, false, Lease::Unknown),
+            plan(Some(&lost), None, false, Lease::Free),
             Plan::Resume { note: Some(_), .. }
         ));
         let held = row("orphan_held", None, Some(&file));
@@ -1689,12 +1718,12 @@ mod tests {
         let gone = row("stopped", Some("clean"), Some(&dir.join("missing.jsonl")));
         assert!(matches!(
             plan(Some(&gone), None, false, Lease::Free),
-            Plan::Fresh(LeadStart::Gone, _)
+            Plan::Refuse(_)
         ));
-        assert_eq!(
+        assert!(matches!(
             plan(Some(&clean), Some("s1"), true, Lease::Free),
-            resume(None)
-        );
+            Plan::Refuse(_)
+        ));
         assert!(matches!(
             plan(Some(&clean), Some("s2"), false, Lease::Free),
             Plan::Refuse(_)

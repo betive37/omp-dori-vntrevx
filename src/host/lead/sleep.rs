@@ -70,18 +70,23 @@ impl<R: Runtime> Lead<R> {
         if self.env.config.borrow().lead.is_none() || self.phase().0 != Phase::NotStarted {
             return;
         }
-        let last = match self
-            .env
-            .store
-            .read(crate::store::Reads::lead_resume_record)
-            .await
-        {
-            Ok((last, _)) => last,
-            Err(e) => {
-                log::warn("lead sleep not read", &[("error", &e)]);
+        let pin = self.env.config.borrow().lead.as_ref().and_then(|settings| settings.session_id.clone());
+        let selected = match self.resolve(pin).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.set_phase(Phase::Held, Some(error));
                 return;
             }
         };
+        if let Some(reason) = selected.hold {
+            self.set_phase(Phase::Held, Some(reason));
+            return;
+        }
+        if selected.intent != "resume" {
+            self.set_phase(Phase::Held, Some("fresh start did not bind; choose `lead start --fresh` or `lead start` to resume old".into()));
+            return;
+        }
+        let last = selected.row;
         let Some(row) =
             last.filter(|r| r.state == "stopped" && r.stop_how.as_deref() == Some(ASLEEP))
         else {
