@@ -1114,6 +1114,144 @@ fn hub_shutdown_cancels_a_lead_ready_retry_and_next_hub_can_resume() {
     w.no_orphans();
 }
 
+/// The events of `kind` the hub recorded, across all its runs.
+fn told(hub: &TestHub, kind: &str) -> Vec<Value> {
+    hub.events()
+        .into_iter()
+        .filter(|e| e["kind"] == kind)
+        .collect()
+}
+
+/// A resume that the start rejects (its OMP exits before ready: no timeout, nothing to retry)
+/// holds the lead, and the owner is told once, directly, in his language: the reason, that the
+/// conversation is kept, `cataly lead start` after the fix, and that an update does not lift the
+/// hold. `lead status` and `health` show the same text. Hub restarts (an update's path) keep it
+/// held without a start and without telling him again; after the fix `lead start` resumes A.
+#[test]
+fn a_rejected_resume_stays_held_over_restarts_and_the_owner_is_told_once() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    let (id, file) = (
+        first["session"]["session_id"].clone(),
+        first["session"]["session_file"].clone(),
+    );
+    assert!(w.hub.stop().success());
+    w.arm("fail", "");
+    w.hub.start();
+    let v = held(&w.hub, 60);
+    let notice = v["notice"].as_str().unwrap_or_default().to_string();
+    for part in [
+        "보류",
+        "원인:",
+        "보존",
+        id.as_str().unwrap(),
+        file.as_str().unwrap(),
+        "`cataly lead start`",
+        "업데이트나 허브 재시작만으로는",
+    ] {
+        assert!(notice.contains(part), "{part}: {v}");
+    }
+    let notices = w.hub.until(Duration::from_secs(10), || {
+        let n = told(&w.hub, "lead.held");
+        (!n.is_empty()).then_some(n)
+    });
+    assert_eq!(notices.len(), 1, "{notices:?}");
+    assert_eq!(
+        notices[0]["text"].as_str().unwrap(),
+        notice,
+        "the same text"
+    );
+    let status = w.hub.cli(&["lead", "status"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains(&notice), "{status}");
+    assert!(
+        status.contains(&format!("target   {}", id.as_str().unwrap())),
+        "{status}"
+    );
+    let health = w.hub.cli(&["health"]);
+    let health = String::from_utf8_lossy(&health.stdout);
+    assert!(
+        health.contains(&notice.lines().collect::<Vec<_>>().join(" ")),
+        "{health}"
+    );
+    let attempts = w.starts("resume").len();
+    assert_eq!(attempts, 1, "a rejection is not retried");
+    for _ in 0..2 {
+        assert!(w.hub.stop().success());
+        w.hub.start();
+        let again = held(&w.hub, 30);
+        assert_eq!(again["anchor"]["session_id"], id, "{again}");
+        assert_eq!(again["notice"].as_str(), Some(notice.as_str()), "{again}");
+        std::thread::sleep(Duration::from_secs(3));
+        assert_eq!(told(&w.hub, "lead.held").len(), 1, "told only once");
+        assert_eq!(
+            w.starts("resume").len(),
+            attempts,
+            "no start until the owner acts"
+        );
+    }
+    assert!(w.starts("fresh").len() == 1, "never a fresh lead");
+    w.disarm("fail");
+    let out = w.hub.cli(&["lead", "start"]);
+    assert!(out.status.success(), "{out:?}");
+    let back = live(&w.hub, &Value::Null);
+    assert_eq!(back["session"]["session_id"], id, "{back}");
+    assert_eq!(back["session"]["session_file"], file, "{back}");
+    assert_eq!(told(&w.hub, "lead.held").len(), 1);
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+}
+
+/// A resume still starting at 15 s tells the owner once, directly: not a failure yet, the
+/// conversation and queued input kept; `lead status` shows the target, the elapsed time and the
+/// attempt. Ready at 20 s binds A, and no hold is told.
+#[test]
+fn a_slow_resume_tells_the_owner_at_15_s_once() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    let id = first["session"]["session_id"].clone();
+    assert!(w.hub.stop().success());
+    w.arm("delay", "20");
+    w.hub.start();
+    let began = Instant::now();
+    w.hub.until(Duration::from_secs(10), || {
+        (!w.starts("resume").is_empty()).then_some(())
+    });
+    assert!(told(&w.hub, "lead.slow").is_empty());
+    let slow = w.hub.until(Duration::from_secs(25), || {
+        let n = told(&w.hub, "lead.slow");
+        (!n.is_empty()).then_some(n)
+    });
+    let at = began.elapsed();
+    assert!(at >= Duration::from_secs(15), "{at:?}");
+    let text = slow[0]["text"].as_str().unwrap();
+    for part in [
+        "15초",
+        "아직 실패가 아닙니다",
+        "보존",
+        id.as_str().unwrap(),
+        "`cataly lead status`",
+    ] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    assert!(!text.contains("--fresh"), "{text}");
+    let status = w.hub.cli(&["lead", "status"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(status.contains("startup  starting for "), "{status}");
+    assert!(status.contains("attempt 1 of up to 6"), "{status}");
+    assert!(
+        status.contains(&format!("target   {}", id.as_str().unwrap())),
+        "{status}"
+    );
+    let back = live(&w.hub, &Value::Null);
+    assert_eq!(back["session"]["session_id"], id, "{back}");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(told(&w.hub, "lead.slow").len(), 1, "once");
+    assert!(told(&w.hub, "lead.held").is_empty());
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+}
+
 /// Stock OMP factories run before ready; `session_start` hooks run after ready but before RPC.
 /// Both must share the same startup budget and resume without issuing inference.
 #[test]

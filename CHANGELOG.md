@@ -26,6 +26,22 @@
 - Conversation-safe stores require schema reader 11. Older hubs must not open them and bypass
   the resume anchor; retain the new version, or explicitly restore the pre-upgrade store backup
   before a compatible downgrade.
+- A written message is resent after a restart only when the whole transcript proves it absent.
+  The marker search now covers the entire file instead of its newest 8 MiB, and a partial,
+  unparsable, oversized or unreadable transcript (or a search out of time) leaves the message in
+  doubt for the owner instead of writing it again. A resend still happens at most once, under
+  the original delivery ID, into the same session; worker deliveries are never resent
+  automatically. Workers answer the hub's search with `absent` or `unknown`; an older worker's
+  "not found" now counts as unknown.
+- The owner hears directly, in `[hub] language`, when the lead is still starting at 15 s (once
+  per recovery) and once per hold, with the reason, what is kept, `cataly lead start` after the
+  fix, and that an update does not lift the hold. A hold found again after a hub restart or an
+  update is not announced again. `cataly lead status` and `cataly health` show the target, the
+  startup phase and elapsed time, attempts and next retry, the last cleanup and lease evidence,
+  the inbox counts, and the same hold text; the ops panel shows a recovering lead.
+- After an update, sessions still recovering are reported as recovering, not as a final state,
+  by the hub's message and by `cataly update`; a second `update.sessions` message gives the final
+  result once they settle.
 
 ## 0.2.6 (Unreleased)
 

@@ -899,13 +899,13 @@ fn transcript(worker: &Worker, name: &str, params: &Value) -> Result<Value, Stri
     let text = |key: &str| params.get(key).and_then(Value::as_str).unwrap_or_default();
     let path = worker.confine(text("path"))?;
     if name == method::FIND {
-        let found = match find_marker(&path, text("marker")).map_err(|e| e.to_string())? {
-            Found::Yes => "yes",
-            Found::No => "no",
-            Found::Missing => "missing",
-            Found::OutOfTime => "out_of_time",
+        let (found, reason) = match find_marker(&path, text("marker")).map_err(|e| e.to_string())? {
+            Found::Yes => ("yes", None),
+            Found::Absent => ("absent", None),
+            Found::Missing => ("missing", None),
+            Found::Unknown(reason) => ("unknown", Some(reason)),
         };
-        return Ok(json!({ "found": found }));
+        return Ok(json!({ "found": found, "reason": reason }));
     }
     let root = worker.confine(text("root"))?;
     let folder = match (params.get("exactly"), params.get("recorded")) {

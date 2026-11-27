@@ -138,35 +138,54 @@ fn hub_version(paths: &Paths) -> Option<String> {
     hub_status(paths).map(|s| s.version)
 }
 
-/// The sessions the new hub brought back, once it settled (at most [`STOP_WAIT`]).
+/// The sessions the new hub brought back, once they settled; at [`STOP_WAIT`], what it said last,
+/// which may still be recovering.
 async fn resumed(paths: &Paths) -> Option<crate::proto::Resumed> {
     let deadline = Instant::now() + STOP_WAIT;
+    let mut last = None;
     loop {
         if let Some(r) = hub_status(paths).and_then(|s| s.resumed) {
-            return Some(r);
+            if r.settled() {
+                return Some(r);
+            }
+            last = Some(r);
         }
         if Instant::now() >= deadline {
-            return None;
+            return last;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
 /// The line `cataly update` and `cataly rollback` add about the sessions the new hub brought back:
-/// how the lead came back (or what holds it) and the lanes, or that the hub did not say in time.
+/// how the lead came back (or what holds it) and the lanes. Sessions still recovering are said so,
+/// never as final; the hub posts the final result to the owner's home room.
 async fn sessions_note(paths: &Paths) -> String {
+    let language = owner_language(paths);
+    let korean = language == Language::Korean;
     match resumed(paths).await {
         Some(r) => {
-            let text = crate::jobs::update::resumed_text(owner_language(paths), Some(r));
+            let settled = r.settled();
+            let text = crate::jobs::update::resumed_text(language, Some(r));
+            let watch = match (settled, korean) {
+                (true, _) => "",
+                (false, true) => " 진행 상황은 `cataly lead status`로 볼 수 있습니다.",
+                (false, false) => " `cataly lead status` shows the progress.",
+            };
             if text.is_empty() {
                 text
             } else {
-                format!("\n{text}")
+                format!("\n{text}{watch}")
             }
         }
+        None if korean => format!(
+            "\n새 허브의 세션은 {}초가 지나도록 아직 복구 중입니다(대화와 작업은 보존됨). \
+             최종 결과는 홈 방으로 알려드리며, `cataly lead status`로 lead를 볼 수 있습니다.",
+            STOP_WAIT.as_secs()
+        ),
         None => format!(
-            "\nthe new hub did not say within {} s which sessions it brought back; \
-             `cataly lead status` shows the lead",
+            "\nthe new hub's sessions are still recovering after {} s (conversations and work are kept); \
+             the final result goes to your home room, and `cataly lead status` shows the lead",
             STOP_WAIT.as_secs()
         ),
     }

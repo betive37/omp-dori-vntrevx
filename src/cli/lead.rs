@@ -63,6 +63,21 @@ fn print_view(v: &Value) {
         text(v, "sent"),
         text(v, "in_doubt")
     ));
+    for line in v
+        .get("startup")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+    {
+        out::line(line);
+    }
+    if let Some(notice) = v.get("notice").and_then(Value::as_str) {
+        out::line("");
+        for line in notice.lines() {
+            out::line(line);
+        }
+    }
 }
 
 fn simple(hub: &mut Client, name: &str, params: Value, as_json: bool) -> Result<(), Failure> {
