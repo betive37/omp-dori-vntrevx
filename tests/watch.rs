@@ -127,10 +127,13 @@ fn fresh(n: u64) -> u64 {
 /// The owner picks two channels: the file and the running intake follow on the same connection,
 /// and his message in the new channel reaches the lead and is answered there. Dropping the first
 /// channel then stops intake from it at once and moves the home to a watched channel.
+/// The strict fake rejects an archived-thread limit of 1 with Discord's 400/50035; keep this
+/// picker in Korean so a regression reports the same failure the owner saw.
 #[test]
 fn owner_adds_a_channel_then_drops_one() {
     let fake = FakeDiscord::start();
     let mut hub = hub(&fake, &[CH], &format!("others = [\"{CH}\"]\n"));
+    hub.write_config(&config_text(&hub).replace("language = \"en\"", "language = \"ko\""));
     hub.start();
     let panel = ready(&hub, &fake);
     let picker = press(&fake, OWNER, &panel);
@@ -151,8 +154,15 @@ fn owner_adds_a_channel_then_drops_one() {
     assert_eq!(done["type"], 7, "{done}");
     assert_eq!(
         done["data"]["content"],
-        format!("📡 Watching: <#{CH}> <#{NEW}>")
+        format!("📡 지켜보는 채널: <#{CH}> <#{NEW}>")
     );
+    let checks = fake.calls("GET", &format!("/channels/{NEW}/threads/archived/public"));
+    assert_eq!(
+        checks.len(),
+        1,
+        "one bounded readability check per new channel"
+    );
+    assert_eq!(checks[0].query, "limit=2");
     let text = config_text(&hub);
     assert!(
         text.contains(&format!("channels = [\"{CH}\", \"{NEW}\"]")),
@@ -170,7 +180,10 @@ fn owner_adds_a_channel_then_drops_one() {
     answered(&fake, NEW, first);
 
     let done = pick(&fake, GUILD, OWNER, &panel, &[NEW]);
-    assert_eq!(done["data"]["content"], format!("📡 Watching: <#{NEW}>"));
+    assert_eq!(
+        done["data"]["content"],
+        format!("📡 지켜보는 채널: <#{NEW}>")
+    );
     let text = config_text(&hub);
     assert!(text.contains(&format!("channels = [\"{NEW}\"]")), "{text}");
     assert!(text.contains(&format!("home = \"{NEW}\"")), "{text}");
@@ -193,6 +206,68 @@ fn owner_adds_a_channel_then_drops_one() {
     });
     assert_eq!(fake.connections().len(), 1, "one Gateway connection");
     assert!(hub.stop().success());
+}
+
+/// The fake enforces Discord's page bounds, including their different lower endpoints, so it
+/// cannot silently bless another invalid request from the hub.
+#[test]
+fn discord_page_limits_match_the_api() {
+    use std::io::{Read as _, Write as _};
+
+    let fake = FakeDiscord::start();
+    for (route, minimum) in [("threads/archived/public", 2), ("messages", 1)] {
+        for limit in [
+            None,
+            Some(-1),
+            Some(0),
+            Some(1),
+            Some(2),
+            Some(100),
+            Some(101),
+        ] {
+            let query = limit.map_or_else(String::new, |n| format!("?limit={n}"));
+            let mut stream =
+                std::net::TcpStream::connect(fake.base().strip_prefix("http://").unwrap()).unwrap();
+            stream.set_read_timeout(Some(WAIT)).unwrap();
+            stream.set_write_timeout(Some(WAIT)).unwrap();
+            write!(
+                stream,
+                "GET /channels/{NEW}/{route}{query} HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n"
+            )
+            .unwrap();
+            let mut response = String::new();
+            stream.read_to_string(&mut response).unwrap();
+            let (headers, body) = response.split_once("\r\n\r\n").unwrap();
+            let error = match limit {
+                Some(n) if n < minimum => Some((
+                    "NUMBER_TYPE_MIN",
+                    format!("int value should be greater than or equal to {minimum}."),
+                )),
+                Some(n) if n > 100 => Some((
+                    "NUMBER_TYPE_MAX",
+                    "int value should be less than or equal to 100.".into(),
+                )),
+                _ => None,
+            };
+            if let Some((code, message)) = error {
+                assert!(
+                    headers.starts_with("HTTP/1.1 400 "),
+                    "{route}{query}: {response}"
+                );
+                assert_eq!(
+                    serde_json::from_str::<Value>(body).unwrap(),
+                    json!({ "message": "Invalid Form Body", "code": 50035,
+                        "errors": { "limit": { "_errors": [{ "code": code, "message": message }] } } }),
+                    "{route}{query}"
+                );
+            } else {
+                assert!(
+                    headers.starts_with("HTTP/1.1 200 "),
+                    "{route}{query}: {response}"
+                );
+            }
+        }
+    }
 }
 
 /// Someone else's press or pick, or one from another server, is refused and changes nothing; so

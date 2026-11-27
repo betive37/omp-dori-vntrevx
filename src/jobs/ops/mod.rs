@@ -11,6 +11,7 @@
 //! table and mute.
 
 pub(crate) mod render;
+pub(crate) mod voice;
 
 use std::collections::{BTreeMap, VecDeque};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -51,6 +52,8 @@ pub(crate) const JOB_FAILURES: i64 = 2;
 
 /// The lead and lanes as the panel shows them; set by the hub once both exist.
 pub(crate) type PeopleFn = Arc<dyn Fn() -> BoxFut<'static, People> + Send + Sync>;
+/// Voice uses the same Gateway facts as the call, not another connection or owner poll.
+type VoiceFn = Arc<dyn Fn() -> BoxFut<'static, Option<voice::Voice>> + Send + Sync>;
 
 /// The hand-off between the router, the buttons and the panel task.
 #[derive(Default)]
@@ -58,6 +61,7 @@ pub(crate) struct Ops {
     inbox: Mutex<VecDeque<EventRecord>>,
     wake: Notify,
     people: OnceLock<PeopleFn>,
+    voice: OnceLock<VoiceFn>,
     /// The owner asked for a refresh.
     refresh: AtomicBool,
     /// The last reason the panel could not be kept, logged once.
@@ -81,6 +85,11 @@ impl Ops {
 
     pub(crate) fn set_people(&self, people: PeopleFn) {
         let _ = self.people.set(people);
+    }
+
+    #[cfg(feature = "voice")]
+    pub(crate) fn set_voice(&self, voice: VoiceFn) {
+        let _ = self.voice.set(voice);
     }
 
     fn drain(&self) -> Vec<EventRecord> {
@@ -729,6 +738,10 @@ async fn gather(ctx: &Ctx, config: &Config, jobs: &[JobView]) -> (Panel, Extra) 
         Some(f) => f().await,
         None => People::default(),
     };
+    let voice = match ctx.ops.voice.get() {
+        Some(f) => f().await,
+        None => None,
+    };
     let state = match &job {
         Some((name, _)) => {
             let name = name.clone();
@@ -786,6 +799,7 @@ async fn gather(ctx: &Ctx, config: &Config, jobs: &[JobView]) -> (Panel, Extra) 
         host,
         limits,
         people,
+        voice,
         jobs: jobs.len(),
         issues,
         recent: Vec::new(),

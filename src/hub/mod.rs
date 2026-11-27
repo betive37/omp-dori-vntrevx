@@ -678,6 +678,11 @@ fn voice_task(
         },
     );
     let tap = voice.tap(ops);
+    let panel_voice = Arc::clone(&voice);
+    jobs.ctx().ops.set_voice(Arc::new(move || {
+        let voice = Arc::clone(&panel_voice);
+        Box::pin(async move { voice.summary().await })
+    }));
     let (task, stop) = (Arc::clone(&voice), shutdown.clone());
     supervisor.spawn("voice", move || Arc::clone(&task).run(stop.clone()));
     (voice, Some(tap))

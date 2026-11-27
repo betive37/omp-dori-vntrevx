@@ -47,6 +47,9 @@ pub(crate) enum PartOutcome {
     SourceGone,
     /// Nothing was created.
     Rejected(String),
+    /// Nothing was created and the room takes no posts from the bot: it is gone, locked or out of
+    /// reach (Discord: 403, unknown channel, archived thread).
+    Closed(String),
     /// It may exist; a part with a deterministic enforced nonce may be posted again.
     Uncertain(String),
 }
@@ -83,6 +86,24 @@ pub(crate) trait Relay: Send + Sync + 'static {
 
     /// The queued raw message as the normalised owner message (MSG-01).
     fn normalise(&self, row: &crate::store::relay::QueueRow) -> Result<Inbound, String>;
+
+    /// Another room bound to `source` that takes the whole answer to it instead of a reply in `room`
+    /// (Discord: the thread started from that message). `None` keeps the reply in `room`; `Err`
+    /// when the lookup failed for now, which the pipeline asks again a bounded number of times.
+    fn answer_room(
+        &self,
+        _room: &str,
+        _source: &str,
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send {
+        async { Ok(None) }
+    }
+
+    /// A short message posted in the request's room just before the rest of an answer begun in
+    /// the bound room `from` continues there, pointing back to it; `None` posts none. It is its
+    /// own message, so no part's text ever changes with where it goes.
+    fn moved_note(&self, _from: &str) -> Option<String> {
+        None
+    }
 
     /// Posts one part; the first part of an answer replies to `reply_to`.
     fn post(

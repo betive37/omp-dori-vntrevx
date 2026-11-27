@@ -93,6 +93,11 @@ fn config(hub: &TestHub, discord: &FakeDiscord, voice: &str) -> String {
 impl Call {
     /// Starts the fakes and the hub; voice joins and the owner is present.
     fn start(transport: &str, script: Script, dave: u16, extra: &str) -> Self {
+        Self::launch(transport, script, dave, extra, true)
+    }
+
+    /// Starts with the owner's current Gateway voice state, including an empty channel.
+    fn launch(transport: &str, script: Script, dave: u16, extra: &str, owner_in: bool) -> Self {
         let rt = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(2)
             .enable_all()
@@ -105,7 +110,11 @@ impl Call {
         discord.set_voice(
             &voice.endpoint,
             json!({"id": GUILD, "channels": [{"id": VOICE_CH, "type": 2}, {"id": CH, "type": 0}],
-                "voice_states": [{"user_id": OWNER, "channel_id": VOICE_CH, "session_id": "o1"}]}),
+            "voice_states": if owner_in {
+                vec![json!({"user_id": OWNER, "channel_id": VOICE_CH, "session_id": "o1"})]
+            } else {
+                Vec::new()
+            }}),
         );
         let mut hub = TestHub::new("");
         hub.install_fake("omp");
@@ -130,7 +139,14 @@ impl Call {
             _rt: rt,
             n: 0,
         };
-        call.hub.until(WAIT, || call.voice.ready().then_some(()));
+        if owner_in {
+            call.hub.until(WAIT, || call.voice.ready().then_some(()));
+        } else {
+            call.hub.until(WAIT, || {
+                let s = call.status();
+                (s["gateway"] == true && s["call"].is_string()).then_some(())
+            });
+        }
         call
     }
 
@@ -218,6 +234,135 @@ macro_rules! both {
     };
 }
 
+/// An empty channel never invites the bot, even after an explicit voice restart.
+#[test]
+fn owner_absent_at_start_and_voice_restart_does_not_join() {
+    let mut call = Call::launch("websocket", Script::default(), 0, "", false);
+    assert!(
+        call.discord.voice_ops().is_empty(),
+        "no Discord join while absent"
+    );
+    assert_eq!(call.sessions(), 0);
+    assert_eq!(call.status()["call"], "waiting");
+    assert!(call.hub.cli(&["voice", "restart"]).status.success());
+    assert_eq!(call.status()["call"], "waiting");
+    assert!(call.discord.voice_ops().is_empty(), "restart still waits");
+    assert_eq!(call.sessions(), 0);
+    // Waiting must outlive the 30 s connection-readiness deadline.
+    assert!(!call.until(Duration::from_secs(31), |c| {
+        !c.discord.voice_ops().is_empty() || c.status()["state"] != "running"
+    }));
+    let shown = call.hub.cli(&["voice", "status"]);
+    assert!(
+        String::from_utf8_lossy(&shown.stdout)
+            .contains(&format!("waiting for you in <#{VOICE_CH}>"))
+    );
+    call.hub.stop();
+}
+
+/// Presence joins Discord and opens the provider; departure closes both, without stopping voice.
+fn follows_owner(t: &str) {
+    let mut call = Call::launch(t, Script::default(), 0, "", false);
+    call.owner_in(true);
+    // The WebRTC POST creates a session before its data channel and session.started arrive.
+    // Exercise departure from a live session, not cancellation of an in-flight start.
+    assert!(call.until(WAIT, |c| c.sessions() == 1 && c.status()["call"] == "live"));
+    assert_eq!(call.discord.voice_ops()[0]["channel_id"], VOICE_CH);
+    call.owner_in(false);
+    assert!(call.until(WAIT, |c| {
+        !c.events("session.close").is_empty()
+            && c.discord
+                .voice_ops()
+                .last()
+                .is_some_and(|op| op["channel_id"].is_null())
+            && c.status()["call"] == "waiting"
+    }));
+    assert_eq!(call.status()["state"], "running", "waiting is not stopped");
+    // A later arrival can open a new connection after the old session has settled.
+    call.owner_in(true);
+    assert!(call.until(WAIT, |c| c.sessions() == 2 && c.status()["present"] == true));
+    call.hub.stop();
+}
+both!(joins_and_leaves_with_owner, follows_owner);
+
+#[test]
+fn hub_restart_joins_when_owner_is_already_present() {
+    let mut call = Call::start("websocket", Script::default(), 0, "");
+    assert!(call.until(WAIT, |c| c.sessions() == 1));
+    call.hub.stop();
+    call.hub.start();
+    assert!(call.until(WAIT, |c| c.sessions() == 2 && c.status()["present"] == true));
+    assert_eq!(call.voice.connections(), 2);
+    call.hub.stop();
+}
+
+#[test]
+fn dropped_voice_reconnects_only_while_owner_remains() {
+    let mut call = Call::start("websocket", Script::default(), 0, "");
+    assert!(call.until(WAIT, |c| c.status()["present"] == true));
+    call.voice.disconnect();
+    assert!(call.until(WAIT, |c| c.voice.connections() == 2
+        && c.status()["present"] == true));
+    call.owner_in(false);
+    assert!(call.until(WAIT, |c| {
+        c.discord
+            .voice_ops()
+            .last()
+            .is_some_and(|op| op["channel_id"].is_null())
+    }));
+    call.voice.disconnect();
+    assert!(!call.until(Duration::from_secs(9), |c| c.voice.connections() != 2));
+    assert_eq!(call.status()["call"], "waiting");
+    call.hub.stop();
+}
+
+#[test]
+fn a_fresh_gateway_snapshot_replaces_presence_before_rejoining() {
+    let mut call = Call::start("websocket", Script::default(), 0, "");
+    assert!(call.until(WAIT, |c| c.sessions() == 1));
+    call.discord.set_voice(
+        &call.voice.endpoint,
+        json!({"id": GUILD, "channels": [{"id": VOICE_CH, "type": 2}], "voice_states": []}),
+    );
+    call.discord.gw(Gw::Op9(false));
+    assert!(call.until(WAIT, |c| c.discord.connections().len() == 2
+        && c.status()["call"] == "waiting"));
+    assert_eq!(
+        call.voice.connections(),
+        1,
+        "the old owner presence cannot cause a fresh join"
+    );
+    assert_eq!(call.status()["state"], "running");
+    call.hub.stop();
+}
+
+#[test]
+fn ops_panel_reports_waiting_from_the_same_voice_state() {
+    let mut call = Call::launch("websocket", Script::default(), 0, "", false);
+    let ops = "600000000000000002";
+    call.discord.channel(ops, 0, None);
+    let config = std::fs::read_to_string(call.hub.config_path()).unwrap();
+    call.hub.write_config(&format!(
+        "{config}\n[hub]\nlanguage = \"ko\"\n[destinations.cataly-ops]\nkind = \"discord\"\nchannel = \"{ops}\"\n"
+    ));
+    assert!(call.hub.cli(&["config", "reload"]).status.success());
+    let post = call.discord.wait(WAIT, |f| {
+        f.creates()
+            .into_iter()
+            .find(|c| c.path == format!("/channels/{ops}/messages"))
+    });
+    let fields = post.body["embeds"][0]["fields"].as_array().unwrap();
+    let voice = fields
+        .iter()
+        .find(|f| f["name"] == "음성")
+        .expect("voice field");
+    assert_eq!(
+        voice["value"],
+        format!("<#{VOICE_CH}>에서 너를 기다리는 중")
+    );
+    call.hub.stop();
+}
+
 /// Check 1: with a setting missing voice stays off and names it; a missing key file is named; valid
 /// settings start voice, which joins with op 4 on the one Gateway connection, asking for the voice
 /// intents.
@@ -229,7 +374,8 @@ fn check1_settings_name_the_field_and_valid_ones_start() {
     discord.channel(CH, 0, None);
     discord.set_voice(
         "127.0.0.1:9",
-        json!({"id": GUILD, "channels": [{"id": VOICE_CH, "type": 2}], "voice_states": []}),
+        json!({"id": GUILD, "channels": [{"id": VOICE_CH, "type": 2}],
+            "voice_states": [{"user_id": OWNER, "channel_id": VOICE_CH, "session_id": "o1"}]}),
     );
     let mut hub = TestHub::new("");
     hub.install_fake("omp");
@@ -410,6 +556,12 @@ fn wake_and_pace(t: &str) {
     call.voice.speaking(OWNER, OWNER_SSRC, true);
     assert!(call.until(WAIT, |c| c.sessions() == 1));
     assert!(call.until(WAIT, |c| !c.events("session.close").is_empty()));
+    assert_eq!(
+        call.status()["present"],
+        true,
+        "idle close keeps Discord connected"
+    );
+    assert_eq!(call.discord.voice_ops().len(), 1, "idle close never leaves");
     call.say(OWNER_SSRC, 3000, false);
     call.say(OWNER_SSRC, 400, true);
     assert!(call.until(Duration::from_secs(10), |c| c.sessions() == 2));

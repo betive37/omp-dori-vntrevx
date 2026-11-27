@@ -53,7 +53,8 @@ const MIGRATIONS: [Migration; 11] = [
     },
     Migration {
         sql: include_str!("migrations/0010_outbox_destinations.sql"),
-        additive: true,
+        // Old readers do not honor destination pins or in-flight uncertainty.
+        additive: false,
     },
     Migration {
         sql: include_str!("migrations/0011_lead_anchor.sql"),
@@ -169,6 +170,44 @@ mod tests {
         conn.execute_batch("UPDATE meta SET value = '1' WHERE key = 'min_reader';")
             .unwrap();
         migrate(&mut conn, &dir.join("backup")).unwrap();
+    }
+
+    #[test]
+    fn legacy_pending_parts_are_pinned_and_old_readers_are_refused() {
+        let dir = scratch("schema-destinations");
+        let mut conn = Connection::open(dir.join("s.db")).unwrap();
+        for migration in MIGRATIONS.iter().take(9) {
+            conn.execute_batch(migration.sql).unwrap();
+        }
+        conn.execute_batch(
+            "PRAGMA user_version = 9;
+             INSERT INTO outbox_parts (relay, room, source, idx, text, nonce, state, created_ms, updated_ms)
+             VALUES ('discord', 'room', 'source', 0, 'one', 'n0', 'confirmed', 0, 0),
+                    ('discord', 'room', 'source', 1, 'two', 'n1', 'pending', 0, 0);",
+        )
+        .unwrap();
+        migrate(&mut conn, &dir.join("backup")).unwrap();
+        let mut rows = conn
+            .prepare("SELECT destination, uncertain FROM outbox_parts ORDER BY idx")
+            .unwrap();
+        let pins: Vec<(String, bool)> = rows
+            .query_map([], |r| Ok((r.get(0)?, r.get(1)?)))
+            .unwrap()
+            .collect::<rusqlite::Result<_>>()
+            .unwrap();
+        assert_eq!(pins, vec![("room".into(), false), ("room".into(), true)]);
+        assert!(
+            conn.execute(
+                "UPDATE outbox_parts SET destination = 'elsewhere' WHERE idx = 1",
+                [],
+            )
+            .is_err(),
+            "uncertain parts cannot move at the storage boundary"
+        );
+        assert!(matches!(
+            check_reader(&conn, latest(), 9, &dir.join("backup")),
+            Err(StoreError::TooNew { .. })
+        ));
     }
 
     #[test]

@@ -72,6 +72,8 @@ pub(crate) struct DiscordRelay {
     pub(crate) rest: Arc<Rest>,
     pub(crate) bot: Snowflake,
     pub(crate) checks: Checks,
+    /// `[discord] follow_threads`: only then may an answer go into a thread started from its request.
+    pub(crate) follow_threads: bool,
 }
 
 fn id(text: &str) -> Result<Snowflake, String> {
@@ -99,6 +101,27 @@ impl Relay for DiscordRelay {
         let raw: Value = serde_json::from_str(&row.raw).map_err(|e| e.to_string())?;
         let parent = row.parent.as_deref().and_then(Snowflake::parse);
         types::normalise(&raw, parent)
+    }
+
+    /// The thread started from the request, looked up within 5 s (DISC-OUT req. 25).
+    async fn answer_room(&self, room: &str, source: &str) -> Result<Option<String>, String> {
+        if !self.follow_threads {
+            return Ok(None);
+        }
+        let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
+            return Ok(None);
+        };
+        let lookup = self.rest.started_thread(channel, message);
+        match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(thread)) => Ok(thread.map(|t| t.to_string())),
+            Ok(Err(why)) => Err(why),
+            Err(_) => Err("no answer within 5 s".into()),
+        }
+    }
+
+    /// The pointer back to the thread where the answer began (DISC-OUT req. 25).
+    fn moved_note(&self, from: &str) -> Option<String> {
+        Some(format!("-# continued from <#{from}>"))
     }
 
     async fn post(
@@ -332,13 +355,13 @@ impl<T: Runtime> Intake<T> {
             WsUrl::parse("wss://gateway.discord.gg").map_err(Stop::Fatal)?
         };
         let token = rest.token().to_string();
-        let relay = Arc::new(DiscordRelay {
-            rest: Arc::clone(&rest),
-            bot,
-            checks: config.outgoing.clone(),
-        });
         let pipeline = Arc::new(Pipeline::new(
-            relay,
+            Arc::new(DiscordRelay {
+                rest: Arc::clone(&rest),
+                bot,
+                checks: config.outgoing.clone(),
+                follow_threads: settings.follow_threads,
+            }),
             crate::relay::pipeline::Parts {
                 store: env.store.clone(),
                 lead: Arc::clone(&env.lead),
@@ -359,7 +382,7 @@ impl<T: Runtime> Intake<T> {
             token_intents: (token, gateway::intents(settings.follow_threads, voice)),
             tap: (env.tap.clone(), voice),
             events: Arc::clone(&env.events),
-            settings: Mutex::new(settings.clone()),
+            settings: Mutex::new(settings),
             language: config.hub.language,
             rest,
             bot,
@@ -386,6 +409,9 @@ impl<T: Runtime> Intake<T> {
             intake.unlist(*channel, e);
         }
         intake.close_left_open().await;
+        if !shared.presses_recovered.swap(true, Ordering::SeqCst) {
+            intake.tell_untold_presses().await;
+        }
         intake.baseline_listed().await?;
         // A queue left from before is drained after a full catch-up read (DISC-IN req. 28).
         let queued = env
@@ -693,7 +719,7 @@ impl<T: Runtime> Intake<T> {
     }
 
     /// Renews the typing indicator while a lead turn runs (DESIGN 12.2 C4).
-    async fn typing(&self) {
+    async fn typing(self: &Arc<Self>) {
         if !self.turn_running.load(Ordering::Acquire) {
             return;
         }
@@ -705,13 +731,44 @@ impl<T: Runtime> Intake<T> {
         if !due {
             return;
         }
-        let Some(room) = self.pipeline.typing_room().await else {
+        let Some((room, message)) = self.pipeline.typing_room().await else {
+            return;
+        };
+        // A pending lookup wakes the handling round as soon as its destination is known.
+        let Some(room) = self.typing_target(room, message) else {
             return;
         };
         *self.typed.lock().unwrap_or_else(PoisonError::into_inner) = Some(Instant::now());
         if let Err(e) = self.pipeline.relay.typing(&room).await {
             log::debug("typing not shown", &[("error", &e)]);
         }
+    }
+
+    /// Where typing shows for the request `message` in `room`: where its answer would go now
+    /// (DISC-OUT req. 25). Only a followed thread with the request's ID (a thread started from a
+    /// message takes its ID) needs the answer's own lookup, shared with posting and run off the
+    /// handling round; `None` while it runs or after it failed (a later round looks again).
+    fn typing_target(self: &Arc<Self>, room: String, message: String) -> Option<String> {
+        let followed = Snowflake::parse(&message).is_some_and(|m| {
+            self.scope()
+                .threads
+                .get(&m)
+                .is_some_and(|p| Some(*p) == Snowflake::parse(&room))
+        });
+        if !followed {
+            return Some(room);
+        }
+        if let Some(known) = self.pipeline.known_answer_room(&room, &message) {
+            return Some(known);
+        }
+        let intake = Arc::clone(self);
+        tokio::spawn(async move {
+            // A failure is logged and counted by the pipeline; only success wakes immediately.
+            if intake.pipeline.answer_room(&room, &message).await.is_ok() {
+                intake.wake.notify_one();
+            }
+        });
+        None
     }
 
     /// Lists active threads and follows those under listed channels (DISC-IN req. 8).
@@ -1284,7 +1341,7 @@ impl<T: Runtime> Handler for Arc<Intake<T>> {
         });
         log::info("Discord Gateway ready", &[("resumed", &resumed)]);
         if let (Some(tap), Ok(bot)) = (self.active_tap(), self.bot.to_string().parse::<u64>()) {
-            (tap.seen)(Seen::Up(bot));
+            (tap.seen)(Seen::Up { bot, resumed });
         }
         self.wake.notify_one();
     }

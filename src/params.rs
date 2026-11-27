@@ -369,9 +369,9 @@ params! {
     /// Where the item came from.
     SOURCE: "source", Type::Text, "where it came from, such as discord:<room>:<message>", [Lead], false;
     /// The thread or room.
-    THREAD: "thread", Type::Text, "the thread or room it belongs to", [Lead], false;
+    THREAD: "thread", Type::Text, "the thread or room it belongs to; question.ask posts in a discord:<id> thread when room is not given", [Lead], false;
     /// The channel to ask in.
-    ROOM: "room", Type::Text, "the Discord channel to post a question in (default the home channel)", [Lead], false;
+    ROOM: "room", Type::Text, "the Discord channel ID to post a question in (default the discord:<id> thread, else the home channel)", [Lead], false;
     /// A message ID.
     MESSAGE: "message", Type::Text, "the owner's or the announcing message ID", [Lead], false;
     /// Why.
