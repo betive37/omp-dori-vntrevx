@@ -34,6 +34,23 @@ pub(crate) enum TranscriptError {
     TooLarge,
     /// Not valid JSON lines.
     Malformed,
+    Verification(VerificationCheck),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationCheck {
+    Path,
+    FileNameIdentity,
+    CanonicalLocation,
+    DirectorySafety,
+    FileSafety,
+    Header,
+    WorkingDirectory,
+    HeaderIdentity,
+    SiblingSafety,
+    Continuation,
+    Departed,
+    RemoteUnverified,
 }
 
 impl fmt::Display for TranscriptError {
@@ -42,6 +59,7 @@ impl fmt::Display for TranscriptError {
             Self::Io(e) => write!(f, "session file: {e}"),
             Self::TooLarge => f.write_str("session file exceeds 64 MiB"),
             Self::Malformed => f.write_str("session file is not valid JSON lines"),
+            Self::Verification(check) => write!(f, "exact resume check failed: {check:?}"),
         }
     }
 }
@@ -256,20 +274,28 @@ pub(crate) fn exact(
     session: &str,
     folder: &Folder,
 ) -> Result<Option<Transcript>> {
+    match exact_checked(path, root, session, folder) {
+        Ok(transcript) => Ok(Some(transcript)),
+        Err(TranscriptError::Verification(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn exact_checked(path: &Path, root: &Path, session: &str, folder: &Folder) -> Result<Transcript> {
     let name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
-    if !path.is_absolute()
-        || path.to_string_lossy().chars().any(char::is_control)
-        || session_file_id(name) != Some(session)
-    {
-        return Ok(None);
+    if !path.is_absolute() || path.to_string_lossy().chars().any(char::is_control) {
+        return Err(TranscriptError::Verification(VerificationCheck::Path));
+    }
+    if session_file_id(name) != Some(session) {
+        return Err(TranscriptError::Verification(VerificationCheck::FileNameIdentity));
     }
     let file = real(path)?;
     let root = real(root)?;
     if file != path || !strictly_inside(&root, &file) {
-        return Ok(None);
+        return Err(TranscriptError::Verification(VerificationCheck::CanonicalLocation));
     }
     let uid = rustix::process::getuid().as_raw();
     let parent = root.parent().map(fs::metadata).transpose()?;
@@ -284,7 +310,7 @@ pub(crate) fn exact(
     while let Some(at) = dir {
         let info = fs::metadata(&at)?;
         if !info.is_dir() || info.uid() != uid || info.mode() & write_mask != 0 {
-            return Ok(None);
+            return Err(TranscriptError::Verification(VerificationCheck::DirectorySafety));
         }
         if at == root {
             break;
@@ -294,17 +320,17 @@ pub(crate) fn exact(
     let mut handle = read_only(&file)?;
     let info = handle.metadata()?;
     if !info.is_file() || info.uid() != uid || info.nlink() != 1 || info.mode() & write_mask != 0 {
-        return Ok(None);
+        return Err(TranscriptError::Verification(VerificationCheck::FileSafety));
     }
     if info.len() > FILE_LIMIT {
         return Err(TranscriptError::TooLarge);
     }
     let Some(head) = header(&mut handle, REOPEN_HEADER_BYTES)? else {
-        return Ok(None);
+        return Err(TranscriptError::Verification(VerificationCheck::Header));
     };
     let header_cwd = head.get("cwd").and_then(Value::as_str).map(Path::new);
     let Some(recorded) = header_cwd.filter(|c| c.is_absolute()) else {
-        return Ok(None);
+        return Err(TranscriptError::Verification(VerificationCheck::WorkingDirectory));
     };
     let recorded = real(recorded)?;
     let allowed = match folder {
@@ -314,8 +340,11 @@ pub(crate) fn exact(
                 || fs::metadata(&recorded).is_ok_and(|m| m.is_dir() && m.uid() == uid)
         }
     };
-    if head.get("id").and_then(Value::as_str) != Some(session) || !allowed {
-        return Ok(None);
+    if head.get("id").and_then(Value::as_str) != Some(session) {
+        return Err(TranscriptError::Verification(VerificationCheck::HeaderIdentity));
+    }
+    if !allowed {
+        return Err(TranscriptError::Verification(VerificationCheck::WorkingDirectory));
     }
     // Only generated sibling headers can redirect OMP's resume target.
     let dir = file.parent().unwrap_or(root.as_path());
@@ -331,12 +360,12 @@ pub(crate) fn exact(
         let mut other = read_only(&sibling.path())?;
         let entry = other.metadata()?;
         if !entry.is_file() || entry.uid() != uid || entry.mode() & write_mask != 0 {
-            return Ok(None);
+            return Err(TranscriptError::Verification(VerificationCheck::SiblingSafety));
         }
         match header(&mut other, HEADER_BYTES)? {
             Some(candidate)
                 if candidate.get("continuationOf").and_then(Value::as_str) != Some(session) => {}
-            _ => return Ok(None),
+            _ => return Err(TranscriptError::Verification(VerificationCheck::Continuation)),
         }
     }
     handle.seek(SeekFrom::Start(0))?;
@@ -345,7 +374,7 @@ pub(crate) fn exact(
 
 /// Reads every entry for the saved model; `None` when the transcript departed or holds a non-object
 /// line.
-fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
+fn read_branch(handle: File, cwd: PathBuf) -> Result<Transcript> {
     let mut reader = BufReader::new(handle);
     let mut entries: HashMap<String, BranchEntry> = HashMap::new();
     let mut leaf: Option<String> = None;
@@ -366,7 +395,7 @@ fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
         trim_newline(&mut line);
         let entry: Value = serde_json::from_slice(&line).map_err(|_| TranscriptError::Malformed)?;
         if !entry.is_object() {
-            return Ok(None);
+            return Err(TranscriptError::Malformed);
         }
         if entry.get("type").and_then(Value::as_str) == Some("custom_message")
             && entry.get("customType").and_then(Value::as_str) == Some("session-transfer")
@@ -374,7 +403,7 @@ fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
                 .get("details")
                 .is_some_and(|d| d.get("kind").and_then(Value::as_str) == Some("departed"))
         {
-            return Ok(None);
+            return Err(TranscriptError::Verification(VerificationCheck::Departed));
         }
         let Some(id) = entry.get("id").and_then(Value::as_str).map(str::to_owned) else {
             continue;
@@ -400,10 +429,10 @@ fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
         Some(at) if entries.contains_key(at) => Some(at.as_str()),
         Some(_) => last_self_selected.as_deref(),
     };
-    Ok(Some(Transcript {
+    Ok(Transcript {
         model: saved_model(&entries, start),
         cwd,
-    }))
+    })
 }
 
 fn trim_newline(line: &mut Vec<u8>) {
@@ -770,6 +799,21 @@ pub(crate) async fn verify(
     tokio::task::spawn_blocking(move || exact(&path, &root, &session, &folder))
         .await
         .map_err(|e| TranscriptError::Io(format!("verify task: {e}")))?
+}
+
+/// Exact resume with a diagnostic for the precise failed verification gate.
+pub(crate) async fn verify_exact(
+    path: PathBuf,
+    root: PathBuf,
+    session: String,
+    folder: Folder,
+) -> Result<Transcript> {
+    if crate::worker::split_remote(&path).is_some() {
+        return verify(path, root, session, folder).await?
+            .ok_or(TranscriptError::Verification(VerificationCheck::RemoteUnverified));
+    }
+    tokio::task::spawn_blocking(move || exact_checked(&path, &root, &session, &folder))
+        .await.map_err(|e| TranscriptError::Io(format!("verify task: {e}")))?
 }
 
 /// A session file larger than this is an issue for spend reading (WS req. 34).
