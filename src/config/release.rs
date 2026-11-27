@@ -7,17 +7,17 @@ use crate::jobs::event::{EventKind, Template};
 use crate::relay::http::Base;
 
 /// The default notice in Korean; `{current}`, `{latest}` and `{url}` are filled in.
-const KOREAN: &str = "새로운 버전이 나왔습니다! 보스. 콘솔 창에 `cataly update` 명령어를 입력해주세요.\n\
+const KOREAN: &str = "새로운 버전이 나왔습니다, 주인님! 콘솔 창에 `cataly update` 명령어를 입력해주세요.\n\
                       {current} -> {latest} {url}";
 /// The default notice in English.
-const ENGLISH: &str = "A new version is out, boss. Run `cataly update` in a terminal.\n\
+const ENGLISH: &str = "A new version is out, Master. Run `cataly update` in a terminal.\n\
                        {current} -> {latest} {url}";
 /// After the hub first runs a newer version, in Korean and English; `{previous}`, `{latest}` and
 /// `{sessions}` (the sessions resumed, a sentence or nothing).
-const UPDATED_KOREAN: &str = "{latest} 버전으로 업데이트했습니다. 보스, 감사합니다!\n\
+const UPDATED_KOREAN: &str = "{latest} 버전으로 업데이트했습니다. 주인님, 감사합니다!\n\
                               {previous} -> {latest}\n{sessions}";
 const UPDATED_ENGLISH: &str =
-    "Updated to {latest}. Thanks, boss!\n{previous} -> {latest}\n{sessions}";
+    "Updated to {latest}. Thank you, Master!\n{previous} -> {latest}\n{sessions}";
 /// After the hub first runs an older version (a rollback).
 const ROLLED_BACK_KOREAN: &str =
     "{latest} 버전으로 되돌렸습니다.\n{previous} -> {latest}\n{sessions}";

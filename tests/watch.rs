@@ -280,7 +280,7 @@ fn refused_or_invalid_picks_change_nothing() {
     hub.start();
     let panel = ready(&hub, &fake);
     let before = config_text(&hub);
-    let refusal = "Only the owner may change the watched channels.";
+    let refusal = "Only Master may change the watched channels.";
     let refused = press(&fake, OTHER, &panel);
     assert_eq!(refused["type"], 4);
     assert_eq!(refused["data"]["flags"], 64);

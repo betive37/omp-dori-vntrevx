@@ -36,7 +36,7 @@ pub(super) const fn words(language: Language) -> Words {
         Language::Korean => Words {
             hint: "번호를 누르거나, 원하는 답을 채팅으로 보내 주세요.",
             panel_hint: "메뉴에서 고르고 Fill in으로 글을 채운 뒤 Submit을 눌러 주세요. 질문 하나에 답장으로 답할 수도 있어요.",
-            answered: "보스가 채팅으로 답했습니다.",
+            answered: "주인님이 채팅으로 답했습니다.",
             which: "열린 질문이 여러 개예요. 답할 질문의 메시지에 답장하거나 메뉴를 써 주세요",
             length: "답은 1자에서 2000자까지예요",
             retry: ["그 답은 받을 수 없어요: ", ". 다시 보내 주세요."],
@@ -53,7 +53,7 @@ pub(super) const fn words(language: Language) -> Words {
         Language::English => Words {
             hint: "Reply to this message with a number or your answer.",
             panel_hint: "Choose in the menus, use Fill in for text, then press Submit. You can also reply to one question.",
-            answered: "Answered by the owner's reply.",
+            answered: "Answered by Master's reply.",
             which: "several parts are open; reply to that part's message or use the menus",
             length: "answers are 1 to 2000 characters",
             retry: ["That answer was not taken: ", ". Please try again."],

@@ -557,13 +557,13 @@ const KINDS: [KindRow; 72] = [
         EventKind::UpdateAvailable,
         "update.available",
         &["current", "latest", "url"],
-        "A new version is out, boss. Run `cataly update` in a terminal. {current} -> {latest} {url}",
+        "A new version is out, Master. Run `cataly update` in a terminal. {current} -> {latest} {url}",
     ),
     (
         EventKind::UpdateDone,
         "update.done",
         &["previous", "latest", "sessions"],
-        "Updated to {latest}. Thanks, boss! {previous} -> {latest} {sessions}",
+        "Updated to {latest}. Thank you, Master! {previous} -> {latest} {sessions}",
     ),
     (
         EventKind::UpdateRolledBack,

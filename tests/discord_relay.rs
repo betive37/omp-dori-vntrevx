@@ -1227,7 +1227,7 @@ fn questions_are_answered_by_the_owner_once() {
         edited["content"]
             .as_str()
             .unwrap()
-            .contains("Answered by the owner: Red")
+            .contains("Answered by Master: Red")
     );
 
     // The local answer wins this time; the Discord question closes and a later press is refused.
@@ -1719,7 +1719,7 @@ fn a_question_button_answers_the_recorded_question_once() {
         edited["content"]
             .as_str()
             .unwrap()
-            .contains("Answered by the owner: 2. no"),
+            .contains("Answered by Master: 2. no"),
         "{edited}"
     );
     let told = hub.until(WAIT, || {
@@ -1816,7 +1816,7 @@ fn a_reply_closes_the_question_buttons_and_nothing_is_chosen_by_itself() {
         edited["content"]
             .as_str()
             .unwrap()
-            .contains("Answered by the owner: 2. b"),
+            .contains("Answered by Master: 2. b"),
         "{edited}"
     );
     fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
@@ -1952,7 +1952,7 @@ fn a_press_on_a_long_question_keeps_the_choice_in_view() {
     let content = edited["content"].as_str().unwrap();
     assert!(content.encode_utf16().count() <= 2000, "{content}");
     assert!(
-        content.ends_with(&format!("…\n\nAnswered by the owner: 2. {}", options[1])),
+        content.ends_with(&format!("…\n\nAnswered by Master: 2. {}", options[1])),
         "{content}"
     );
     assert!(hub.stop().success());
@@ -2019,7 +2019,7 @@ fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
         edited["content"]
             .as_str()
             .unwrap()
-            .ends_with("Answered by the owner: 2. b"),
+            .ends_with("Answered by Master: 2. b"),
         "{edited}"
     );
     assert!(hub.stop().success());

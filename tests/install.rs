@@ -435,7 +435,7 @@ fn the_updated_hub_says_so_once_in_the_home_room() {
     assert_eq!(updated.len(), 1, "{updated:?}");
     assert!(
         updated[0].starts_with(&format!(
-            "{v2} 버전으로 업데이트했습니다. 보스, 감사합니다!\n{V1} -> {v2}"
+            "{v2} 버전으로 업데이트했습니다. 주인님, 감사합니다!\n{V1} -> {v2}"
         )),
         "{updated:?}"
     );

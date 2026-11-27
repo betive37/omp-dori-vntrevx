@@ -361,7 +361,7 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
             (
                 "answered",
                 format!("owner message {message}: {text}"),
-                "Answered by the owner.".to_string(),
+                "Answered by Master.".to_string(),
             )
         }
         "question.choose" => {

@@ -674,10 +674,10 @@ in the store is lost. Install the current version again to get the hub and the c
 Default notice, in `[hub] language` (`ko`, then `en`):
 
 ```text
-새로운 버전이 나왔습니다! 보스. 콘솔 창에 `cataly update` 명령어를 입력해주세요.
+새로운 버전이 나왔습니다, 주인님! 콘솔 창에 `cataly update` 명령어를 입력해주세요.
 {current} -> {latest} {url}
 
-A new version is out, boss. Run `cataly update` in a terminal.
+A new version is out, Master. Run `cataly update` in a terminal.
 {current} -> {latest} {url}
 ```
 
@@ -692,7 +692,7 @@ place gives the final result: `{latest} 업데이트 후 세션 최종 결과: {
 final line.
 
 ```text
-{latest} 버전으로 업데이트했습니다. 보스, 감사합니다!
+{latest} 버전으로 업데이트했습니다. 주인님, 감사합니다!
 {previous} -> {latest}
 {sessions}
 
@@ -700,7 +700,7 @@ final line.
 {previous} -> {latest}
 {sessions}
 
-Updated to {latest}. Thanks, boss!
+Updated to {latest}. Thank you, Master!
 {previous} -> {latest}
 {sessions}
 

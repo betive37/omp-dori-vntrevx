@@ -1085,16 +1085,16 @@ fn picked(now: &DiscordSettings, chosen: &[Snowflake]) -> Picked {
 /// The refusal for anyone but the owner, in the owner's language.
 pub(crate) fn refusal(lang: Language) -> &'static str {
     match lang {
-        Language::Korean => "이 버튼은 주인만 누를 수 있어요.",
-        Language::English => "Only the owner can use these buttons.",
+        Language::Korean => "이 버튼은 주인님만 누를 수 있어요.",
+        Language::English => "Only Master can use these buttons.",
     }
 }
 
 /// The refusal of a watched-channel change by anyone but the owner, or from another server.
 pub(crate) fn watch_refusal(lang: Language) -> &'static str {
     match lang {
-        Language::Korean => "감시 채널은 주인만 바꿀 수 있어요.",
-        Language::English => "Only the owner may change the watched channels.",
+        Language::Korean => "감시 채널은 주인님만 바꿀 수 있어요.",
+        Language::English => "Only Master may change the watched channels.",
     }
 }
 
