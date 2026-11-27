@@ -654,8 +654,9 @@ pub(crate) fn store_floor(db: &Path) -> Result<Option<i64>, String> {
         OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
     )
     .map_err(fail)?;
-    conn.busy_timeout(std::time::Duration::from_secs(5))
+    conn.busy_timeout(std::time::Duration::from_millis(250))
         .map_err(fail)?;
+    conn.execute_batch("PRAGMA query_only=ON;").map_err(fail)?;
     let version: i64 = conn
         .query_row("PRAGMA user_version", [], |r| r.get(0))
         .map_err(fail)?;
@@ -737,6 +738,10 @@ fn make_writable_and_remove(path: &Path) -> Result<(), String> {
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
+
+#[cfg(test)]
+#[path = "install_floor_tests.rs"]
+mod floor_tests;
 
 #[cfg(test)]
 mod tests {

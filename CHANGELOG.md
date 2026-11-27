@@ -67,6 +67,8 @@
   version again brings it back.
   An unreadable candidate report also refuses an install over retained state; an empty home
   remains installable without a store-reader capability.
+  Preflight uses a query-only reader with a 250 ms busy limit; an unreadable floor refuses
+  rather than waiting on or changing a running hub's store.
 - Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the
   lead's existing backoff after verifying the child exited and the session lease is free. Failed
   resume attempts keep their diagnostics without superseding the last bound session.
