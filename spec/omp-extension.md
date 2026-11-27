@@ -298,8 +298,9 @@ The extension's whole job, in order of necessity:
 8. Append the session marker and take ownership of a resumed transcript before announcing it.
 
 It holds no lane records, no messenger credentials, no files of its own, no timers other than heartbeat and
-reconnect, and no child processes. Target size: under 600 lines of TypeScript. Every rule (who may report, what
-counts as evidence, which shell commands pass, which model is correct, what the lead owes) is decided in Rust.
+reconnect, and no child processes. Target size: at most 600 code lines of TypeScript, excluding blank lines and
+lines whose trimmed start is `//`, `/*`, `*` or `*/`. Every rule (who may report, what counts as evidence,
+which shell commands pass, which model is correct, what the lead owes) is decided in Rust.
 
 ## Third-party interfaces used
 

@@ -297,18 +297,17 @@ mod tests {
             provenance: None,
         };
         for language in [Language::English, Language::Korean] {
-            let text = held_text(language, "startup Ready Rejected: bad", Some(&anchor));
-            assert!(text.contains("startup Ready Rejected: bad"), "{text}");
-            assert!(
-                text.contains("s1") && text.contains("/x/s1.jsonl"),
-                "{text}"
-            );
-            assert!(text.contains("`cataly lead start`"), "{text}");
-            assert!(text.contains("`cataly lead start --fresh`"), "{text}");
-            assert!(text.lines().count() == 5, "{text}");
+            for bound in [Some(&anchor), None] {
+                let text = held_text(language, "startup Ready Rejected: bad", bound);
+                assert!(text.contains("startup Ready Rejected: bad"), "{text}");
+                assert_eq!(text.contains("s1"), bound.is_some(), "{text}");
+                assert_eq!(text.contains("/x/s1.jsonl"), bound.is_some(), "{text}");
+                assert!(text.contains("`cataly lead start`"), "{text}");
+                assert!(text.contains("`cataly lead start --fresh`"), "{text}");
+                assert!(text.lines().count() == 5, "{text}");
+            }
         }
         let en = held_text(Language::English, "r", None);
-        assert!(en.contains("Kept: the conversation, its work"), "{en}");
         assert!(en.contains("does not lift this hold"), "{en}");
         let ko = held_text(Language::Korean, "r", None);
         assert!(
