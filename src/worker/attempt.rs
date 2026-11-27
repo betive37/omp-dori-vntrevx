@@ -13,6 +13,9 @@ use crate::host::lead::Lease;
 use crate::sys::command::Exit;
 use crate::sys::fs;
 
+#[path = "attempt_retention.rs"]
+mod retention;
+
 /// Longest attempt token.
 const TOKEN_MAX: usize = 64;
 /// Tokens one `attempts` question names, at most.

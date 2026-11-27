@@ -789,6 +789,23 @@ impl Link {
             .collect())
     }
 
+    /// Acknowledges tokens no durable hub state references. The worker retains unknown/live
+    /// writers; callers keep their journals on an error so a later reconciliation can retry.
+    pub(crate) async fn forget_attempts(&self, tokens: &[&str]) -> Result<(), String> {
+        if tokens.len() > QUERY_MAX {
+            return Err(format!(
+                "at most {QUERY_MAX} attempt tokens per acknowledgement"
+            ));
+        }
+        self.call(
+            method::FORGET_ATTEMPTS,
+            json!({ "attempts": tokens }),
+            Duration::from_secs(15),
+        )
+        .await
+        .map(|_| ())
+    }
+
     /// TERM or KILL to a spawned child.
     pub(crate) async fn signal(&self, channel: u32, signal: &str) -> Result<(), String> {
         self.call(
