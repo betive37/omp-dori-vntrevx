@@ -9,9 +9,9 @@
 //! Resume rule (acceptance check 12): the lead resumes its last session (same ID and file) after a
 //! clean close; after an unclean stop with a free lease it resumes with a note; with a held lease it
 //! is reported and not started. A configured lead session ID must be resumed exactly. When its OMP
-//! exits by itself or misses the ready deadline on an automatic resume, the lead is restarted on the
-//! same session with backoff, and held for the owner after more than 5 restarts in 10 minutes
-//! (DESIGN 2.2). A lead idle for `[lead] idle_sleep` is put to sleep and woken on the same session
+//! exits by itself, the lead is restarted on the same session with bounded backoff. Startup
+//! timeouts require verified cleanup and a free lease, with five retries inside one durable
+//! 300-second episode. A lead idle for `[lead] idle_sleep` is woken on the same session
 //! when a message needs it ([`sleep`]).
 
 pub(crate) mod ownership;
@@ -167,7 +167,7 @@ pub(crate) enum Lease {
     Unknown,
 }
 
-/// Decides fresh or resume from the newest lead record (HOST req. 81-82, 86-88; check 12).
+/// Decides fresh or resume from the resolver's proven binding (HOST req. 81-82, 86-88).
 pub(crate) fn plan(
     last: Option<&SessionRow>,
     required: Option<&str>,
@@ -673,15 +673,14 @@ impl<R: Runtime> Lead<R> {
             Some((id, file)) => self.again(id, file, default).await?,
             None => self.target(&settings, fresh, default).await?,
         };
-        if let Some(id) = &expected {
-            if let Err(reason) = self
+        if let Some(id) = &expected
+            && let Err(reason) = self
                 .recovery()
                 .admit(id, self.startup_cancel.subscribe())
                 .await
-            {
-                self.set_phase(Phase::Held, Some(reason.clone()));
-                return Err(reason);
-            }
+        {
+            self.set_phase(Phase::Held, Some(reason.clone()));
+            return Err(reason);
         }
         self.overlay(&config)?;
         let kind = match &expected {
@@ -775,7 +774,7 @@ impl<R: Runtime> Lead<R> {
             .map_err(|e| e.to_string())
     }
 
-    /// Fresh or resume target for the next start, from the newest lead record.
+    /// Fresh or exact resume target from the durable binding resolver and owner intent.
     async fn target(
         &self,
         settings: &crate::config::session::LeadSettings,

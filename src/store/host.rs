@@ -576,7 +576,7 @@ fn resolve(
 }
 
 /// Retention (DESIGN 7.2): finished inbox rows, deliveries and receipts after 7 days; once-only
-/// identities after 30 days; stopped session records after 30 days except each role's newest.
+/// identities after 30 days; stopped attempts after 30 days, never proven lead bindings.
 pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
     let finished = now - FINISHED_KEEP_MS;
     tx.execute(
