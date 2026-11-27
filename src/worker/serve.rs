@@ -477,6 +477,19 @@ async fn handle(
         method::SPAWN => spawn(worker, mux, parse(params)?).await,
         method::SIGNAL => signal(worker, &parse(params)?),
         method::ATTEMPTS => attempts(worker, parse(params)?).await,
+        method::FORGET_ATTEMPTS => {
+            let p: AttemptsParams = parse(params)?;
+            if p.attempts.len() > attempt::QUERY_MAX {
+                return Err("too many attempt tokens".into());
+            }
+            for token in p.attempts {
+                if worker.live(&token).is_some() {
+                    return Err("attempt is still running; kept".into());
+                }
+                worker.attempts.forget(&token).await?;
+            }
+            Ok(json!({}))
+        }
         method::READ | method::STAT | method::WRITE => {
             let p: FileParams = parse(params)?;
             let (worker, name) = (Arc::clone(worker), name.to_string());

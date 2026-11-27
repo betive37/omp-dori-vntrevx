@@ -16,6 +16,9 @@ pub(crate) mod link;
 pub(crate) mod mux;
 pub(crate) mod serve;
 
+#[cfg(test)]
+mod attempt_tests;
+
 use serde::{Deserialize, Serialize};
 
 /// Worker protocol major (design 2.2, 2.8): fields are only added within a major. 2: `spawn`
@@ -50,6 +53,8 @@ pub(crate) mod method {
     pub(crate) const VERIFY: &str = "verify";
     /// The state of attempt tokens after a reconnect: running, reaped or unknown (protocol 2).
     pub(crate) const ATTEMPTS: &str = "attempts";
+    /// Hub acknowledgement that these reaped tokens are no longer referenced.
+    pub(crate) const FORGET_ATTEMPTS: &str = "forget_attempts";
 }
 
 /// Where per-machine work runs (design 2.1): here, or on a worker over its stream. Parsers stay
