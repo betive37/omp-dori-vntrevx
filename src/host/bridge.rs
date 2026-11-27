@@ -265,13 +265,13 @@ impl Links {
     /// waits for the bridge to connect and answer until `until`, the caller's deadline. A bridge
     /// whose hello lacks the capability is unverified at once, without a query, and so is a
     /// session whose bridge never connected by `until`. `Err` when a connected bridge gave no
-    /// answer.
+    /// answer. A bridge that has not connected by `connect_by` counts as never connecting.
     pub(crate) async fn resolve_model(
         &self,
         handle: &str,
         selector: &str,
         thinking: Option<&str>,
-        until: Instant,
+        (connect_by, until): (Instant, Instant),
     ) -> Result<Proof, String> {
         let (session, tx) = loop {
             let arrived = self.arrived.notified();
@@ -283,7 +283,10 @@ impl Links {
                 }
                 break (q.session.clone(), q.tx.clone());
             }
-            if tokio::time::timeout_at(until, arrived).await.is_err() {
+            if tokio::time::timeout_at(connect_by.min(until), arrived)
+                .await
+                .is_err()
+            {
                 return Ok(Proof::Unverified(super::model::NO_BRIDGE.into()));
             }
         };
@@ -442,7 +445,11 @@ mod tests {
         let (tx, mut rx) = mpsc::channel(8);
         let asked = {
             let links = Arc::clone(&links);
-            tokio::spawn(async move { links.resolve_model("h1", "p/m:high", None, until).await })
+            tokio::spawn(async move {
+                links
+                    .resolve_model("h1", "p/m:high", None, (until, until))
+                    .await
+            })
         };
         tokio::task::yield_now().await;
         links.connect("h1", Role::Lead, "k1", "s1");
@@ -472,7 +479,10 @@ mod tests {
             &json!({ "session": "s2", "version": "0.2.6" }),
             tx,
         );
-        let old = links.resolve_model("h2", "p/m", None, until).await.unwrap();
+        let old = links
+            .resolve_model("h2", "p/m", None, (until, until))
+            .await
+            .unwrap();
         assert!(
             matches!(&old, Proof::Unverified(why) if why.contains("(0.2.6)")),
             "{old:?}"
@@ -482,7 +492,9 @@ mod tests {
         links.open_query("h3", "k3", &json!({ "model_resolution_version": 1 }), tx);
         let closing = {
             let links = Arc::clone(&links);
-            tokio::spawn(async move { links.resolve_model("h3", "p/m", None, until).await })
+            tokio::spawn(
+                async move { links.resolve_model("h3", "p/m", None, (until, until)).await },
+            )
         };
         while links.lock().asked.is_empty() {
             tokio::task::yield_now().await;

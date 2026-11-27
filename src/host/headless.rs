@@ -807,14 +807,19 @@ impl Session {
         // never connects, leaves the model unverified and the session bound and fenced, never
         // retried.
         let left = deadline.saturating_duration_since(tokio::time::Instant::now());
-        let until = deadline - BIND_MARGIN.min(left);
+        let connect_by = deadline - BIND_MARGIN.min(left);
         let proof = inner
             .settings
             .links
-            .resolve_model(&inner.handle, &spec.model, spec.thinking.as_deref(), until)
+            .resolve_model(
+                &inner.handle,
+                &spec.model,
+                spec.thinking.as_deref(),
+                (connect_by, deadline),
+            )
             .await
             .map_err(|e| {
-                if tokio::time::Instant::now() >= until {
+                if tokio::time::Instant::now() >= deadline {
                     BindFailure::Rpc(RpcError::Timeout("startup deadline"))
                 } else {
                     BindFailure::Invalid(format!("model resolution: {e}"))
@@ -1708,7 +1713,7 @@ impl Control for Session {
         let r = match inner
             .settings
             .links
-            .resolve_model(&inner.handle, selector, None, until)
+            .resolve_model(&inner.handle, selector, None, (until, until))
             .await?
         {
             Proof::Resolved(r) => r,
