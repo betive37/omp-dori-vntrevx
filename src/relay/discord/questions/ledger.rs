@@ -72,6 +72,51 @@ pub(crate) fn shown(q: &QuestionRow, n: usize) -> String {
     format!("{n}. {}", neutral(option(q, n)))
 }
 
+/// The question's text in the lead's event is cut to this many characters, so the event's one line
+/// (`jobs::event::TEXT_MAX`) always holds the question ID and the whole chosen option first.
+const EXCERPT_MAX: usize = 100;
+
+/// Told privately when a press was acknowledged but could not be recorded.
+const NOT_RECORDED: &str = "Your answer could not be recorded. Press the button again.";
+
+fn excerpt(text: &str) -> String {
+    if text.chars().count() <= EXCERPT_MAX {
+        return text.to_string();
+    }
+    let mut out: String = text.chars().take(EXCERPT_MAX - 1).collect();
+    out.push('…');
+    out
+}
+
+/// The question's body followed by `status`, within one Discord message: a body too long to leave
+/// room for the status is cut at its end and marked with "…", so the status always shows.
+fn closed(body: &str, status: &str) -> String {
+    const CUT: &str = "…";
+    let tail = format!("\n\n{status}");
+    let full = body.encode_utf16().count() + tail.encode_utf16().count();
+    if full <= DISCORD_LIMIT {
+        return format!("{body}{tail}");
+    }
+    let room =
+        DISCORD_LIMIT.saturating_sub(tail.encode_utf16().count() + CUT.encode_utf16().count());
+    let mut used = 0;
+    let head: String = body
+        .chars()
+        .take_while(|c| {
+            used += c.len_utf16();
+            used <= room
+        })
+        .collect();
+    // A cut right after an escaping backslash would escape the mark instead.
+    let escaping = head.chars().rev().take_while(|c| *c == '\\').count() % 2 == 1;
+    let head = if escaping {
+        head.strip_suffix('\\').unwrap_or(&head)
+    } else {
+        &head
+    };
+    format!("{head}{CUT}{tail}")
+}
+
 /// Edits a settled question's message to end with `status` and drop its buttons; best effort,
 /// in the background.
 pub(crate) fn close(rest: Arc<Rest>, q: &QuestionRow, status: &str) {
@@ -81,15 +126,8 @@ pub(crate) fn close(rest: Arc<Rest>, q: &QuestionRow, status: &str) {
     ) else {
         return;
     };
-    let content = format!(
-        "{}\n\n{status}",
-        body(&q.id, &q.text, &q.options, q.recommended)
-    );
-    let edit = if content.encode_utf16().count() <= DISCORD_LIMIT {
-        json!({ "content": content, "components": [] })
-    } else {
-        json!({ "components": [] })
-    };
+    let content = closed(&body(&q.id, &q.text, &q.options, q.recommended), status);
+    let edit = json!({ "content": content, "components": [] });
     tokio::spawn(async move {
         match tokio::time::timeout(EDIT_BUDGET, rest.edit(room, message, edit)).await {
             Ok(Ok(())) => {}
@@ -144,14 +182,23 @@ impl<T: Runtime> Intake<T> {
             Ok(_) => return true,
             Err(e) => {
                 log::warn("question answer not recorded", &[("error", &e)]);
+                // Acknowledged but not recorded: the owner hears so privately and may press again.
+                let note = json!({ "content": NOT_RECORDED, "flags": 64 });
+                if let Err(e) = self
+                    .rest
+                    .follow_up(self.application, &press.token, note)
+                    .await
+                {
+                    log::info("unrecorded press not reported", &[("error", &e)]);
+                }
                 return true;
             }
         }
         (self.events)(
             Emit::new(EventKind::QuestionAnswered, Severity::Info, true, &q.id)
                 .with("question", &q.id)
-                .with("text", &q.text)
-                .with("outcome", &picked),
+                .with("outcome", &picked)
+                .with("text", excerpt(&q.text)),
         );
         let status = format!("Answered by the owner: {}", shown(&q, n + 1));
         close(Arc::clone(&self.rest), &q, &status);
@@ -180,6 +227,25 @@ mod tests {
         let long = rows[1]["components"][1]["label"].as_str().unwrap();
         assert!(long.starts_with("7. x"), "{long}");
         assert_eq!(long.chars().count(), LABEL_MAX);
+    }
+
+    #[test]
+    fn a_long_question_is_cut_so_its_status_shows() {
+        let options = vec!["o".repeat(200); 4];
+        let body = body("0a1b2c3d", &"q".repeat(1000), &options, Some(2));
+        let status = format!("Answered by the owner: 2. {}", "o".repeat(200));
+        let short = closed("short", &status);
+        assert_eq!(short, format!("short\n\n{status}"));
+        let cut = closed(&body, &status);
+        assert!(cut.encode_utf16().count() <= DISCORD_LIMIT);
+        assert!(cut.starts_with("**Question 0a1b2c3d**"), "{cut}");
+        assert!(cut.ends_with(&format!("…\n\n{status}")), "{cut}");
+        let escaped = closed(
+            &format!("{}\\*{}", "a".repeat(1986), "b".repeat(10)),
+            "Withdrawn.",
+        );
+        assert!(!escaped.contains("\\…"), "{escaped}");
+        assert!(excerpt(&"q".repeat(900)).chars().count() == EXCERPT_MAX);
     }
 
     #[test]

@@ -1965,7 +1965,7 @@ fn a_question_button_answers_the_recorded_question_once() {
             .find(|e| e["kind"] == "question.answered")
     });
     assert_eq!(told["urgent"], true, "{told}");
-    let said = format!("question {id} (Ship it?): option 2 (no)");
+    let said = format!("question {id}: option 2 (no) — Ship it?");
     assert!(told["text"].as_str().unwrap().contains(&said), "{told}");
     hub.until(WAIT, || {
         let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
@@ -2139,5 +2139,39 @@ fn without_gateway_buttons_a_question_is_text_only() {
         (l.0 != "open").then_some(l)
     });
     assert_eq!(state, "answered");
+    assert!(hub.stop().success());
+}
+
+/// A press on a question near Discord's size limit (1000 characters, four options of 200): the
+/// lead's event still names the whole chosen option, and the closed message still says which
+/// option the owner chose, its question cut short to make room.
+#[test]
+fn a_press_on_a_long_question_keeps_the_choice_in_view() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let options: Vec<String> = ["a", "b", "c", "d"].iter().map(|c| c.repeat(200)).collect();
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "q".repeat(1000), "options": options, "recommended": 1 }),
+    );
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
+    let told = hub.until(WAIT, || {
+        hub.events()
+            .into_iter()
+            .find(|e| e["kind"] == "question.answered")
+    });
+    let text = told["text"].as_str().unwrap();
+    let chosen = format!("question {id}: option 2 ({})", options[1]);
+    assert!(text.contains(&chosen), "{text}");
+    let edited = closed(&fake, &message);
+    let content = edited["content"].as_str().unwrap();
+    assert!(content.encode_utf16().count() <= 2000, "{content}");
+    assert!(
+        content.ends_with(&format!("…\n\nAnswered by the owner: 2. {}", options[1])),
+        "{content}"
+    );
     assert!(hub.stop().success());
 }

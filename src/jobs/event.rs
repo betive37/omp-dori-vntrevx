@@ -511,7 +511,7 @@ const KINDS: [KindRow; 67] = [
         EventKind::QuestionAnswered,
         "question.answered",
         &["question", "text", "outcome"],
-        "the owner's button answers question {question} ({text}): {outcome}",
+        "the owner's button answers question {question}: {outcome} — {text}",
     ),
     (
         EventKind::NotesRefresh,
