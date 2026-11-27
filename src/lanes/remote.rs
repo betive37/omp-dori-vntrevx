@@ -389,6 +389,7 @@ impl<R: Runtime> Lanes<R> {
                     true,
                     &rec.key,
                 )
+                .for_owner()
                 .with("lane", &rec.key)
                 .with("detail", format!("{worker} is back: {line}")),
             );

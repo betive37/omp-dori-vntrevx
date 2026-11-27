@@ -232,6 +232,7 @@ impl<R: Runtime> Lanes<R> {
     fn alert(&self, key: &str, what: &str, detail: &str, urgent: bool) {
         self.emit(
             Emit::new(EventKind::LaneAlert, Severity::Warning, urgent, key)
+                .for_owner()
                 .with("lane", key)
                 .with("what", what)
                 .with("detail", detail),

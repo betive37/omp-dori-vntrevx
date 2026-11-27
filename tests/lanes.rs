@@ -45,6 +45,15 @@ fn lane_hub(extra: &str) -> (TestHub, PathBuf) {
     (hub, work)
 }
 
+fn owner_room(hub: &TestHub) -> FakeDiscord {
+    let fake = FakeDiscord::start();
+    fake.channel(CH, 0, None);
+    let token = hub.private_file("owner-token", "fake-token");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!("{config}{}", fake.config(&token, OWNER, &[CH])));
+    fake
+}
+
 fn data(hub: &TestHub) -> PathBuf {
     hub.root.join("bin/omp-data")
 }
@@ -243,6 +252,7 @@ fn open_preview_refusals_and_dedupe() {
 #[test]
 fn model_mismatch_holds_the_start() {
     let (mut hub, _) = lane_hub("");
+    let owner = owner_room(&hub);
     hub.fixture("omp", "model", Some("fake/other"));
     start(&mut hub);
     let out = open(&hub, "m-1", &json!({}));
@@ -270,6 +280,15 @@ fn model_mismatch_holds_the_start() {
             .unwrap()
             .contains("start held: model")
     );
+    owner.wait(WAIT, |fake| {
+        fake.bot_messages(CH)
+            .iter()
+            .any(|message| {
+                let text = message["content"].as_str().unwrap();
+                text.contains("m-1") && text.contains("start held: model")
+            })
+            .then_some(())
+    });
     hub.stop();
 }
 
@@ -876,6 +895,7 @@ fn reports_reach_the_thread_by_policy() {
 #[test]
 fn hub_restart_brings_lanes_back_on_their_files() {
     let (mut hub, _) = lane_hub("");
+    let owner = owner_room(&hub);
     start(&mut hub);
     for key in ["a-1", "a-2", "a-3"] {
         open(&hub, key, &json!({}));
@@ -916,6 +936,15 @@ fn hub_restart_brings_lanes_back_on_their_files() {
     let text = recap[0]["text"].as_str().unwrap();
     assert!(text.contains("a-3: restarted; stays held"), "{text}");
     assert!(text.contains("a-1: restarted; goal active"), "{text}");
+    owner.wait(WAIT, |fake| {
+        fake.bot_messages(CH)
+            .iter()
+            .any(|message| {
+                let text = message["content"].as_str().unwrap();
+                text.contains("a-1: restarted") && text.contains("a-3: restarted")
+            })
+            .then_some(())
+    });
     hub.stop();
 }
 
@@ -1390,30 +1419,7 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
         )
         .unwrap();
         stall_resumes(&hub);
-        let asked = Instant::now();
-        let response = lane(&hub, "reopen", &json!({"key":"preserve"})).unwrap();
-        assert!(
-            response.as_str().unwrap().starts_with("recovering:"),
-            "{response}"
-        );
-        assert!(
-            asked.elapsed() < Duration::from_secs(120),
-            "the response must not wait for the whole episode"
-        );
-        hub.until(WAIT, || {
-            (std::fs::read_to_string(data(&hub).join("resume-started"))
-                .unwrap()
-                .lines()
-                .count()
-                == 2)
-                .then_some(())
-        });
-        hub.until(Duration::from_secs(400), || {
-            record(&hub, "preserve")["status"]
-                .as_str()
-                .is_some_and(|status| status.contains("start failed; work retained"))
-                .then_some(())
-        });
+        assert_recovering_reopen(&hub, "preserve");
     } else {
         hub.stop();
         stall_resumes(&hub);
@@ -1455,6 +1461,33 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
         }
     );
     hub.stop();
+}
+
+fn assert_recovering_reopen(hub: &TestHub, key: &str) {
+    let asked = Instant::now();
+    let response = lane(hub, "reopen", &json!({"key":key})).unwrap();
+    assert!(
+        response.as_str().unwrap().starts_with("recovering:"),
+        "{response}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(120),
+        "the response must not wait for the whole episode"
+    );
+    hub.until(WAIT, || {
+        (std::fs::read_to_string(data(hub).join("resume-started"))
+            .unwrap()
+            .lines()
+            .count()
+            == 2)
+            .then_some(())
+    });
+    hub.until(Duration::from_secs(400), || {
+        record(hub, key)["status"]
+            .as_str()
+            .is_some_and(|status| status.contains("start failed; work retained"))
+            .then_some(())
+    });
 }
 
 #[test]
@@ -1657,6 +1690,26 @@ fn parking_cancels_an_existing_session_start_without_losing_work() {
     assert_eq!(
         std::fs::read_to_string(tree.join("ignored.txt")).unwrap(),
         "retained on cancellation"
+    );
+    hub.stop();
+}
+
+#[test]
+fn lane_status_selects_the_positional_key() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "cli-one", &json!({}));
+    open(&hub, "cli-two", &json!({}));
+    let status = hub.cli(&["lane", "status", "cli-one"]);
+    assert!(status.status.success(), "{status:?}");
+    let text = String::from_utf8(status.stdout).unwrap();
+    assert!(text.contains("cli-one"), "{text}");
+    assert!(!text.contains("cli-two"), "{text}");
+    let json_status = hub.json(&["lane", "status", "cli-two", "--json"]);
+    let text = json_status.as_str().unwrap();
+    assert!(
+        text.contains("cli-two") && !text.contains("cli-one"),
+        "{text}"
     );
     hub.stop();
 }

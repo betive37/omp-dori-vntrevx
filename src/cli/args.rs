@@ -25,10 +25,10 @@ pub(crate) const COMMANDS: [Spec; 59] = [
     },
     Spec {
         path: &["lane"],
-        args: &["op"],
+        args: &["op", "key?"],
         flags: &["--json"],
         values: &["--params"],
-        summary: "one lane operation (open, list, board, pause, resume, park, abandon, claim, object, close, \
+        summary: "one lane operation (open, list, board, status [key], pause, resume, park, abandon, claim, object, close, \
                   reopen, send, release, read, interrupt, model, answer, grant, drift, spend); --params '<json>'",
     },
     Spec {

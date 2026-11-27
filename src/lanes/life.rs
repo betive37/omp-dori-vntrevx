@@ -940,6 +940,7 @@ impl<R: Runtime> Lanes<R> {
         if !lines.is_empty() {
             self.emit(
                 Emit::new(EventKind::LaneRecap, Severity::Info, true, "lanes")
+                    .for_owner()
                     .with("detail", lines.join("; ")),
             );
         }

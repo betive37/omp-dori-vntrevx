@@ -101,6 +101,7 @@ impl<R: Runtime> Lanes<R> {
         if resumed {
             self.emit(
                 Emit::new(EventKind::LaneRecap, Severity::Info, true, key)
+                    .for_owner()
                     .with("lane", key)
                     .with("detail", text),
             );

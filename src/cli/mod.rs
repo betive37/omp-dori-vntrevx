@@ -506,9 +506,20 @@ fn lane(hub: &mut Client, p: &Parsed, as_json: bool) -> Result<(), Failure> {
     let map = params
         .as_object_mut()
         .ok_or_else(|| Failure::Usage("--params must be a JSON object".into()))?;
+    let op = p.args.first().map_or("", String::as_str);
+    if let Some(key) = p.args.get(1) {
+        if op != "status" {
+            return Err(Failure::Usage(
+                "only lane status takes a positional key; use --params for other operations".into(),
+            ));
+        }
+        if map.insert("key".into(), json!(key)).is_some() {
+            return Err(Failure::Usage("lane status key given twice".into()));
+        }
+    }
     map.insert(
         "op".into(),
-        json!(p.args.first().cloned().unwrap_or_default()),
+        json!(if op == "status" { "board" } else { op }),
     );
     let value = hub.call(method::LANE, params, LANE_TIMEOUT)?;
     match value {

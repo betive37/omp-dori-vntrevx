@@ -13,6 +13,8 @@
 - Reopen answers with `resumed`, `recovering` or `held` after its first definite outcome instead
   of blocking the caller for the whole recovery episode. Continuing recovery retains ownership,
   reports its final result to the owner and lane thread, and is cancelled by close, park or hub stop.
+- `cataly lane status <key>` shows the named lane. Lane alerts and recovery recaps reach the
+  owner's home room directly, even while no lead is available.
 - Retain the lead's proven conversation independently of failed launch attempts and history
   retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
   hold rather than silently starting fresh. After a failed explicit fresh start, use
