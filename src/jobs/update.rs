@@ -381,7 +381,7 @@ mod tests {
         assert_eq!(
             event.text,
             format!(
-                "새로운 버전이 나왔습니다! 보스. 콘솔 창에 `cataly update` 명령어를 입력해주세요.\n\
+                "새로운 버전이 나왔습니다, 주인님! 콘솔 창에 `cataly update` 명령어를 입력해주세요.\n\
                  {} -> 99.0.0 https://github.com/{}/releases/tag/v99.0.0",
                 release::VERSION,
                 release::REPOSITORY
@@ -414,7 +414,7 @@ mod tests {
         assert!(
             event
                 .text
-                .starts_with("A new version is out, boss. Run `cataly update` in a terminal.\n")
+                .starts_with("A new version is out, Master. Run `cataly update` in a terminal.\n")
         );
         for bad in [
             "[update]\ntemplate = \"{version}\"\n",
@@ -457,7 +457,7 @@ mod tests {
         assert_eq!(
             event.text,
             format!(
-                "{v} 버전으로 업데이트했습니다. 보스, 감사합니다!\n{older} -> {v}\n\
+                "{v} 버전으로 업데이트했습니다. 주인님, 감사합니다!\n{older} -> {v}\n\
                  lead를 이어서 열었습니다. lane 2개를 이어서 열었습니다: build, docs."
             )
         );
@@ -497,7 +497,7 @@ mod tests {
         assert_eq!(
             event.text,
             format!(
-                "Updated to {v}. Thanks, boss!\n{older} -> {v}\nResumed the lead. Resumed 1 lane: build."
+                "Updated to {v}. Thank you, Master!\n{older} -> {v}\nResumed the lead. Resumed 1 lane: build."
             )
         );
         assert_eq!(

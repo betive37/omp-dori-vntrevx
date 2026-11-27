@@ -629,6 +629,23 @@ pub(crate) fn owed_line(room: &str, message: &str, at_ms: i64, text: &str) -> St
 mod tests {
     use super::*;
 
+    /// The lead and lanes address the owner as "주인님" in Korean and "Master" in English.
+    #[test]
+    fn guidance_addresses_the_owner_as_master() {
+        let guidance = |lane| {
+            welcome("k", false, lane, false)["guidance"]
+                .as_str()
+                .map(str::to_string)
+        };
+        let lead = guidance(None).unwrap();
+        assert!(
+            lead.contains("Address the owner as \"주인님\" in Korean and \"Master\" in English.")
+        );
+        let lane = ("a".to_string(), "pin".to_string());
+        let lane = guidance(Some(&lane)).unwrap();
+        assert!(lane.contains("Address him as \"주인님\" in Korean and \"Master\" in English."));
+    }
+
     #[test]
     fn a_subagents_parent_resolves_to_its_root_session() {
         let id = "0b5c1d2e-3f40-4a51-8b62-7c83d94ea5f6";

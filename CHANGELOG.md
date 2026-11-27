@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- Cataly addresses the owner as "주인님" in Korean and "Master" in English instead of "보스" and
+  "boss": the update notice and message, the closing line of an approval card ("주인님이
+  허용했습니다") or a typed answer ("주인님이 채팅으로 답했습니다"), and the lead's and lanes'
+  guidance.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a

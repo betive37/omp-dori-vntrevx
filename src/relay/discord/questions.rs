@@ -1597,7 +1597,7 @@ mod tests {
             ko.hint,
             "번호를 누르거나, 원하는 답을 채팅으로 보내 주세요."
         );
-        assert_eq!(ko.answered, "보스가 채팅으로 답했습니다.");
+        assert_eq!(ko.answered, "주인님이 채팅으로 답했습니다.");
         assert_eq!(
             ko.retry("x"),
             "그 답은 받을 수 없어요: x. 다시 보내 주세요."

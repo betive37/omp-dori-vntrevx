@@ -623,10 +623,10 @@ or your DM. With neither, they stay in the event log; for Slack, name a destinat
 Default notice, in `[hub] language` (`ko`, then `en`):
 
 ```text
-새로운 버전이 나왔습니다! 보스. 콘솔 창에 `cataly update` 명령어를 입력해주세요.
+새로운 버전이 나왔습니다, 주인님! 콘솔 창에 `cataly update` 명령어를 입력해주세요.
 {current} -> {latest} {url}
 
-A new version is out, boss. Run `cataly update` in a terminal.
+A new version is out, Master. Run `cataly update` in a terminal.
 {current} -> {latest} {url}
 ```
 
@@ -635,7 +635,7 @@ again, such as `lead를 이어서 열었습니다. lane 2개를 이어서 열었
 fresh says so and why, such as `lead는 이전 대화를 이어가지 못해 새로 시작했습니다(...)`; or nothing):
 
 ```text
-{latest} 버전으로 업데이트했습니다. 보스, 감사합니다!
+{latest} 버전으로 업데이트했습니다. 주인님, 감사합니다!
 {previous} -> {latest}
 {sessions}
 
@@ -643,7 +643,7 @@ fresh says so and why, such as `lead는 이전 대화를 이어가지 못해 새
 {previous} -> {latest}
 {sessions}
 
-Updated to {latest}. Thanks, boss!
+Updated to {latest}. Thank you, Master!
 {previous} -> {latest}
 {sessions}
 
