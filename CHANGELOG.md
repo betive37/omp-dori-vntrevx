@@ -4,7 +4,7 @@
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
   stop signal sent right after the start (as a service manager or a terminal's Ctrl-C may do) could
-  end the launcher by default, leaving the binary running without its parent.
+  end the launcher by default, leaving the binary running without its parent (#297, @betive37).
 
 ## 0.2.5 (2026-11-27)
 
