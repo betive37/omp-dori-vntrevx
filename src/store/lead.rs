@@ -383,6 +383,19 @@ impl Reads {
         self.0.query_row(&sql, [id], question_of).optional()
     }
 
+    /// Questions the owner answered with a button since `since_ms` whose `question.answered`
+    /// event is missing: the hub stopped between recording the answer and telling the lead.
+    pub(crate) fn pressed_untold(&self, since_ms: i64) -> rusqlite::Result<Vec<QuestionRow>> {
+        let sql = format!(
+            "SELECT {QUESTION_COLUMNS} FROM questions AS q WHERE state = 'answered' \
+             AND outcome LIKE 'owner press %' AND settled_ms >= ?1 AND NOT EXISTS \
+             (SELECT 1 FROM events AS e WHERE e.kind = 'question.answered' AND e.subject = q.id) \
+             ORDER BY settled_ms LIMIT 50"
+        );
+        let mut stmt = self.0.prepare(&sql)?;
+        stmt.query_map([since_ms], question_of)?.collect()
+    }
+
     /// The open question bound to a posted message (EVR req. 37).
     pub(crate) fn question_at(
         &self,

@@ -76,6 +76,10 @@ pub(crate) fn shown(q: &QuestionRow, n: usize) -> String {
 /// (`jobs::event::TEXT_MAX`) always holds the question ID and the whole chosen option first.
 const EXCERPT_MAX: usize = 100;
 
+/// A press whose event went missing is told at start if it was recorded within this window, well
+/// inside the event log's 7-day retention.
+const UNTOLD_WINDOW_MS: i64 = 24 * 3_600_000;
+
 /// Told privately when a press was acknowledged but could not be recorded.
 const NOT_RECORDED: &str = "Your answer could not be recorded. Press the button again.";
 
@@ -194,15 +198,41 @@ impl<T: Runtime> Intake<T> {
                 return true;
             }
         }
+        self.tell_pressed(&q, n + 1);
+        true
+    }
+
+    /// Tells the lead that the owner's press chose option `n` (from 1) and closes the question.
+    fn tell_pressed(&self, q: &QuestionRow, n: usize) {
         (self.events)(
             Emit::new(EventKind::QuestionAnswered, Severity::Info, true, &q.id)
                 .with("question", &q.id)
-                .with("outcome", &picked)
+                .with("outcome", picked(q, n))
                 .with("text", excerpt(&q.text)),
         );
-        let status = format!("Answered by the owner: {}", shown(&q, n + 1));
-        close(Arc::clone(&self.rest), &q, &status);
-        true
+        let status = format!("Answered by the owner: {}", shown(q, n));
+        close(Arc::clone(&self.rest), q, &status);
+    }
+
+    /// At start: a press recorded in the last day whose event is missing (the hub stopped between
+    /// the two writes) is told to the lead now, and its question closed.
+    pub(in super::super) async fn tell_untold_presses(&self) {
+        let since = crate::sys::now_ms() - UNTOLD_WINDOW_MS;
+        let untold = match self.store.read(move |r| r.pressed_untold(since)).await {
+            Ok(rows) => rows,
+            Err(e) => return log::warn("untold presses not read", &[("error", &e)]),
+        };
+        for q in untold {
+            let n = q
+                .outcome
+                .as_deref()
+                .and_then(|o| o.split_once(": option "))
+                .and_then(|(_, rest)| rest.split_once(' '))
+                .and_then(|(n, _)| n.parse::<usize>().ok());
+            if let Some(n) = n {
+                self.tell_pressed(&q, n);
+            }
+        }
     }
 }
 
