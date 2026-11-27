@@ -119,8 +119,12 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     (or the request's tag) with the text and optionally another room. The first answer is stored
     in the outbox and posted like an automatic answer (rules 24-28, the thread rule of 25), at
     once, and settles the obligation (33); the call reports whether it was posted. The same text
-    again (a retry) posts nothing and says so. While the answer is still being posted, another
-    text is refused, so nothing goes ahead of its remaining parts. Later calls for the same
+    again (a retry) posts nothing and says so; a retry naming a room other than the one the
+    answer went to (the request's room included) is refused, so the first call's room is never
+    silently kept for another. A reply that the answer is still being posted by itself needs no
+    retry; one that it may already be posted (uncertain) asks to check the room first. While the
+    answer is still being posted, another text is refused, so nothing goes ahead of its remaining
+    parts. Later calls for the same
     message are follow-ups: each is stored as its own outbox entry (the message and a digest of
     its text, nonces from those) for the room the answer went to (another room given now, else
     the room its last part was posted in; for parts stored without a room it is read back as in
@@ -130,7 +134,10 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     or follow-up whose send ended uncertain is never posted again, by a round or by the same call:
     the call says to check the room. The bridge waits up to 150 s for
     the call; the hub takes an answer back unposted when its messenger has not taken it within
-    120 s. A request the lead never answers is let go after the obligation window (34);
+    120 s. A request the lead never answers is let go after the obligation window (34); a later
+    `answer` to it is still its answer: with nothing of an answer stored it is posted as the
+    first answer and settles the request as posted, and after an answer of uncertain outcome a
+    follow-up that is posted in full settles it as posted too;
     reminders and the stop notice (35) name the operation, and a final message never counts as an
     answer for the stop gate. While onboarding runs (read-only) an answer in place, as the reply
     to the owner's message, still goes out (it carries onboarding's questions); one that would go

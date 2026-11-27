@@ -190,7 +190,8 @@ pub(crate) enum RelayWrite {
         remote: String,
         linked: bool,
     },
-    /// The answer of a hand-off: `abandoned`, or `dropped` with its pending parts discarded.
+    /// The answer of a hand-off: `abandoned`, `posted` (a follow-up answered a request let go), or
+    /// `dropped` with its pending parts discarded.
     Answer {
         relay: String,
         room: String,
@@ -698,10 +699,11 @@ fn write_replies(
                     )?;
                 }
             }
+            // A late answer to a request let go with nothing stored is its answer all the same.
             tx.execute(
                 "UPDATE handoffs SET answer = 'posting', updated_ms = ?4 WHERE relay = ?1 AND room = ?2 \
-                 AND message = ?3 AND answer = 'waiting'",
-                params![relay, room, source, now],
+                 AND message = ?3 AND (answer = 'waiting' OR (answer = 'abandoned' AND ?5 = 0))",
+                params![relay, room, source, now, existing],
             )?;
             Ok(RelayDone::Done)
         }

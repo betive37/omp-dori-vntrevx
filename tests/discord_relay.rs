@@ -1701,12 +1701,74 @@ fn a_repeated_answer_is_posted_once() {
     assert!(!error && said.contains("posted as its reply"), "{said}");
     let (said, error) = lead.tool(&call);
     assert!(!error && said.contains("already posted"), "{said}");
+    // Naming the room it went to is the same call; naming another room is refused, not ignored.
+    let mut named = call.clone();
+    named["room"] = json!(CH);
+    let (said, error) = lead.tool(&named);
+    assert!(!error && said.contains("already posted"), "{said}");
+    named["room"] = json!("600000000000000078");
+    let (said, error) = lead.tool(&named);
+    assert!(
+        error && said.contains(&format!("already went to {CH}")),
+        "{said}"
+    );
     assert_eq!(
         fake.bot_messages(CH).len(),
         1,
         "{:?}",
         fake.bot_messages(CH)
     );
+    assert!(
+        fake.calls("POST", "/channels/600000000000000078/")
+            .is_empty()
+    );
+    assert!(hub.stop().success());
+}
+
+/// The answer of a hand-off as stored.
+fn handoff_answer(hub: &TestHub, source: &str) -> String {
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.query_row(
+        "SELECT answer FROM handoffs WHERE relay = 'discord' AND message = ?1",
+        [source],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A late `answer` to a request whose owed reply was let go (30 minutes without an answer under
+/// `answers = "tool"`) with nothing posted is still its reply: posted as the linked reply, and the
+/// request settles as posted.
+#[test]
+fn a_late_answer_settles_a_request_let_go() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_322, "late");
+    assert!(hub.stop().success());
+    // As the reminder round writes it once the owed window is over.
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.execute(
+        "UPDATE handoffs SET answer = 'abandoned' WHERE relay = 'discord' AND message = ?1",
+        [&source],
+    )
+    .unwrap();
+    drop(db);
+    hub.start();
+    ready(&hub);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let call = json!({ "op": "answer", "message": format!("discord:{CH}/{source}"), "text": "late but here" });
+    let (said, error) = lead.tool(&call);
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    let posted = fake.bot_messages(CH);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(
+        posted[0]["message_reference"]["message_id"],
+        source.as_str()
+    );
+    assert_eq!(handoff_answer(&hub, &source), "posted");
+    drop(lead);
     assert!(hub.stop().success());
 }
 

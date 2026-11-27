@@ -32,7 +32,9 @@ pub(crate) fn definition() -> Value {
         "description": "Cataly's records and watches. op is one of: answer (message: the owner message as \
     discord:<room>/<message> from its [discord <room>/<message>] tag, text, room?: another room such as a thread you \
     opened): posts your answer to that owner message like an automatic answer (split, into the thread started from \
-    it if any) and settles it; later calls for the same message post follow-ups. With [lead] answers = \"tool\" it is \
+    it if any) and settles it; later calls for the same message post follow-ups. A repeat with the same text posts \
+    only what is missing, where it went (naming another room is refused): after \"still being posted by itself\" it \
+    is not needed; after \"may already be posted\" check the room first. With [lead] answers = \"tool\" it is \
     the only way an answer reaches the owner: your final message is not posted. requests (all?), request.add (title, source, thread?), \
     request.next (id, text), request.note (id, text), request.close (id, text); questions, question.ask (text, source, \
     options, recommended?, settle owner|lead, thread?, request?, room?), question.answer (id, text, message), \

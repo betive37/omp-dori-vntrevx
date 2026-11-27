@@ -11,8 +11,10 @@
   itself, and the lead answers each owner message with its tool (`cataly_lead` op `answer`,
   naming the message as `discord:<room>/<message>`). The answer is posted like an automatic one
   (split, once only, into the thread started from the message, or into a room the lead names) and
-  settles the owed reply; the same answer again posts nothing, and later calls add follow-ups in
-  the room the answer went to, also after a restart. While onboarding runs, `answer` still
+  settles the owed reply; the same answer again posts nothing (naming another room for it is
+  refused), and later calls add follow-ups in the room the answer went to, also after a restart.
+  An answer that comes after the owed reply was let go (30 minutes) is still posted as the reply
+  and settles the request. While onboarding runs, `answer` still
   replies in place (that is how its questions reach you) but may not post anywhere else. In tool
   mode a background job's result that starts another turn can no longer have that turn's text
   taken for the answer. Reminders still come for unanswered messages. The operation also works
