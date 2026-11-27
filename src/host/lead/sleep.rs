@@ -137,7 +137,9 @@ impl<R: Runtime> Lead<R> {
         let session_idle = self.phase().0 == Phase::Live
             && self.current().filter(|s| s.alive()).is_some_and(|s| {
                 let snapshot = s.snapshot();
-                snapshot.status == Status::Idle && snapshot.dialogs.is_empty()
+                snapshot.status == Status::Idle
+                    && !snapshot.input_blocked
+                    && snapshot.dialogs.is_empty()
             });
         let idle = session_idle
             && matches!(

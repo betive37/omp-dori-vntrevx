@@ -789,8 +789,9 @@ fn sync_tree(from: &Path, to: &Path, rewrite: &dyn Fn(&Path, Vec<u8>) -> Vec<u8>
     }
 }
 
-/// A build of this crate reporting V1 whose version report carries no store reader capability, as
-/// every release up to 0.2.6. Built in the variants' target folder under their lock.
+const CAPABILITY_LESS_VERSION: &str = "0.2.6";
+
+/// A build reporting the last release without `store_reader`, under the variants' build lock.
 fn capability_less() -> PathBuf {
     let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
     let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("install-variants");
@@ -798,11 +799,22 @@ fn capability_less() -> PathBuf {
     let lock = std::fs::File::create(out_dir.join(".lock")).unwrap();
     lock.lock().unwrap();
     let report = repo.join("src/sys/release.rs");
+    let manifest = repo.join("Cargo.toml");
     let field = "store_reader: Some(crate::store::latest_schema()),";
     sync_tree(
         repo,
         &out_dir.join("src-capability-less"),
         &|path, bytes| {
+            if path == manifest {
+                return String::from_utf8(bytes)
+                    .unwrap()
+                    .replacen(
+                        &format!("\nversion = \"{V1}\"\n"),
+                        &format!("\nversion = \"{CAPABILITY_LESS_VERSION}\"\n"),
+                        1,
+                    )
+                    .into_bytes();
+            }
             if path != report {
                 return bytes;
             }
@@ -900,7 +912,11 @@ fn a_rollback_across_the_store_floor_is_refused_before_anything_stops() {
 fn unknown_capability_and_install_sh_downgrades_are_refused() {
     let v2 = bump(V1, 1);
     let hub = sandbox("");
-    let old = release(&hub.root.join("old"), &capability_less(), V1);
+    let old = release(
+        &hub.root.join("old"),
+        &capability_less(),
+        CAPABILITY_LESS_VERSION,
+    );
     let r1 = release(&hub.root.join("r1"), &variant(V1, false), V1);
     let r2 = release(&hub.root.join("r2"), &variant(&v2, false), &v2);
     let out = run(
@@ -926,7 +942,11 @@ fn unknown_capability_and_install_sh_downgrades_are_refused() {
     let before = snapshot(&hub);
     let out = run(&hub, &command_link(&hub), &["rollback"]);
     assert_eq!(out.status.code(), Some(6), "{}", text(&out));
-    assert!(refused_for_the_store(&out, V1), "{}", text(&out));
+    assert!(
+        refused_for_the_store(&out, CAPABILITY_LESS_VERSION),
+        "{}",
+        text(&out)
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("스키마 10까지 읽고"),
         "{}",
@@ -934,14 +954,14 @@ fn unknown_capability_and_install_sh_downgrades_are_refused() {
     );
     assert_eq!(snapshot(&hub), before, "nothing switched");
 
-    for (folder, floor) in [(&old, 11), (&r1, 99)] {
+    for (folder, floor, version) in [(&old, 11, CAPABILITY_LESS_VERSION), (&r1, 99, V1)] {
         set_floor(&hub, floor);
         let out = install_sh(&hub, folder);
         assert_eq!(out.status.code(), Some(1), "{}", text(&out));
-        assert!(refused_for_the_store(&out, V1), "{}", text(&out));
+        assert!(refused_for_the_store(&out, version), "{}", text(&out));
         assert!(
             String::from_utf8_lossy(&out.stderr).contains(&format!(
-                "the installed Cataly refused {V1}; nothing was installed"
+                "the installed Cataly refused {version}; nothing was installed"
             )),
             "{}",
             text(&out)
@@ -954,5 +974,5 @@ fn unknown_capability_and_install_sh_downgrades_are_refused() {
     let out = run(&hub, &command_link(&hub), &["rollback"]);
     assert!(out.status.success(), "{}", text(&out));
     let (_, s) = status_install(&hub);
-    assert_eq!(s["current"]["version"], V1);
+    assert_eq!(s["current"]["version"], CAPABILITY_LESS_VERSION);
 }

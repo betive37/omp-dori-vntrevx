@@ -100,6 +100,9 @@ fn inconsistent_binding_locations_hold_instead_of_guessing() {
         [],
     )
     .unwrap();
+    let tx = db.transaction().unwrap();
+    maintain(&tx, 3).unwrap();
+    tx.commit().unwrap();
     let selected = Reads(db).lead_target(Some("A")).unwrap();
     assert!(selected.row.is_none());
     assert!(selected.hold.unwrap().contains("2 verified identities"));
@@ -214,4 +217,43 @@ fn explicit_fresh_intent_lifts_a_migrated_unbound_hold() {
     assert!(selected.hold.is_none(), "{selected:?}");
     assert_eq!(selected.intent, "fresh");
     assert!(selected.row.is_none());
+}
+
+#[test]
+fn explicit_fresh_binding_supersedes_only_older_unknown_attempt_holds() {
+    let mut db = database();
+    attempt(&mut db, "old", "fresh", 1);
+    bind(&mut db, "old", "A", 1);
+    attempt(&mut db, "unknown-old", "resume", 2);
+    db.execute(
+        "UPDATE sessions SET state = 'held' WHERE handle = 'unknown-old'",
+        [],
+    )
+    .unwrap();
+    let mut reads = Reads(db);
+    assert!(reads.lead_target(None).unwrap().hold.is_some());
+    attempt(&mut reads.0, "chosen-fresh", "fresh", 3);
+    bind(&mut reads.0, "chosen-fresh", "B", 3);
+    assert!(reads.lead_target(None).unwrap().hold.is_none());
+    let retained: String = reads
+        .0
+        .query_row(
+            "SELECT state FROM sessions WHERE handle = 'unknown-old'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        retained, "held",
+        "the old uncertain ownership record remains"
+    );
+    attempt(&mut reads.0, "unknown-new", "resume", 4);
+    reads
+        .0
+        .execute(
+            "UPDATE sessions SET state = 'held' WHERE handle = 'unknown-new'",
+            [],
+        )
+        .unwrap();
+    assert!(reads.lead_target(None).unwrap().hold.is_some());
 }
