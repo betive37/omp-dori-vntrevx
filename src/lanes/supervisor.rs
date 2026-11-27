@@ -66,8 +66,7 @@ impl<R: Runtime> Lanes<R> {
                 .await
             {
                 if let Some(recovery) = &recovery {
-                    recovery
-                        .end("held", Some(error.to_string()))
+                    self.hold_episode(recovery, &error.to_string())
                         .await
                         .map_err(|detail| rejected(detail, cleanup(&error)))?;
                 }
@@ -90,7 +89,7 @@ impl<R: Runtime> Lanes<R> {
                 Ok(pair) => return Ok(pair),
                 Err(error) => error,
             };
-            launch.record.startup_cleanup = cleanup(&error);
+            launch.record.startup_cleanup = Some(cleanup(&error));
             *launch.revision = self
                 .save(
                     launch.record,
@@ -99,6 +98,13 @@ impl<R: Runtime> Lanes<R> {
                 )
                 .await
                 .map_err(|detail| rejected(detail, cleanup(&error)))?;
+            if self
+                .starts
+                .stopping
+                .load(std::sync::atomic::Ordering::Acquire)
+            {
+                return Err(error);
+            }
             let Some(recovery) = &recovery else {
                 return Err(error);
             };
@@ -147,10 +153,11 @@ impl<R: Runtime> Lanes<R> {
                 .await
                 .map_err(|detail| rejected(detail, Cleanup::Unknown))?
                 .ok_or_else(|| rejected("recovery episode disappeared".into(), Cleanup::Unknown))?;
-            let prior = previous_exit(&self.env.state_dir, launch.record)
+            let prior = self
+                .previous_exit(launch.record)
                 .await
                 .map_err(|detail| rejected(detail, Cleanup::Unknown))?;
-            if !prior.confirmed() {
+            if let Some(prior) = prior.filter(|cleanup| !cleanup.confirmed()) {
                 return Err(rejected(
                     "previous startup writer exit is unconfirmed; work retained".into(),
                     prior,
@@ -159,7 +166,7 @@ impl<R: Runtime> Lanes<R> {
             if self.lease_free(launch.record.worker.as_deref(), id).await != Some(true) {
                 return Err(rejected(
                     "session lease is held or unknown; work retained".into(),
-                    prior,
+                    prior.unwrap_or_default(),
                 ));
             }
             launch.record.start_note = Some(format!(
@@ -175,19 +182,19 @@ impl<R: Runtime> Lanes<R> {
             launch.spec.handle = crate::host::random_hex(8);
         }
         launch.record.handle = Some(launch.spec.handle.clone());
-        launch.record.startup_cleanup = Cleanup::Unknown;
+        launch.record.startup_cleanup = Some(Cleanup::Unknown);
         *launch.revision = self
             .save(launch.record, Some(*launch.revision), None)
             .await
             .map_err(|detail| {
-                launch.record.startup_cleanup = Cleanup::NotSpawned;
+                launch.record.startup_cleanup = Some(Cleanup::NotSpawned);
                 StartError::Refused(detail)
             })?;
         // Ownership/lease reads and durable handle writes consume the same episode budget.
         if let (Some(recovery), Some(id)) = (recovery, &launch.spec.expected_id)
             && let Err(detail) = recovery.begin(id, false).await
         {
-            launch.record.startup_cleanup = Cleanup::NotSpawned;
+            launch.record.startup_cleanup = Some(Cleanup::NotSpawned);
             return Err(rejected(detail, Cleanup::NotSpawned));
         }
         Ok(())
@@ -212,16 +219,6 @@ impl<R: Runtime> Lanes<R> {
         })
         .await
     }
-}
-
-async fn previous_exit(state: &std::path::Path, rec: &Record) -> Result<Cleanup, String> {
-    if rec.startup_cleanup.confirmed() {
-        return Ok(rec.startup_cleanup);
-    }
-    let Some(handle) = &rec.handle else {
-        return Ok(Cleanup::Unknown);
-    };
-    crate::host::lead::ownership::reconcile_attempt(state, handle, rec.worker.as_deref()).await
 }
 
 pub(super) async fn stop<S: Control>(session: &S) -> Stopped {

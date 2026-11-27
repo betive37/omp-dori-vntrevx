@@ -16,6 +16,12 @@
 
 mod support;
 
+#[path = "workers/recovery.rs"]
+mod recovery;
+
+#[path = "workers/retention.rs"]
+mod retention;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -1200,14 +1206,6 @@ fn worker_resume_preserves_work(kind: &str) {
         }),
     )
     .unwrap();
-    if kind == "dirty" {
-        lane(
-            &hub,
-            "pause",
-            &json!({"key":"preserve","reason":"owner pause"}),
-        )
-        .unwrap();
-    }
     let before = record(&hub, "preserve");
     let tree = PathBuf::from(before["cwd"].as_str().unwrap());
     let files: &[(&str, &str)] = match kind {

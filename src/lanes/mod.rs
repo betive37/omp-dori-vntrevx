@@ -16,20 +16,23 @@ mod git;
 mod life;
 pub(crate) mod oversight;
 mod plan;
+mod preservation;
 mod publish;
 mod queue;
 pub(crate) mod record;
+mod recovery;
 mod remote;
+mod reopen;
 mod replies;
 mod review;
 pub(crate) mod shell;
 pub(crate) mod slots;
 mod starts;
 mod startup;
+mod status;
 mod supervisor;
 
 use std::collections::HashMap;
-use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
@@ -1054,7 +1057,8 @@ impl<R: Runtime> Lanes<R> {
             earlier_ids: Vec::new(),
             pid: None,
             start_note: None,
-            startup_cleanup: crate::host::startup::Cleanup::Unknown,
+            startup_cleanup: Some(crate::host::startup::Cleanup::Unknown),
+            pending_reopen: None,
             held_by: None,
             hold_reason: None,
             claim: None,
@@ -1320,7 +1324,7 @@ impl<R: Runtime> Lanes<R> {
         text: &str,
         identity: &str,
         deadline: Instant,
-    ) -> ReceiptState {
+    ) -> Result<ReceiptState, String> {
         let mailbox = self.mailbox(key);
         let message = Message {
             sender: HUB_SENDER.into(),
@@ -1328,20 +1332,18 @@ impl<R: Runtime> Lanes<R> {
             urgent: true,
             owner: false,
             identity: Some(identity.to_string()),
-            request_id: None,
+            request_id: Some(identity.to_string()),
         };
-        let Ok((receipt, id, _)) = mailbox.deliver(&message, Some(&**session), false).await else {
-            return ReceiptState::Failed;
-        };
+        let (receipt, id, _) = mailbox.deliver(&message, Some(&**session), false).await?;
         let Some(id) = id else {
-            return receipt.state;
+            return Ok(receipt.state);
         };
         loop {
             let state = mailbox.receipt(None, id).await.state;
             if !matches!(state, ReceiptState::Waiting | ReceiptState::Sent)
                 || Instant::now() >= deadline
             {
-                return state;
+                return Ok(state);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
             let _ = mailbox.flush(Some(&**session), false).await;
@@ -1583,64 +1585,6 @@ impl<R: Runtime> Lanes<R> {
             }));
         }
         Ok(Value::Array(out))
-    }
-
-    /// The status view (EVR-29, COORD-45): one line per open lane, or one named lane.
-    async fn board(&self, key: Option<&str>) -> Result<String, String> {
-        let rows = match key {
-            Some(k) => self.row(k).await?.into_iter().collect(),
-            None => self
-                .env
-                .store
-                .read(|r| r.lanes(true))
-                .await
-                .map_err(|e| e.to_string())?,
-        };
-        let now = now_ms();
-        let mut text = format!("{} lane(s)\n", rows.len());
-        for row in rows {
-            let Ok(rec) = serde_json::from_str::<Record>(&row.record) else {
-                let _ = writeln!(text, "{}  unknown (record damaged)", row.key);
-                continue;
-            };
-            let snap = self.session(&rec.key).map(|s| s.snapshot());
-            let agent = snap.as_ref().map_or("gone".to_string(), |s| {
-                format!("{:?}", s.status).to_lowercase()
-            });
-            let goal = snap
-                .as_ref()
-                .and_then(|s| s.goal.as_ref())
-                .map_or("unknown".into(), |g| {
-                    format!("{:?}", g.status).to_lowercase()
-                });
-            let approvals = snap.as_ref().map_or(0, |s| s.dialogs.len());
-            let (k, run) = (rec.key.clone(), rec.run_id.clone());
-            let last = self
-                .env
-                .store
-                .read(move |r| r.reports(&k, Some(&run), 1))
-                .await
-                .ok()
-                .and_then(|v| v.into_iter().next());
-            let report = last.map_or("no report".into(), |r| {
-                format!(
-                    "{} {}: {}",
-                    crate::jobs::instant_text(r.at_ms),
-                    r.kind,
-                    evidence::cut(&evidence::display(&r.text), 120)
-                )
-            });
-            let _ = writeln!(
-                text,
-                "{} [{}] {} | {}m | agent {agent} | goal {goal} | approvals {approvals} | {}",
-                rec.key,
-                rec.thread.as_deref().unwrap_or("-"),
-                rec.status(),
-                (now - rec.opened_ms) / 60_000,
-                report
-            );
-        }
-        Ok(text)
     }
 
     /// The drift report (LANE req. 71); changes nothing.

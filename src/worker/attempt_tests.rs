@@ -22,30 +22,43 @@ async fn only_acknowledged_reaped_attempts_are_forgotten() {
         retained.exit.wait().await,
         AttemptState::Reaped { .. }
     ));
-    let live = link.spawn(&argv, &cwd, &[], "live", None).await.unwrap();
-    link.call(
-        "forget_attempts",
-        json!({"attempts":["old", "missing"]}),
-        Duration::from_secs(15),
-    )
-    .await
-    .unwrap();
+    // An earlier connection's process still exists. Its lifetime is owned by the fixture,
+    // not the current worker channel, so the forget request must consult its saved identity.
+    let mut live = tokio::process::Command::new("sleep")
+        .arg("60")
+        .kill_on_drop(true)
+        .spawn()
+        .unwrap();
+    let mut live_record = super::attempt::Attempts::new(&root)
+        .begin("live", None)
+        .unwrap();
+    live_record.spawned(live.id()).await.unwrap();
+    let observed = link.attempts(&["live"]).await.unwrap();
     assert!(
-        link.call(
+        matches!(observed["live"], AttemptState::Running { .. }),
+        "{observed:?}"
+    );
+    link.forget_attempts(&["old", "missing"]).await.unwrap();
+    let refusal = link
+        .call(
             "forget_attempts",
             json!({"attempts":["live"]}),
-            Duration::from_secs(15)
+            Duration::from_secs(15),
         )
-        .await
-        .is_err()
-    );
+        .await;
+    assert!(refusal.is_err(), "{refusal:?}");
     assert!(!root.join("attempts/old.json").exists());
     assert!(root.join("attempts/retained.json").exists());
     assert!(root.join("attempts/live.json").exists());
+    super::attempt::Attempts::new(&root)
+        .begin("unknown", None)
+        .unwrap();
+    assert!(link.forget_attempts(&["unknown"]).await.is_err());
+    assert!(root.join("attempts/unknown.json").exists());
     let states = link.attempts(&["retained", "live"]).await.unwrap();
     assert!(matches!(states["retained"], AttemptState::Reaped { .. }));
     assert!(matches!(states["live"], AttemptState::Running { .. }));
-    drop(live);
+    live.kill().await.unwrap();
     link.mux.close();
     assert_eq!(serving.await.unwrap(), crate::cli::exit::OK);
 }

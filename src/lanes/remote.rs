@@ -398,6 +398,7 @@ impl<R: Runtime> Lanes<R> {
                 self.worker_note(&rec, &worker, true).await;
             }
         }
+        self.prune_attempts().await;
     }
 
     /// One line in the lane's thread, in the owner's language, when its worker drops (`back` false)

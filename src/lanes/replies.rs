@@ -14,6 +14,7 @@ use crate::store::host::episode::Episode;
 pub(super) struct Reply {
     first: Option<oneshot::Sender<String>>,
     continuing: bool,
+    pub(super) begun: bool,
 }
 
 impl Reply {
@@ -56,6 +57,7 @@ impl<R: Runtime> Lanes<R> {
         let mut reply = Reply {
             first: Some(first),
             continuing: false,
+            begun: false,
         };
         let lanes = Arc::clone(self);
         let key = key.to_string();
@@ -65,7 +67,14 @@ impl<R: Runtime> Lanes<R> {
             let (resumed, text) = match result {
                 Ok(text) => (true, text),
                 Err(why) => {
-                    lanes.reopen_refused(&key, &why).await;
+                    if reply.begun
+                        && !lanes
+                            .starts
+                            .stopping
+                            .load(std::sync::atomic::Ordering::Acquire)
+                    {
+                        lanes.reopen_refused(&key, &why).await;
+                    }
                     (
                         false,
                         format!("held: {why}; the work and worktree are kept"),
@@ -77,6 +86,7 @@ impl<R: Runtime> Lanes<R> {
             } else {
                 reply.send(text);
             }
+            lanes.prune_attempts().await;
         });
         answer
             .await
@@ -84,13 +94,55 @@ impl<R: Runtime> Lanes<R> {
     }
 
     async fn reopen_refused(&self, key: &str, why: &str) {
+        let Ok(_turn) = self.turn(key).await else {
+            return;
+        };
+        self.reopen_failed_locked(key, why).await;
+    }
+
+    pub(super) async fn reopen_failed_locked(&self, key: &str, why: &str) {
         let Ok((mut rec, rev)) = self.load(key).await else {
             return;
         };
-        if self.session(key).is_some()
-            || rec.start_note.as_deref() == Some("start failed; work retained")
+        if rec.state == super::record::State::Closed
+            || matches!(
+                rec.start_note.as_deref(),
+                Some("start failed; work retained" | "start held: model")
+            )
         {
             return;
+        }
+        if let Some(session) = self.session(key) {
+            let stopped = super::supervisor::stop(&*session).await;
+            rec.startup_cleanup = Some(stopped.cleanup);
+            self.drop_session(key);
+        }
+        if self
+            .starts
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+        {
+            if let Err(error) = self.save(&rec, Some(rev), None).await {
+                crate::log::warn(
+                    "interrupted reopen cleanup not saved",
+                    &[("lane", &key), ("error", &error)],
+                );
+            }
+            return;
+        }
+        let target = format!("lane:{key}");
+        if let Err(error) = self
+            .hold_episode(
+                &crate::host::startup::Recovery {
+                    store: &self.env.store,
+                    target: &target,
+                },
+                why,
+            )
+            .await
+        {
+            rec.receipt
+                .push(format!("recovery hold not recorded: {error}"));
         }
         super::cleanup::hold_failed(&mut rec, why);
         self.announce_hold(&rec, rev, why).await;

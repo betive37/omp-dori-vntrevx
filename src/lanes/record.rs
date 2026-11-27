@@ -130,9 +130,12 @@ pub(crate) struct Record {
     pub(crate) pid: Option<u32>,
     /// `start held: model`, `unconfirmed`, or why the start did not finish.
     pub(crate) start_note: Option<String>,
-    /// Exit evidence for `handle`; reset before each attempt is allowed to spawn.
+    /// Exit evidence for `handle`; absent only in records written before startup supervision.
     #[serde(default)]
-    pub(super) startup_cleanup: crate::host::startup::Cleanup,
+    pub(super) startup_cleanup: Option<crate::host::startup::Cleanup>,
+    /// An accepted reopen's episode, new-run checkpoint and note; absent in older records.
+    #[serde(default)]
+    pub(super) pending_reopen: Option<super::reopen::Pending>,
     pub(crate) held_by: Option<String>,
     pub(crate) hold_reason: Option<String>,
     pub(crate) claim: Option<Claim>,

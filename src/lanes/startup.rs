@@ -145,7 +145,7 @@ impl<R: Runtime> Lanes<R> {
             .map(|reason| format!("start held: {reason}"));
         let persisted = async {
             rev = self.save(&rec, Some(rev), note).await?;
-            if ownership.identity().is_some() {
+            if ownership.identity().is_some() && rec.pending_reopen.is_none() {
                 let target = format!("lane:{}", rec.key);
                 crate::host::startup::Recovery {
                     store: &self.env.store,
@@ -159,7 +159,7 @@ impl<R: Runtime> Lanes<R> {
         .await;
         if let Err(e) = persisted {
             let stopped = supervisor::stop(&*session).await;
-            rec.startup_cleanup = stopped.cleanup;
+            rec.startup_cleanup = Some(stopped.cleanup);
             return self
                 .start_failed(
                     rec,
@@ -212,6 +212,10 @@ impl<R: Runtime> Lanes<R> {
                 deadline,
             )
             .await;
+        let delivered = match delivered {
+            Ok(state) => state,
+            Err(why) => return self.unconfirmed(rec, rev, &why).await,
+        };
         if delivered != ReceiptState::Delivered {
             return self
                 .unconfirmed(

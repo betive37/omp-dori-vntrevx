@@ -1,12 +1,9 @@
-//! The only worktree removal boundary. Durable authority is necessary, never sufficient.
+//! Failed-start ownership: retain established runs and roll back only unused fresh allocations.
 
-use std::path::Path;
-use std::time::Duration;
-
+use super::Lanes;
 use super::record::{Intent, Record, State};
 use super::startup::Ownership;
 use super::supervisor;
-use super::{Lanes, git};
 use crate::host::{Runtime, StartError};
 use crate::store::lanes::{LaneDone, LaneWrite, Revision};
 
@@ -27,24 +24,48 @@ impl<R: Runtime> Lanes<R> {
         }
         let why = failure.to_string();
         let cleanup = supervisor::cleanup(&failure);
+        if self
+            .starts
+            .stopping
+            .load(std::sync::atomic::Ordering::Acquire)
+            && matches!(ownership, Ownership::ResumeExisting(_))
+        {
+            if let Err(error) = self
+                .save(
+                    &rec,
+                    Some(rev),
+                    Some("startup interrupted by hub shutdown; recovery retained".into()),
+                )
+                .await
+            {
+                crate::log::warn(
+                    "lane shutdown recovery not saved",
+                    &[("lane", &rec.key), ("error", &error)],
+                );
+            }
+            return "interrupted by hub shutdown; recovery and work retained".into();
+        }
         match ownership {
             Ownership::ResumeExisting((id, file)) => {
                 rec.session_id = Some(id.clone());
                 rec.session_file = Some(file.display().to_string());
                 let target = format!("lane:{}", rec.key);
-                if let Err(error) = (crate::host::startup::Recovery {
-                    store: &self.env.store,
-                    target: &target,
-                })
-                .end("held", Some(why.clone()))
-                .await
+                if let Err(error) = self
+                    .hold_episode(
+                        &crate::host::startup::Recovery {
+                            store: &self.env.store,
+                            target: &target,
+                        },
+                        &why,
+                    )
+                    .await
                 {
                     rec.receipt
                         .push(format!("recovery hold not recorded: {error}"));
                 }
             }
             Ownership::FreshAttempt => {
-                rec.startup_cleanup = cleanup;
+                rec.startup_cleanup = Some(cleanup);
                 // A bound attempt may already have background writers. It is not unused.
                 if rec.session_id.is_none() && cleanup.confirmed() {
                     rec.intent = Some(Intent {
@@ -63,40 +84,8 @@ impl<R: Runtime> Lanes<R> {
                     {
                         Ok(saved) => {
                             rev = saved;
-                            let mut removed = true;
-                            for path in &rec.worktrees {
-                                match self.remove_worktree(&rec, path).await {
-                                    Ok(()) => {
-                                        rec.receipt.push(format!("worktree {path} removed"));
-                                    }
-                                    Err(detail) => {
-                                        removed = false;
-                                        rec.receipt.push(format!("worktree {path} kept: {detail}"));
-                                    }
-                                }
-                            }
-                            if removed {
-                                match self
-                                    .env
-                                    .store
-                                    .lanes(LaneWrite::Delete {
-                                        key: rec.key.clone(),
-                                        expect: rev,
-                                    })
-                                    .await
-                                {
-                                    Ok(LaneDone::Done) => {
-                                        return format!(
-                                            "failed: {why}; unused allocation rolled back"
-                                        );
-                                    }
-                                    Ok(answer) => {
-                                        rec.receipt.push(format!("record retained: {answer:?}"));
-                                    }
-                                    Err(error) => {
-                                        rec.receipt.push(format!("record retained: {error}"));
-                                    }
-                                }
+                            if self.rollback_allocation(&mut rec, rev).await {
+                                return format!("failed: {why}; unused allocation rolled back");
                             }
                         }
                         Err(error) => rec
@@ -116,6 +105,36 @@ impl<R: Runtime> Lanes<R> {
         format!("failed: {detail}")
     }
 
+    /// The fresh rollback deletes its record only when every owned worktree was removed.
+    async fn rollback_allocation(&self, rec: &mut Record, rev: Revision) -> bool {
+        let mut removed = true;
+        for path in &rec.worktrees {
+            match self.remove_worktree(rec, path).await {
+                Ok(()) => rec.receipt.push(format!("worktree {path} removed")),
+                Err(detail) => {
+                    removed = false;
+                    rec.receipt.push(format!("worktree {path} kept: {detail}"));
+                }
+            }
+        }
+        if removed {
+            match self
+                .env
+                .store
+                .lanes(LaneWrite::Delete {
+                    key: rec.key.clone(),
+                    expect: rev,
+                })
+                .await
+            {
+                Ok(LaneDone::Done) => return true,
+                Ok(answer) => rec.receipt.push(format!("record retained: {answer:?}")),
+                Err(error) => rec.receipt.push(format!("record retained: {error}")),
+            }
+        }
+        false
+    }
+
     pub(super) async fn announce_hold(&self, rec: &Record, rev: Revision, detail: &str) {
         if let Err(error) = self.save(rec, Some(rev), Some(detail.to_string())).await {
             self.alert(
@@ -128,98 +147,6 @@ impl<R: Runtime> Lanes<R> {
             self.alert(&rec.key, "start held", detail, true);
         }
     }
-
-    /// Re-read authority and preservation immediately before non-forced Git removal, locally
-    /// or on the worker. Every unknown is a keep, including ignored files and stale ownership.
-    pub(super) async fn remove_worktree(&self, rec: &Record, path: &str) -> Result<(), String> {
-        let (saved, _) = self.load(&rec.key).await?;
-        if saved.run_id != rec.run_id || !saved.worktrees.iter().any(|p| p == path) {
-            return Err("worktree ownership changed".into());
-        }
-        let intent = saved
-            .intent
-            .as_ref()
-            .ok_or("no durable removal authority")?;
-        match intent.outcome.as_str() {
-            "completed" => {}
-            "fresh-rollback" if saved.session_id.is_none() => {}
-            _ => return Err("the intent does not authorize removal".into()),
-        }
-        if !intent.quiescence.confirmed() {
-            return Err(
-                "writer exit is unconfirmed (worker removal requires a reap acknowledgement)"
-                    .into(),
-            );
-        }
-        if self
-            .session(&rec.key)
-            .is_some_and(|s| crate::host::Control::alive(&*s))
-        {
-            return Err("a lane writer is still live".into());
-        }
-        if saved.doubt.is_some() || self.undelivered(&rec.key).await > 0 {
-            return Err("input is pending or uncertain".into());
-        }
-        if self.holds_published(path).await {
-            return Err("it holds a published file".into());
-        }
-        if let Some(id) = &saved.session_id
-            && self.lease_free(saved.worker.as_deref(), id).await != Some(true)
-        {
-            return Err("session lease is held or unknown".into());
-        }
-        let place = saved.place();
-        let dir = Path::new(path);
-        let limit = Duration::from_secs(60);
-        let (ok, status) = git::git(
-            &place,
-            dir,
-            &[
-                "status",
-                "--porcelain",
-                "--untracked-files=all",
-                "--ignored",
-            ],
-            limit,
-        )
-        .await?;
-        if !ok || !status.is_empty() {
-            return Err(
-                "tracked, untracked or ignored content exists, or status is unreadable".into(),
-            );
-        }
-        let (ok, commits) = git::git(
-            &place,
-            dir,
-            &["rev-list", "--count", "HEAD", "--not", "--remotes"],
-            limit,
-        )
-        .await?;
-        if !ok || commits.trim() != "0" {
-            return Err("unpushed commits exist or commit preservation is unknown".into());
-        }
-        let (ok, _) = git::git(&place, dir, &["worktree", "remove", path], limit).await?;
-        if ok {
-            Ok(())
-        } else {
-            Err("git worktree remove refused; retained".into())
-        }
-    }
-}
-
-/// Restore only the hub's failed-start hold; an owner's paused goal remains paused.
-pub(super) fn prepare_restart(rec: &mut Record) -> bool {
-    if rec.start_note.as_deref() == Some("start failed; work retained") {
-        if rec.held_by.as_deref() == Some("hub") {
-            rec.state = rec.prev.unwrap_or(rec.state);
-            rec.prev = None;
-            rec.held_by = None;
-            rec.hold_reason = None;
-        }
-        rec.start_note = None;
-    }
-    rec.lost = None;
-    matches!(rec.state, State::Running | State::Rejected | State::Claimed)
 }
 
 pub(super) fn hold_failed(rec: &mut Record, why: &str) {

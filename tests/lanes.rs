@@ -11,6 +11,15 @@
 
 mod support;
 
+#[path = "lanes/recovery.rs"]
+mod recovery;
+
+#[path = "lanes/tern_recovery.rs"]
+mod tern_recovery;
+
+#[path = "lanes/reopen.rs"]
+mod reopen;
+
 use std::io::{BufRead as _, BufReader, Write as _};
 use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
@@ -621,7 +630,7 @@ fn park_and_reopen_on_the_exact_session() {
         "{refused}"
     );
     let held = record(&hub, "k-2");
-    assert_eq!(held["state"], "held");
+    assert_eq!(held["state"], "closed");
     assert_eq!(held["session_id"], k2["session_id"]);
     assert_eq!(held["run_id"], k2["run_id"]);
     hub.stop();
@@ -889,9 +898,8 @@ fn reports_reach_the_thread_by_policy() {
     hub.stop();
 }
 
-/// Check 10 (decision 9): three running lanes, two with active goals and one paused by the lead, are
-/// restarted on their exact files after a hub restart; the two get `goal resume`, the paused one
-/// stays paused, the lead receives the recap.
+/// Running lanes resume on their exact files; an owner-paused lane stays down with its goal paused.
+/// The owner receives the recap of both outcomes.
 #[test]
 fn hub_restart_brings_lanes_back_on_their_files() {
     let (mut hub, _) = lane_hub("");
@@ -917,7 +925,7 @@ fn hub_restart_brings_lanes_back_on_their_files() {
             .iter()
             .map(|k| record(&hub, k))
             .collect();
-        r.iter().all(|x| x["live"] == true).then_some(r)
+        (r[0]["live"] == true && r[1]["live"] == true && r[2]["live"] == false).then_some(r)
     });
     for (b, a) in before.iter().zip(&after) {
         assert_eq!(a["session_id"], b["session_id"], "{a}");
@@ -929,19 +937,20 @@ fn hub_restart_brings_lanes_back_on_their_files() {
     assert_eq!(goal(&hub, &after[0]["session_id"]), "active");
     assert_eq!(goal(&hub, &after[2]["session_id"]), "paused");
     assert_eq!(after[2]["state"], "held");
+    assert_eq!(after[2]["live"], false);
     let recap = hub.until(WAIT, || {
         let r = events_of(&hub, "lane.recap");
         (!r.is_empty()).then_some(r)
     });
     let text = recap[0]["text"].as_str().unwrap();
-    assert!(text.contains("a-3: restarted; stays held"), "{text}");
+    assert!(text.contains("a-3: held:"), "{text}");
     assert!(text.contains("a-1: restarted; goal active"), "{text}");
     owner.wait(WAIT, |fake| {
         fake.bot_messages(CH)
             .iter()
             .any(|message| {
                 let text = message["content"].as_str().unwrap();
-                text.contains("a-1: restarted") && text.contains("a-3: restarted")
+                text.contains("a-1: restarted") && text.contains("a-3: held:")
             })
             .then_some(())
     });
@@ -1628,14 +1637,6 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
             "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
         }),
     );
-    if kind == "dirty" {
-        lane(
-            &hub,
-            "pause",
-            &json!({"key":"preserve","reason":"owner pause"}),
-        )
-        .unwrap();
-    }
     let before = record(&hub, "preserve");
     let files: &[(&str, &str)] = match kind {
         "dirty" => &[("a.txt", "tracked work"), ("new.txt", "untracked work")],
@@ -1693,11 +1694,7 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
     }
     assert_eq!(
         goal(&hub, &before["session_id"]),
-        if kind == "dirty" || reopen {
-            "paused"
-        } else {
-            "active"
-        }
+        if reopen { "paused" } else { "active" }
     );
     hub.stop();
 }
