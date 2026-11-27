@@ -158,7 +158,8 @@ in their own areas; this spec only states what lifecycle needs from them.
     "starting" durably before the process spawns; after the start it is marked "started". A crash between the two
     leaves "starting", which is shown to the lead and never retried automatically.
 27. Cancelling a queued launch is refused once a lane record exists for the key. Cancelling removes no process or
-    worktree.
+    worktree. A queued launch is a fresh start: if it fails, only what that attempt itself allocated and never used
+    may be rolled back (61); it never claims or removes another run's resources.
 
 ### The lane record and listing (LANE-13, LANE-20, LANE-28, LANE-31, LANE-33)
 
@@ -265,9 +266,14 @@ in their own areas; this spec only states what lifecycle needs from them.
     uncommitted changes or commits on no remote count. Untracked files do not. Git state that cannot be read counts
     as unsent work. Git commands run with inherited git override variables removed and the C locale.
 61. Worktree ownership: worktrees created at open, plus worktrees the lane registers through the extension. (The old
-    name-prefix guess is a fallback only for lanes migrated without a list; see questions.) Removal is the
-    non-forced git removal; a failure or a worktree that the artifacts area marks as needed is kept and named in the
-    receipt.
+    name-prefix guess is a fallback only for lanes migrated without a list; see questions.) Removal has one boundary:
+    it needs a durable close intent (or the rollback of a fresh attempt's own unused allocation), the writer proven
+    gone (on a worker, the worker's acknowledgement; a dropped connection is not one), and a fresh preservation check
+    at removal time. Tracked changes, untracked files, ignored files (build caches included), commits on no remote,
+    uncertain input, a worktree the artifacts area marks as needed, and any check that cannot be read all keep the
+    worktree. Removal is the non-forced git removal; a failure keeps the record and the worktree and is named in
+    the receipt. Disposing of kept ignored files or caches is a separate, explicit owner action, never part of a
+    close or of a recovery.
 62. Crash during close: on restart, a lane with a recorded close intent resumes the close from the step it reached,
     using the recorded intent; it never starts over or re-runs checks with a different result.
 
@@ -282,8 +288,11 @@ in their own areas; this spec only states what lifecycle needs from them.
     cleared, report-tracking fields reset, thread, completion condition and history kept); start OMP resuming the exact
     session file; confirm within the start deadline that the live session ID and file equal the saved ones; then
     continue (45); then, if a note was given, send it once. An unconfirmed note is reported and never resent.
-66. If the start or identity check fails, the lane stays registered in held state with the new revision, the reason is
-    reported, and the lead must inspect before continuing. Removed worktrees are not recreated.
+66. If the start or identity check fails, the lane stays registered in held state with the new revision and its
+    session, run, thread, mailbox, goal and worktree ownership, the reason is reported, and the lead must inspect
+    before continuing. A failed resume never removes a record or a worktree. Removed worktrees are not recreated.
+    Reopen answers once it knows: resumed, recovering (a timed-out attempt retries within its recovery episode,
+    which then reports its final result to the owner and the lane's thread), or held.
 
 ### Death, crash and reconciliation (LANE-26, LANE-27)
 
@@ -292,11 +301,18 @@ in their own areas; this spec only states what lifecycle needs from them.
     few transcript lines.
 68. Tern: the extension keeps a connection to the daemon. If it closes, or tern reports the block gone, the lane is
     marked lost the same way. A connection that misses heartbeats for 45 s is treated as closed.
-69. A lost lane is never deleted and its worktrees are kept. Recovery is reopen-style restart of the same session (65),
-    on an explicit instruction (see questions for daemon restarts).
+69. A lost lane is never deleted and its worktrees are kept. Recovery is a reopen-style restart of the same session
+    (65), with the start supervision of the session-host spec: one 60 s deadline per attempt from spawn to binding,
+    a still-starting notice at 15 s, retries only of a timed-out attempt whose exit is verified (on a worker, by the
+    worker), and a 300 s recovery episode per lane that survives hub restarts. Anything else holds the lane with its
+    diagnostics and everything it owns.
 70. At daemon start, before taking any new work, reconcile every open lane: live and identical identity, re-attach;
-    process gone, mark lost (or finish a recorded close or park intent, 52 and 62); a "starting" record with no
-    confirmed kickoff, mark start failed or unconfirmed by the rule in 16. Report a summary line per lane to the lead.
+    process gone, finish a recorded close or park intent (52 and 62), else resume a lane that was running on its
+    exact session once its lease is free (69), keeping active goals and never replaying its kickoff; a "starting"
+    record with no confirmed kickoff, mark start failed or unconfirmed by the rule in 16. A worker that reconnects
+    brings its lanes back the same way. Report a summary line per lane to the lead. Batches written to a lane before
+    the restart follow the session-host delivery rule (107): a batch on a worker whose connection dropped is never
+    written again automatically.
 71. On demand the lead can ask for a drift report: lanes whose session is gone, lanes whose live session ID differs
     from the record, tern blocks running OMP that belong to no lane, and lanes with an empty completion condition.
     The report changes nothing.
@@ -331,6 +347,8 @@ in their own areas; this spec only states what lifecycle needs from them.
 - Every lane record: inputs, identity (35), state, revision history, claim, objection, close or park intent,
   receipt, thread, owned worktrees, ceilings, run ID, earlier session IDs.
 - The assembled brief text per lane.
+- Per lane, its recovery episode (retries, next retry, deadline, state, first cause) and the cleanup evidence of
+  its last start attempt.
 - Queued launches with their state, predecessors, expiry and last notice sent.
 - Request-ID dedupe entries (digest and outcome).
 - Shell rule snapshots and their grants (used or not) and the most recent block per lane.
