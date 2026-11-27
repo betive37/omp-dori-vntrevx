@@ -580,6 +580,11 @@ fn an_uncertain_telegram_answer_is_never_posted_again() {
     let (said, error) = lead.tool(&call("second"));
     assert!(!error && said.contains("follow-up"), "{said}");
     assert_eq!(sends(), 2);
+    // That follow-up answered the request let go after the uncertain first answer: its owed reply
+    // is settled, not left open.
+    let s = status(&hub, "telegram");
+    assert_eq!(s["counts"]["owed_open"], 0, "{s}");
+    assert_eq!(s["counts"]["owed_settled"], 1, "{s}");
     tg.script_send(500);
     let (said, error) = lead.tool(&call("third"));
     assert!(error && said.contains("check the room"), "{said}");

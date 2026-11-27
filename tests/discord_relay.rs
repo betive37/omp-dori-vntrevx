@@ -1737,6 +1737,30 @@ fn a_repeated_answer_is_posted_once() {
     assert!(hub.stop().success());
 }
 
+/// A long answer repeated is matched against its stored parts too. They are split at Discord's
+/// full limit, as every earlier version split them, so a repeat after an upgrade still matches the
+/// parts an earlier version stored and posts nothing.
+#[test]
+fn a_repeated_long_answer_matches_its_stored_parts() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_323, "long");
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let call = json!({ "op": "answer", "message": format!("discord:{CH}/{source}"),
+        "text": "word ".repeat(600) });
+    let (said, error) = lead.tool(&call);
+    assert!(!error && said.contains("(2 part(s))"), "{said}");
+    let (said, error) = lead.tool(&call);
+    assert!(!error && said.contains("already posted"), "{said}");
+    let posted = fake.bot_messages(CH);
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    let first = posted[0]["content"].as_str().unwrap();
+    assert!(first.encode_utf16().count() > 1958, "{}", first.len());
+    assert!(hub.stop().success());
+}
+
 /// The answer of a hand-off as stored.
 fn handoff_answer(hub: &TestHub, source: &str) -> String {
     let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();

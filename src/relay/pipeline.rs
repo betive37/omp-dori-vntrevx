@@ -1353,7 +1353,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             Err(Self::unsure(&tag))
         } else {
             Err(format!(
-                "follow-up to {tag}: {out} of {} part(s) posted; repeating the same call posts only what is missing",
+                "follow-up to {tag}: {out} of {} part(s) posted; repeating the same text with no room posts only what is missing",
                 now.len()
             ))
         }

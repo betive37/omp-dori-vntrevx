@@ -751,6 +751,15 @@ fn write_marks(tx: &Transaction<'_>, change: &RelayWrite, now: i64) -> rusqlite:
                     params![relay, room, message, now],
                 )?;
             }
+            // A follow-up answered a request let go: its owed reply is settled with it, though no
+            // linked first part of the request's own answer is confirmed.
+            if answer == "posted" {
+                tx.execute(
+                    "UPDATE owed_replies SET settled_ms = ?4 WHERE relay = ?1 AND room = ?2 \
+                     AND message = ?3 AND settled_ms IS NULL",
+                    params![relay, room, message, now],
+                )?;
+            }
             Ok(RelayDone::Done)
         }
         RelayWrite::Question {

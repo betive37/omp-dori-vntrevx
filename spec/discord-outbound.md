@@ -137,7 +137,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     120 s. A request the lead never answers is let go after the obligation window (34); a later
     `answer` to it is still its answer: with nothing of an answer stored it is posted as the
     first answer and settles the request as posted, and after an answer of uncertain outcome a
-    follow-up that is posted in full settles it as posted too;
+    follow-up that is posted in full settles it as posted too, its owed reply with it. A
+    follow-up only partly posted is completed by the same text again with no room (a room named
+    again must be the one it went to, which a part moved from a closed thread changes);
     reminders and the stop notice (35) name the operation, and a final message never counts as an
     answer for the stop gate. While onboarding runs (read-only) an answer in place, as the reply
     to the owner's message, still goes out (it carries onboarding's questions); one that would go
