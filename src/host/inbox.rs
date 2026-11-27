@@ -1002,10 +1002,7 @@ impl Mailbox {
 
 /// Whether two recorded paths name the same session file: equal, or the same file once resolved.
 fn same_file(a: &str, b: &str) -> bool {
-    a == b
-        || std::fs::canonicalize(a)
-            .ok()
-            .is_some_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
+    a == b || std::fs::canonicalize(a).is_ok_and(|a| std::fs::canonicalize(b).is_ok_and(|b| a == b))
 }
 
 impl Receipt {

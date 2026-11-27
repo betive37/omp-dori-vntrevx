@@ -814,22 +814,21 @@ impl<R: Runtime> Lead<R> {
     /// Starts the lead (COORD req. 2): refused when a lead runs; resume or fresh by [`plan`]. Earlier
     /// automatic restarts no longer count.
     pub(crate) async fn start(self: &Arc<Self>, fresh: bool) -> Result<View, String> {
-        let _one = match self.starting.try_lock() {
-            Ok(lock) => lock,
-            Err(_) => {
-                // Only a different, explicit target supersedes an owned startup. A second
-                // same-target request must not turn the first fresh attempt into a held failure.
-                if fresh {
-                    self.startup_cancel.send_replace(true);
-                }
-                let lock = self.starting.lock().await;
-                if !fresh {
-                    return Err(self
-                        .refusal()
-                        .unwrap_or_else(|| "a lead is already running".into()));
-                }
-                lock
+        let _one = if let Ok(lock) = self.starting.try_lock() {
+            lock
+        } else {
+            // Only a different, explicit target supersedes an owned startup. A second
+            // same-target request must not turn the first fresh attempt into a held failure.
+            if fresh {
+                self.startup_cancel.send_replace(true);
             }
+            let lock = self.starting.lock().await;
+            if !fresh {
+                return Err(self
+                    .refusal()
+                    .unwrap_or_else(|| "a lead is already running".into()));
+            }
+            lock
         };
         self.startup_cancel.send_replace(true);
         if self.current().is_some_and(|session| session.alive()) {

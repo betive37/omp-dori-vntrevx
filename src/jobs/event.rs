@@ -702,7 +702,7 @@ impl Emit {
     }
 
     /// Sends a hub event to the owner's home room too ([`owner_post`]).
-    pub(crate) fn to_owner(mut self) -> Self {
+    pub(crate) fn for_owner(mut self) -> Self {
         self.owner = true;
         self
     }

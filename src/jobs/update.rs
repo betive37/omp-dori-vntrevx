@@ -225,7 +225,12 @@ async fn sessions(
     watched: &mut BTreeSet<String>,
 ) -> Option<Resumed> {
     let mut r = resumed()?;
-    let episodes = match jobs.ctx().store.read(|r| r.startup_episodes()).await {
+    let episodes = match jobs
+        .ctx()
+        .store
+        .read(crate::store::Reads::startup_episodes)
+        .await
+    {
         Ok(episodes) => episodes,
         Err(e) => {
             log::warn("lane recovery not read", &[("error", &e)]);
@@ -865,6 +870,10 @@ mod tests {
         }
         assert!(!last.text.contains("확정되면 따로"), "{}", last.text);
         assert!(polls.load(Ordering::SeqCst) > 200);
+    }
+
+    #[test]
+    fn update_summary_preserves_recovery_and_hold_guidance() {
         let english = |r: Resumed| resumed_text(Language::English, Some(r));
         let recovering = english(Resumed {
             lead_start: Some(LeadStart::NotRunning),

@@ -168,7 +168,7 @@ pub(crate) fn lead_check(view: &crate::host::lead::View) -> Check {
             )
         }
         Phase::Live => check("lead", "ok", said("running"), None),
-        Phase::Starting if view.recovering => check(
+        Phase::Starting | Phase::Stopped if view.recovering => check(
             "lead",
             "info",
             evidence(said("recovering")),
@@ -176,12 +176,6 @@ pub(crate) fn lead_check(view: &crate::host::lead::View) -> Check {
         ),
         Phase::Starting => check("lead", "ok", "starting", None),
         Phase::NotStarted => check("lead", "info", said("not started"), None),
-        Phase::Stopped if view.recovering => check(
-            "lead",
-            "info",
-            evidence(said("recovering")),
-            Some("cataly lead status"),
-        ),
         Phase::Stopped => check("lead", "info", said("stopped"), None),
         Phase::Held => check(
             "lead",

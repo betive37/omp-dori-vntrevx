@@ -1217,7 +1217,7 @@ fn a_slow_resume_tells_the_owner_at_15_s_once() {
     w.hub.until(Duration::from_secs(10), || {
         (!w.starts("resume").is_empty()).then_some(())
     });
-    assert!(told(&w.hub, "lead.slow").is_empty());
+    assert_eq!(told(&w.hub, "lead.slow"), Vec::<Value>::new());
     let slow = w.hub.until(Duration::from_secs(25), || {
         let n = told(&w.hub, "lead.slow");
         (!n.is_empty()).then_some(n)
@@ -1247,7 +1247,7 @@ fn a_slow_resume_tells_the_owner_at_15_s_once() {
     assert_eq!(back["session"]["session_id"], id, "{back}");
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(told(&w.hub, "lead.slow").len(), 1, "once");
-    assert!(told(&w.hub, "lead.held").is_empty());
+    assert_eq!(told(&w.hub, "lead.held"), Vec::<Value>::new());
     assert!(w.hub.stop().success());
     w.no_orphans();
 }

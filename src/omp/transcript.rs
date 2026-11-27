@@ -1263,7 +1263,7 @@ mod tests {
             serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
                 .to_string()
         };
-        let suffix = usize::try_from(SEARCH_TAIL).unwrap() - (edge.len() + 1) / 2;
+        let suffix = usize::try_from(SEARCH_TAIL).unwrap() - edge.len().div_ceil(2);
         let pad = assistant(&"x".repeat(suffix - 1 - assistant("").len()));
         assert_eq!(pad.len() + 1, suffix);
         fs::write(

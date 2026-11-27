@@ -194,7 +194,7 @@ async fn one(env: &Env, notice: Notice) -> Result<(), String> {
                 Emit::new(EventKind::LeadSlow, Severity::Warning, true, LEAD)
                     .with("notice", text)
                     .with("session", session.unwrap_or_default())
-                    .to_owner(),
+                    .for_owner(),
             );
         }
         Notice::Held(reason) => {
@@ -209,8 +209,8 @@ async fn one(env: &Env, notice: Notice) -> Result<(), String> {
                 Emit::new(EventKind::LeadHeld, Severity::Warning, true, LEAD)
                     .with("notice", text)
                     .with("reason", reason)
-                    .with("session", anchor.map(|a| a.session_id).unwrap_or_default())
-                    .to_owner(),
+                    .with("session", anchor.map_or_default(|a| a.session_id))
+                    .for_owner(),
             );
         }
     }
