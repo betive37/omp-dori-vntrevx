@@ -90,7 +90,7 @@ pub(crate) struct Tern {
 impl Tern {
     /// `tern new tab [SESSION] --cwd DIR -- /usr/bin/env CATALY_LAUNCH=.. CATALY_SOCKET=.. omp ..`.
     fn argv(&self, tern: &Path, spec: &StartSpec, token: &str) -> Vec<String> {
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let omp = Launch {
             exe: &self.omp,
             model: &spec.model,
@@ -100,7 +100,7 @@ impl Tern {
             instructions: spec.instructions.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .tui_argv();
         let mut argv = vec![tern.display().to_string(), "new".into(), "tab".into()];

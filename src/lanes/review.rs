@@ -17,10 +17,12 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use tokio::sync::Semaphore;
 
+use super::Lanes;
 use super::docs::{self, VERDICT};
-use super::{LOOK_ONLY, Lanes};
 use crate::host::Runtime;
 use crate::log;
+use crate::omp::launch::write_overlay;
+use crate::omp::tools::{self, Role as ToolRole};
 use crate::params as p;
 use crate::sys::command::{self, KILL_GRACE, Output, Spec};
 use crate::sys::now_ms;
@@ -93,8 +95,8 @@ fn prompt(repo: &str, number: u64, head: &str, text: &Path) -> String {
 }
 
 /// The built-in reviewer's command line (DESIGN 9.2, OPC-46): print mode without a session, the
-/// lanes' overlay, the look-only tools, `always-ask` (print mode has nobody to approve, so any other
-/// call is refused) and OMP's cost cap.
+/// reviewer's policy overlay, the inspection tools, `always-ask` (print mode has nobody to approve,
+/// so any other call is refused) and OMP's cost cap.
 fn reviewer_argv(
     exe: &Path,
     overlay: &Path,
@@ -109,9 +111,11 @@ fn reviewer_argv(
         "--approval-mode".into(),
         "always-ask".into(),
         format!("--config={}", overlay.display()),
-        format!("--tools={LOOK_ONLY}"),
-        format!("--max-cost={max_cost}"),
     ];
+    if let Some(tools) = tools::selection(ToolRole::Reviewer) {
+        argv.push(format!("--tools={tools}"));
+    }
+    argv.push(format!("--max-cost={max_cost}"));
     if let Some(m) = model {
         argv.push(format!("--model={m}"));
     }
@@ -303,7 +307,8 @@ impl<R: Runtime> Lanes<R> {
                 .text(input)
                 .map(str::to_string)
                 .or_else(|| config.coord.review_model.clone());
-            let overlay = self.overlay(&config)?;
+            let overlay = write_overlay(&self.env.state_dir, &config.fallback, ToolRole::Reviewer)
+                .map_err(|e| e.to_string())?;
             let text = self.review_file(&repo, number, &head, &cwd).await?;
             let argv = reviewer_argv(
                 &exe,

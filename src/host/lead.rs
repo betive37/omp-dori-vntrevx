@@ -242,7 +242,7 @@ fn lead_spec(
         expected_id,
         instructions: settings.instructions.clone(),
         max_cost: None,
-        tools: None,
+        look_only: false,
         worker: None,
     }
 }
@@ -990,8 +990,12 @@ impl<R: Runtime> Lead<R> {
         if let Some(path) = self.overlay.get() {
             return Ok(path.clone());
         }
-        let path = crate::omp::launch::write_overlay(&self.env.state_dir, &config.fallback, false)
-            .map_err(|e| e.to_string())?;
+        let path = crate::omp::launch::write_overlay(
+            &self.env.state_dir,
+            &config.fallback,
+            crate::omp::tools::Role::Lead,
+        )
+        .map_err(|e| e.to_string())?;
         Ok(self.overlay.get_or_init(|| path).clone())
     }
 

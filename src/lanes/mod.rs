@@ -59,9 +59,6 @@ const ANSWER_MAX: usize = 64 * 1024;
 const WAKE_TEXT: usize = 500;
 /// The kickoff line the lead gives a new thread, in characters.
 const KICKOFF_MAX: usize = 1000;
-/// The look-only tool set (OPC-46), also the reviewer's. OMP 19.1.1 refuses `--tools` naming an
-/// unknown tool (`ls`) or one unavailable in the session (`find` needs a native judge model).
-const LOOK_ONLY: &str = "read,grep,glob";
 
 pub(crate) type BoxFut<'a, T> = Pin<Box<dyn Future<Output = T> + Send + 'a>>;
 
@@ -125,7 +122,7 @@ pub(crate) struct Lanes<R: Runtime> {
     opening: Mutex<Vec<String>>,
     /// Closes on threads are serialised so two last lanes cannot both skip the hook (LANE req. 42).
     closing: AsyncMutex<()>,
-    overlay: OnceLock<PathBuf>,
+    overlay: OnceLock<()>,
     spend: Mutex<HashMap<String, crate::omp::transcript::SpendTree>>,
     /// Wakes oversight early (a report, a state change, a claim).
     pub(crate) nudge: Notify,
@@ -391,14 +388,20 @@ impl<R: Runtime> Lanes<R> {
         }
     }
 
-    /// The lanes' overlay, written once per hub run (DESIGN 4.2): goal mode on (decision 5).
-    fn overlay(&self, config: &Config) -> Result<PathBuf, String> {
-        if let Some(path) = self.overlay.get() {
-            return Ok(path.clone());
+    /// Both lane profiles, written once per hub run; workers use these same files.
+    fn overlay(&self, config: &Config) -> Result<(), String> {
+        if self.overlay.get().is_some() {
+            return Ok(());
         }
-        let path = crate::omp::launch::write_overlay(&self.env.state_dir, &config.fallback, true)
-            .map_err(|e| e.to_string())?;
-        Ok(self.overlay.get_or_init(|| path).clone())
+        for role in [
+            crate::omp::tools::Role::Lane,
+            crate::omp::tools::Role::LookOnly,
+        ] {
+            crate::omp::launch::write_overlay(&self.env.state_dir, &config.fallback, role)
+                .map_err(|e| e.to_string())?;
+        }
+        self.overlay.get_or_init(|| ());
+        Ok(())
     }
 
     /// Admission for every open, reopen and restart (LANE req. 18; C14). A lane on a worker is
@@ -1289,7 +1292,7 @@ impl<R: Runtime> Lanes<R> {
             expected_id: expected,
             instructions: None,
             max_cost: rec.ceilings.cost,
-            tools: rec.look_only.then(|| LOOK_ONLY.to_string()),
+            look_only: rec.look_only,
             worker: rec.worker.clone(),
         })
     }

@@ -6,6 +6,7 @@ pub(crate) mod extension;
 pub(crate) mod launch;
 pub(crate) mod probe;
 pub(crate) mod rpc;
+pub(crate) mod tools;
 pub(crate) mod transcript;
 pub(crate) mod usage;
 

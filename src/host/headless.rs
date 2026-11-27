@@ -91,7 +91,7 @@ impl Runtime for Headless {
         if let Some(worker) = spec.worker.clone() {
             return self.start_remote(spec, &worker, &token).await;
         }
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let argv = Launch {
             exe: &self.exe,
             model: &spec.model,
@@ -101,7 +101,7 @@ impl Runtime for Headless {
             instructions: spec.instructions.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .argv();
         let env = session_env(&self.credentials, &self.socket, &token);
@@ -156,7 +156,7 @@ impl Headless {
             root.join("settings")
                 .join(local.file_name().unwrap_or_default())
         };
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let (overlay_there, instructions_there) =
             (there(&overlay), spec.instructions.as_deref().map(there));
         let copies = std::iter::once((&overlay, &overlay_there))
@@ -197,7 +197,7 @@ impl Headless {
             instructions: instructions_there.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .argv();
         // The worker's own OMP profile and logins: nothing of this machine's environment goes along.

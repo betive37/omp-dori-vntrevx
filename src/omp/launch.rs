@@ -15,6 +15,7 @@ use std::path::{Path, PathBuf};
 
 use serde_json::{Map, Value, json};
 
+use super::tools::{self, Class, Role};
 use crate::config::session::FallbackSettings;
 use crate::sys::fs::{FsError, write_atomic};
 
@@ -40,8 +41,8 @@ pub(crate) struct Launch<'a> {
     pub(crate) extra: &'a [String],
     /// `--max-cost` (a lane's cost ceiling, WS-18).
     pub(crate) max_cost: Option<f64>,
-    /// `--tools` (a look-only lane, OPC-46).
-    pub(crate) tools: Option<&'a str>,
+    /// Tool policy role; transport does not alter the policy.
+    pub(crate) role: Role,
 }
 
 impl Launch<'_> {
@@ -80,7 +81,7 @@ impl Launch<'_> {
         if let Some(cost) = self.max_cost {
             argv.push(format!("--max-cost={cost}"));
         }
-        if let Some(tools) = self.tools {
+        if let Some(tools) = tools::selection(self.role) {
             argv.push(format!("--tools={tools}"));
         }
         argv
@@ -113,11 +114,12 @@ pub(crate) fn session_env(
 /// The overlay file of a session kind in the state directory. Lanes run OMP goals (decision 5);
 /// the lead holds no standing goal (OPC-36, DESIGN 9.1), so its overlay turns goal mode off and OMP
 /// itself refuses a goal and hides the goal tool there.
-pub(crate) fn overlay_path(state: &Path, lane: bool) -> PathBuf {
-    state.join(if lane {
-        "omp-overlay-lane.yml"
-    } else {
-        "omp-overlay.yml"
+pub(crate) fn overlay_path(state: &Path, role: Role) -> PathBuf {
+    state.join(match role {
+        Role::Lead => "omp-overlay.yml",
+        Role::Lane | Role::Subagent => "omp-overlay-lane.yml",
+        Role::LookOnly => "omp-overlay-look-only.yml",
+        Role::Reviewer => "omp-overlay-reviewer.yml",
     })
 }
 
@@ -133,8 +135,8 @@ pub(crate) const NO_REDEEM: [(&str, &str); 5] = [
     ("claudeResets", "autoRedeemFable"),
 ];
 
-/// The overlay's settings for a lane (`lane`) or the lead.
-pub(crate) fn overlay(fallback: &FallbackSettings, lane: bool) -> Value {
+/// The role's overlay. Goal continuation is explicit; every hidden capability comes from the table.
+pub(crate) fn overlay(fallback: &FallbackSettings, role: Role) -> Value {
     let mut retry = Map::new();
     retry.insert("modelFallback".into(), Value::Bool(true));
     retry.insert("fallbackRevertPolicy".into(), json!("cooldown-expiry"));
@@ -145,14 +147,13 @@ pub(crate) fn overlay(fallback: &FallbackSettings, lane: bool) -> Value {
         retry.insert("fallbackChains".into(), json!(fallback.chains));
     }
     let mut root = Map::new();
-    // Disabling both kernels keeps eval and its commit instructions out of model requests.
-    // Keep the approval denial: eval can run commands outside Cataly's shell rules.
-    root.insert("eval".into(), json!({ "py": false, "js": false }));
-    root.insert("tools".into(), json!({ "approval": { "eval": "deny" } }));
     root.insert("ask".into(), json!({ "timeout": 0 }));
     root.insert(
         "goal".into(),
-        json!({ "enabled": lane, "continuationModes": ["interactive", "rpc"] }),
+        json!({
+            "enabled": tools::STOCK.iter().any(|t| t.name == "goal" && t.class(role) == Class::Offered),
+            "continuationModes": ["interactive", "rpc"],
+        }),
     );
     for (section, key) in NO_REDEEM {
         if let Value::Object(keys) = root
@@ -163,6 +164,7 @@ pub(crate) fn overlay(fallback: &FallbackSettings, lane: bool) -> Value {
         }
     }
     root.insert("retry".into(), Value::Object(retry));
+    tools::apply(&mut root, role);
     Value::Object(root)
 }
 
@@ -170,10 +172,10 @@ pub(crate) fn overlay(fallback: &FallbackSettings, lane: bool) -> Value {
 pub(crate) fn write_overlay(
     state: &Path,
     fallback: &FallbackSettings,
-    lane: bool,
+    role: Role,
 ) -> Result<PathBuf, FsError> {
-    let path = overlay_path(state, lane);
-    let mut text = overlay(fallback, lane).to_string();
+    let path = overlay_path(state, role);
+    let mut text = overlay(fallback, role).to_string();
     text.push('\n');
     write_atomic(&path, text.as_bytes())?;
     Ok(path)
@@ -196,7 +198,7 @@ mod tests {
             instructions: Some(Path::new("/lead.md")),
             extra: &extra,
             max_cost: None,
-            tools: None,
+            role: Role::Lead,
         };
         assert_eq!(
             launch.argv(),
@@ -216,10 +218,10 @@ mod tests {
 
     #[test]
     fn overlay_pins_safety_and_carries_only_owner_chains() {
-        let plain = overlay(&FallbackSettings::default(), false);
+        let plain = overlay(&FallbackSettings::default(), Role::Lead);
         assert_eq!(plain["goal"]["enabled"], false, "the lead holds no goal");
         assert_eq!(
-            overlay(&FallbackSettings::default(), true)["goal"]["enabled"],
+            overlay(&FallbackSettings::default(), Role::Lane)["goal"]["enabled"],
             true
         );
         assert_eq!(plain["ask"]["timeout"], 0);
@@ -247,7 +249,7 @@ mod tests {
                 on: Some("usage-limit".into()),
                 chains,
             },
-            true,
+            Role::Lane,
         );
         assert_eq!(owner["retry"]["fallbackChains"]["default"][0], "p/backup");
         assert_eq!(owner["retry"]["fallbackOn"], "usage-limit");
@@ -265,24 +267,39 @@ mod tests {
     }
 
     #[test]
+    /// #300: hiding and denial must agree for every role, without forcing offered tools on.
     fn overlay_disables_and_denies_eval_in_every_session() {
-        for lane in [false, true] {
-            let o = overlay(&FallbackSettings::default(), lane);
-            assert_eq!(
-                o["eval"],
-                json!({ "py": false, "js": false }),
-                "lane {lane}"
-            );
-            assert_eq!(o["tools"]["approval"]["eval"], "deny", "lane {lane}");
+        for role in [
+            Role::Lead,
+            Role::Lane,
+            Role::Subagent,
+            Role::Reviewer,
+            Role::LookOnly,
+        ] {
+            let o = overlay(&FallbackSettings::default(), role);
+            assert_eq!(o["eval"], json!({ "py": false, "js": false }), "{role:?}");
+            assert_eq!(o["tools"]["approval"]["eval"], "deny", "{role:?}");
+            for tool in tools::STOCK
+                .iter()
+                .filter(|t| t.class(role) == Class::Offered)
+            {
+                assert!(
+                    o["tools"]["approval"].get(tool.name).is_none(),
+                    "{} {role:?}",
+                    tool.name
+                );
+            }
+            assert!(o.get("debug").is_none());
+            assert!(o.get("lsp").is_none());
         }
     }
 
     #[test]
     fn approvals_are_left_to_the_owners_omp_settings() {
-        for lane in [false, true] {
-            let o = overlay(&FallbackSettings::default(), lane);
-            assert!(o.get("bash").is_none(), "no shell patterns, lane {lane}");
-            assert!(o["tools"].get("approvalMode").is_none(), "lane {lane}");
+        for role in [Role::Lead, Role::Lane] {
+            let o = overlay(&FallbackSettings::default(), role);
+            assert!(o.get("bash").is_none(), "no shell patterns, {role:?}");
+            assert!(o["tools"].get("approvalMode").is_none(), "{role:?}");
         }
     }
 }
