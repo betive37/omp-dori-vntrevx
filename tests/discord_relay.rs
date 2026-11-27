@@ -2654,7 +2654,8 @@ fn onboarding_lets_answers_in_place_through_and_nothing_else() {
 }
 
 /// An answer sent to another room whose first part was in doubt at a restart stays pinned to that
-/// room: once the room takes posts again the part goes there, and nothing goes to the channel.
+/// room: a refusal there afterwards does not send it to the channel, and once the room takes posts
+/// again the part goes there.
 #[test]
 fn an_answer_in_another_room_in_doubt_at_a_restart_stays_there() {
     const ROOM: &str = "600000000000000079";
@@ -2673,8 +2674,21 @@ fn an_answer_in_another_room_in_doubt_at_a_restart_stays_there() {
     assert!(!error && said.contains("retried by itself"), "{said}");
     drop(lead);
     assert!(hub.stop().success());
+    // After the restart the room refuses the part for its own sake for a while.
     fake.unscript_in(ROOM);
+    fake.script_in(ROOM, &[400; 3]);
+    let in_room = || {
+        fake.calls("POST", &format!("/channels/{ROOM}/messages"))
+            .len()
+    };
+    let before = in_room();
     hub.start();
+    fake.wait(WAIT, |_| (in_room() >= before + 3).then_some(()));
+    assert!(
+        fake.bot_messages(CH).is_empty(),
+        "a refusal does not move a part in doubt"
+    );
+    assert_eq!(answer_state(&hub, &source), "posting");
     let posted = fake.wait(WAIT, |f| {
         let posted = f.bot_messages(ROOM);
         (!posted.is_empty()).then_some(posted)
@@ -2683,6 +2697,50 @@ fn an_answer_in_another_room_in_doubt_at_a_restart_stays_there() {
     assert_eq!(posted[0]["content"], "x");
     settled(&hub);
     assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
+    assert!(hub.stop().success());
+}
+
+/// A long answer for another room that refuses its first part goes to the channel; when that
+/// part is in doubt there at a restart, the answer resumes in the channel (where the part is
+/// pinned), not in the room the later, untried parts were stored for.
+#[test]
+fn an_answer_moved_from_its_named_room_resumes_in_the_channel_after_a_restart() {
+    const ROOM: &str = "600000000000000081";
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    fake.channel(ROOM, 0, None);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_381, "moved then restarted");
+    let message = format!("discord:{CH}/{source}");
+    // The named room refuses the first part for its own sake; in the channel every attempt
+    // before the restart ends uncertain.
+    fake.script_in(ROOM, &[400; 64]);
+    fake.script_in(CH, &[502; 64]);
+    let text = "word ".repeat(600);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": text, "room": ROOM }));
+    assert!(!error && said.contains("retried by itself"), "{said}");
+    drop(lead);
+    assert!(hub.stop().success());
+    fake.unscript_in(CH);
+    hub.start();
+    let posted = fake.wait(WAIT, |f| {
+        let posted = f.bot_messages(CH);
+        (posted.len() >= 2).then_some(posted)
+    });
+    settled(&hub);
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(
+        posted[0]["message_reference"]["message_id"],
+        source.as_str(),
+        "the first part is the reply to the request"
+    );
+    assert!(
+        fake.bot_messages(ROOM).is_empty(),
+        "nothing in the named room"
+    );
     assert!(hub.stop().success());
 }
 

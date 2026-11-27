@@ -174,7 +174,8 @@ pub(crate) enum RelayWrite {
         message: String,
     },
     /// Stores the parts of an answer before the first post; nothing when parts already exist.
-    /// `to` names the room the parts go to, stored as their destination until a post pins one.
+    /// `to` names the room the parts go to, stored as the first part's destination until a post
+    /// pins one.
     Outbox {
         relay: String,
         room: String,
@@ -705,7 +706,9 @@ fn write_replies(
                             text,
                             nonce,
                             now,
-                            to
+                            // Only the first part: the rest follow it, so an untried later part
+                            // never names a room over one where an earlier part was pinned.
+                            to.as_ref().filter(|_| idx == 0)
                         ],
                     )?;
                 }

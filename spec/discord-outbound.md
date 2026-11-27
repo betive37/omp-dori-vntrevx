@@ -127,7 +127,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     parts. Later calls for the same
     message are follow-ups: each is stored as its own outbox entry (the message and a digest of
     its text, nonces from those) for the room the answer went to (another room given now, else
-    the destination stored with its last confirmed part), posted at once, and settles nothing;
+    the destination stored with its last confirmed part; with none confirmed, the last
+    destination stored with its parts, else where an answer would go now), posted at once, and
+    settles nothing;
     the same text again posts only what is missing,
     also after a restart, and a room that refuses the bot as such sends the follow-up to the
     request's room as its reply. Where the messenger enforces no nonce (Telegram, Slack) an answer
@@ -183,8 +185,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     count toward the three). Lane ownership is checked again before posting. After a restart,
     the last attempted part's saved destination is used, or the last confirmed part's destination
     if the next part has not been attempted. A new lookup never overrides a persisted destination.
-    Parts stored for a room the lead's `answer` names (21a), and every follow-up, carry that room
-    as their destination from the start.
+    The first part of an answer stored for a room the lead's `answer` names (21a), and of every
+    follow-up, carries that room as its destination from the start; the later parts have none
+    until they are tried, so they follow the first part wherever it went.
     While the lead works, typing shows where the answer would go.
 26. If Discord reports the source message unknown (error 10008, on the post or on a follow-up check
     after a 400/404), remaining parts without uncertain earlier attempts are discarded and logged;
