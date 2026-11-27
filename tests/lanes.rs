@@ -368,10 +368,7 @@ fn reopen_leaves_the_claim_notice_behind(hub: &TestHub, closed: &Value) {
     let note = json!({ "key": "c-ok", "note": "one more thing" });
     let reopened = lane(hub, "reopen", &note).unwrap();
     assert!(
-        reopened
-            .as_str()
-            .unwrap()
-            .starts_with("reopened on session"),
+        reopened.as_str().unwrap().starts_with("resumed on session"),
         "{reopened}"
     );
     let file = record(hub, "c-ok")["session_file"]
@@ -598,8 +595,16 @@ fn park_and_reopen_on_the_exact_session() {
         1,
     );
     std::fs::write(path, forged).unwrap();
-    let refused = lane(&hub, "reopen", &json!({ "key": "k-2" })).unwrap_err();
-    assert!(refused.contains("another session"), "{refused}");
+    let refused = lane(&hub, "reopen", &json!({ "key": "k-2" })).unwrap();
+    let refused = refused.as_str().unwrap();
+    assert!(
+        refused.starts_with("held:") && refused.contains("another session"),
+        "{refused}"
+    );
+    let held = record(&hub, "k-2");
+    assert_eq!(held["state"], "held");
+    assert_eq!(held["session_id"], k2["session_id"]);
+    assert_eq!(held["run_id"], k2["run_id"]);
     hub.stop();
 }
 
@@ -1319,7 +1324,7 @@ fn stall_resumes(hub: &TestHub) {
     std::fs::rename(bin.join("omp"), bin.join("omp-real")).unwrap();
     std::fs::write(
         bin.join("omp"),
-        "#!/bin/sh\nfor arg do\n case \"$arg\" in --resume=*) cat >/dev/null; exit 1;; esac\ndone\nexec \"$(dirname \"$0\")/omp-real\" \"$@\"\n",
+        "#!/bin/sh\nfor arg do\n case \"$arg\" in --resume=*) printf 'attempt\\n' >> \"$(dirname \"$0\")/omp-data/resume-started\"; cat >/dev/null; exit 1;; esac\ndone\nexec \"$(dirname \"$0\")/omp-real\" \"$@\"\n",
     )
     .unwrap();
     std::fs::set_permissions(bin.join("omp"), std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -1385,7 +1390,30 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
         )
         .unwrap();
         stall_resumes(&hub);
-        assert!(lane(&hub, "reopen", &json!({"key":"preserve"})).is_err());
+        let asked = Instant::now();
+        let response = lane(&hub, "reopen", &json!({"key":"preserve"})).unwrap();
+        assert!(
+            response.as_str().unwrap().starts_with("recovering:"),
+            "{response}"
+        );
+        assert!(
+            asked.elapsed() < Duration::from_secs(120),
+            "the response must not wait for the whole episode"
+        );
+        hub.until(WAIT, || {
+            (std::fs::read_to_string(data(&hub).join("resume-started"))
+                .unwrap()
+                .lines()
+                .count()
+                == 2)
+                .then_some(())
+        });
+        hub.until(Duration::from_secs(400), || {
+            record(&hub, "preserve")["status"]
+                .as_str()
+                .is_some_and(|status| status.contains("start failed; work retained"))
+                .then_some(())
+        });
     } else {
         hub.stop();
         stall_resumes(&hub);
@@ -1399,6 +1427,10 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
     }
     let after = record(&hub, "preserve");
     assert_eq!(after["state"], "held", "{after}");
+    assert!(
+        after["lost"].as_str().unwrap().contains("Timeout"),
+        "{after}"
+    );
     assert_eq!(after["worktrees"], json!([tree]));
     for field in [
         "session_id",
@@ -1422,25 +1454,6 @@ fn resume_preserves_work(kind: &str, reopen: bool) {
             "active"
         }
     );
-    if !reopen && kind != "ignored" {
-        hub.stop();
-        std::fs::rename(hub.root.join("bin/omp-real"), hub.root.join("bin/omp")).unwrap();
-        start(&mut hub);
-        let restored = hub.until(WAIT, || {
-            let rec = record(&hub, "preserve");
-            (rec["live"] == true && rec["lost"].is_null()).then_some(rec)
-        });
-        assert_eq!(restored["run_id"], before["run_id"]);
-        assert_eq!(restored["session_id"], before["session_id"]);
-        assert_eq!(
-            restored["state"],
-            if kind == "dirty" { "held" } else { "running" }
-        );
-        assert_eq!(
-            goal(&hub, &before["session_id"]),
-            if kind == "dirty" { "paused" } else { "active" }
-        );
-    }
     hub.stop();
 }
 
@@ -1603,6 +1616,47 @@ fn queued_fresh_failure_removes_only_its_unused_worktree() {
     assert_eq!(
         std::fs::read_to_string(owned.join("ignored.txt")).unwrap(),
         "another run's work"
+    );
+    hub.stop();
+}
+
+#[test]
+fn parking_cancels_an_existing_session_start_without_losing_work() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "cancel-resume",
+        &json!({
+            "cwd":repo, "worktree":{"path":tree,"branch":"cancel-resume","base":"HEAD"}
+        }),
+    );
+    std::fs::write(tree.join("ignored.txt"), "retained on cancellation").unwrap();
+    let before = record(&hub, "cancel-resume");
+    hub.stop();
+    stall_resumes(&hub);
+    start(&mut hub);
+    hub.until(WAIT, || {
+        data(&hub).join("resume-started").exists().then_some(())
+    });
+    let parked = lane(
+        &hub,
+        "park",
+        &json!({
+            "key":"cancel-resume", "reason":"owner stopped recovery", "condition":"explicit retry"
+        }),
+    )
+    .unwrap();
+    assert_eq!(parked, "closed parked");
+    let after = record(&hub, "cancel-resume");
+    assert_eq!(after["session_id"], before["session_id"]);
+    assert_eq!(after["run_id"], before["run_id"]);
+    assert_eq!(after["live"], false);
+    assert_eq!(
+        std::fs::read_to_string(tree.join("ignored.txt")).unwrap(),
+        "retained on cancellation"
     );
     hub.stop();
 }

@@ -5,9 +5,9 @@ use std::time::Duration;
 
 use super::record::{Intent, Record, State};
 use super::startup::Ownership;
-use super::supervisor::StartError;
+use super::supervisor;
 use super::{Lanes, git};
-use crate::host::Runtime;
+use crate::host::{Runtime, StartError};
 use crate::store::lanes::{LaneDone, LaneWrite, Revision};
 
 impl<R: Runtime> Lanes<R> {
@@ -25,15 +25,28 @@ impl<R: Runtime> Lanes<R> {
         {
             self.drop_session(&rec.key);
         }
-        let why = failure.detail;
+        let why = failure.to_string();
+        let cleanup = supervisor::cleanup(&failure);
         match ownership {
             Ownership::ResumeExisting((id, file)) => {
                 rec.session_id = Some(id.clone());
                 rec.session_file = Some(file.display().to_string());
+                let target = format!("lane:{}", rec.key);
+                if let Err(error) = (crate::host::startup::Recovery {
+                    store: &self.env.store,
+                    target: &target,
+                })
+                .end("held", Some(why.clone()))
+                .await
+                {
+                    rec.receipt
+                        .push(format!("recovery hold not recorded: {error}"));
+                }
             }
             Ownership::FreshAttempt => {
+                rec.startup_cleanup = cleanup;
                 // A bound attempt may already have background writers. It is not unused.
-                if rec.session_id.is_none() && failure.cleanup.confirmed() {
+                if rec.session_id.is_none() && cleanup.confirmed() {
                     rec.intent = Some(Intent {
                         outcome: "fresh-rollback".into(),
                         note: why.clone(),
@@ -42,7 +55,7 @@ impl<R: Runtime> Lanes<R> {
                         step: "rollback".into(),
                         receipt: Vec::new(),
                         lesson: None,
-                        quiescence: failure.cleanup,
+                        quiescence: cleanup,
                     });
                     match self
                         .save(&rec, Some(rev), Some(format!("fresh rollback: {why}")))
@@ -94,20 +107,17 @@ impl<R: Runtime> Lanes<R> {
                 }
             }
         }
-        if rec.state != State::Held {
-            rec.prev = Some(rec.state);
-            rec.held_by = Some("hub".into());
-        }
-        rec.state = State::Held;
-        rec.hold_reason.get_or_insert_with(|| why.clone());
-        rec.lost = Some(why.clone());
-        rec.start_note = Some("start failed; work retained".into());
-        rec.receipt
-            .push(format!("startup cleanup: {:?}", failure.cleanup));
+        hold_failed(&mut rec, &why);
+        rec.receipt.push(format!("startup cleanup: {cleanup:?}"));
         let detail = format!(
             "{why}; conversation and work retained; correct the cause then reopen the lane"
         );
-        if let Err(error) = self.save(&rec, Some(rev), Some(detail.clone())).await {
+        self.announce_hold(&rec, rev, &detail).await;
+        format!("failed: {detail}")
+    }
+
+    pub(super) async fn announce_hold(&self, rec: &Record, rev: Revision, detail: &str) {
+        if let Err(error) = self.save(rec, Some(rev), Some(detail.to_string())).await {
             self.alert(
                 &rec.key,
                 "failed start record not saved",
@@ -115,9 +125,8 @@ impl<R: Runtime> Lanes<R> {
                 true,
             );
         } else {
-            self.alert(&rec.key, "start held", &detail, true);
+            self.alert(&rec.key, "start held", detail, true);
         }
-        format!("failed: {detail}")
     }
 
     /// Re-read authority and preservation immediately before non-forced Git removal, locally
@@ -211,4 +220,15 @@ pub(super) fn prepare_restart(rec: &mut Record) -> bool {
     }
     rec.lost = None;
     matches!(rec.state, State::Running | State::Rejected | State::Claimed)
+}
+
+pub(super) fn hold_failed(rec: &mut Record, why: &str) {
+    if rec.state != State::Held {
+        rec.prev = Some(rec.state);
+        rec.held_by = Some("hub".into());
+    }
+    rec.state = State::Held;
+    rec.hold_reason.get_or_insert_with(|| why.to_string());
+    rec.lost = Some(why.to_string());
+    rec.start_note = Some("start failed; work retained".into());
 }

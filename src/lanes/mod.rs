@@ -20,9 +20,11 @@ mod publish;
 mod queue;
 pub(crate) mod record;
 mod remote;
+mod replies;
 mod review;
 pub(crate) mod shell;
 pub(crate) mod slots;
+mod starts;
 mod startup;
 mod supervisor;
 
@@ -140,7 +142,7 @@ pub(crate) struct Lanes<R: Runtime> {
     /// The lanes live once start-up recovery finished, by name (DESIGN decision 9); unset before.
     pub(crate) resumed: OnceLock<Vec<String>>,
     /// Set at hub stop: no lane is reattached or started by itself any more.
-    stopping: std::sync::atomic::AtomicBool,
+    starts: starts::Starts,
 }
 
 fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -181,7 +183,7 @@ impl<R: Runtime> Lanes<R> {
             slots,
             planning: AsyncMutex::new(()),
             resumed: OnceLock::new(),
-            stopping: std::sync::atomic::AtomicBool::new(false),
+            starts: starts::Starts::default(),
         })
     }
 
@@ -1051,6 +1053,7 @@ impl<R: Runtime> Lanes<R> {
             earlier_ids: Vec::new(),
             pid: None,
             start_note: None,
+            startup_cleanup: crate::host::startup::Cleanup::Unknown,
             held_by: None,
             hold_reason: None,
             claim: None,
@@ -1138,7 +1141,14 @@ impl<R: Runtime> Lanes<R> {
         }
         let (key, thread) = (rec.key.clone(), rec.thread.clone());
         let outcome = self
-            .start(rec, rev, exe, &config, startup::Ownership::FreshAttempt)
+            .start(
+                rec,
+                rev,
+                exe,
+                &config,
+                startup::Ownership::FreshAttempt,
+                &mut replies::Reply::default(),
+            )
             .await;
         if let Some(rid) = request_id
             && outcome != "unconfirmed"

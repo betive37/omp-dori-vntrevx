@@ -71,7 +71,7 @@ pub(crate) struct Intent {
     pub(crate) lesson: Option<String>,
     /// Durable exit evidence; legacy close intents have no authority to discard work.
     #[serde(default)]
-    pub(super) quiescence: super::supervisor::Quiescence,
+    pub(super) quiescence: crate::host::startup::Cleanup,
 }
 
 /// A one-attempt grant for one rule of one command (LANE req. 75).
@@ -130,6 +130,9 @@ pub(crate) struct Record {
     pub(crate) pid: Option<u32>,
     /// `start held: model`, `unconfirmed`, or why the start did not finish.
     pub(crate) start_note: Option<String>,
+    /// Exit evidence for `handle`; reset before each attempt is allowed to spawn.
+    #[serde(default)]
+    pub(super) startup_cleanup: crate::host::startup::Cleanup,
     pub(crate) held_by: Option<String>,
     pub(crate) hold_reason: Option<String>,
     pub(crate) claim: Option<Claim>,

@@ -495,7 +495,7 @@ fn print_status(s: &Status) {
 /// `cataly lane <op> [--params <json>]`: one request per lane operation; `op` and the JSON object's
 /// fields are the same as the lead's `lane.<op>` tool operations.
 fn lane(hub: &mut Client, p: &Parsed, as_json: bool) -> Result<(), Failure> {
-    // A start or reopen may take the whole start deadline (LANE req. 15, default 180 s).
+    // Reopen answers on binding, a terminal hold, or the first scheduled retry; recovery outlives the request.
     const LANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
     let mut params: Value = match p.value("--params") {
         Some(text) => {

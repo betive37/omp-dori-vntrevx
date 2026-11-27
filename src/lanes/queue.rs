@@ -215,7 +215,10 @@ impl<R: Runtime> Lanes<R> {
             };
             if state == "ready"
                 && q.waits_for_worker()
-                && !self.stopping.load(std::sync::atomic::Ordering::Acquire)
+                && !self
+                    .starts
+                    .stopping
+                    .load(std::sync::atomic::Ordering::Acquire)
             {
                 let detail = match self.start_queued(&q.key).await {
                     Ok(v) => format!(

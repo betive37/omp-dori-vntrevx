@@ -1237,6 +1237,10 @@ fn worker_resume_preserves_work(kind: &str) {
     });
     let after = record(&hub, "preserve");
     assert_eq!(after["state"], "held", "{after}");
+    assert!(
+        after["lost"].as_str().unwrap().contains("Timeout"),
+        "{after}"
+    );
     assert_eq!(after["worktrees"], json!([tree]));
     for field in [
         "session_id",
@@ -1251,31 +1255,6 @@ fn worker_resume_preserves_work(kind: &str) {
     assert_eq!(after["live"], false);
     for (file, text) in files {
         assert_eq!(std::fs::read_to_string(tree.join(file)).unwrap(), *text);
-    }
-    if kind != "ignored" {
-        hub.stop();
-        std::fs::rename(bin.join("omp-real"), bin.join("omp")).unwrap();
-        start(&mut hub);
-        let restored = hub.until(WAIT, || {
-            let rec = record(&hub, "preserve");
-            (rec["live"] == true && rec["lost"].is_null()).then_some(rec)
-        });
-        assert_eq!(restored["run_id"], before["run_id"]);
-        assert_eq!(restored["session_id"], before["session_id"]);
-        assert_eq!(
-            restored["state"],
-            if kind == "dirty" { "held" } else { "running" }
-        );
-        let goal = std::fs::read_to_string(
-            w.root
-                .join("bin/omp-data")
-                .join(format!("goal-{}", before["session_id"].as_str().unwrap())),
-        )
-        .unwrap();
-        assert_eq!(
-            goal.trim(),
-            if kind == "dirty" { "paused" } else { "active" }
-        );
     }
     hub.stop();
 }

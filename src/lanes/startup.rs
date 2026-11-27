@@ -8,7 +8,7 @@ use super::record::{Record, State};
 use super::{LOOK_ONLY, Lanes, record, supervisor};
 use crate::config::Config;
 use crate::host::inbox::ReceiptState;
-use crate::host::{Role, Runtime, StartSpec};
+use crate::host::{Role, Runtime, StartError, StartSpec};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::omp::launch::Target;
 use crate::store::lanes::Revision;
@@ -83,46 +83,36 @@ impl<R: Runtime> Lanes<R> {
         exe: PathBuf,
         config: &Config,
         ownership: Ownership,
+        reply: &mut super::replies::Reply,
     ) -> String {
         let began = Instant::now();
-        let handle = crate::host::random_hex(8);
-        rec.handle = Some(handle.clone());
-        let spec = match self.start_spec(&rec, handle, ownership.identity()) {
-            Ok(spec) => spec,
-            Err(e) => {
+        let (_starting, cancel) = match self.starts.enter(&rec.key) {
+            Ok(starting) => starting,
+            Err(why) => {
                 return self
-                    .start_failed(
-                        rec,
-                        rev,
-                        &ownership,
-                        supervisor::StartError {
-                            detail: e.to_string(),
-                            cleanup: supervisor::Quiescence::NotSpawned,
-                        },
-                    )
+                    .start_failed(rec, rev, &ownership, StartError::Failed(why))
                     .await;
             }
         };
-        // The bridge says hello while OMP starts; its handle must already name this lane.
-        match self.save(&rec, Some(rev), None).await {
-            Ok(r) => rev = r,
+        let spec = match self.start_spec(&rec, crate::host::random_hex(8), ownership.identity()) {
+            Ok(spec) => spec,
             Err(e) => {
                 return self
-                    .start_failed(
-                        rec,
-                        rev,
-                        &ownership,
-                        supervisor::StartError {
-                            detail: e,
-                            cleanup: supervisor::Quiescence::NotSpawned,
-                        },
-                    )
+                    .start_failed(rec, rev, &ownership, StartError::Refused(e.to_string()))
                     .await;
             }
-        }
+        };
         let runtime = (self.env.make)(config, &exe, rec.runtime);
-        let budget = config.lanes.start_budget;
-        let (session, started) = match supervisor::start(&runtime, spec, budget).await {
+        let budget = config.lanes.start_budget.max(
+            crate::host::startup::STARTUP_BUDGET + crate::host::startup::STARTUP_CLEANUP_BUDGET,
+        );
+        let launch = supervisor::Launch {
+            record: &mut rec,
+            revision: &mut rev,
+            spec,
+            reply,
+        };
+        let (session, started) = match self.supervise(&runtime, launch, cancel).await {
             Ok(pair) => pair,
             Err(failure) => return self.start_failed(rec, rev, &ownership, failure).await,
         };
@@ -131,7 +121,7 @@ impl<R: Runtime> Lanes<R> {
         rec.session_id = Some(started.session_id.clone());
         rec.session_file = Some(started.file.clone());
         rec.pid = started.pid;
-        tokio::spawn(Arc::clone(self).watch(rec.key.clone(), Arc::clone(&session)));
+        rec.start_note = None;
         if let Some(reason) = &started.held {
             // Never substitute a model; keep the process for inspection (LANE req. 15f).
             rec.state = State::Held;
@@ -143,23 +133,38 @@ impl<R: Runtime> Lanes<R> {
             .held
             .as_ref()
             .map(|reason| format!("start held: {reason}"));
-        match self.save(&rec, Some(rev), note).await {
-            Ok(r) => rev = r,
-            Err(e) => {
-                let stopped = supervisor::stop(&*session, &rec).await;
-                return self
-                    .start_failed(
-                        rec,
-                        rev,
-                        &ownership,
-                        supervisor::StartError {
-                            detail: format!("{e}; cleanup: {}", stopped.detail),
-                            cleanup: stopped.cleanup,
-                        },
-                    )
-                    .await;
+        let persisted = async {
+            rev = self.save(&rec, Some(rev), note).await?;
+            if ownership.identity().is_some() {
+                let target = format!("lane:{}", rec.key);
+                crate::host::startup::Recovery {
+                    store: &self.env.store,
+                    target: &target,
+                }
+                .end("bound", None)
+                .await?;
             }
+            Ok::<(), String>(())
         }
+        .await;
+        if let Err(e) = persisted {
+            let stopped = supervisor::stop(&*session).await;
+            rec.startup_cleanup = stopped.cleanup;
+            return self
+                .start_failed(
+                    rec,
+                    rev,
+                    &ownership,
+                    StartError::Startup {
+                        stage: crate::host::startup::StartupStage::Binding,
+                        outcome: crate::host::startup::StartupOutcome::Rejected,
+                        detail: format!("{e}; cleanup: {}", stopped.detail),
+                        cleanup: stopped.cleanup,
+                    },
+                )
+                .await;
+        }
+        tokio::spawn(Arc::clone(self).watch(rec.key.clone(), Arc::clone(&session)));
         if let Some(reason) = started.held {
             self.alert(&rec.key, "start held: model", &reason, true);
             return "start held: model".into();
