@@ -275,6 +275,10 @@ time with immediate "busy" refusal; delivery receipts keyed by request ID (HOST-
 - Session switches by the user are detected and fenced as in PATCH-01 rules 6-9 and 12-14.
 - Tern lanes support the full lifecycle (open, pause, resume, park, abandon, claim, close, reopen); only remote
   dialog answers are missing. Losing the bridge connection (45 s without heartbeat) marks the lane lost.
+- Automatic goal resume on an owner or lead answer is headless-only and never clears an owner
+  hold, pending reopen, in-doubt input or budget block. Tern cannot prove who paused its goal;
+  it keeps the goal paused and asks for an explicit terminal resume or `lane.pause` followed by
+  `lane.resume`.
 
 ### 4.4 Headless on a worker
 
@@ -591,7 +595,7 @@ privacy (`pub(crate)` at most) rather than by packages.
 | --- | --- | --- |
 | `cataly` (one package, `lib` + `bin` targets) | Modules: `cli`, `hub` (start-up, supervision, socket, dispatcher), `proto` (control and bridge messages), `sys` (paths, modes, atomic writes, locks, peer credentials, host readers, signals, sd_notify, stall detector), `log`, `store`, `omp` (rpc-ui client, launch, overlay, probe, session-file reader, usage and lease parsers), `host` (`Runtime` trait, headless, tern, session actors, deliveries, inboxes), `relay` (trait, pipeline, `http`, `text`, `discord`, `telegram`, `slack`), `jobs` (scheduler, events, routing, job kinds), `lanes` (lifecycle, reports, evidence, done checks, oversight, planner, slots, questions, grants, review gate, profile) | The product. The `lib` target exists only so integration tests and the contract suite can call modules directly. |
 | `cataly-voice` (optional dependency behind the `voice` feature) | Discord voice connection, DAVE, Opus, resampling and pacing, realtime model over WebSocket and WebRTC, usage ledger, reply playback queue | (1) **Dependency kept out:** libopus (C), the DAVE/MLS stack and the WebRTC stack compile and link only in voice builds. (2) **Feature gate:** a build without voice contains none of it. (3) **Test seam:** the crate defines a small `VoiceHost` trait (lead delivery with receipt, status read, note post, Gateway voice events in); `cataly` implements it, and voice tests run against a fake host and a fake realtime server. Cargo forbids a dependency cycle, so the narrow trait is enforced by construction. |
-| `extension/cataly.ts` | The bridge, under 600 lines, with its own tests | Not Rust; OMP loads TypeScript. |
+| `extension/cataly.ts` | The bridge, at most 600 code lines (non-blank, non-comment), with its own tests | Not Rust; OMP loads TypeScript. |
 
 Removed boundaries, and why nothing is lost: `proto`, `sys`, `store`, `omp`, `host`, `relay`, `jobs` and `lanes`
 had no feature gate, no dependency that only they use, and no consumer outside the hub, so as crates they
@@ -830,7 +834,7 @@ From `docs/decisions.md`. These are no longer assumptions.
 | 6 | Helper session | The lead is the only standing session; no `duty` role | C5, part of A26 |
 | 7 | Model fallback | On: overlay pins `retry.modelFallback: true` and `cooldown-expiry` revert; chains from the owner's config; resets, credits and overage refused in code; model job reports instead of repairing (4.2, 6.1, 9.2) | A1 |
 | 8 | Stuck OMP exit | End input, 15 s, SIGTERM, 5 s, SIGKILL, own children only (4.2) | A4 |
-| 9 | Hub restart | Every lane that was running is restarted on its exact session file after the lease shows it free. OMP restores a goal paused; the hub sends `goal resume` only for lanes whose goal was active when the hub stopped, and leaves lanes paused by the lead or owner paused (OPC-34) | A7 |
+| 9 | Hub restart | Running lanes resume their exact session only after writer-exit and free-lease checks. Explicit reopen continues its persisted episode, run, note and step. Owner-paused or held lanes without that intent stay down; no kickoff or reopen note is replayed (OPC-34). | A7 |
 | 10 | Slack senders | Allowlist, default the owner only | part of A20 |
 | 11 | Voice transport | WebSocket and WebRTC behind one `RealtimeLink` (5.2); a gated live test against the real API before release, at a cost the owner approves; CI uses a fake | A21 |
 | 12 | Updates | Notice only; `cataly update` installs; nothing installs by itself (11.3) | part of A28 |

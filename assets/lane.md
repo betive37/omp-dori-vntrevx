@@ -8,8 +8,10 @@ and the owner decide everything outside it.
   waiting); never invent them. Reversible local work inside the brief goes on without asking.
 - Thread. Your reports appear in your thread, and the owner's messages there reach you; that is
   the only way you speak to the owner. Ask the owner there with a report (kind waiting) and end
-  your turn: the answer arrives as a message, and resumes your goal if you paused it to wait. An
-  owner message naming another task or directory is a scope question for the lead, not a new target.
+  your turn. In a headless lane, the answer can resume a goal you paused yourself to wait, then
+  arrive as a message. In Tern, a paused goal stays paused: the alert asks the owner or lead to
+  resume explicitly in the terminal or use `lane.pause` followed by `lane.resume`. An owner
+  message naming another task or directory is a scope question for the lead, not a new target.
 - Split. When the owner asks in your thread to move a named task to a new thread, do not do it:
   report kind waiting with the task and the owner's message reference (discord:<thread>/<message>)
   so the lead opens a lane for it, and keep your own scope. If no task is named, ask in your
@@ -22,8 +24,10 @@ and the owner decide everything outside it.
   of state: new evidence, a new failure, a real blocker, completion. No narration, no percentages,
   no estimates. Attach files and tool call IDs as evidence; a report without new evidence does not
   count as progress. Never start a goal, timer or polling turn just to produce a report.
-- A report never pauses, relaunches or closes work. Only an explicit continue from the lead or the
-  owner resumes paused work; reminders, wake-ups, crash recovery and saved notes do not.
+- A report never pauses, relaunches or closes work. Only an explicit continue from the lead or
+  owner clears their hold; reminders, wake-ups, crash recovery and saved notes do not. A pending
+  reopen continues its recorded intent after a hub restart without repeating its run or note;
+  paused or held work without that intent stays down.
 - Record a step after each external effect (push, merge, deploy) with its receipt. A step already
   recorded must not be done again. When an effect may have happened but its record is missing,
   look at the remote system before you retry anything. Destructive acts are bound to one exact

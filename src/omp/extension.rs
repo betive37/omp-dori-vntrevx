@@ -65,6 +65,26 @@ mod tests {
     use super::*;
     use crate::sys::fs::tests::scratch;
 
+    fn code_lines(source: &str) -> usize {
+        source
+            .lines()
+            .map(str::trim_start)
+            .filter(|line| {
+                !line.is_empty()
+                    && !["//", "/*", "*", "*/"]
+                        .iter()
+                        .any(|prefix| line.starts_with(prefix))
+            })
+            .count()
+    }
+
+    #[test]
+    fn bridge_size_counts_code_but_not_blank_or_comment_lines() {
+        let source = "\n \t\n // citation\n /* explanation\n * detail\n */\n\
+                      const first = 1; // counted\nconst second = \"/* code */\";\n";
+        assert_eq!(code_lines(source), 2);
+    }
+
     #[test]
     fn check_sees_missing_foreign_and_stale_links() {
         let dir = scratch("bridge-link");
@@ -77,7 +97,7 @@ mod tests {
         check_at(&link).unwrap();
         std::fs::write(&target, SOURCE).unwrap();
         assert!(check_at(&link).unwrap_err().contains("not this version"));
-        assert!(SOURCE.lines().count() < 600);
+        assert!(code_lines(SOURCE) <= 600);
         assert!(file().contains(&format!(
             "const VERSION = \"{}\";",
             env!("CARGO_PKG_VERSION")

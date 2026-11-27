@@ -850,14 +850,18 @@ fn refused_for_the_store(out: &Output, version: &str) -> bool {
     ))
 }
 
-/// A rollback to a version that cannot read the store (its floor raised, as 0.2.7's lead anchor
-/// raises it) is refused before the hub is stopped or anything switched; once the candidate can
-/// read the store, the same rollback restarts the hub on it as before.
+/// An older reader is refused before the live hub is stopped or anything switched. Store reads
+/// leave its writer usable. The permitted rollback also restarts normally; simulated floor changes
+/// happen only while the hub is stopped, never through a second live writer.
 #[test]
 fn a_rollback_across_the_store_floor_is_refused_before_anything_stops() {
     let v2 = bump(V1, 1);
     let hub = sandbox("");
-    let r1 = release(&hub.root.join("r1"), &variant(V1, false), V1);
+    let r1 = release(
+        &hub.root.join("r1"),
+        &capability_less(),
+        CAPABILITY_LESS_VERSION,
+    );
     let r2 = release(&hub.root.join("r2"), &variant(&v2, false), &v2);
     let out = run(
         &hub,
@@ -876,12 +880,14 @@ fn a_rollback_across_the_store_floor_is_refused_before_anything_stops() {
     hub.until(Duration::from_secs(20), || {
         (hub_version(&hub).as_deref() == Some(v2.as_str())).then_some(())
     });
-    // The running hub opened the store before its floor rose; no binary of this source reads 99.
-    set_floor(&hub, 99);
     let before = snapshot(&hub);
     let out = run(&hub, &command_link(&hub), &["rollback"]);
     assert_eq!(out.status.code(), Some(6), "{}", text(&out));
-    assert!(refused_for_the_store(&out, V1), "{}", text(&out));
+    assert!(
+        refused_for_the_store(&out, CAPABILITY_LESS_VERSION),
+        "{}",
+        text(&out)
+    );
     assert!(
         String::from_utf8_lossy(&out.stderr).contains("업그레이드 전 저장소 사본이 없어"),
         "no copy is invented: {}",
@@ -895,11 +901,33 @@ fn a_rollback_across_the_store_floor_is_refused_before_anything_stops() {
         "the hub was not stopped"
     );
 
-    // A store the candidate reads: the ordinary rollback restarts the hub on it.
-    set_floor(&hub, 1);
+    // Normal CLI reads must leave the running hub and its store writer usable.
+    let commands: &[&[&str]] = &[
+        &["status", "--json"],
+        &["lead", "status", "--json"],
+        &[
+            "lead",
+            "send",
+            "keep this queued across the reader preflight",
+        ],
+    ];
+    for args in commands {
+        let out = run(&hub, &command_link(&hub), args);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    assert_eq!(hub_version(&hub).as_deref(), Some(v2.as_str()));
+
+    stop_hub(&hub);
+    let _ = running.wait();
+    // Simulate a compatible store only after its sole writer has stopped.
+    set_floor(&hub, 10);
+    let mut running = installed_hub(&hub);
+    hub.until(Duration::from_secs(20), || {
+        (hub_version(&hub).as_deref() == Some(v2.as_str())).then_some(())
+    });
     let out = run(&hub, &command_link(&hub), &["rollback"]);
     assert!(out.status.success(), "{}", text(&out));
-    assert_eq!(hub_version(&hub).as_deref(), Some(V1));
+    assert_eq!(hub_version(&hub).as_deref(), Some(CAPABILITY_LESS_VERSION));
     let _ = running.wait();
     stop_hub(&hub);
 }

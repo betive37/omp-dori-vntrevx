@@ -222,11 +222,13 @@ in their own areas; this spec only states what lifecycle needs from them.
 46. Hold and continue are refused while a close is in progress.
 47. A held lane that starts a turn (a queued message, a background result) stays held. The daemon tells the lead once
     per active stretch; the next stretch after it went idle is reported again. Nothing ever continues a held lane
-    except an explicit continue or reopen. A lane may pause its own goal while it waits for an answer; that is no
-    hold, since every pause the daemon makes is recorded as one (44). Before a message from the owner or the lead
-    (not a daemon notice or reminder) is delivered to a running, rejected or claimed lane whose goal is paused,
-    the daemon resumes the goal, so the answer arrives. A goal blocked by its budget is never resumed this way.
-    While a paused or blocked goal still keeps such messages out, the lead is told once, with that reason.
+    except an explicit continue or reopen. A headless lane may pause its own goal while it waits for an answer;
+    that is no hold, since every pause the daemon makes is recorded as one (44). Before an owner or lead message
+    (not a daemon notice or reminder) is delivered to a running, rejected or claimed headless lane whose goal is
+    paused, the daemon may resume the goal only if no reopen intent or in-doubt input remains. A budget-blocked
+    goal is never resumed this way. Tern cannot prove who paused a goal and never automatically resumes it for
+    an answer. While a paused or blocked goal keeps messages out, the lead is told once with the reason and,
+    for Tern, how to resume explicitly in the terminal or with `lane.pause` followed by `lane.resume`.
 
 ### Long-term suspension and giving up (LANE-19)
 
@@ -292,6 +294,9 @@ in their own areas; this spec only states what lifecycle needs from them.
     cleared, report-tracking fields reset, thread, completion condition and history kept); start OMP resuming the exact
     session file; confirm within the start deadline that the live session ID and file equal the saved ones; then
     continue (45); then, if a note was given, send it once. An unconfirmed note is reported and never resent.
+    Persist the reopen's `{episode_ms, note, step}` with that revision before starting. A hub stop cancels its
+    current attempt; restart continues the same episode, run and completed step rather than creating another
+    revision or repeating the note. Preflight refusal leaves the original record unchanged.
 66. If the start or identity check fails, the lane stays registered in held state with the new revision and its
     session, run, thread, mailbox, goal and worktree ownership, the reason is reported, and the lead must inspect
     before continuing. A failed resume never removes a record or a worktree. Removed worktrees are not recreated.
@@ -317,6 +322,10 @@ in their own areas; this spec only states what lifecycle needs from them.
     brings its lanes back the same way. Report a summary line per lane to the lead. Batches written to a lane before
     the restart follow the session-host delivery rule (107): a batch on a worker whose connection dropped is never
     written again automatically.
+    Owner-paused or held lanes without a pending explicit reopen intent stay down. A pending reopen continues
+    its recorded episode and step (65), not a new reopen. Legacy records without startup journals may resume
+    only when no attempt ownership was recorded and a fresh lease check proves the saved session free;
+    recorded unknown ownership holds instead.
 71. On demand the lead can ask for a drift report: lanes whose session is gone, lanes whose live session ID differs
     from the record, tern blocks running OMP that belong to no lane, and lanes with an empty completion condition.
     The report changes nothing.
