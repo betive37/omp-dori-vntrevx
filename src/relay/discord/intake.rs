@@ -1284,7 +1284,7 @@ impl<T: Runtime> Handler for Arc<Intake<T>> {
         });
         log::info("Discord Gateway ready", &[("resumed", &resumed)]);
         if let (Some(tap), Ok(bot)) = (self.active_tap(), self.bot.to_string().parse::<u64>()) {
-            (tap.seen)(Seen::Up(bot));
+            (tap.seen)(Seen::Up { bot, resumed });
         }
         self.wake.notify_one();
     }

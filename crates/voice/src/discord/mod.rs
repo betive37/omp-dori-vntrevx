@@ -27,6 +27,7 @@ const REJOIN: Duration = Duration::from_secs(3);
 /// Discord's channel type of a guild voice channel.
 const GUILD_VOICE: u64 = 2;
 
+// allow: SIZE_OK — the Gateway, connection and recovery events form one connection state machine.
 /// The voice side of the Discord connection. The flags are the audibility conditions of VOICE
 /// req. 54, each set by a different event, so they stay separate.
 #[allow(clippy::struct_excessive_bools)]
@@ -102,6 +103,9 @@ impl<H: VoiceHost> Voice<H> {
                 }
                 e = events.recv() => {
                     let Some(e) = e else { continue };
+                    if self.conn.is_none() {
+                        continue;
+                    }
                     match e {
                         ConnEvent::Ready => {
                             self.conn_ready = true;
@@ -136,10 +140,13 @@ impl<H: VoiceHost> Voice<H> {
                         break Err("voice was not ready within 30 s".to_string());
                     }
                     if self.down_since.is_some_and(|t| now >= t + DOWN) {
-                        // Tear down and rejoin after 3 s (VOICE req. 53).
-                        self.down_since = None;
+                        // Recovery keeps its original readiness deadline.
+                        let deadline = self.not_ready_since;
                         self.teardown().await;
-                        self.rejoin_at = Some(now + REJOIN);
+                        self.not_ready_since = deadline;
+                        if self.owner_in {
+                            self.rejoin_at = Some(now + REJOIN);
+                        }
                     }
                     if self.rejoin_at.is_some_and(|t| now >= t) {
                         self.rejoin_at = None;
@@ -147,12 +154,17 @@ impl<H: VoiceHost> Voice<H> {
                     }
                 }
             }
-            // Losing audibility discards queued audio and marks the owner absent.
-            if self.audible() {
+            // Waiting for the owner has no readiness deadline and keeps the audio feed alive.
+            if !self.joined {
+                while events.try_recv().is_ok() {}
+            }
+            if self.audible() || !self.owner_in {
                 self.not_ready_since = None;
             } else {
-                while play.try_recv().is_ok() {}
                 self.not_ready_since.get_or_insert(Instant::now());
+            }
+            if !self.audible() {
+                while play.try_recv().is_ok() {}
             }
             let present = self.owner_in && self.audible();
             presence.send_if_modified(|p| {
@@ -173,14 +185,16 @@ impl<H: VoiceHost> Voice<H> {
     ) -> Result<(), String> {
         let s = Arc::clone(&self.settings);
         match event {
-            GatewayEvent::Ready { bot } => {
+            GatewayEvent::Ready { bot, resumed } => {
                 if bot == s.owner {
                     return Err("the owner ID is the bot's own ID".into());
                 }
                 self.bot = Some(bot);
                 self.gateway_up = true;
-                if self.checked {
-                    self.join().await;
+                if !resumed {
+                    self.teardown().await;
+                    self.checked = false;
+                    self.owner_in = false;
                 }
             }
             GatewayEvent::Guild {
@@ -190,14 +204,13 @@ impl<H: VoiceHost> Voice<H> {
                 if channel_type != Some(GUILD_VOICE) {
                     return Err("the voice channel is not a guild voice channel".into());
                 }
-                self.gateway_up = true;
                 self.owner_in = voice_states
                     .iter()
                     .any(|(u, c, _)| *u == s.owner && *c == Some(s.voice_channel));
-                if !self.checked {
-                    self.checked = true;
-                    self.join().await;
-                }
+                self.bot_in = voice_states
+                    .iter()
+                    .any(|(u, c, _)| Some(*u) == self.bot && *c == Some(s.voice_channel));
+                self.checked = true;
             }
             GatewayEvent::VoiceState {
                 user,
@@ -227,7 +240,7 @@ impl<H: VoiceHost> Voice<H> {
                 }
             }
             GatewayEvent::VoiceServer { token, endpoint } => {
-                if let Some(e) = endpoint {
+                if let Some(e) = endpoint.filter(|_| self.joined) {
                     self.server = Some((token, e));
                     self.connect(events);
                 } else {
@@ -238,11 +251,21 @@ impl<H: VoiceHost> Voice<H> {
                 self.gateway_up = false;
             }
         }
+        if self.owner_in {
+            if self.rejoin_at.is_none() {
+                self.join().await;
+            }
+        } else {
+            self.teardown().await;
+        }
         Ok(())
     }
 
     async fn join(&mut self) {
         let Some(_) = self.bot else { return };
+        if !self.checked || !self.gateway_up || !self.owner_in || self.joined {
+            return;
+        }
         self.joined = true;
         self.not_ready_since.get_or_insert(Instant::now());
         if let Err(e) = self
@@ -257,17 +280,32 @@ impl<H: VoiceHost> Voice<H> {
     async fn teardown(&mut self) {
         if let Some((task, _)) = self.conn.take() {
             task.abort();
+            if let Err(e) = task.await
+                && !e.is_cancelled()
+            {
+                self.host.log(&format!("voice connection task failed: {e}"));
+            }
         }
         self.conn_ready = false;
         self.session_id = None;
         self.server = None;
-        if self.joined {
-            let _ = self.host.voice_state(self.settings.guild, None).await;
+        if (self.joined || self.bot_in)
+            && let Err(e) = self.host.voice_state(self.settings.guild, None).await
+        {
+            self.host.log(&format!("voice leave not sent: {e}"));
         }
+        self.joined = false;
+        self.bot_in = false;
+        self.not_ready_since = None;
+        self.down_since = None;
+        self.rejoin_at = None;
     }
 
     /// Starts a connection once the session ID and the server are known.
     fn connect(&mut self, events: &mpsc::Sender<ConnEvent>) {
+        if !self.owner_in || !self.joined || !self.gateway_up || !self.bot_in {
+            return;
+        }
         let (Some(bot), Some(session_id), Some((token, endpoint))) =
             (self.bot, self.session_id.clone(), self.server.clone())
         else {

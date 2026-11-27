@@ -100,6 +100,11 @@ impl VoiceServer {
         }
     }
 
+    /// Drops the live voice socket, as a transport disconnect would.
+    pub fn disconnect(&self) {
+        self.state.lock().unwrap().ws = None;
+    }
+
     /// Sends a frame on the voice WebSocket.
     pub fn send(&self, frame: Value) {
         if let Some(tx) = &self.state.lock().unwrap().ws {

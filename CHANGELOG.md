@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.6 (Unreleased)
+
+- Discord voice now joins when you enter the configured voice channel and leaves when you leave,
+  including after hub starts, updates and voice restarts. Silence closes only the paid session
+  while you remain; status and the ops panel distinguish waiting for you, in the call and held.
+
 ## 0.2.5 (2026-11-27)
 
 - The lead can open lanes again: `cataly_lead` now declares every parameter its operations read,
