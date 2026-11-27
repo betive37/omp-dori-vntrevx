@@ -16,6 +16,7 @@ use std::path::PathBuf;
 use std::time::Duration;
 
 use serde_json::{Value, json};
+use support::LeadBridge;
 use support::TestHub;
 use support::discord::{BOT, FakeDiscord, Gw};
 
@@ -1464,82 +1465,10 @@ fn owed_messages_bring_a_reminder_after_a_minute() {
     assert!(hub.stop().success());
 }
 
-/// The lead's side of the bridge, as its OMP extension speaks it, for calls of its tool.
-struct LeadBridge {
-    reader: std::io::BufReader<std::os::unix::net::UnixStream>,
-    writer: std::os::unix::net::UnixStream,
-    session: Value,
-    next: u64,
-}
-
-impl LeadBridge {
-    /// Connects as the live lead with its launch token; also returns the hello answer.
-    fn connect(hub: &TestHub) -> (Self, Value) {
-        let session = hub.until(WAIT, || {
-            let v = hub.json(&["lead", "status", "--json"]);
-            (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
-        });
-        let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
-        let token = launch
-            .lines()
-            .rfind(|l| l.split(' ').nth(1) == session.as_str())
-            .and_then(|l| l.split(' ').next())
-            .unwrap()
-            .to_string();
-        let writer = std::os::unix::net::UnixStream::connect(hub.socket()).unwrap();
-        writer
-            .set_read_timeout(Some(Duration::from_secs(120)))
-            .unwrap();
-        let reader = std::io::BufReader::new(writer.try_clone().unwrap());
-        let mut bridge = Self {
-            reader,
-            writer,
-            session: session.clone(),
-            next: 1,
-        };
-        let hello = bridge.call(
-            "bridge.hello",
-            &json!({ "ext": 1, "token": token, "session": session, "agent": "main" }),
-        );
-        (bridge, hello)
-    }
-
-    fn call(&mut self, method: &str, params: &Value) -> Value {
-        use std::io::{BufRead, Write};
-        let id = self.next;
-        self.next += 1;
-        let line = json!({ "v": 1, "id": id, "method": method, "params": params });
-        self.writer
-            .write_all(format!("{line}\n").as_bytes())
-            .unwrap();
-        loop {
-            let mut reply = String::new();
-            self.reader.read_line(&mut reply).unwrap();
-            let v: Value = serde_json::from_str(&reply).unwrap();
-            if v["id"] == id {
-                return v["ok"].clone();
-            }
-        }
-    }
-
-    /// One `cataly_lead` call: its text and whether it is an error.
-    fn tool(&mut self, input: &Value) -> (String, bool) {
-        let call = format!("call-{}", self.next);
-        let params =
-            json!({ "call": call, "tool": "cataly_lead", "session": self.session, "input": input });
-        let v = self.call("bridge.tool", &params);
-        (
-            v["text"].as_str().unwrap_or_default().to_string(),
-            v["error"] == true,
-        )
-    }
-}
-
 /// A hub whose lead answers only with its tool (`[lead] answers = "tool"`).
 fn tool_hub(fake: &FakeDiscord, fixtures: &[&str]) -> TestHub {
     let hub = relay_hub(fake, fixtures, "");
-    let config = std::fs::read_to_string(hub.config_path()).unwrap();
-    hub.write_config(&config.replace("[lead]\n", "[lead]\nanswers = \"tool\"\n"));
+    hub.tool_answers();
     hub
 }
 
@@ -1774,26 +1703,126 @@ fn a_follow_up_refused_by_a_closed_thread_goes_to_the_channel() {
     assert!(hub.stop().success());
 }
 
-/// While onboarding runs (read-only) `answer` is refused like every other post.
+/// While onboarding runs (read-only) the lead still answers the owner in place: that is how its
+/// consent and tool questions reach the owner with answers = "tool". Posting elsewhere is refused.
 #[test]
-fn onboarding_blocks_the_answer_operation() {
+fn onboarding_lets_answers_in_place_through_and_nothing_else() {
+    const ROOM: &str = "600000000000000078";
     let fake = FakeDiscord::start();
     let mut hub = tool_hub(&fake, &[]);
+    fake.channel(ROOM, 0, None);
     hub.start();
     ready(&hub);
     let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_351, "during onboarding");
     let (mut lead, _) = LeadBridge::connect(&hub);
     let (said, error) = lead.tool(&json!({ "op": "onboarding.start" }));
     assert!(!error, "{said}");
+    let message = format!("discord:{CH}/{source}");
     let (said, error) = lead.tool(&json!({
-        "op": "answer",
-        "message": format!("discord:{CH}/{source}"),
-        "text": "not now"
+        "op": "answer", "message": message, "text": "May I look at your tools?", "room": ROOM
     }));
     assert!(
         error && said.contains("refused while onboarding runs"),
         "{said}"
     );
     assert!(fake.creates().is_empty());
+    let (said, error) = lead.tool(&json!({
+        "op": "answer", "message": message, "text": "May I look at your tools?"
+    }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    let posted = fake.bot_messages(CH);
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(
+        posted[0]["message_reference"]["message_id"],
+        source.as_str()
+    );
+    assert!(
+        fake.bot_messages(ROOM).is_empty(),
+        "nothing in the other room"
+    );
+    let (said, error) = lead
+        .tool(&json!({ "op": "question.ask", "text": "x", "source": message, "options": ["a"] }));
+    assert!(
+        error && said.contains("refused while onboarding runs"),
+        "{said}"
+    );
+    assert!(hub.stop().success());
+}
+
+/// Turns the stored parts of one source back into the form an earlier version wrote: the remote
+/// ID alone, without the room. The hub must be stopped.
+fn as_legacy_rows(hub: &TestHub, source: &str) {
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    let n = db
+        .execute(
+            "UPDATE outbox_parts SET remote = substr(remote, instr(remote, '/') + 1) \
+             WHERE relay = 'discord' AND source = ?1 AND remote LIKE '%/%'",
+            [source],
+        )
+        .unwrap();
+    assert!(n > 0, "rows rewritten");
+}
+
+/// A follow-up to an answer an earlier version posted in the thread (its stored part names no
+/// room) goes to that thread: the hub reads the part back to find it.
+#[test]
+fn a_follow_up_to_an_answer_stored_without_its_room_finds_the_thread() {
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    hub.start();
+    ready(&hub);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_361, "legacy row");
+    hub.until(WAIT, || (requests(&hub).len() == 1).then_some(()));
+    let message = format!("discord:{CH}/{thread}");
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) = lead.tool(&json!({ "op": "answer", "message": message, "text": "first" }));
+    assert!(!error && said.contains("posted as its reply"), "{said}");
+    drop(lead);
+    assert!(hub.stop().success());
+    as_legacy_rows(&hub, &thread);
+    hub.start();
+    ready(&hub);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) = lead.tool(&json!({ "op": "answer", "message": message, "text": "later" }));
+    assert!(!error && said.contains("follow-up"), "{said}");
+    let posted = fake.bot_messages(&thread);
+    assert_eq!(posted.len(), 2, "{posted:?}");
+    assert_eq!(posted[1]["content"], "later");
+    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
+    assert!(hub.stop().success());
+}
+
+/// An answer sent to another room whose first part was still out in the open at a restart may
+/// still go to the request's room when that room refuses it afterwards, as before the restart.
+#[test]
+fn an_answer_in_another_room_refused_after_a_restart_replies_in_the_channel() {
+    const ROOM: &str = "600000000000000079";
+    let fake = FakeDiscord::start();
+    let mut hub = tool_hub(&fake, &[]);
+    fake.channel(ROOM, 0, None);
+    hub.start();
+    ready(&hub);
+    let source = ask_tool_lead(
+        &hub,
+        &fake,
+        800_000_000_000_000_371,
+        "refused after restart",
+    );
+    let message = format!("discord:{CH}/{source}");
+    // One call's four attempts end uncertain without reaching Discord; every later one is refused
+    // for its own sake.
+    let mut script = vec![502; 4];
+    script.extend([400; 64]);
+    fake.script_in(ROOM, &script);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (said, error) =
+        lead.tool(&json!({ "op": "answer", "message": message, "text": "x", "room": ROOM }));
+    assert!(!error && said.contains("retried by itself"), "{said}");
+    drop(lead);
+    assert!(hub.stop().success());
+    hub.start();
+    let reply = fake.wait(WAIT, |f| f.bot_messages(CH).pop());
+    assert_eq!(reply["message_reference"]["message_id"], source.as_str());
+    settled(&hub);
     assert!(hub.stop().success());
 }

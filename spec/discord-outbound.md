@@ -123,13 +123,18 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     text is refused, so nothing goes ahead of its remaining parts. Later calls for the same
     message are follow-ups: each is stored as its own outbox entry (the message and a digest of
     its text, nonces from those) for the room the answer went to (another room given now, else
-    the room its last part was posted in), posted at once, and settles nothing; the same text
-    again posts only what is missing, also after a restart, and a room that refuses the bot as
-    such sends the follow-up to the request's room as its reply. The bridge waits up to 150 s for
+    the room its last part was posted in; for parts stored without a room it is read back as in
+    rule 25), posted at once, and settles nothing; the same text again posts only what is missing,
+    also after a restart, and a room that refuses the bot as such sends the follow-up to the
+    request's room as its reply. Where the messenger enforces no nonce (Telegram, Slack) an answer
+    or follow-up whose send ended uncertain is never posted again, by a round or by the same call:
+    the call says to check the room. The bridge waits up to 150 s for
     the call; the hub takes an answer back unposted when its messenger has not taken it within
     120 s. A request the lead never answers is let go after the obligation window (34);
     reminders and the stop notice (35) name the operation, and a final message never counts as an
-    answer for the stop gate. While onboarding runs (read-only) the operation is refused. The
+    answer for the stop gate. While onboarding runs (read-only) an answer in place, as the reply
+    to the owner's message, still goes out (it carries onboarding's questions); one naming
+    another room is refused. The
     request text the lead receives says that its final message is not posted. The operation is
     also available with the default `"final"`; an answer posted with it replaces the automatic
     one. It works for Discord, Telegram and Slack alike.
@@ -161,7 +166,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     message, so a thread locked or deleted mid-answer holds up no later answer. The lookup is
     shared with typing, so both use one result per request. The choice lives in daemon memory for
     that delivery. A part posted outside the request's room is stored with that room
-    (`<room>/<id>`), and a part stored for another room keeps it while pending (`<room>/`). After a
+    (`<room>/<id>`), and a part stored for another room keeps it while pending (`<room>/`); an
+    earlier version reads such a value as a message ID, so roll back only when no answer is
+    being posted. After a
     restart in the middle of an answer the rest follows the last part out, in the room stored
     with it, or the stored room of the pending parts. For parts stored without a room (in the
     request's room, or by an earlier version) the daemon reads the first part back, from the

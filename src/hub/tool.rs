@@ -265,6 +265,16 @@ async fn answer(hub: &Hub, input: &Value) -> Result<String, String> {
         other => return Err(format!("message: unknown messenger {other}")),
     };
     let to = s(input, "room").filter(|r| !r.is_empty());
+    // Onboarding is read-only, but the lead's replies to the owner still go out (its guidance): an
+    // answer in place, as the reply to the owner's message, carries its questions; nothing goes
+    // elsewhere.
+    if to.is_some() && super::onboarding::running(hub).await {
+        return Err(
+            "answer with room is refused while onboarding runs: onboarding is read-only; answer \
+             in place, as the reply to the owner's message"
+                .into(),
+        );
+    }
     shared.answer(room, message, text, to).await
 }
 

@@ -1028,11 +1028,19 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         // The same answer again (a retry after a timeout) posts nothing new.
         let first = self.parts_of(room, message).await?;
         if !first.is_empty() && first.iter().map(|p| &p.text).eq(parts.iter()) {
-            return Ok(if first.iter().all(|p| p.state == "confirmed") {
-                format!("this answer to {tag} is already posted: nothing posted again")
+            return if first.iter().all(|p| p.state == "confirmed") {
+                Ok(format!(
+                    "this answer to {tag} is already posted: nothing posted again"
+                ))
+            } else if h.answer == "posting" {
+                Ok(format!(
+                    "this answer to {tag} is already stored and still being posted by itself"
+                ))
             } else {
-                format!("this answer to {tag} is already stored and still being posted by itself")
-            });
+                Err(format!(
+                    "this answer to {tag} may already be posted, in part or whole (its outcome was uncertain): check the room before posting it again; nothing posted again"
+                ))
+            };
         }
         // Nothing goes ahead of the answer's remaining parts.
         if h.answer == "posting" {
@@ -1130,7 +1138,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         if stored.is_empty() {
             let dest = match to {
                 Some(to) => Some(to.to_string()),
-                None => self.answer_went(&h, first).await,
+                None => self.answer_went(&h, first).await.map_err(|why| {
+                    format!("where the answer to {tag} went cannot be read now ({why}): try again, or name the room")
+                })?,
             };
             let parts = parts
                 .iter()
@@ -1151,6 +1161,8 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             return Ok(format!(
                 "this follow-up to {tag} is already posted: nothing posted again"
             ));
+        } else if stored.iter().any(|p| p.state == "dropped") {
+            return Err(Self::unsure(&tag));
         }
         let posting = HandoffRow {
             answer: "posting".into(),
@@ -1161,6 +1173,8 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         let out = now.iter().filter(|p| p.state == "confirmed").count();
         if out == now.len() {
             Ok(format!("follow-up to {tag} posted ({out} part(s))"))
+        } else if now.iter().any(|p| p.state == "dropped") {
+            Err(Self::unsure(&tag))
         } else {
             Err(format!(
                 "follow-up to {tag}: {out} of {} part(s) posted; repeating the same call posts only what is missing",
@@ -1169,13 +1183,34 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
     }
 
-    /// The room the answer to `h` went to, from its stored parts: the room its last part names,
-    /// else the request's room (`None`); with no part out, where an answer would go now.
-    async fn answer_went(&self, h: &HandoffRow, first: &[PartRow]) -> Option<String> {
-        match first.iter().rfind(|p| p.state == "confirmed") {
-            Some(last) => placed(last.remote.as_deref()).map(str::to_string),
-            None => self.answer_room(&h.room, &h.message).await,
+    /// A follow-up whose outcome is unknown (no enforced nonce) or whose request was deleted.
+    fn unsure(tag: &str) -> String {
+        format!(
+            "this follow-up to {tag} may be posted, in part or whole (its outcome was uncertain, or the request was deleted): check the room before posting it again; nothing is posted again"
+        )
+    }
+
+    /// The room the answer to `h` went to, from its stored parts: the room its last part names, the
+    /// request's room (`None`) once parts went there after another room, else (parts stored
+    /// without a room, as by an earlier version) where the relay reads its first part back; with
+    /// no part out, where an answer would go now.
+    async fn answer_went(
+        &self,
+        h: &HandoffRow,
+        first: &[PartRow],
+    ) -> Result<Option<String>, String> {
+        let out: Vec<&PartRow> = first.iter().filter(|p| p.state == "confirmed").collect();
+        let Some(last) = out.last() else {
+            return Ok(self.answer_room(&h.room, &h.message).await);
+        };
+        if let Some(room) = placed(last.remote.as_deref()) {
+            return Ok(Some(room.to_string()));
         }
+        if out.iter().any(|p| placed(p.remote.as_deref()).is_some()) {
+            return Ok(None);
+        }
+        let posted = out.first().and_then(|p| p.remote.as_deref()).unwrap_or("");
+        Ok(self.resumed(h, posted).await?.room)
     }
 
     async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
@@ -1272,8 +1307,14 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 }
                 None => held(None),
             },
+            // Nothing out yet: the room stored for the parts, which may still refuse the first
+            // part and send it to the request's room, as before the restart.
             None => match parts.first().and_then(|p| placed(p.remote.as_deref())) {
-                Some(room) => held(Some(room)),
+                Some(room) => Target {
+                    room: Some(room.to_string()),
+                    held: false,
+                    reply_next: false,
+                },
                 None if source != h.message => held(None),
                 None => Target {
                     room: self.answer_room(&h.room, &h.message).await,
@@ -1511,12 +1552,19 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                             ("reason", &why),
                         ],
                     );
+                    // A follow-up has no hand-off to give up: its parts end here instead, so
+                    // neither a round nor the same call posts them again.
+                    let answer = if source == h.message {
+                        "abandoned"
+                    } else {
+                        "dropped"
+                    };
                     self.store
                         .relay(RelayWrite::Answer {
                             relay: R::NAME.into(),
                             room: h.room.clone(),
                             message: source.to_string(),
-                            answer: "abandoned".into(),
+                            answer: answer.into(),
                         })
                         .await
                         .map_err(|e| e.to_string())?;
