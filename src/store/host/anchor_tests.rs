@@ -162,7 +162,7 @@ fn migration_preserves_fresh_intent_behind_a_newer_failed_resume() {
 }
 
 #[test]
-fn migration_holds_ambiguous_equal_timestamp_history_but_accepts_an_exact_pin() {
+fn migration_orders_equal_timestamps_by_rowid_and_accepts_an_exact_pin() {
     let mut db = database();
     attempt(&mut db, "a", "fresh", 1);
     bind(&mut db, "a", "A", 1);
@@ -170,8 +170,48 @@ fn migration_holds_ambiguous_equal_timestamp_history_but_accepts_an_exact_pin() 
     bind(&mut db, "b", "B", 1);
     migrate_history(&db);
     let reads = Reads(db);
-    assert!(reads.lead_target(None).unwrap().hold.is_some());
+    let current = reads.lead_target(None).unwrap();
+    assert!(current.hold.is_none());
+    assert_eq!(current.row.unwrap().session_id.as_deref(), Some("B"));
     let pinned = reads.lead_target(Some("A")).unwrap();
     assert!(pinned.hold.is_none());
     assert_eq!(pinned.row.unwrap().session_id.as_deref(), Some("A"));
+}
+
+#[test]
+fn migration_keeps_the_latest_of_successive_conversations() {
+    let mut db = database();
+    for (handle, id, mode, now) in [
+        ("a1", "A", "fresh", 1),
+        ("a2", "A", "resume", 2),
+        ("b1", "B", "fresh", 3),
+        ("b2", "B", "resume", 4),
+    ] {
+        attempt(&mut db, handle, mode, now);
+        bind(&mut db, handle, id, now);
+        db.execute(
+            "UPDATE sessions SET expected_id = session_id, expected_file = session_file WHERE handle = ?1 AND mode = 'resume'",
+            [handle],
+        ).unwrap();
+    }
+    migrate_history(&db);
+    let selected = Reads(db).lead_target(None).unwrap();
+    assert!(selected.hold.is_none(), "{selected:?}");
+    assert_eq!(selected.row.unwrap().handle, "b2");
+}
+
+#[test]
+fn explicit_fresh_intent_lifts_a_migrated_unbound_hold() {
+    let mut db = database();
+    attempt(&mut db, "only-failed-resume", "resume", 1);
+    migrate_history(&db);
+    let mut reads = Reads(db);
+    assert!(reads.lead_target(None).unwrap().hold.is_some());
+    let tx = reads.0.transaction().unwrap();
+    intent(&tx, Intent::Fresh).unwrap();
+    tx.commit().unwrap();
+    let selected = reads.lead_target(None).unwrap();
+    assert!(selected.hold.is_none(), "{selected:?}");
+    assert_eq!(selected.intent, "fresh");
+    assert!(selected.row.is_none());
 }

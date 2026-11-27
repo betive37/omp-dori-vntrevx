@@ -1397,3 +1397,65 @@ fn a_duplicate_start_does_not_replace_the_owned_resume_attempt() {
     assert!(w.hub.stop().success());
     w.no_orphans();
 }
+
+#[test]
+fn first_failed_start_retries_when_no_conversation_was_bound() {
+    let mut w = wrapped("", None);
+    w.arm("fail-fresh", "");
+    w.hub.start();
+    held(&w.hub, 20);
+    w.disarm("fail-fresh");
+    let retried = w.hub.cli(&["lead", "start"]);
+    assert!(retried.status.success(), "{retried:?}");
+    let started = live(&w.hub, &Value::Null);
+    assert!(started["anchor"]["session_id"].is_string(), "{started}");
+    assert_eq!(w.starts("fresh").len(), 2);
+    assert!(w.hub.stop().success());
+}
+
+#[test]
+fn a_startup_model_mismatch_keeps_the_session_fenced_until_owner_acceptance() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    assert!(w.hub.cli(&["lead", "stop"]).status.success());
+    w.hub.fixture("omp", "model", Some("fake/other"));
+    let out = w.hub.cli(&["lead", "start", "--fresh"]);
+    assert!(out.status.success(), "{out:?}");
+    let fenced = live(&w.hub, &first["session"]["pid"]);
+    assert!(fenced["session"]["input_blocked"].as_bool().unwrap());
+    assert_eq!(
+        fenced["anchor"]["session_id"],
+        first["anchor"]["session_id"]
+    );
+    assert_ne!(
+        fenced["session"]["session_id"],
+        first["session"]["session_id"]
+    );
+    assert!(
+        w.hub
+            .cli(&["lead", "send", "AFTER-MODEL-ACCEPT"])
+            .status
+            .success()
+    );
+    assert_eq!(
+        user_entries(&fenced["session"]["session_file"], "AFTER-MODEL-ACCEPT"),
+        0
+    );
+    w.hub.until(Duration::from_secs(10), || {
+        w.hub
+            .events()
+            .iter()
+            .any(|e| e["kind"] == "session.fenced")
+            .then_some(())
+    });
+    let accepted = w.hub.cli(&["lead", "accept-model"]);
+    assert!(accepted.status.success(), "{accepted:?}");
+    w.hub.until(Duration::from_secs(10), || {
+        (user_entries(&fenced["session"]["session_file"], "AFTER-MODEL-ACCEPT") == 1).then_some(())
+    });
+    assert_eq!(
+        lead_view(&w.hub)["anchor"]["session_id"],
+        fenced["session"]["session_id"]
+    );
+    assert!(w.hub.stop().success());
+}

@@ -8,6 +8,7 @@ use super::{HostDone, Reads, SESSION_COLUMNS, SessionRow, SessionUpdate, session
 pub(crate) struct Selection {
     pub(crate) row: Option<SessionRow>,
     pub(crate) ever_started: bool,
+    pub(crate) ever_bound: bool,
     pub(crate) intent: String,
     pub(crate) hold: Option<String>,
     pub(crate) provenance: Option<String>,
@@ -21,7 +22,7 @@ pub(crate) enum Intent {
 
 pub(super) fn intent(tx: &Transaction<'_>, intent: Intent) -> rusqlite::Result<HostDone> {
     tx.execute(
-        "UPDATE lead_anchor SET intent = ?1 WHERE singleton = 1",
+        "UPDATE lead_anchor SET intent = ?1, hold = CASE WHEN ?1 = 'fresh' THEN NULL ELSE hold END WHERE singleton = 1",
         [match intent {
             Intent::Fresh => "fresh",
             Intent::Resume => "resume",
@@ -42,6 +43,10 @@ pub(super) fn bound(
         return Err(rusqlite::Error::InvalidQuery);
     }
     let done = super::update(tx, update, now)?;
+    tx.execute(
+        "UPDATE sessions SET fault = NULL WHERE handle = ?1",
+        [&update.handle],
+    )?;
     let written = tx.execute(
         "INSERT INTO lead_bindings(handle, session_id, session_file, cwd, runtime, provenance, bound_ms) \
          SELECT handle, ?2, ?3, cwd, runtime, \
@@ -119,13 +124,34 @@ impl Reads {
         if self.0.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE role = 'lead' AND session_id IS NULL AND state IN ('starting', 'held', 'orphan_held'))", [], |r| r.get::<_, bool>(0))? {
             hold = Some("an earlier unbound lead attempt has unknown process ownership; held until its exit is reconciled".into());
         }
+        let ever_bound = self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lead_bindings) OR EXISTS(SELECT 1 FROM sessions WHERE role = 'lead' AND session_id IS NOT NULL)",
+            [], |r| r.get(0),
+        )?;
         Ok(Selection {
             row,
             ever_started,
             intent,
+            ever_bound,
             hold,
             provenance,
         })
+    }
+
+    /// Current/pinned bindings, any lane record and the episode containing an attempt retain it.
+    pub(crate) fn startup_referenced(
+        &self,
+        handle: &str,
+        session: Option<&str>,
+        created_ms: i64,
+    ) -> rusqlite::Result<bool> {
+        self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM lead_bindings WHERE handle = ?1) \
+             OR EXISTS(SELECT 1 FROM lanes WHERE json_extract(record, '$.handle') = ?1) \
+             OR EXISTS(SELECT 1 FROM startup_episodes WHERE session_id = ?2 AND started_ms <= ?3)",
+            params![handle, session, created_ms],
+            |r| r.get(0),
+        )
     }
 }
 

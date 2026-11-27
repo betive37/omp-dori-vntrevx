@@ -628,7 +628,7 @@ async fn lead_method(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure
             .await
             .map_err(refused)?),
         method::LEAD_ACCEPT_MODEL => {
-            lead.accept_model().map_err(refused)?;
+            lead.accept_model().await.map_err(refused)?;
             done()
         }
         method::LEAD_ANSWER => {

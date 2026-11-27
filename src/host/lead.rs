@@ -745,6 +745,9 @@ impl<R: Runtime> Lead<R> {
                 log::warn("session recovery not recorded", &[("error", &e)]);
             }
         }
+        if let Err(error) = ownership::prune(&self.env.state_dir, &self.env.store).await {
+            log::warn("startup receipts retained", &[("error", &error)]);
+        }
     }
 
     async fn lease(&self, id: &str) -> Lease {
@@ -846,6 +849,16 @@ impl<R: Runtime> Lead<R> {
         {
             return Err("a pinned session_id conflicts with --fresh".into());
         }
+        let pin = self
+            .env
+            .config
+            .borrow()
+            .lead
+            .as_ref()
+            .and_then(|lead| lead.session_id.clone());
+        // An owner retry can repeat the first fresh start only when no identity ever bound.
+        // Automatic recovery never takes this path, and a missing pinned identity stays held.
+        let fresh = fresh || (pin.is_none() && !self.resolve(None).await?.ever_bound);
         self.env
             .store
             .host(HostWrite::LeadIntent(if fresh {
@@ -1010,7 +1023,7 @@ impl<R: Runtime> Lead<R> {
         default: PathBuf,
     ) -> Result<Chosen, String> {
         let selected = self.resolve(settings.session_id.clone()).await?;
-        if let Some(reason) = selected.hold {
+        if !fresh && let Some(reason) = selected.hold {
             self.set_phase(Phase::Held, Some(reason.clone()));
             return Err(reason);
         }
@@ -1092,9 +1105,6 @@ impl<R: Runtime> Lead<R> {
         note: Option<String>,
     ) -> Result<(), String> {
         let committed = async {
-            if let Some(reason) = &started.held {
-                return Err(reason.clone());
-            }
             let canonical = binding_file(Path::new(&started.file), how)?;
             let update = SessionUpdate {
                 handle: handle.clone(),
@@ -1107,7 +1117,11 @@ impl<R: Runtime> Lead<R> {
             };
             self.env
                 .store
-                .host(HostWrite::BindLead(update))
+                .host(if started.held.is_some() {
+                    HostWrite::Session(update)
+                } else {
+                    HostWrite::BindLead(update)
+                })
                 .await
                 .map_err(|e| e.to_string())
         }
@@ -1968,8 +1982,34 @@ impl<R: Runtime> Lead<R> {
         self.live()?.set_model(selector).await
     }
 
-    pub(crate) fn accept_model(&self) -> Result<(), String> {
-        self.live()?.accept_model()?;
+    pub(crate) async fn accept_model(&self) -> Result<(), String> {
+        let session = self.live()?;
+        let snapshot = session.snapshot();
+        if !snapshot
+            .reason
+            .as_deref()
+            .is_some_and(|reason| reason.starts_with("model mismatch"))
+        {
+            return Err("the session is not held for a model mismatch".into());
+        }
+        let file = snapshot
+            .session_file
+            .as_deref()
+            .ok_or("the lead has no bound file")?;
+        let canonical = binding_file(Path::new(file), LeadStart::Asked)?;
+        self.env
+            .store
+            .host(HostWrite::BindLead(SessionUpdate {
+                handle: snapshot.handle.clone(),
+                state: Some("live".into()),
+                session_id: snapshot.session_id.clone(),
+                session_file: Some(canonical.display().to_string()),
+                ..SessionUpdate::default()
+            }))
+            .await
+            .map_err(|e| e.to_string())?;
+        // The durable anchor must exist before releasing the session's input fence.
+        session.accept_model()?;
         self.set_phase(Phase::Live, None);
         self.wake.notify_one();
         Ok(())

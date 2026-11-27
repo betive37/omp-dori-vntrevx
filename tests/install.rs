@@ -922,20 +922,19 @@ fn unknown_capability_and_install_sh_downgrades_are_refused() {
     stop_hub(&hub);
     let _ = first.wait();
 
-    set_floor(&hub, 10);
+    set_floor(&hub, 11);
     let before = snapshot(&hub);
     let out = run(&hub, &command_link(&hub), &["rollback"]);
     assert_eq!(out.status.code(), Some(6), "{}", text(&out));
     assert!(refused_for_the_store(&out, V1), "{}", text(&out));
     assert!(
-        String::from_utf8_lossy(&out.stderr)
-            .contains("어떤 저장소를 읽을 수 있는지 알려주지 않습니다"),
+        String::from_utf8_lossy(&out.stderr).contains("스키마 10까지 읽고"),
         "{}",
         text(&out)
     );
     assert_eq!(snapshot(&hub), before, "nothing switched");
 
-    for (folder, floor) in [(&old, 10), (&r1, 99)] {
+    for (folder, floor) in [(&old, 11), (&r1, 99)] {
         set_floor(&hub, floor);
         let out = install_sh(&hub, folder);
         assert_eq!(out.status.code(), Some(1), "{}", text(&out));
@@ -951,7 +950,7 @@ fn unknown_capability_and_install_sh_downgrades_are_refused() {
     }
 
     // At the schema capability-less releases read, the same rollback goes through.
-    set_floor(&hub, 9);
+    set_floor(&hub, 10);
     let out = run(&hub, &command_link(&hub), &["rollback"]);
     assert!(out.status.success(), "{}", text(&out));
     let (_, s) = status_install(&hub);

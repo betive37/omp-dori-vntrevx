@@ -14,7 +14,25 @@ struct Evidence {
     pid: Option<u32>,
     birth: Option<String>,
     reaped: bool,
+    #[serde(default)]
+    created_ms: i64,
+    #[serde(default)]
+    session: Option<String>,
+    #[serde(default)]
+    worker: Option<String>,
+    #[serde(default)]
+    terminal: Option<Terminal>,
 }
+
+#[derive(Clone, Debug, Deserialize, Serialize)]
+struct Terminal {
+    program: PathBuf,
+    block: String,
+}
+
+#[path = "ownership_prune.rs"]
+mod retention;
+pub(crate) use retention::prune;
 
 #[derive(Debug)]
 pub(crate) struct Ownership {
@@ -30,6 +48,10 @@ impl Ownership {
             pid: None,
             birth: None,
             reaped: false,
+            created_ms: crate::sys::now_ms(),
+            session: None,
+            worker: None,
+            terminal: None,
         };
         let bytes = serde_json::to_vec(&evidence).map_err(|e| e.to_string())?;
         let owner = Self {
@@ -54,6 +76,91 @@ impl Ownership {
         self.save(&evidence)
     }
 
+    pub(crate) fn identify(
+        &self,
+        session: Option<&str>,
+        worker: Option<&str>,
+    ) -> Result<(), String> {
+        let mut evidence = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        evidence.session = session.map(str::to_string);
+        evidence.worker = worker.map(str::to_string);
+        self.save(&evidence)
+    }
+
+    pub(crate) fn terminal(&self, program: &Path, block: &str) -> Result<(), String> {
+        let mut evidence = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        evidence.terminal = Some(Terminal {
+            program: program.to_path_buf(),
+            block: block.into(),
+        });
+        self.save(&evidence)
+    }
+
+    pub(crate) fn cleanup(&self) -> Cleanup {
+        if self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .reaped
+        {
+            Cleanup::LocalReaped
+        } else {
+            Cleanup::Unknown
+        }
+    }
+
+    pub(crate) async fn close_terminal(&self) -> Result<Cleanup, String> {
+        let (pid, saved, reaped) = {
+            let evidence = self
+                .evidence
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner);
+            (evidence.pid, evidence.birth.clone(), evidence.reaped)
+        };
+        let proof = process_exit(pid, saved.as_deref(), reaped).await?;
+        if proof.confirmed() {
+            self.finished(proof)?;
+            return Ok(proof);
+        }
+        let terminal = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .terminal
+            .clone();
+        let Some(terminal) = terminal else {
+            return Ok(Cleanup::Unknown);
+        };
+        let argv = [
+            terminal.program.display().to_string(),
+            "close".into(),
+            terminal.block,
+        ];
+        let result = crate::sys::command::run(&crate::sys::command::Spec {
+            argv: &argv,
+            cwd: None,
+            env: &[],
+            timeout: std::time::Duration::from_secs(10),
+            kill_grace: crate::sys::command::KILL_GRACE,
+            output_cap: 64 * 1024,
+            output: crate::sys::command::Output::Capture,
+        })
+        .await
+        .map_err(|e| e.to_string())?;
+        if result.success() {
+            self.finished(Cleanup::LocalReaped)?;
+            Ok(Cleanup::LocalReaped)
+        } else {
+            Ok(Cleanup::Unknown)
+        }
+    }
+
     pub(crate) fn finished(&self, cleanup: Cleanup) -> Result<(), String> {
         let mut evidence = self
             .evidence
@@ -69,16 +176,30 @@ impl Ownership {
     }
 }
 
+pub(crate) fn recorded(state: &Path, handle: &str) -> Result<bool, String> {
+    fs::read_private(&state.join("startup").join(format!("{handle}.json")), 4096)
+        .map(|record| record.is_some())
+        .map_err(|e| e.to_string())
+}
+
 pub(crate) async fn reconcile(state: &Path, handle: &str) -> Result<Cleanup, String> {
     let path = state.join("startup").join(format!("{handle}.json"));
     let Some(bytes) = fs::read_private(&path, 4096).map_err(|e| e.to_string())? else {
         return Ok(Cleanup::Unknown);
     };
     let evidence: Evidence = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-    if evidence.reaped {
+    process_exit(evidence.pid, evidence.birth.as_deref(), evidence.reaped).await
+}
+
+async fn process_exit(
+    pid: Option<u32>,
+    saved: Option<&str>,
+    reaped: bool,
+) -> Result<Cleanup, String> {
+    if reaped {
         return Ok(Cleanup::LocalReaped);
     }
-    match (evidence.pid, evidence.birth) {
+    match (pid, saved) {
         (Some(pid), Some(saved)) => match birth(pid).await? {
             None => Ok(Cleanup::LocalReaped),
             Some(current) if current != saved => Ok(Cleanup::LocalReaped),

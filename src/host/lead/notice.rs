@@ -85,6 +85,24 @@ pub(crate) fn hold(episode: Option<&Episode>, reason: &str) -> (String, String) 
 /// not lift the hold.
 pub(crate) fn held_text(language: Language, reason: &str, anchor: Option<&AnchorView>) -> String {
     let reason = one_line(reason, REASON_MAX);
+    if anchor.is_none() {
+        return match language {
+            Language::Korean => format!(
+                "Cataly: lead가 보류되어 스스로 시작하지 않습니다.\n원인: {reason}\n\
+                 보존: 기존 대화 파일과 작업, 대기 중인 메시지. 아무것도 교체하거나 삭제하지 않았습니다.\n\
+                 원인을 해결한 뒤 `cataly lead start`를 실행하세요. 이전에 확인된 대화가 없을 때만 최초 시작을 다시 시도합니다. \
+                 새 대화를 명시적으로 선택하려면 `cataly lead start --fresh`를 쓰세요.\n\
+                 업데이트나 허브 재시작만으로는 이 보류가 풀리지 않습니다."
+            ),
+            Language::English => format!(
+                "Cataly: the lead is held and will not start by itself.\nReason: {reason}\n\
+                 Kept: existing transcript files, work and queued messages; nothing was replaced or deleted.\n\
+                 After fixing the cause, run `cataly lead start`; it retries the initial start only if no conversation was ever bound. \
+                 Choose `cataly lead start --fresh` explicitly for a new conversation.\n\
+                 An update or a hub restart does not lift this hold by itself."
+            ),
+        };
+    }
     let which = |ko: bool| {
         anchor.map_or_else(String::new, |a| {
             if ko {

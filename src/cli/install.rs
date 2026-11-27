@@ -29,10 +29,17 @@ const STOP_WAIT: Duration = Duration::from_mins(1);
 const START_WAIT: Duration = Duration::from_secs(30);
 /// `omp --version`: 5 s (IR req. 25).
 const OMP_TIMEOUT: Duration = Duration::from_secs(5);
-/// The conservative store floor for a report without a reader capability (through 0.2.6).
-/// Schema 10 first raised the floor for pinned destinations; schema 11 raises it for lead anchors.
-/// An unknown reader is admitted only below both safety boundaries.
-const CAPABILITY_LESS_READER: i64 = 9;
+/// Released binaries without `store_reader`, verified from their migration registries.
+/// No version-range inference: an unlisted report has unknown compatibility.
+const RELEASED_READERS: [(&str, i64); 7] = [
+    ("0.2.0", 9),
+    ("0.2.1", 9),
+    ("0.2.2", 9),
+    ("0.2.3", 9),
+    ("0.2.4", 9),
+    ("0.2.5", 9),
+    ("0.2.6", 10),
+];
 
 /// The four outcomes (IR req. 34).
 enum Outcome {
@@ -456,6 +463,21 @@ async fn restart_switch(
         }
         Err(why) => {
             let _ = stop_hub(paths).await;
+            match layout_ops::store_floor(&paths.db_file()) {
+                Ok(None) => {}
+                Ok(Some(floor)) if floor <= crate::store::latest_schema() => {}
+                Ok(Some(floor)) => {
+                    return Outcome::NeedsAttention(format!(
+                        "{why}; the store now requires schema {floor}; {was} cannot read it. \
+                     The new version remains selected; restore a compatible store backup or repair the new hub."
+                    ));
+                }
+                Err(error) => {
+                    return Outcome::NeedsAttention(format!(
+                        "{why}; automatic switch-back to {was} was refused: {error}"
+                    ));
+                }
+            }
             let back = layout_ops::switch(l, was)
                 .and_then(|()| layout_ops::settle_records(l, Some(version)).map(drop));
             if let Err(e) = back {
@@ -587,10 +609,17 @@ fn busy_held(language: Language, busy: &str) -> String {
     }
 }
 
-/// Whether a binary reporting `reader` (none: a report from before the capability) opens a store
-/// whose reader floor is `floor`.
-fn reads(reader: Option<i64>, floor: i64) -> bool {
-    floor <= reader.unwrap_or(CAPABILITY_LESS_READER)
+/// A reported capability is authoritative; otherwise only an exact known release is admitted.
+fn reader(candidate: &release::Report) -> Option<i64> {
+    candidate.store_reader.or_else(|| {
+        RELEASED_READERS
+            .iter()
+            .find_map(|(version, reader)| (*version == candidate.version).then_some(*reader))
+    })
+}
+
+fn reads(candidate: &release::Report, floor: i64) -> bool {
+    reader(candidate).is_some_and(|reader| floor <= reader)
 }
 
 /// Refuses a switch from `current` to `candidate` when the candidate's hub could not open the store
@@ -606,21 +635,20 @@ fn store_preflight(
         Ok(Some(floor)) => floor,
         Err(e) => return Err(format!("{e}; nothing was stopped or switched")),
     };
-    if reads(candidate.store_reader, floor) {
+    if reads(candidate, floor) {
         return Ok(());
     }
     let copy = layout_ops::store_copies(&paths.backup_dir)
         .into_iter()
         .find(|(_, path)| {
-            layout_ops::store_floor(path)
-                .is_ok_and(|f| f.is_some_and(|f| reads(candidate.store_reader, f)))
+            layout_ops::store_floor(path).is_ok_and(|f| f.is_some_and(|f| reads(candidate, f)))
         })
         .map(|(_, path)| path);
     Err(store_refusal(
         owner_language(paths),
         &Refusal {
             candidate: &candidate.version,
-            reader: candidate.store_reader,
+            reader: reader(candidate),
             floor,
             current,
             store: &paths.db_file(),
@@ -1554,10 +1582,10 @@ mod tests {
     }
 
     #[test]
-    fn an_unknown_capability_is_refused_above_the_capability_less_schema() {
+    fn a_known_capability_less_release_is_refused_above_its_released_schema() {
         let dir = scratch("preflight");
         let paths = paths_in(&dir);
-        store_at(&paths, CAPABILITY_LESS_READER);
+        store_at(&paths, 9);
         store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
         // The copy the hub made before a migration, readable by a capability-less release.
         crate::sys::fs::ensure_private_dir(&paths.backup_dir).unwrap();
@@ -1566,7 +1594,7 @@ mod tests {
             .unwrap()
             .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
             .unwrap();
-        raise_floor(&paths.db_file(), CAPABILITY_LESS_READER + 2);
+        raise_floor(&paths.db_file(), 11);
         let held = store_preflight(&paths, &candidate(None), "0.2.7").unwrap_err();
         assert!(held.contains(&copy.display().to_string()), "{held}");
         let refusal = |language| {
@@ -1669,5 +1697,44 @@ mod tests {
                 assert_eq!(std::fs::read(paths.db_file()).ok(), before);
             }
         }
+    }
+
+    #[test]
+    fn released_reader_versions_are_known_but_unknown_versions_fail_closed() {
+        let dir = scratch("released-readers");
+        let paths = paths_in(&dir);
+        store_at(&paths, 10);
+        let mut old = candidate(None);
+        old.version = "0.2.6".into();
+        store_preflight(&paths, &old, "0.2.7").unwrap();
+        old.version = "0.2.5".into();
+        assert!(store_preflight(&paths, &old, "0.2.7").is_err());
+        raise_floor(&paths.db_file(), 1);
+        old.version = "0.1.99".into();
+        assert!(store_preflight(&paths, &old, "0.2.7").is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_start_never_switches_back_across_a_migrated_store_floor() {
+        let dir = scratch("switch-back-floor");
+        let paths = paths_in(&dir);
+        store_at(&paths, crate::store::latest_schema() + 1);
+        let layout = Layout {
+            root: dir.join("program"),
+            command: dir.join("bin/cataly"),
+            extension: dir.join("extensions/cataly.ts"),
+            package: None,
+        };
+        layout_ops::prepare_root(&layout).unwrap();
+        // Missing binaries reproduce the two start errors without running another hub.
+        let outcome = restart_switch(&layout, &paths, "new", "old", Instant::now()).await;
+        let Outcome::NeedsAttention(reason) = outcome else {
+            panic!("an incompatible automatic rollback must need owner attention");
+        };
+        assert_eq!(layout.current_version().as_deref(), Some("new"), "{reason}");
+        assert!(
+            reason.contains("store") && reason.contains("old"),
+            "{reason}"
+        );
     }
 }

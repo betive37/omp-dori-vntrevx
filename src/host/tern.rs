@@ -49,8 +49,6 @@ found; install Tern and put `tern` on PATH, or set [sessions] tern to its absolu
 const TOKEN_LIFE_MS: i64 = 60_000;
 /// `tern new` itself.
 const TERN_CALL: Duration = Duration::from_secs(10);
-/// Block opened to bridge hello (HOST req. 28).
-const START_BUDGET: Duration = Duration::from_secs(30);
 /// A command the bridge must answer.
 const COMMAND_WAIT: Duration = Duration::from_secs(10);
 /// How long a goal create retries OMP's "busy" refusal, and how often.
@@ -123,13 +121,6 @@ impl Tern {
         argv.extend(omp);
         argv
     }
-
-    /// Asks Tern to close a block that never said hello.
-    async fn close_block(tern: &Path, block: Option<&str>) {
-        let Some(block) = block else { return };
-        let argv = [tern.display().to_string(), "close".into(), block.into()];
-        let _ = command::run(&tern_spec(&argv, None)).await;
-    }
 }
 
 fn tern_spec<'a>(argv: &'a [String], cwd: Option<&'a Path>) -> Spec<'a> {
@@ -165,6 +156,7 @@ impl Runtime for Tern {
         spec: StartSpec,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<(Arc<Session>, Started), StartError> {
+        let deadline = Instant::now() + super::startup::STARTUP_BUDGET;
         if *cancel.borrow() {
             return Err(StartError::Refused(
                 "terminal startup cancelled before spawn".into(),
@@ -175,6 +167,13 @@ impl Runtime for Tern {
         };
         crate::sys::fs::ensure_private_dir(&self.spill)
             .map_err(|e| StartError::Refused(e.to_string()))?;
+        let ownership = Arc::new(
+            super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
+                .map_err(StartError::Refused)?,
+        );
+        ownership
+            .identify(spec.expected_id.as_deref(), None)
+            .map_err(StartError::Refused)?;
         let token = super::random_hex(16);
         self.links
             .issue_for(&token, &spec.handle, spec.role, TOKEN_LIFE_MS);
@@ -184,6 +183,10 @@ impl Runtime for Tern {
             self.agent_start.clone(),
             LOST_AFTER,
         );
+        *port
+            .ownership
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&ownership));
         self.links.add_port(&spec.handle, Arc::clone(&port));
         {
             // The port leaves the registry with the session.
@@ -220,31 +223,39 @@ impl Runtime for Tern {
                 return Err(StartError::Refused(format!("tern: {e}")));
             }
         };
-        let bound = tokio::select! {
-            biased;
-            () = super::startup::cancelled(&mut cancel) => Err("terminal startup cancelled".into()),
-            result = timeout(START_BUDGET, attached) => match result {
-                Ok(Ok(())) => port.bind(&spec),
-                _ => Err("no bridge hello from the Tern block within 30 s".into()),
+        port.block.lock().await.clone_from(&block);
+        let recorded = match &block {
+            Some(block) => ownership.terminal(&tern, block),
+            None => Ok(()),
+        };
+        let (outcome, bound) = match recorded {
+            Err(error) => (super::startup::StartupOutcome::Rejected, Err(error)),
+            Ok(()) => tokio::select! {
+                biased;
+                () = super::startup::cancelled(&mut cancel) =>
+                    (super::startup::StartupOutcome::Cancelled, Err("terminal startup cancelled".into())),
+                result = tokio::time::timeout_at(deadline, async {
+                    attached.await.map_err(|_| "the terminal bridge closed before binding".to_string())?;
+                    let pid = port.snapshot.borrow().pid;
+                    ownership.spawned(pid).await?;
+                    port.bind(&spec)
+                }) => match result {
+                    Ok(result) => (super::startup::StartupOutcome::Rejected, result),
+                    Err(_) => (super::startup::StartupOutcome::Timeout,
+                        Err("no terminal identity binding within the 60 s startup deadline".into())),
+                },
             },
         };
         match bound {
-            Ok(started) => {
-                port.block.lock().await.clone_from(&block);
-                Ok((Arc::new(Session { port }), started))
-            }
+            Ok(started) => Ok((Arc::new(Session { port }), started)),
             Err(reason) => {
                 self.links.remove_port(&spec.handle);
+                let cleanup = port.confirm_exit().await;
                 port.record_stop("failed".into(), Some(reason.clone()));
-                Self::close_block(&tern, block.as_deref()).await;
                 Err(StartError::Startup {
                     stage: super::startup::StartupStage::Binding,
-                    outcome: if *cancel.borrow() {
-                        super::startup::StartupOutcome::Cancelled
-                    } else {
-                        super::startup::StartupOutcome::Rejected
-                    },
-                    cleanup: super::startup::Cleanup::Unknown,
+                    outcome,
+                    cleanup,
                     detail: reason,
                 })
             }
@@ -319,6 +330,7 @@ pub(crate) struct Port {
     events: broadcast::Sender<(u64, SessionEvent)>,
     busy: AtomicBool,
     block: tokio::sync::Mutex<Option<String>>,
+    ownership: Mutex<Option<Arc<super::lead::ownership::Ownership>>>,
 }
 
 impl std::fmt::Debug for Port {
@@ -410,6 +422,7 @@ impl Port {
             events: broadcast::channel(EVENT_KEEP).0,
             busy: AtomicBool::new(false),
             block: tokio::sync::Mutex::new(None),
+            ownership: Mutex::new(None),
         });
         (port, rx)
     }
@@ -502,13 +515,44 @@ impl Port {
         }
     }
 
+    async fn confirm_exit(&self) -> super::startup::Cleanup {
+        let owner = self
+            .ownership
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .clone();
+        let Some(owner) = owner else {
+            return super::startup::Cleanup::Unknown;
+        };
+        match owner.close_terminal().await {
+            Ok(cleanup) => {
+                if let Some(record) = &mut self.lock().stop {
+                    record.cleanup = cleanup;
+                }
+                cleanup
+            }
+            Err(error) => {
+                log::warn(
+                    "terminal exit is unconfirmed",
+                    &[("handle", &self.handle), ("error", &error)],
+                );
+                super::startup::Cleanup::Unknown
+            }
+        }
+    }
+
     fn record_stop(&self, how: String, detail: Option<String>) -> StopRecord {
         let mut st = self.lock();
         if let Some(record) = st.stop.clone() {
             return record;
         }
         let record = StopRecord {
-            cleanup: super::startup::Cleanup::Unknown,
+            cleanup: self
+                .ownership
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .as_ref()
+                .map_or(super::startup::Cleanup::Unknown, |owner| owner.cleanup()),
             how,
             detail,
             session_id: st.current.as_ref().map(|(id, _)| id.clone()),
@@ -656,7 +700,7 @@ impl Port {
     }
 
     /// One `bridge.event` (or `bridge.switch`) from the session's main agent.
-    pub(crate) fn event(&self, params: &Value) {
+    pub(crate) fn event(self: &Arc<Self>, params: &Value) {
         let kind = params
             .get("kind")
             .and_then(Value::as_str)
@@ -725,7 +769,23 @@ impl Port {
                 let asked = st.stopping;
                 drop(st);
                 let how = if asked { "clean" } else { "exited" };
-                self.record_stop(how.into(), Some("OMP in the Tern block shut down".into()));
+                if self
+                    .ownership
+                    .lock()
+                    .unwrap_or_else(PoisonError::into_inner)
+                    .is_some()
+                {
+                    let port = Arc::clone(self);
+                    tokio::spawn(async move {
+                        port.confirm_exit().await;
+                        port.record_stop(
+                            how.into(),
+                            Some("OMP in the Tern block shut down".into()),
+                        );
+                    });
+                } else {
+                    self.record_stop(how.into(), Some("OMP in the Tern block shut down".into()));
+                }
                 return;
             }
             _ => return,
@@ -1174,7 +1234,9 @@ impl Control for Session {
     }
 
     async fn close(&self, force: bool) -> Result<StopRecord, String> {
-        if let Some(record) = self.port.lock().stop.clone() {
+        let stopped = self.port.lock().stop.clone();
+        if let Some(mut record) = stopped {
+            record.cleanup = self.port.confirm_exit().await;
             return Ok(record);
         }
         let _busy = self.begin()?;
@@ -1208,6 +1270,7 @@ impl Control for Session {
         let detail = gone
             .is_err()
             .then(|| "OMP did not go within 15 s".to_string());
+        self.port.confirm_exit().await;
         Ok(self.port.record_stop("clean".into(), detail))
     }
 }
