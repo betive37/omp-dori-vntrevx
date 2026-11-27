@@ -161,6 +161,20 @@ impl Runtime for Tern {
     }
 
     async fn start(&self, spec: StartSpec) -> Result<(Arc<Session>, Started), StartError> {
+        let (_keep, cancel) = watch::channel(false);
+        self.start_supervised(spec, cancel).await
+    }
+
+    async fn start_supervised(
+        &self,
+        spec: StartSpec,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
+        if *cancel.borrow() {
+            return Err(StartError::Refused(
+                "terminal startup cancelled before spawn".into(),
+            ));
+        }
         let Some(tern) = self.program.clone() else {
             return Err(StartError::Refused(INSTALL_HINT.into()));
         };
@@ -211,9 +225,13 @@ impl Runtime for Tern {
                 return Err(StartError::Refused(format!("tern: {e}")));
             }
         };
-        let bound = match timeout(START_BUDGET, attached).await {
-            Ok(Ok(())) => port.bind(&spec),
-            _ => Err("no bridge hello from the Tern block within 30 s".into()),
+        let bound = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err("terminal startup cancelled".into()),
+            result = timeout(START_BUDGET, attached) => match result {
+                Ok(Ok(())) => port.bind(&spec),
+                _ => Err("no bridge hello from the Tern block within 30 s".into()),
+            },
         };
         match bound {
             Ok(started) => {
@@ -224,7 +242,16 @@ impl Runtime for Tern {
                 self.links.remove_port(&spec.handle);
                 port.record_stop("failed".into(), Some(reason.clone()));
                 Self::close_block(&tern, block.as_deref()).await;
-                Err(StartError::Failed(reason))
+                Err(StartError::Startup {
+                    stage: super::startup::StartupStage::Binding,
+                    outcome: if *cancel.borrow() {
+                        super::startup::StartupOutcome::Cancelled
+                    } else {
+                        super::startup::StartupOutcome::Rejected
+                    },
+                    cleanup: super::startup::Cleanup::Unknown,
+                    detail: reason,
+                })
             }
         }
     }
@@ -486,6 +513,7 @@ impl Port {
             return record;
         }
         let record = StopRecord {
+            cleanup: super::startup::Cleanup::Unknown,
             how,
             detail,
             session_id: st.current.as_ref().map(|(id, _)| id.clone()),

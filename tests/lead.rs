@@ -133,6 +133,49 @@ fn lead_restarts_on_its_session_after_omp_exits() {
     assert_eq!(pids.lines().count(), 4, "{pids}");
 }
 
+/// From PR #299 (Momentum96): a resume that never gets ready (`slow-resume` reads input until it
+/// closes) fails at the 60 s startup deadline; after proven cleanup it is retried on the same
+/// transcript and the waiting message is delivered once.
+#[test]
+fn hub_restart_recovers_from_a_lead_ready_timeout_on_the_same_transcript() {
+    let mut hub = TestHub::new("");
+    let omp = hub.install_fake("omp");
+    hub.fixture("omp", "rpc", Some(""));
+    hub.fixture("omp", "turns", Some(""));
+    let work = hub.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    hub.write_config(&format!(
+        "[omp]\npath = \"{}\"\n[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        omp.display(),
+        work.display()
+    ));
+    hub.start();
+    let first = live(&hub, &Value::Null);
+    assert!(hub.stop().success());
+    hub.fixture("omp", "slow-resume", Some(""));
+    hub.start();
+    assert!(hub.cli(&["lead", "send", "after-restart"]).status.success());
+    let resumed = hub.until(Duration::from_secs(120), || {
+        let v = lead_view(&hub);
+        (v["phase"] == "live" && v["session"]["pid"].is_u64()).then_some(v)
+    });
+    assert_eq!(
+        resumed["session"]["session_id"],
+        first["session"]["session_id"]
+    );
+    let file = resumed["session"]["session_file"].as_str().unwrap();
+    assert_eq!(file, first["session"]["session_file"].as_str().unwrap());
+    let pids = std::fs::read_to_string(hub.root.join("bin/omp-data/resume-pids")).unwrap();
+    assert_eq!(pids.lines().count(), 2, "one failed start and one retry");
+    let failed: Value = pids.lines().next().unwrap().parse::<u64>().unwrap().into();
+    assert!(!running(&failed), "failed OMP {failed} is still running");
+    hub.until(Duration::from_secs(5), || {
+        (user_entries(&Value::from(file), "after-restart") == 1).then_some(())
+    });
+    assert!(hub.stop().success());
+    assert_eq!(user_entries(&Value::from(file), "after-restart"), 1);
+}
+
 /// Just after an OMP update the first probe can outlast its bound under load. A failed probe is
 /// tried again by itself after 5 s, with no change to the executable; status, health and the
 /// sessions refusal name the retry, and the lead starts as soon as a probe works.
@@ -599,4 +642,474 @@ fn zero_idle_sleep_never_sleeps() {
     let first = live(&hub, &Value::Null);
     stays_awake(&hub, &first["session"]["pid"], 5);
     assert!(hub.stop().success());
+}
+
+// ---- Lossless resume (docs/design/lead-resume.md): the lead keeps its proven conversation. ----
+
+/// A lead hub whose OMP is the fake behind a private wrapper. The wrapper logs every rpc-ui start
+/// to `wrap/starts` (`<pid> resume|fresh`) and obeys control files in `wrap/`, read only by those
+/// starts, never by the probe: on a resume, `withhold` (one-shot) reads input until it closes and
+/// exits 1 without a ready frame; `delay` (one-shot, seconds) holds the ready frame back that long;
+/// `fail` (kept) exits 7. On a fresh start `fail-fresh` (kept) exits 9.
+struct Wrapped {
+    hub: TestHub,
+    wrap: std::path::PathBuf,
+    config: String,
+}
+
+fn wrapped(lead: &str, sleep: Option<&str>) -> Wrapped {
+    let mut hub = TestHub::new("");
+    let omp = hub.install_fake("omp");
+    hub.fixture("omp", "rpc", Some(""));
+    hub.fixture("omp", "turns", Some(""));
+    let wrap = hub.root.join("wrap");
+    std::fs::create_dir_all(&wrap).unwrap();
+    let script = wrap.join("omp");
+    std::fs::write(
+        &script,
+        format!(
+            "#!/bin/sh\n\
+             d='{d}'\n\
+             case \" $* \" in\n\
+             *' --resume='*)\n\
+                 echo \"$$ resume\" >> \"$d/starts\"\n\
+                 if mv \"$d/withhold\" \"$d/withhold.used\" 2>/dev/null; then cat > /dev/null; exit 1; fi\n\
+                 if mv \"$d/delay\" \"$d/delay.used\" 2>/dev/null; then sleep \"$(cat \"$d/delay.used\")\"; fi\n\
+                 [ -f \"$d/fail\" ] && exit 7 ;;\n\
+             *' --session-dir='*)\n\
+                 echo \"$$ fresh\" >> \"$d/starts\"\n\
+                 [ -f \"$d/fail-fresh\" ] && exit 9 ;;\n\
+             esac\n\
+             exec '{real}' \"$@\"\n",
+            d = wrap.display(),
+            real = omp.display()
+        ),
+    )
+    .unwrap();
+    std::fs::set_permissions(&script, std::os::unix::fs::PermissionsExt::from_mode(0o755)).unwrap();
+    let work = hub.root.join("work");
+    std::fs::create_dir_all(&work).unwrap();
+    if let Some(sleep) = sleep {
+        hub.env
+            .push(("CATALY_IDLE_SLEEP".into(), std::path::PathBuf::from(sleep)));
+    }
+    let config = format!(
+        "[omp]\npath = \"{}\"\n[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n{lead}",
+        script.display(),
+        work.display()
+    );
+    hub.write_config(&config);
+    Wrapped { hub, wrap, config }
+}
+
+impl Wrapped {
+    fn arm(&self, name: &str, text: &str) {
+        std::fs::write(self.wrap.join(name), text).unwrap();
+    }
+
+    fn disarm(&self, name: &str) {
+        std::fs::remove_file(self.wrap.join(name)).unwrap();
+    }
+
+    /// The PIDs of the wrapper's starts of `kind` (`resume` or `fresh`).
+    fn starts(&self, kind: &str) -> Vec<String> {
+        std::fs::read_to_string(self.wrap.join("starts"))
+            .unwrap_or_default()
+            .lines()
+            .filter(|l| l.ends_with(kind))
+            .map(|l| l.split(' ').next().unwrap().to_string())
+            .collect()
+    }
+
+    /// No started OMP (wrapper or fake) is still running.
+    fn no_orphans(&self) {
+        let pids = std::fs::read_to_string(self.wrap.join("starts")).unwrap_or_default();
+        for line in pids.lines() {
+            let pid: Value = line
+                .split(' ')
+                .next()
+                .unwrap()
+                .parse::<u64>()
+                .unwrap()
+                .into();
+            assert!(!running(&pid), "OMP {line} is still running");
+        }
+    }
+}
+
+/// Starts the hub, sends ORIGINAL, waits for it in transcript A and returns the live view.
+fn original(w: &mut Wrapped) -> Value {
+    w.hub.start();
+    let first = live(&w.hub, &Value::Null);
+    assert!(w.hub.cli(&["lead", "send", "ORIGINAL"]).status.success());
+    w.hub.until(Duration::from_secs(20), || {
+        (user_entries(&first["session"]["session_file"], "ORIGINAL") == 1).then_some(())
+    });
+    first
+}
+
+fn held(hub: &TestHub, limit: u64) -> Value {
+    hub.until(Duration::from_secs(limit), || {
+        let v = lead_view(hub);
+        (v["phase"] == "held").then_some(v)
+    })
+}
+
+/// The transcripts in A's folder.
+fn transcripts(file: &Value) -> Vec<std::path::PathBuf> {
+    let dir = std::path::Path::new(file.as_str().unwrap())
+        .parent()
+        .unwrap();
+    std::fs::read_dir(dir)
+        .unwrap()
+        .map(|e| e.unwrap().path())
+        .filter(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .collect()
+}
+
+/// Transcripts in A's folder whose owner lines carry `marker`.
+fn transcripts_with(file: &Value, marker: &str) -> Vec<String> {
+    transcripts(file)
+        .into_iter()
+        .map(|p| p.display().to_string())
+        .filter(|p| user_entries(&Value::from(p.as_str()), marker) > 0)
+        .collect()
+}
+
+fn session_files(file: &Value) -> usize {
+    transcripts(file).len()
+}
+
+/// A resume that never becomes ready fails that attempt only. The owner's message waits; after the
+/// attempt and a hub restart without the fault the lead is on session A, never a fresh B, and the
+/// message reaches A exactly once.
+#[test]
+fn a_ready_timeout_then_restart_resumes_the_same_conversation() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    let (id, file) = (
+        first["session"]["session_id"].clone(),
+        first["session"]["session_file"].clone(),
+    );
+    assert!(w.hub.stop().success());
+    w.arm("withhold", "");
+    w.hub.start();
+    assert!(w.hub.cli(&["lead", "send", "WAITING"]).status.success());
+    // Past the old 15 s limit the attempt is still starting, its input untouched.
+    w.hub.until(Duration::from_secs(10), || {
+        (!w.starts("resume").is_empty()).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(20));
+    let during = lead_view(&w.hub);
+    assert_eq!(during["phase"], "starting", "{during}");
+    assert_eq!(during["waiting"], 1, "{during}");
+    assert_eq!(user_entries(&file, "WAITING"), 0);
+    // The withheld attempt ends at its deadline; whatever follows, a hub restart resumes A.
+    w.hub.until(Duration::from_secs(120), || {
+        let v = lead_view(&w.hub);
+        (w.starts("resume").len() >= 2 || v["phase"] == "held").then_some(())
+    });
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+    w.hub.start();
+    let resumed = live(&w.hub, &Value::Null);
+    assert_eq!(resumed["session"]["session_id"], id, "{resumed}");
+    assert_eq!(resumed["session"]["session_file"], file, "{resumed}");
+    assert_eq!(resumed["anchor"]["session_id"], id, "{resumed}");
+    w.hub.until(Duration::from_secs(20), || {
+        (user_entries(&file, "WAITING") == 1).then_some(())
+    });
+    assert!(w.hub.stop().success());
+    assert_eq!(user_entries(&file, "WAITING"), 1, "delivered once");
+    assert_eq!(
+        transcripts_with(&file, "WAITING"),
+        vec![file.as_str().unwrap().to_string()]
+    );
+    assert_eq!(session_files(&file), 1, "no fresh conversation was made");
+    w.no_orphans();
+}
+
+/// A pin selects its exact earlier binding, also behind a newer bound conversation and a newer
+/// failed attempt: the restart resumes A.
+#[test]
+fn a_pinned_session_resumes_behind_newer_attempts() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    let (id, file) = (
+        first["session"]["session_id"].clone(),
+        first["session"]["session_file"].clone(),
+    );
+    // A newer bound conversation B.
+    assert!(w.hub.cli(&["lead", "stop"]).status.success());
+    let started = w.hub.cli(&["lead", "start", "--fresh"]);
+    assert!(started.status.success(), "{started:?}");
+    let b = live(&w.hub, &first["session"]["pid"]);
+    assert_ne!(b["session"]["session_id"], id, "{b}");
+    assert!(w.hub.stop().success());
+    // Pin A; its next resume never gets ready and the hub stops under it: a newer unbound attempt.
+    let id_str = id.as_str().unwrap();
+    w.hub
+        .write_config(&format!("{}session_id = \"{id_str}\"\n", w.config));
+    w.arm("withhold", "");
+    w.hub.start();
+    w.hub.until(Duration::from_secs(30), || {
+        (!w.starts("resume").is_empty()).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+    assert!(w.wrap.join("withhold.used").exists());
+    w.hub.start();
+    let resumed = live(&w.hub, &Value::Null);
+    assert_eq!(resumed["session"]["session_id"], id, "{resumed}");
+    assert_eq!(resumed["session"]["session_file"], file, "{resumed}");
+    assert!(w.hub.cli(&["lead", "send", "PINNED"]).status.success());
+    w.hub.until(Duration::from_secs(20), || {
+        (user_entries(&file, "PINNED") == 1).then_some(())
+    });
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+}
+
+/// Unpinned, a missing or unverified transcript holds the lead: no fresh conversation, the files
+/// stay, the owner's message waits, and status names the precise check.
+#[test]
+fn an_unpinned_lead_with_a_missing_or_unverified_transcript_is_held() {
+    for case in ["missing", "unverified"] {
+        let mut w = wrapped("", None);
+        let first = original(&mut w);
+        let (id, file) = (
+            first["session"]["session_id"].clone(),
+            first["session"]["session_file"].clone(),
+        );
+        assert!(w.hub.stop().success());
+        let path = std::path::PathBuf::from(file.as_str().unwrap());
+        let kept = path.with_extension("kept");
+        let before = std::fs::read_to_string(&path).unwrap();
+        let expected = if case == "missing" {
+            std::fs::rename(&path, &kept).unwrap();
+            "missing"
+        } else {
+            let other = before.replacen(
+                id.as_str().unwrap(),
+                "00000000-0000-0000-0000-000000000000",
+                1,
+            );
+            std::fs::write(&path, &other).unwrap();
+            "HeaderIdentity"
+        };
+        let snapshot = if case == "missing" {
+            std::fs::read_to_string(&kept).unwrap()
+        } else {
+            std::fs::read_to_string(&path).unwrap()
+        };
+        let files = std::fs::read_dir(path.parent().unwrap()).unwrap().count();
+        w.hub.start();
+        assert!(w.hub.cli(&["lead", "send", "WAITING"]).status.success());
+        let v = held(&w.hub, 30);
+        let reason = v["reason"].as_str().unwrap_or_default();
+        assert!(reason.contains(expected), "{case}: {v}");
+        assert!(reason.contains(id.as_str().unwrap()), "{case}: {v}");
+        assert_eq!(v["anchor"]["session_id"], id, "{case}: {v}");
+        // It stays held: never fresh.
+        std::thread::sleep(Duration::from_secs(3));
+        let v = lead_view(&w.hub);
+        assert_eq!(v["phase"], "held", "{case}: {v}");
+        assert_eq!(v["waiting"], 1, "{case}: {v}");
+        assert!(
+            w.starts("fresh").len() == 1,
+            "{case}: only A's first start was fresh"
+        );
+        assert!(
+            w.starts("resume").is_empty(),
+            "{case}: an unverified file is never resumed"
+        );
+        assert!(w.hub.stop().success());
+        assert_eq!(
+            std::fs::read_dir(path.parent().unwrap()).unwrap().count(),
+            files,
+            "{case}: no file added or removed"
+        );
+        let after = if case == "missing" {
+            std::fs::read_to_string(&kept).unwrap()
+        } else {
+            std::fs::read_to_string(&path).unwrap()
+        };
+        assert_eq!(after, snapshot, "{case}: the transcript is kept as it was");
+    }
+}
+
+/// An explicit fresh start that fails keeps A recorded and held, also over a hub restart; then
+/// "resume old" (`lead start`) resumes A, and "retry fresh" (`lead start --fresh`) makes B.
+#[test]
+fn a_failed_fresh_start_keeps_the_old_conversation_held_for_the_owner() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    let (id, file) = (
+        first["session"]["session_id"].clone(),
+        first["session"]["session_file"].clone(),
+    );
+    let fail_fresh = |w: &Wrapped| {
+        assert!(w.hub.cli(&["lead", "stop"]).status.success());
+        w.arm("fail-fresh", "");
+        let out = w.hub.cli(&["lead", "start", "--fresh"]);
+        assert!(!out.status.success(), "{out:?}");
+        let v = held(&w.hub, 20);
+        assert!(v["session"]["pid"].is_null(), "{v}");
+        w.disarm("fail-fresh");
+    };
+    fail_fresh(&w);
+    // A hub restart neither revives A nor starts fresh by itself.
+    assert!(w.hub.stop().success());
+    let fresh = w.starts("fresh").len();
+    w.hub.start();
+    assert!(w.hub.cli(&["lead", "send", "WAITING"]).status.success());
+    let v = held(&w.hub, 20);
+    let reason = v["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.contains("lead start --fresh") && reason.contains("lead start`"),
+        "{v}"
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    let v = lead_view(&w.hub);
+    assert_eq!(v["phase"], "held", "{v}");
+    assert_eq!(v["anchor"]["session_id"], id, "{v}");
+    assert_eq!(v["waiting"], 1, "{v}");
+    assert_eq!(w.starts("fresh").len(), fresh);
+    assert_eq!(w.starts("resume"), Vec::<String>::new());
+
+    // Resume old.
+    let out = w.hub.cli(&["lead", "start"]);
+    assert!(out.status.success(), "{out:?}");
+    let old = live(&w.hub, &Value::Null);
+    assert_eq!(old["session"]["session_id"], id, "{old}");
+    assert_eq!(old["session"]["session_file"], file, "{old}");
+    w.hub.until(Duration::from_secs(20), || {
+        (user_entries(&file, "WAITING") == 1).then_some(())
+    });
+
+    // Retry fresh.
+    fail_fresh(&w);
+    let out = w.hub.cli(&["lead", "start", "--fresh"]);
+    assert!(out.status.success(), "{out:?}");
+    let b = live(&w.hub, &Value::Null);
+    assert_ne!(b["session"]["session_id"], id, "{b}");
+    assert_eq!(b["anchor"]["session_id"], b["session"]["session_id"], "{b}");
+    assert!(w.hub.stop().success());
+    assert!(
+        std::path::Path::new(file.as_str().unwrap()).is_file(),
+        "A is kept"
+    );
+    assert_eq!(user_entries(&file, "WAITING"), 1);
+    w.no_orphans();
+}
+
+/// A sleeping lead woken by the owner on a slow resume. Ready after 20 s (past the old 15 s limit,
+/// within the 60 s deadline) binds A on that attempt; a resume that never gets ready fails at the
+/// deadline and is retried under backoff onto A. Each wake delivers the owner's message, and the
+/// quiet notes with the first, once, then the lead sleeps again.
+#[test]
+fn a_slow_wake_recovers_the_sleeping_session_and_delivers_once() {
+    let mut w = wrapped("", Some("2s"));
+    w.hub.start();
+    let first = live(&w.hub, &Value::Null);
+    // An exit by itself brings the lead back on A with a quiet resume note.
+    kill(&first["session"]["pid"]);
+    let second = live(&w.hub, &first["session"]["pid"]);
+    let (id, file) = (
+        second["session"]["session_id"].clone(),
+        second["session"]["session_file"].clone(),
+    );
+    assert_eq!(id, first["session"]["session_id"]);
+    assert_eq!(asleep(&w.hub)["notes"], 1);
+
+    w.arm("delay", "20");
+    let resumes = w.starts("resume").len();
+    assert!(w.hub.cli(&["lead", "send", "WAKE-SLOW"]).status.success());
+    std::thread::sleep(Duration::from_secs(17));
+    let during = lead_view(&w.hub);
+    assert_eq!(during["phase"], "starting", "{during}");
+    assert_eq!(user_entries(&file, "WAKE-SLOW"), 0);
+    let woke = live(&w.hub, &second["session"]["pid"]);
+    assert_eq!(woke["session"]["session_id"], id, "{woke}");
+    assert_eq!(woke["session"]["session_file"], file, "{woke}");
+    assert_eq!(w.starts("resume").len(), resumes + 1, "one attempt");
+    w.hub.until(Duration::from_secs(20), || {
+        (user_entries(&file, "WAKE-SLOW") == 1).then_some(())
+    });
+    let text = std::fs::read_to_string(file.as_str().unwrap()).unwrap();
+    let turn = text
+        .lines()
+        .find(|l| l.contains("\"role\":\"user\"") && l.contains("WAKE-SLOW"))
+        .unwrap();
+    assert!(
+        turn.contains("resume note"),
+        "one turn carries both: {turn}"
+    );
+    let again = asleep(&w.hub);
+    assert_eq!(again["asleep"]["session_id"], id, "{again}");
+
+    w.arm("withhold", "");
+    let resumes = w.starts("resume").len();
+    assert!(w.hub.cli(&["lead", "send", "WAKE-LATE"]).status.success());
+    let woke = w.hub.until(Duration::from_secs(150), || {
+        let v = lead_view(&w.hub);
+        assert_ne!(v["phase"], "held", "{v}");
+        (v["phase"] == "live" && v["session"]["pid"].is_u64()).then_some(v)
+    });
+    assert_eq!(woke["session"]["session_id"], id, "{woke}");
+    assert_eq!(woke["session"]["session_file"], file, "{woke}");
+    assert_eq!(
+        w.starts("resume").len(),
+        resumes + 2,
+        "a timed-out attempt and its retry"
+    );
+    w.hub.until(Duration::from_secs(20), || {
+        (user_entries(&file, "WAKE-LATE") == 1).then_some(())
+    });
+    asleep(&w.hub);
+    assert_eq!(user_entries(&file, "WAKE-SLOW"), 1);
+    assert_eq!(user_entries(&file, "WAKE-LATE"), 1);
+    assert_eq!(user_entries(&file, "resume note"), 1);
+    assert_eq!(session_files(&file), 1, "no fresh conversation was made");
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+}
+
+/// From PR #299 (Momentum96), now on a ready timeout: a hub shutdown while a timed-out resume waits
+/// for its retry cancels the retry and leaves no OMP running; the next hub resumes A. A start that
+/// exits before ready (EOF) is held, not retried, so the fault is a withheld ready.
+#[test]
+fn hub_shutdown_cancels_a_lead_ready_retry_and_next_hub_can_resume() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    let id = first["session"]["session_id"].clone();
+    assert!(w.hub.stop().success());
+    w.arm("withhold", "");
+    w.hub.start();
+    w.hub.until(Duration::from_secs(120), || {
+        let v = lead_view(&w.hub);
+        assert_ne!(v["phase"], "held", "{v}");
+        v["reason"]
+            .as_str()
+            .is_some_and(|r| r.contains("restarting in"))
+            .then_some(())
+    });
+    let stopping = Instant::now();
+    assert!(w.hub.stop().success());
+    assert!(stopping.elapsed() < Duration::from_secs(20));
+    let attempts = w.starts("resume").len();
+    assert!(attempts <= 2, "{attempts}");
+    w.no_orphans();
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(
+        w.starts("resume").len(),
+        attempts,
+        "nothing started after shutdown"
+    );
+    w.hub.start();
+    let resumed = live(&w.hub, &Value::Null);
+    assert_eq!(resumed["session"]["session_id"], id, "{resumed}");
+    assert!(w.hub.stop().success());
+    w.no_orphans();
 }

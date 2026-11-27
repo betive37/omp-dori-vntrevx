@@ -11,6 +11,8 @@ pub(crate) mod headless;
 pub(crate) mod hosted;
 pub(crate) mod inbox;
 pub(crate) mod lead;
+#[path = "lead/startup.rs"]
+pub(crate) mod startup;
 pub(crate) mod tern;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -76,6 +78,13 @@ pub(crate) enum StartError {
     Refused(String),
     /// The child was spawned and closed again.
     Failed(String),
+    /// Startup failed with phase and process-ownership evidence.
+    Startup {
+        stage: startup::StartupStage,
+        outcome: startup::StartupOutcome,
+        cleanup: startup::Cleanup,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StartError {
@@ -83,7 +92,31 @@ impl std::fmt::Display for StartError {
         match self {
             Self::Refused(r) => write!(f, "refused: {r}"),
             Self::Failed(r) => write!(f, "failed: {r}"),
+            Self::Startup {
+                stage,
+                outcome,
+                cleanup,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "startup {stage:?} {outcome:?}: {detail} (cleanup: {cleanup:?})"
+                )
+            }
         }
+    }
+}
+
+impl StartError {
+    pub(crate) const fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Startup {
+                outcome: startup::StartupOutcome::Timeout,
+                cleanup: startup::Cleanup::LocalReaped | startup::Cleanup::WorkerReaped,
+                ..
+            }
+        )
     }
 }
 
@@ -125,6 +158,7 @@ pub(crate) enum DeliverOutcome {
 /// How a session ended (HOST req. 69).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct StopRecord {
+    pub(crate) cleanup: startup::Cleanup,
     /// `clean`, `forced`, `term`, `kill`, `exited`, `failed`.
     pub(crate) how: String,
     pub(crate) detail: Option<String>,
@@ -262,6 +296,13 @@ pub(crate) trait Runtime: Send + Sync + 'static {
     fn start(
         &self,
         spec: StartSpec,
+    ) -> impl Future<Output = Result<(Arc<Self::Session>, Started), StartError>> + Send;
+
+    /// Cooperative startup cancellation: ownership cleanup finishes before this returns.
+    fn start_supervised(
+        &self,
+        spec: StartSpec,
+        cancel: tokio::sync::watch::Receiver<bool>,
     ) -> impl Future<Output = Result<(Arc<Self::Session>, Started), StartError>> + Send;
 }
 
