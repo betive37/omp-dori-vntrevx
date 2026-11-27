@@ -20,6 +20,7 @@ pub(crate) const RETRY_DELAYS: [Duration; 5] = [
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub(crate) enum StartupStage {
+    Prepare,
     Spawn,
     Ready,
     Protocol,

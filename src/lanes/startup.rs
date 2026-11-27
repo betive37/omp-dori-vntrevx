@@ -90,7 +90,12 @@ impl<R: Runtime> Lanes<R> {
             Ok(starting) => starting,
             Err(why) => {
                 return self
-                    .start_failed(rec, rev, &ownership, StartError::Failed(why))
+                    .start_failed(rec, rev, &ownership, StartError::Startup {
+                        stage: crate::host::startup::StartupStage::Prepare,
+                        outcome: crate::host::startup::StartupOutcome::Rejected,
+                        cleanup: crate::host::startup::Cleanup::NotSpawned,
+                        detail: why,
+                    })
                     .await;
             }
         };

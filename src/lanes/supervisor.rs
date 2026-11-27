@@ -26,7 +26,6 @@ pub(super) struct Stopped {
 pub(super) fn cleanup(error: &StartError) -> Cleanup {
     match error {
         StartError::Refused(_) => Cleanup::NotSpawned,
-        StartError::Failed(_) => Cleanup::Unknown,
         StartError::Startup { cleanup, .. } => *cleanup,
     }
 }
@@ -222,11 +221,7 @@ async fn previous_exit(state: &std::path::Path, rec: &Record) -> Result<Cleanup,
     let Some(handle) = &rec.handle else {
         return Ok(Cleanup::Unknown);
     };
-    match &rec.worker {
-        None => crate::host::lead::ownership::reconcile(state, handle).await,
-        // A transport disconnect is not a worker-side exit receipt.
-        Some(_) => Ok(Cleanup::Unknown),
-    }
+    crate::host::lead::ownership::reconcile_attempt(state, handle, rec.worker.as_deref()).await
 }
 
 pub(super) async fn stop<S: Control>(session: &S) -> Stopped {
