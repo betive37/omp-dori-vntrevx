@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- Hosted OMP sessions hide `eval` and its commit instructions from the model by disabling both
+  eval kernels. Cataly's existing eval denial and shell rules still apply.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
