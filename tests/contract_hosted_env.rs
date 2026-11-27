@@ -359,14 +359,37 @@ fn overridden_by(
         "config set {id} under {probe}: {out:?}"
     );
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    let provenance = report
-        .get("overriddenBy")
-        .expect("stock config set must report override provenance");
-    assert!(
-        provenance.is_null() || provenance.as_str().is_some_and(|name| names.contains(name)),
-        "config set {id} under {probe} has an unclassified override: {provenance}"
-    );
-    provenance.as_str().map(str::to_owned)
+    provenance(&report, names, id)
+        .unwrap_or_else(|why| panic!("config set {id} under {probe}: {why}"))
+}
+
+/// The override a `config set --json` report names. Stock omits `overriddenBy` (or sends null)
+/// for a setting no variable overrides; that is a complete answer. A report for another setting,
+/// an unknown field, or a name outside the discovered candidates means discovery is incomplete.
+fn provenance(
+    report: &Value,
+    names: &BTreeSet<String>,
+    id: &str,
+) -> Result<Option<String>, String> {
+    let fields = report
+        .as_object()
+        .ok_or_else(|| format!("report is not an object: {report}"))?;
+    if report["key"] != id {
+        return Err(format!("report names a different setting: {report}"));
+    }
+    if let Some(key) = fields.keys().find(|key| {
+        !matches!(
+            key.as_str(),
+            "key" | "value" | "overriddenBy" | "fallbackEnv" | "redacted"
+        )
+    }) {
+        return Err(format!("unknown report field {key}: {report}"));
+    }
+    match fields.get("overriddenBy") {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(name)) if names.contains(name) => Ok(Some(name.clone())),
+        Some(other) => Err(format!("unclassified override {other}")),
+    }
 }
 
 /// The (setting, variable) pairs the table lacks or names wrongly.
@@ -533,4 +556,54 @@ fn tern_without_the_pins_fails_the_contract() {
     );
     eprintln!("red Tern without pins: {red:?}");
     assert!(host.hub.stop().success());
+}
+
+/// Runs without stock OMP: an omitted override is a complete "no binding" answer, while a wrong
+/// or unexpected binding and an incomplete report fail.
+#[test]
+fn provenance_accepts_omitted_overrides_and_rejects_wrong_bindings() {
+    use serde_json::json;
+    let names: BTreeSet<String> = ["PI_PY", "PI_JS"].map(str::to_owned).into();
+    let id = "eval.py";
+    // Legitimately omitted: a setting with no env binding.
+    for report in [
+        json!({ "key": id, "value": false }),
+        json!({ "key": id, "value": false, "overriddenBy": null }),
+    ] {
+        assert_eq!(provenance(&report, &names, id), Ok(None), "{report}");
+    }
+    let bound = json!({ "key": id, "value": false, "overriddenBy": "PI_PY" });
+    assert_eq!(provenance(&bound, &names, id), Ok(Some("PI_PY".to_owned())));
+    // Incomplete discovery fails closed.
+    for report in [
+        json!({ "key": id, "value": false, "overriddenBy": "PI_UNKNOWN" }),
+        json!({ "key": id, "value": false, "overriddenBy": 1 }),
+        json!({ "key": id, "value": false, "source": "env" }),
+        json!({ "key": "eval.js", "value": false }),
+        json!([id]),
+    ] {
+        assert!(provenance(&report, &names, id).is_err(), "{report}");
+    }
+    // Present but wrong: stock binds a variable the table names differently, or not at all.
+    let table = [("eval.py", "PI_PY")];
+    let found = |pairs: &[(&str, &str)]| -> BTreeSet<(String, String)> {
+        pairs
+            .iter()
+            .map(|(s, n)| ((*s).to_owned(), (*n).to_owned()))
+            .collect()
+    };
+    assert_eq!(
+        mismatches(&found(&[("eval.py", "PI_PY")]), &table),
+        Vec::<String>::new()
+    );
+    let differs = mismatches(&found(&[("eval.py", "PI_JS")]), &table);
+    assert_eq!(differs.len(), 2, "{differs:?}");
+    let unexpected = mismatches(
+        &found(&[("eval.py", "PI_PY"), ("eval.js", "PI_JS")]),
+        &table,
+    );
+    assert_eq!(
+        unexpected,
+        ["stock binds PI_JS to pinned eval.js; add it to policy ENV"]
+    );
 }

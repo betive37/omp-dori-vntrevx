@@ -7,6 +7,10 @@
   contracts gate PRs and releases against both the minimum and latest versions; the documented shell
   and reset guards prevent accidents, not arbitrary spending. Thanks to @Momentum96 in
   [PR #300](https://github.com/vntrevx/Cataly/pull/300) for finding the eval mismatch.
+- Every hosted OMP launch now sets `PI_PY=0` and `PI_JS=0` last. Stock OMP refills unset or empty
+  variables from project, agent and home `.env` files, so a `.env` line could turn the eval
+  kernels back on. The variables come from a table derived from OMP's settings schema, and a stock
+  contract fails when OMP adds or renames a binding for a pinned setting.
 
 ## 0.2.6 (2026-11-27)
 
