@@ -74,8 +74,10 @@
   level OMP clamped is still a mismatch. The lead, lanes, the lane model barrier, `lead model` and
   terminal sessions all use the resolution; a terminal `lead model` no longer splits the selector
   at its first colon. A bridge older than the hub cannot answer: the session stays open and fenced
-  as "model unverified" at once, and the owner hears once (not on every restart) to restart the
-  session or run `cataly update`, or to keep the model with `cataly lead accept-model`.
+  as "model unverified" at once. A session whose extension never connects is not a failed start
+  either: at the end of the startup deadline it binds, fenced the same way. The owner hears once
+  (not on every restart) to run `cataly update` or restart the session, or to keep the model with
+  `cataly lead accept-model`.
 - Tern startup journals retain the block ID and process birth identity; confirmed block close
   or disappearance of that exact process proves termination. Unknown exits remain held.
   Settled startup receipts are pruned only after no anchor, recovery episode or lane references

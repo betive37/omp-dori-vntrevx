@@ -1529,3 +1529,60 @@ fn a_suffixed_model_verifies_and_an_old_bridge_is_fenced_unverified_once() {
     });
     assert!(w.hub.stop().success());
 }
+
+/// A lead whose extension never connects is not a failed start: when the shared deadline has
+/// almost run out, the session binds, fenced as unverified, without a retry; the owner is told
+/// once (also after a hub restart finds it again) with the fix and the accept command, and
+/// `lead accept-model` lets the same conversation go on.
+#[test]
+fn a_lead_whose_bridge_never_connects_is_bound_fenced_and_told_once() {
+    let mut w = wrapped("", None);
+    w.hub.fixture("omp", "no-bridge", Some(""));
+    w.hub.start();
+    let bound = |hub: &TestHub| {
+        hub.until(Duration::from_secs(90), || {
+            let v = lead_view(hub);
+            (v["phase"] == "live" && v["session"]["pid"].is_u64()).then_some(v)
+        })
+    };
+    let fenced = bound(&w.hub);
+    assert_eq!(fenced["session"]["input_blocked"], true, "{fenced}");
+    let reason = fenced["session"]["reason"].as_str().unwrap_or_default();
+    assert!(
+        reason.starts_with("model unverified") && reason.contains("didn't connect"),
+        "{fenced}"
+    );
+    assert_eq!(w.starts("fresh").len(), 1, "never retried");
+    let notices = w.hub.until(Duration::from_secs(10), || {
+        let n = told(&w.hub, "lead.held");
+        (!n.is_empty()).then_some(n)
+    });
+    let text = notices[0]["text"].as_str().unwrap();
+    for part in ["`cataly update`", "`cataly lead accept-model`"] {
+        assert!(text.contains(part), "{part}: {text}");
+    }
+    let file = fenced["session"]["session_file"].clone();
+    assert!(
+        w.hub
+            .cli(&["lead", "send", "AFTER-ACCEPT"])
+            .status
+            .success()
+    );
+    assert_eq!(user_entries(&file, "AFTER-ACCEPT"), 0);
+    let accepted = w.hub.cli(&["lead", "accept-model"]);
+    assert!(accepted.status.success(), "{accepted:?}");
+    w.hub.until(Duration::from_secs(10), || {
+        (user_entries(&file, "AFTER-ACCEPT") == 1).then_some(())
+    });
+    assert!(w.hub.stop().success());
+    w.hub.start();
+    let again = bound(&w.hub);
+    assert_eq!(
+        again["session"]["session_id"], fenced["session"]["session_id"],
+        "{again}"
+    );
+    assert_eq!(again["session"]["input_blocked"], true, "{again}");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(told(&w.hub, "lead.held").len(), 1, "told only once");
+    assert!(w.hub.stop().success());
+}

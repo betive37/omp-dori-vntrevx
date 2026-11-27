@@ -123,6 +123,10 @@ pub(crate) fn old_bridge(version: &str) -> String {
     )
 }
 
+/// Why a session whose bridge never said hello within the startup deadline is unverified.
+pub(crate) const NO_BRIDGE: &str =
+    "the Cataly extension didn't connect, so the model OMP runs could not be checked";
+
 /// Whether the owner may accept the model OMP reports for a hold with this reason.
 pub(crate) fn accepts(reason: &str) -> bool {
     reason.starts_with(MISMATCH) || reason.starts_with(UNVERIFIED)
@@ -133,22 +137,33 @@ pub(crate) fn unverified(reason: &str) -> bool {
     reason.starts_with(UNVERIFIED)
 }
 
-/// What the owner hears once about an unverified lead model: what happened, the fix, the accept
-/// command.
+/// What the owner hears once about an unverified lead model: what happened (an extension older
+/// than the hub, or none that connected), the fix, the accept command.
 pub(crate) fn unverified_text(language: Language, reason: &str) -> String {
+    let silent = reason.contains(NO_BRIDGE);
     let reason = crate::jobs::event::one_line(reason, 300);
     match language {
         Language::Korean => format!(
-            "Cataly: lead 세션의 Cataly 확장이 허브보다 오래되어 OMP가 쓰는 모델을 확인할 수 없습니다. 세션은 열려 있지만 더 이상 아무것도 전달하지 않습니다.\n\
+            "Cataly: {} OMP가 쓰는 모델을 확인할 수 없습니다. 세션은 열려 있지만 더 이상 아무것도 전달하지 않습니다.\n\
              원인: {reason}\n\
-             해결: 세션을 다시 시작하거나(`cataly lead stop` 후 `cataly lead start`) `cataly update`를 실행하세요. \
-             OMP가 보고하는 모델을 그대로 쓰려면 `cataly lead accept-model`을 실행하세요."
+             해결: `cataly update`를 실행하거나 lead를 다시 시작하세요(`cataly lead stop` 후 `cataly lead start`). \
+             OMP가 보고하는 모델을 그대로 쓰려면 `cataly lead accept-model`을 실행하세요.",
+            if silent {
+                "lead 세션의 Cataly 확장이 연결되지 않아"
+            } else {
+                "lead 세션의 Cataly 확장이 허브보다 오래되어"
+            }
         ),
         Language::English => format!(
-            "Cataly: the Cataly extension in the lead's session is older than the hub, so the model OMP runs could not be checked. The session stays open, but nothing more is delivered to it.\n\
+            "Cataly: {}, so the model OMP runs could not be checked. The session stays open, but nothing more is delivered to it.\n\
              Reason: {reason}\n\
-             Fix: restart the session (`cataly lead stop`, then `cataly lead start`) or run `cataly update`. \
-             To keep the model OMP reports, run `cataly lead accept-model`."
+             Fix: run `cataly update`, or restart the lead (`cataly lead stop`, then `cataly lead start`). \
+             To keep the model OMP reports, run `cataly lead accept-model`.",
+            if silent {
+                "the Cataly extension in the lead's session didn't connect"
+            } else {
+                "the Cataly extension in the lead's session is older than the hub"
+            }
         ),
     }
 }

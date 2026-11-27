@@ -263,8 +263,9 @@ impl Links {
     /// What OMP in session `handle` makes of `selector` (with an explicit `thinking`, which wins
     /// over its suffix), asked of the session's bridge with the read-only `model.resolve`. It
     /// waits for the bridge to connect and answer until `until`, the caller's deadline. A bridge
-    /// whose hello lacks the capability is unverified at once, without a query. `Err` when no
-    /// answer came.
+    /// whose hello lacks the capability is unverified at once, without a query, and so is a
+    /// session whose bridge never connected by `until`. `Err` when a connected bridge gave no
+    /// answer.
     pub(crate) async fn resolve_model(
         &self,
         handle: &str,
@@ -283,7 +284,7 @@ impl Links {
                 break (q.session.clone(), q.tx.clone());
             }
             if tokio::time::timeout_at(until, arrived).await.is_err() {
-                return Err("the session's Cataly bridge did not connect in time".into());
+                return Ok(Proof::Unverified(super::model::NO_BRIDGE.into()));
             }
         };
         let (waiter, answered) = oneshot::channel();

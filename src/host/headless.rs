@@ -43,6 +43,9 @@ use crate::sys::now_ms;
 const CLOSE_WAIT: Duration = Duration::from_secs(15);
 /// A forced close waits this long for the interrupted turn to stop (HOST req. 66).
 const FORCE_IDLE_WAIT: Duration = Duration::from_secs(15);
+/// The part of the startup deadline the model query leaves for binding after it: a bridge that
+/// has not connected by then leaves the model unverified instead of failing the start.
+const BIND_MARGIN: Duration = Duration::from_secs(2);
 /// Child stderr kept per session (HOST req. 2).
 const STDERR_CAP: u64 = 1024 * 1024;
 /// Events queued between OMP's reader and the session's event task. A full queue drops frames, which
@@ -800,19 +803,18 @@ impl Session {
             }
         }
         // What OMP makes of the selector, from the session's own bridge, within the same deadline
-        // (HOST req. 23, 27). A bridge that cannot tell leaves the model unverified, never retried.
+        // (HOST req. 23, 27), less the moment binding needs after it. A bridge that cannot tell, or
+        // never connects, leaves the model unverified and the session bound and fenced, never
+        // retried.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let until = deadline - BIND_MARGIN.min(left);
         let proof = inner
             .settings
             .links
-            .resolve_model(
-                &inner.handle,
-                &spec.model,
-                spec.thinking.as_deref(),
-                deadline,
-            )
+            .resolve_model(&inner.handle, &spec.model, spec.thinking.as_deref(), until)
             .await
             .map_err(|e| {
-                if tokio::time::Instant::now() >= deadline {
+                if tokio::time::Instant::now() >= until {
                     BindFailure::Rpc(RpcError::Timeout("startup deadline"))
                 } else {
                     BindFailure::Invalid(format!("model resolution: {e}"))
