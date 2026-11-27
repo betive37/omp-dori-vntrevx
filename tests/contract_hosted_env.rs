@@ -157,10 +157,10 @@ fn request(host: &Hosted, from: usize, lane: Option<&str>) -> Surface {
                     .map(Surface::parse)
                     .map(|s| {
                         format!(
-                            "{:?} lane_bridge={} agent={:?}",
+                            "{:?} agent={:?} tools={:?}",
                             s.purpose,
-                            s.tools.contains(LANE_BRIDGE.name),
-                            s.agent.as_ref().map(|a| &a.session)
+                            s.agent.as_ref().map(|a| &a.session),
+                            s.tools
                         )
                     })
                     .collect();

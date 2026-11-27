@@ -589,6 +589,29 @@ impl Drop for TestHub {
                     tail.join("\n")
                 );
             }
+            // Each OMP process's own warnings and errors (`~/.omp/logs` under the sandbox home).
+            let logs = std::fs::read_dir(self.root.join("home/.omp/logs"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|e| e.path());
+            for log in logs {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let lines: Vec<&str> = text
+                    .lines()
+                    .filter(|l| {
+                        l.contains("\"level\":\"error\"") || l.contains("\"level\":\"warn\"")
+                    })
+                    .filter(|l| !l.contains("model discovery failed"))
+                    .collect();
+                let tail = &lines[lines.len().saturating_sub(20)..];
+                eprintln!(
+                    "---- {} (last {} problems)\n{}",
+                    log.display(),
+                    tail.len(),
+                    tail.join("\n")
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&self.root);
         if !left.is_empty() {
