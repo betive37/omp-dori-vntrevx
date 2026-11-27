@@ -71,7 +71,7 @@ pub(crate) fn definition() -> Value {
                 "recommended": int("the recommended option, from 1"),
                 "option": int("the chosen option, from 1"),
                 "settle": text("owner (default) or lead"),
-                "request": int("the request-log item the question belongs to"),
+                "request": int("question.ask: the request-log item it belongs to (lane.open takes request_id)"),
                 "name": text("job name"),
                 "argv": { "type": "array", "items": { "type": "string" } },
                 "filter": text("regular expression an output line must match"),
@@ -82,7 +82,7 @@ pub(crate) fn definition() -> Value {
                 "since": text("ISO instant the digest starts at"),
                 "all": { "type": "boolean" },
                 "calls": { "type": "array", "items": { "type": "string" } },
-                "answer": text("onboarding: yes|no for consent, allowed|declined for a tool"),
+                "answer": { "description": "onboarding: string, yes|no for consent or allowed|declined for a tool; lane.answer: object such as {\"value\":…}" },
                 "reads": text("onboarding: what the tool would read and why"),
                 "reopen": { "type": "boolean", "description": "onboarding.start after the owner raised it again" }
             },
@@ -120,6 +120,7 @@ fn lane_properties() -> Value {
         },
         "required": ["kind"]
     });
+    let ceiling = json!({ "anyOf": [{ "type": "number", "minimum": 0 }, { "type": "string", "enum": ["off"] }] });
     json!({
                 "key": text("lane key"),
                 "brief": text("lane brief"),
@@ -131,7 +132,12 @@ fn lane_properties() -> Value {
                 "model": text("model"),
                 "origin": text("where the lane came from"),
                 "look_only": { "type": "boolean", "description": "the lane only reads" },
-                "ceilings": { "type": "object", "description": "lane.open: spend and time ceilings" },
+                "ceilings": {
+                    "type": "object",
+                    "description": "lane.open: ceilings, each a number of at least 0 or \"off\"",
+                    "properties": { "minutes": ceiling.clone(), "tokens": ceiling.clone(), "cost": ceiling },
+                    "additionalProperties": false
+                },
                 "preview": { "type": "boolean", "description": "lane.open: show, do not start" },
                 "request_id": text("lane.open: the request-log item it serves"),
                 "worktree": {
@@ -632,6 +638,7 @@ pub(crate) async fn recap(hub: &Hub) -> String {
 #[cfg(test)]
 mod tests {
     use super::definition;
+    use serde_json::json;
 
     /// The sources whose code reads the lead tool's input, for every op the tool dispatches.
     const SOURCES: [&str; 9] = [
@@ -647,6 +654,10 @@ mod tests {
     ];
 
     /// Every quoted key after one of `prefixes` in `code` with its whitespace removed.
+    /// The input key reads the dispatcher uses: `s(input, "k")`, `need(input, "k", ..)`,
+    /// `input.get("k")` and `m.remove("k")`.
+    const READS: [&str; 3] = ["(input,\"", "input.get(\"", "m.remove(\""];
+
     fn keys_after(code: &str, prefixes: &[&str], out: &mut Vec<String>) {
         let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
         let flat = flat.split("#[cfg(test)]").next().unwrap_or_default();
@@ -682,14 +693,33 @@ mod tests {
     }
 
     #[test]
+    fn the_key_scan_finds_reads_and_only_reads() {
+        let code = r#"
+            let a = s(input, "alpha");
+            let b = need(
+                input,
+                "beta_key", 64, true)?;
+            let c = input
+                .get("gamma")
+                .and_then(Value::as_bool);
+            let d = i(input, "delta");
+            let e = m.remove("epsilon");
+            let not_input = s(other, "zeta");
+            let not_a_key = input.get(name);
+            let label = "eta";
+            #[cfg(test)]
+            let in_tests = s(input, "theta");
+        "#;
+        let mut keys = Vec::new();
+        keys_after(code, &READS, &mut keys);
+        assert_eq!(keys, ["alpha", "beta_key", "delta", "gamma", "epsilon"]);
+    }
+
+    #[test]
     fn schema_declares_every_input_key() {
         let mut keys = Vec::new();
         for code in SOURCES {
-            keys_after(
-                code,
-                &["(input,\"", "input.get(\"", "m.remove(\""],
-                &mut keys,
-            );
+            keys_after(code, &READS, &mut keys);
         }
         open_fields(&mut keys);
         assert!(
@@ -731,8 +761,55 @@ mod tests {
         ] {
             assert_eq!(p[key]["type"], kind, "{key}");
         }
-        assert_eq!(p["checks"]["items"]["type"], "object");
-        assert!(p["checks"]["items"]["properties"]["kind"]["enum"].is_array());
-        assert_eq!(p["worktree"]["properties"]["branch"]["type"], "string");
+        let signal = &p["checks"]["items"];
+        assert_eq!(signal["type"], "object");
+        assert_eq!(signal["required"], json!(["kind"]));
+        assert_eq!(
+            signal["properties"]["kind"]["enum"],
+            json!([
+                "pr_merged",
+                "issue_closed",
+                "command",
+                "file",
+                "web",
+                "pr_policy"
+            ])
+        );
+        // The fields of the six kinds: pr_merged, issue_closed and pr_policy {repo, number},
+        // command {argv, pattern?}, file {path, sha256?, field?, value?}, web {url, status?, pattern?}.
+        for (field, kind) in [
+            ("repo", "string"),
+            ("number", "integer"),
+            ("argv", "array"),
+            ("pattern", "string"),
+            ("path", "string"),
+            ("sha256", "string"),
+            ("field", "string"),
+            ("url", "string"),
+            ("status", "integer"),
+        ] {
+            assert_eq!(signal["properties"][field]["type"], kind, "{field}");
+        }
+        assert_eq!(signal["properties"]["argv"]["items"]["type"], "string");
+        assert!(
+            signal["properties"]["value"].get("type").is_none(),
+            "any JSON value"
+        );
+        for field in ["path", "branch", "base"] {
+            assert_eq!(
+                p["worktree"]["properties"][field]["type"], "string",
+                "{field}"
+            );
+        }
+        assert_eq!(p["worktree"]["required"], json!(["path", "branch", "base"]));
+        for field in ["minutes", "tokens", "cost"] {
+            let one = &p["ceilings"]["properties"][field]["anyOf"];
+            assert_eq!(one[0]["type"], "number", "{field}");
+            assert_eq!(one[1]["enum"], json!(["off"]), "{field}");
+        }
+        assert!(
+            p["answer"].get("type").is_none(),
+            "lane.answer takes an object"
+        );
     }
 }
