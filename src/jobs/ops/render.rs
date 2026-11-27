@@ -1740,14 +1740,14 @@ pub(crate) mod tests {
         );
         assert!(host(&recovering, Language::Korean).contains("· 회복 중"));
         assert!(host(&recovering, Language::English).contains("· recovering"));
-        let mut lead = calm();
-        lead.people.lead = LeadState::Recovering;
+        let mut restarting = calm();
+        restarting.people.lead = LeadState::Recovering;
         assert_eq!(
-            head(&lead, Language::Korean),
+            head(&restarting, Language::Korean),
             "🟡 살펴볼 것이 있어요: 리드 복구 중"
         );
         assert_eq!(
-            head(&lead, Language::English),
+            head(&restarting, Language::English),
             "🟡 Worth a look: lead recovering"
         );
     }
