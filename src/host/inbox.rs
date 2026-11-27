@@ -831,7 +831,7 @@ impl Mailbox {
                 self.store.host(HostWrite::Rebind { id, handle }).await?;
                 Ok(Some(Note::Sent { written }))
             }
-            DeliverOutcome::NotReady(_) | DeliverOutcome::Refused(_) => Ok(None),
+            DeliverOutcome::NotReady(..) | DeliverOutcome::Refused(_) => Ok(None),
             DeliverOutcome::InDoubt(reason) => self.in_doubt(&d.id, reason).await.map(Some),
         }
     }
@@ -954,8 +954,8 @@ impl Mailbox {
     ) -> Result<Option<Note>, StoreError> {
         match outcome {
             DeliverOutcome::Delivered { written, .. } => Ok(Some(Note::Sent { written })),
-            DeliverOutcome::NotReady(status) => {
-                self.resolve(id, "superseded", Some(format!("not ready: {status:?}")))
+            DeliverOutcome::NotReady(_, why) => {
+                self.resolve(id, "superseded", Some(format!("not ready: {why}")))
                     .await?;
                 Ok(None)
             }

@@ -515,11 +515,14 @@ impl Session {
             let st = inner.lock();
             (Inner::status_of(&st).0, ready_for(&st, &d.expected_session))
         };
-        if fresh.is_err() || checks.is_err() {
-            return DeliverOutcome::NotReady(status);
+        if let Err(why) = fresh.map_err(|e| format!("no fresh readback: {e}")) {
+            return DeliverOutcome::NotReady(status, why);
+        }
+        if let Err(why) = checks {
+            return DeliverOutcome::NotReady(status, why);
         }
         if d.text.trim().is_empty() {
-            return DeliverOutcome::NotReady(status);
+            return DeliverOutcome::NotReady(status, "the text is blank".into());
         }
         if d.text.len() > TEXT_MAX {
             return DeliverOutcome::Refused("text over 256 KiB".into());
@@ -530,7 +533,7 @@ impl Session {
             Timing::Any => matches!(status, Status::Idle | Status::Working),
         };
         if !timing_ok {
-            return DeliverOutcome::NotReady(status);
+            return DeliverOutcome::wrong_timing(status);
         }
         // Text starting with "/" would run as an OMP command (HOST req. 53).
         let text = if d.text.trim_start().starts_with('/') {
@@ -573,7 +576,7 @@ impl Session {
             ),
             Err(RpcError::TooLarge) => DeliverOutcome::Refused("over OMP's frame limit".into()),
             Err(e) if written.is_none() && matches!(e, RpcError::Closed) => {
-                DeliverOutcome::NotReady(Status::Error)
+                DeliverOutcome::NotReady(Status::Error, format!("nothing was written: {e}"))
             }
             Err(e) => {
                 let reason = format!("delivery unconfirmed, do not resend: {e}");
@@ -1172,14 +1175,11 @@ fn ready_for(st: &State, expected: &str) -> Result<(), String> {
     if !st.dialogs.is_empty() {
         return Err("a dialog is pending".into());
     }
-    let goal = st.latest.as_ref().map(|s| s.goal.status);
-    if matches!(
-        goal,
-        Some(dialogs::GoalStatus::Paused | dialogs::GoalStatus::Blocked)
-    ) {
-        return Err("the goal is paused or blocked".into());
+    match st.latest.as_ref().map(|s| s.goal.status) {
+        Some(dialogs::GoalStatus::Paused) => Err("the goal is paused".into()),
+        Some(dialogs::GoalStatus::Blocked) => Err("the goal is blocked by its budget".into()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn push_ring(st: &mut State, entry: Entry) {
@@ -1556,7 +1556,29 @@ mod tests {
                 fresh: false,
             })
             .await;
-        assert!(matches!(wrong, DeliverOutcome::NotReady(_)), "{wrong:?}");
+        assert!(matches!(wrong, DeliverOutcome::NotReady(..)), "{wrong:?}");
+    }
+
+    /// A paused goal refuses delivery, and the outcome names the goal, not the idle status.
+    #[tokio::test]
+    async fn a_paused_goal_is_named_as_the_reason() {
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        fake.set(|s| s.goal = Some("paused"));
+        let outcome = session
+            .deliver(Delivery {
+                expected_session: fake.session_id(),
+                text: "x".into(),
+                timing: Timing::Any,
+                steer: false,
+                fresh: false,
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            DeliverOutcome::NotReady(Status::Idle, "the goal is paused".into())
+        );
+        assert_eq!(fake.seen("prompt").len(), 0);
     }
 
     #[tokio::test]
@@ -1606,7 +1628,7 @@ mod tests {
                 fresh: false,
             })
             .await;
-        assert_eq!(idle_only, DeliverOutcome::NotReady(Status::Working));
+        assert_eq!(idle_only, DeliverOutcome::wrong_timing(Status::Working));
     }
 
     /// Acceptance check 6: a transcript switch, a model mismatch at start and an `rpc_frame_error`
@@ -1629,7 +1651,7 @@ mod tests {
         fake.set(|s| s.session_id = "switched".into());
         let outcome = deliver(Arc::clone(&session), fake.session_id()).await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(Status::Error)),
+            matches!(outcome, DeliverOutcome::NotReady(Status::Error, _)),
             "{outcome:?}"
         );
         assert!(
@@ -1648,7 +1670,7 @@ mod tests {
         assert!(bound.held.unwrap().contains("model mismatch"));
         let outcome = deliver(Arc::clone(&session), fake.session_id()).await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(_)),
+            matches!(outcome, DeliverOutcome::NotReady(..)),
             "{outcome:?}"
         );
         assert_eq!(fake.seen("prompt").len(), 0);
@@ -1660,7 +1682,7 @@ mod tests {
         assert!(snapshot.reason.clone().unwrap().contains("rpc_frame_error"));
         let outcome = deliver(Arc::clone(&session), fake.session_id()).await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(Status::Error)),
+            matches!(outcome, DeliverOutcome::NotReady(Status::Error, _)),
             "{outcome:?}"
         );
         assert_eq!(fake.seen("prompt").len(), 0);
@@ -1783,7 +1805,7 @@ mod tests {
             })
             .await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(Status::Error)),
+            matches!(outcome, DeliverOutcome::NotReady(Status::Error, _)),
             "{outcome:?}"
         );
         assert!(

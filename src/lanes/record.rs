@@ -96,6 +96,9 @@ pub(crate) struct Watch {
     /// A held lane started a turn and the lead heard it for this active stretch (LANE req. 47).
     pub(crate) active_noticed: bool,
     pub(crate) thread_post_ms: Option<i64>,
+    /// Why the owner's or the lead's messages wait undelivered, once the lead heard it.
+    #[serde(default)]
+    pub(crate) held_back: Option<String>,
 }
 
 /// The lane record, stored as JSON (LANE req. 28, "State that must survive a restart").

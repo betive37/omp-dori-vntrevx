@@ -116,10 +116,23 @@ pub(crate) enum DeliverOutcome {
         turn_started: bool,
         written: Option<Instant>,
     },
-    NotReady(Status),
+    /// A check of HOST req. 50 failed: the current status and the check that failed, so a record
+    /// of it shows the real reason (a paused goal reads Idle).
+    NotReady(Status, String),
     Refused(String),
     /// Written, outcome unknown: never resent automatically.
     InDoubt(String),
+}
+
+impl DeliverOutcome {
+    /// Not ready because the delivery's timing rule does not match `status` (HOST req. 50).
+    pub(crate) fn wrong_timing(status: Status) -> Self {
+        let now = format!("{status:?}").to_lowercase();
+        Self::NotReady(
+            status,
+            format!("the session is {now}; the timing rule waits"),
+        )
+    }
 }
 
 /// How a session ended (HOST req. 69).
