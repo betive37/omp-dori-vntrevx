@@ -207,6 +207,11 @@ impl Attempts {
             Ok(r) => r,
             Err(e) => return AttemptState::unknown(format!("attempt {token}'s record: {e}")),
         };
+        if record.attempt != token {
+            return AttemptState::unknown(format!(
+                "attempt token {token} does not match its recorded receipt"
+            ));
+        }
         if let Some(ended @ AttemptState::Reaped { .. }) = record.ended {
             return ended;
         }
@@ -425,5 +430,25 @@ mod tests {
         assert_eq!(attempts.state("first").await, done);
         assert_eq!(first.token(), "first");
         assert_eq!(first.session(), Some("s-1"));
+    }
+
+    #[tokio::test]
+    async fn another_attempts_receipt_cannot_prove_termination() {
+        let dir = crate::sys::fs::tests::scratch("worker-wrong-receipt");
+        let attempts = Attempts::new(&dir);
+        crate::sys::fs::ensure_private_dir(attempts.dir()).unwrap();
+        let mut first = attempts.begin("first", None).unwrap();
+        attempts.begin("second", None).unwrap();
+        first
+            .ended(&AttemptState::Reaped {
+                exit: Reaped::NotSpawned,
+                lease: Lease::Free,
+            })
+            .unwrap();
+        std::fs::copy(attempts.path("first"), attempts.path("second")).unwrap();
+        assert!(matches!(
+            attempts.state("second").await,
+            AttemptState::Unknown { reason } if reason.contains("token")
+        ));
     }
 }

@@ -630,8 +630,24 @@ impl<R: Runtime> Lead<R> {
     /// Starts the lead (COORD req. 2): refused when a lead runs; resume or fresh by [`plan`]. Earlier
     /// automatic restarts no longer count.
     pub(crate) async fn start(self: &Arc<Self>, fresh: bool) -> Result<View, String> {
+        let _one = match self.starting.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                // Only a different, explicit target supersedes an owned startup. A second
+                // same-target request must not turn the first fresh attempt into a held failure.
+                if fresh {
+                    self.startup_cancel.send_replace(true);
+                }
+                let lock = self.starting.lock().await;
+                if !fresh {
+                    return Err(self
+                        .refusal()
+                        .unwrap_or_else(|| "a lead is already running".into()));
+                }
+                lock
+            }
+        };
         self.startup_cancel.send_replace(true);
-        let _one = self.starting.lock().await;
         if self.current().is_some_and(|session| session.alive()) {
             return Err("a lead is already running".into());
         }
@@ -815,7 +831,9 @@ impl<R: Runtime> Lead<R> {
             return Err(reason);
         }
         if !fresh && selected.ever_started && selected.row.is_none() {
-            let reason = "no proven lead anchor; held, never automatically replaced".to_string();
+            let reason = self.refusal().unwrap_or_else(|| {
+                "no proven lead anchor; held, never automatically replaced".into()
+            });
             self.set_phase(Phase::Held, Some(reason.clone()));
             return Err(reason);
         }
@@ -1766,13 +1784,13 @@ impl<R: Runtime> Lead<R> {
     pub(crate) async fn stop(&self, force: bool) -> Result<View, String> {
         let starting = self.phase().0 == Phase::Starting;
         self.startup_cancel.send_replace(true);
-        self.recovery()
-            .end("cancelled", Some("owner stopped recovery".into()))
-            .await?;
         let _one = self.starting.lock().await;
         let session = match self.live() {
             Ok(session) => session,
             Err(e) => {
+                self.recovery()
+                    .end("cancelled", Some("owner stopped recovery".into()))
+                    .await?;
                 if self.stop_asleep().await {
                     return Ok(self.view().await);
                 }

@@ -1190,3 +1190,72 @@ fn stock_omp_delayed_factory_and_session_start_resume_the_exact_anchor() {
         assert!(hub.stop().success());
     }
 }
+
+/// Refusing a busy stop must not cancel the bound recovery episode used by the next wake.
+#[test]
+fn refused_stop_preserves_recovery_for_the_next_wake() {
+    let mut hub = sleepy_hub(&["ask"], "2s", "", "");
+    hub.start();
+    live(&hub, &Value::Null);
+    assert!(hub.stop().success());
+    hub.start();
+    let resumed = live(&hub, &Value::Null);
+    assert_eq!(resumed["recovery"]["state"], "bound");
+    assert!(hub.cli(&["lead", "send", "ASK pick one"]).status.success());
+    hub.until(Duration::from_secs(10), || {
+        let view = lead_view(&hub);
+        view["session"]["dialogs"]
+            .as_array()
+            .is_some_and(|dialogs| !dialogs.is_empty())
+            .then_some(())
+    });
+    assert!(!hub.cli(&["lead", "stop"]).status.success());
+    assert_eq!(lead_view(&hub)["recovery"]["state"], "bound");
+    assert!(
+        hub.cli(&["lead", "answer", "d1", r#"{"data":{"color":"Blue"}}"#])
+            .status
+            .success()
+    );
+    asleep(&hub);
+    assert!(
+        hub.cli(&["lead", "send", "AFTER-REFUSED-STOP"])
+            .status
+            .success()
+    );
+    let awake = live(&hub, &resumed["session"]["pid"]);
+    assert_eq!(
+        awake["session"]["session_id"],
+        resumed["session"]["session_id"]
+    );
+    hub.until(Duration::from_secs(10), || {
+        let view = lead_view(&hub);
+        (view["sent"] == 0 && view["waiting"] == 0).then_some(())
+    });
+    assert_eq!(
+        user_entries(&awake["session"]["session_file"], "AFTER-REFUSED-STOP"),
+        1
+    );
+    assert!(hub.stop().success());
+}
+
+/// A duplicate same-target start observes the owned startup instead of cancelling it.
+#[test]
+fn a_duplicate_start_does_not_replace_the_owned_resume_attempt() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    assert!(w.hub.stop().success());
+    w.arm("delay", "2");
+    w.hub.start();
+    w.hub.until(Duration::from_secs(10), || {
+        (w.starts("resume").len() == 1).then_some(())
+    });
+    assert!(!w.hub.cli(&["lead", "start"]).status.success());
+    let resumed = live(&w.hub, &first["session"]["pid"]);
+    assert_eq!(
+        resumed["session"]["session_id"],
+        first["session"]["session_id"]
+    );
+    assert_eq!(w.starts("resume").len(), 1);
+    assert!(w.hub.stop().success());
+    w.no_orphans();
+}
