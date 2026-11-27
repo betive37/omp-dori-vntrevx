@@ -2,6 +2,19 @@
 
 ## Unreleased
 
+- `[lead] answers = "tool"` lets the lead choose its answers: Cataly then posts no turn text by
+  itself, and the lead answers each owner message with its tool (`cataly_lead` op `answer`,
+  naming the message as `discord:<room>/<message>`). The answer is posted like an automatic one
+  (split, once only, into the thread started from the message, or into a room the lead names) and
+  settles the owed reply; the same answer again posts nothing, and later calls add follow-ups in
+  the room the answer went to, also after a restart. While onboarding runs, `answer` still
+  replies in place (that is how its questions reach you) but may not post anywhere else. In tool
+  mode a background job's result that starts another turn can no longer have that turn's text
+  taken for the answer. Reminders still come for unanswered messages. The operation also works
+  with the default; the default, `"final"`, keeps posting the final message of the turn as before.
+- An answer part posted outside the request's channel (a thread, another room) is now stored with
+  its room, so a restart and later follow-ups find it. An older version cannot read that: roll back
+  only while no answer is being posted.
 - When a Discord thread was started from your message (by you, by the lead through the bot, or by
   a lane), the lead's answer to it goes into that thread instead of a reply in the channel: every
   part of a long answer, with the same once-only posting, and the owed reply counts as answered.
