@@ -290,12 +290,16 @@ fn exact_checked(path: &Path, root: &Path, session: &str, folder: &Folder) -> Re
         return Err(TranscriptError::Verification(VerificationCheck::Path));
     }
     if session_file_id(name) != Some(session) {
-        return Err(TranscriptError::Verification(VerificationCheck::FileNameIdentity));
+        return Err(TranscriptError::Verification(
+            VerificationCheck::FileNameIdentity,
+        ));
     }
     let file = real(path)?;
     let root = real(root)?;
     if file != path || !strictly_inside(&root, &file) {
-        return Err(TranscriptError::Verification(VerificationCheck::CanonicalLocation));
+        return Err(TranscriptError::Verification(
+            VerificationCheck::CanonicalLocation,
+        ));
     }
     let uid = rustix::process::getuid().as_raw();
     let parent = root.parent().map(fs::metadata).transpose()?;
@@ -310,7 +314,9 @@ fn exact_checked(path: &Path, root: &Path, session: &str, folder: &Folder) -> Re
     while let Some(at) = dir {
         let info = fs::metadata(&at)?;
         if !info.is_dir() || info.uid() != uid || info.mode() & write_mask != 0 {
-            return Err(TranscriptError::Verification(VerificationCheck::DirectorySafety));
+            return Err(TranscriptError::Verification(
+                VerificationCheck::DirectorySafety,
+            ));
         }
         if at == root {
             break;
@@ -330,7 +336,9 @@ fn exact_checked(path: &Path, root: &Path, session: &str, folder: &Folder) -> Re
     };
     let header_cwd = head.get("cwd").and_then(Value::as_str).map(Path::new);
     let Some(recorded) = header_cwd.filter(|c| c.is_absolute()) else {
-        return Err(TranscriptError::Verification(VerificationCheck::WorkingDirectory));
+        return Err(TranscriptError::Verification(
+            VerificationCheck::WorkingDirectory,
+        ));
     };
     let recorded = real(recorded)?;
     let allowed = match folder {
@@ -341,35 +349,50 @@ fn exact_checked(path: &Path, root: &Path, session: &str, folder: &Folder) -> Re
         }
     };
     if head.get("id").and_then(Value::as_str) != Some(session) {
-        return Err(TranscriptError::Verification(VerificationCheck::HeaderIdentity));
+        return Err(TranscriptError::Verification(
+            VerificationCheck::HeaderIdentity,
+        ));
     }
     if !allowed {
-        return Err(TranscriptError::Verification(VerificationCheck::WorkingDirectory));
+        return Err(TranscriptError::Verification(
+            VerificationCheck::WorkingDirectory,
+        ));
     }
-    // Only generated sibling headers can redirect OMP's resume target.
-    let dir = file.parent().unwrap_or(root.as_path());
+    check_siblings(&file, session, write_mask)?;
+    handle.seek(SeekFrom::Start(0))?;
+    read_branch(handle, recorded)
+}
+/// Generated sibling headers can redirect OMP's target; every such sibling must be readable.
+fn check_siblings(file: &Path, session: &str, write_mask: u32) -> Result<()> {
+    let dir = file.parent().ok_or(TranscriptError::Verification(
+        VerificationCheck::CanonicalLocation,
+    ))?;
+    let uid = rustix::process::getuid().as_raw();
     for sibling in fs::read_dir(dir)? {
         let sibling = sibling?;
-        let sibling_name = sibling.file_name();
-        let Some(sibling_name) = sibling_name.to_str() else {
-            continue;
-        };
-        if sibling_name == name || session_file_id(sibling_name).is_none() {
+        let name = sibling.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if Some(std::ffi::OsStr::new(name)) == file.file_name() || session_file_id(name).is_none() {
             continue;
         }
         let mut other = read_only(&sibling.path())?;
         let entry = other.metadata()?;
         if !entry.is_file() || entry.uid() != uid || entry.mode() & write_mask != 0 {
-            return Err(TranscriptError::Verification(VerificationCheck::SiblingSafety));
+            return Err(TranscriptError::Verification(
+                VerificationCheck::SiblingSafety,
+            ));
         }
         match header(&mut other, HEADER_BYTES)? {
             Some(candidate)
                 if candidate.get("continuationOf").and_then(Value::as_str) != Some(session) => {}
-            _ => return Err(TranscriptError::Verification(VerificationCheck::Continuation)),
+            _ => {
+                return Err(TranscriptError::Verification(
+                    VerificationCheck::Continuation,
+                ));
+            }
         }
     }
-    handle.seek(SeekFrom::Start(0))?;
-    read_branch(handle, recorded)
+    Ok(())
 }
 
 /// Reads every entry for the saved model; `None` when the transcript departed or holds a non-object
@@ -809,11 +832,15 @@ pub(crate) async fn verify_exact(
     folder: Folder,
 ) -> Result<Transcript> {
     if crate::worker::split_remote(&path).is_some() {
-        return verify(path, root, session, folder).await?
-            .ok_or(TranscriptError::Verification(VerificationCheck::RemoteUnverified));
+        return verify(path, root, session, folder)
+            .await?
+            .ok_or(TranscriptError::Verification(
+                VerificationCheck::RemoteUnverified,
+            ));
     }
     tokio::task::spawn_blocking(move || exact_checked(&path, &root, &session, &folder))
-        .await.map_err(|e| TranscriptError::Io(format!("verify task: {e}")))?
+        .await
+        .map_err(|e| TranscriptError::Io(format!("verify task: {e}")))?
 }
 
 /// A session file larger than this is an issue for spend reading (WS req. 34).

@@ -57,7 +57,7 @@ const MIGRATIONS: [Migration; 11] = [
     },
     Migration {
         sql: include_str!("migrations/0011_lead_anchor.sql"),
-        additive: true,
+        additive: false,
     },
 ];
 

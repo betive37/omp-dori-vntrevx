@@ -614,7 +614,6 @@ pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
 }
 
 impl Reads {
-
     /// Records left starting or live (recovery, HOST req. 85).
     pub(crate) fn open_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
         let mut stmt = self.0.prepare(&format!(

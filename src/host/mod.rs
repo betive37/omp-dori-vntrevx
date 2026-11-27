@@ -92,8 +92,16 @@ impl std::fmt::Display for StartError {
         match self {
             Self::Refused(r) => write!(f, "refused: {r}"),
             Self::Failed(r) => write!(f, "failed: {r}"),
-            Self::Startup { stage, outcome, cleanup, detail } => {
-                write!(f, "startup {stage:?} {outcome:?}: {detail} (cleanup: {cleanup:?})")
+            Self::Startup {
+                stage,
+                outcome,
+                cleanup,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "startup {stage:?} {outcome:?}: {detail} (cleanup: {cleanup:?})"
+                )
             }
         }
     }
@@ -101,11 +109,14 @@ impl std::fmt::Display for StartError {
 
 impl StartError {
     pub(crate) const fn retryable(&self) -> bool {
-        matches!(self, Self::Startup {
-            outcome: startup::StartupOutcome::Timeout,
-            cleanup: startup::Cleanup::LocalReaped | startup::Cleanup::WorkerReaped,
-            ..
-        })
+        matches!(
+            self,
+            Self::Startup {
+                outcome: startup::StartupOutcome::Timeout,
+                cleanup: startup::Cleanup::LocalReaped | startup::Cleanup::WorkerReaped,
+                ..
+            }
+        )
     }
 }
 
@@ -291,10 +302,8 @@ pub(crate) trait Runtime: Send + Sync + 'static {
     fn start_supervised(
         &self,
         spec: StartSpec,
-        _cancel: tokio::sync::watch::Receiver<bool>,
-    ) -> impl Future<Output = Result<(Arc<Self::Session>, Started), StartError>> + Send {
-        self.start(spec)
-    }
+        cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> impl Future<Output = Result<(Arc<Self::Session>, Started), StartError>> + Send;
 }
 
 /// One live session. State-changing calls run one at a time; a second is refused as busy (HOST

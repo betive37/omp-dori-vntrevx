@@ -70,7 +70,13 @@ impl<R: Runtime> Lead<R> {
         if self.env.config.borrow().lead.is_none() || self.phase().0 != Phase::NotStarted {
             return;
         }
-        let pin = self.env.config.borrow().lead.as_ref().and_then(|settings| settings.session_id.clone());
+        let pin = self
+            .env
+            .config
+            .borrow()
+            .lead
+            .as_ref()
+            .and_then(|settings| settings.session_id.clone());
         let selected = match self.resolve(pin).await {
             Ok(selected) => selected,
             Err(error) => {

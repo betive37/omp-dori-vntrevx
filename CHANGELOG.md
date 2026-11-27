@@ -21,6 +21,9 @@
   15-second notice, verified process cleanup, and a durable 300-second recovery episode.
   Retain pre-binding ownership evidence across hub crashes; input stays fenced until the
   validated identity is committed.
+- Conversation-safe stores require schema reader 11. Older hubs must not open them and bypass
+  the resume anchor; retain the new version, or explicitly restore the pre-upgrade store backup
+  before a compatible downgrade.
 
 ## 0.2.6 (Unreleased)
 
