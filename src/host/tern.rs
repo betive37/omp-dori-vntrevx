@@ -203,8 +203,7 @@ impl Runtime for Tern {
             .identify(spec.expected_id.as_deref(), None)
             .map_err(StartError::Refused)?;
         let token = super::random_hex(16);
-        self.links
-            .issue_for(&token, &spec.handle, spec.role, TOKEN_LIFE_MS);
+        self.links.issue_for(&token, &spec, TOKEN_LIFE_MS);
         let (port, attached) = Port::new(
             &spec,
             self.spill.clone(),

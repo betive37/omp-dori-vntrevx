@@ -224,7 +224,9 @@ lane lifecycle area consumes the completion checker, the step records and the pu
     recovery summary from the daemon to the lead's context. It holds: each open lane with status, latest report kind
     and time or "no report", held or suspended lanes with reasons; every open request-log item with its next step;
     every open owner question (ID, age, lane, thread, question); the count of open owner obligations; and each
-    damaged record by name. It is at most 8 KiB; overflow ends with "and N more" per section.
+    damaged record by name. It is at most 8 KiB; overflow ends with "and N more" per section. The start of a lead
+    session is a new conversation, or the lead's first connection after a daemon start; a later connection of a
+    resumed or woken conversation is not a start and adds no summary.
 49. Producing the summary changes nothing. If the daemon cannot be reached, the summary is one line saying so.
 
 ### Status view and status message (EVR-29, EVR-30)

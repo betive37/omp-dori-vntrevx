@@ -88,6 +88,10 @@
   either: at the end of the startup deadline it binds, fenced the same way. The owner hears once
   (not on every restart) to run `cataly update` or restart the session, or to keep the model with
   `cataly lead accept-model`.
+- **A lead woken from sleep or restarted after a crash no longer gets a second start recap.**
+  The recap goes in front of a new conversation and of the lead's first connection after a hub
+  start; the extension's hello on a resumed or woken session is a connection, not a new
+  conversation, so it adds none.
 - Tern startup journals retain the block ID and process birth identity; confirmed block close
   or disappearance of that exact process proves termination. Unknown exits remain held.
   Settled startup receipts are pruned only after no anchor, recovery episode or lane references

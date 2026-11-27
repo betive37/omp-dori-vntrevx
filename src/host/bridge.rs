@@ -14,8 +14,9 @@ use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc, oneshot};
 use tokio::time::Instant;
 
-use super::Role;
 use super::model::{Proof, Resolution};
+use super::{Role, StartSpec};
+use crate::omp::launch::Target;
 use crate::proto::Response;
 use crate::sys::now_ms;
 
@@ -46,6 +47,8 @@ pub(crate) struct LinkView {
 struct Issued {
     handle: String,
     role: Role,
+    /// The launch starts a new conversation; a resume continues one.
+    fresh: bool,
     at_ms: i64,
     life_ms: i64,
 }
@@ -81,6 +84,8 @@ struct Inner {
     /// Queries sent, by number: the session's handle and the waiter.
     asked: HashMap<u64, (String, oneshot::Sender<Value>)>,
     next: u64,
+    /// A lead hello has been accepted in this hub run.
+    lead_greeted: bool,
 }
 
 /// Launch tokens and accepted bridge connections of this hub run.
@@ -103,13 +108,13 @@ impl Links {
     }
 
     /// Records the token handed to a session's OMP child before it is spawned.
-    pub(crate) fn issue(&self, token: &str, handle: &str, role: Role) {
-        self.issue_for(token, handle, role, TOKEN_LIFE_MS);
+    pub(crate) fn issue(&self, token: &str, spec: &StartSpec) {
+        self.issue_for(token, spec, TOKEN_LIFE_MS);
     }
 
     /// A token good for `life_ms`: a terminal block's token is visible in the process list, so it
     /// lives 60 s (DESIGN 4.3).
-    pub(crate) fn issue_for(&self, token: &str, handle: &str, role: Role, life_ms: i64) {
+    pub(crate) fn issue_for(&self, token: &str, spec: &StartSpec, life_ms: i64) {
         let now = now_ms();
         let mut inner = self.lock();
         inner.tokens.retain(|_, t| now - t.at_ms < t.life_ms);
@@ -119,18 +124,33 @@ impl Links {
         inner.tokens.insert(
             token.to_string(),
             Issued {
-                handle: handle.to_string(),
-                role,
+                handle: spec.handle.clone(),
+                role: spec.role,
+                fresh: matches!(spec.target, Target::Fresh(_)),
                 at_ms: now,
                 life_ms,
             },
         );
     }
 
-    /// Uses a token: the session it was issued for, once (EXT req. 5).
-    pub(crate) fn redeem(&self, token: &str) -> Option<(String, Role)> {
+    /// Uses a token, once (EXT req. 5): the session it was issued for, and whether that launch
+    /// started a new conversation.
+    pub(crate) fn redeem(&self, token: &str) -> Option<(String, Role, bool)> {
         let issued = self.lock().tokens.remove(token)?;
-        (now_ms() - issued.at_ms < issued.life_ms).then_some((issued.handle, issued.role))
+        (now_ms() - issued.at_ms < issued.life_ms).then_some((
+            issued.handle,
+            issued.role,
+            issued.fresh,
+        ))
+    }
+
+    /// Whether an accepted lead hello begins the lead's context, so the recap goes in front of it
+    /// (EVR req. 48, OPC req. 57): its conversation is new, or it is the lead's first hello since
+    /// the hub started. Any later hello of a resumed or woken conversation is a new connection to
+    /// a context that already has its recap.
+    pub(crate) fn lead_begins(&self, fresh: bool) -> bool {
+        let first = !std::mem::replace(&mut self.lock().lead_greeted, true);
+        fresh || first
     }
 
     /// Registers the control port of a terminal session under its handle.
@@ -392,10 +412,14 @@ mod tests {
     #[test]
     fn tokens_are_single_use_and_keys_find_their_session() {
         let links = Links::default();
-        links.issue("t1", "h1", Role::Lead);
-        assert_eq!(links.redeem("t1"), Some(("h1".into(), Role::Lead)));
+        let fresh = super::super::testing::spec("h1", None);
+        links.issue("t1", &fresh);
+        assert_eq!(links.redeem("t1"), Some(("h1".into(), Role::Lead, true)));
         assert_eq!(links.redeem("t1"), None);
         assert_eq!(links.redeem("nope"), None);
+        let resume = super::super::testing::spec("h2", Some(("A", "/x/a.jsonl".into())));
+        links.issue("t2", &resume);
+        assert_eq!(links.redeem("t2"), Some(("h2".into(), Role::Lead, false)));
         links.connect("h1", Role::Lead, "k1", "s1");
         assert_eq!(links.by_key("k1"), Some(("h1".into(), Role::Lead)));
         assert_eq!(links.by_key(""), None);
@@ -417,6 +441,20 @@ mod tests {
         );
         assert_eq!(links.place(&[41, 40]), Some(("h1".into(), Role::Lead)));
         assert_eq!(links.place(&[41, 1]), None);
+    }
+
+    /// A hello is a connection, not a new conversation: only a new conversation, or the lead's
+    /// first hello since the hub started, begins the lead's context.
+    #[test]
+    fn only_a_new_conversation_or_the_first_lead_hello_of_a_run_begins_the_lead() {
+        let links = Links::default();
+        assert!(
+            links.lead_begins(false),
+            "the first hello since the hub started"
+        );
+        assert!(!links.lead_begins(false), "a resumed or woken conversation");
+        assert!(links.lead_begins(true), "a new conversation");
+        assert!(!links.lead_begins(false));
     }
 
     /// Every session start brings a new handle; ended sessions' links do not pile up, and a

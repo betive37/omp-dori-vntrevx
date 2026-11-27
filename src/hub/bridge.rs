@@ -91,7 +91,8 @@ fn lane_tool() -> Value {
     })
 }
 
-/// Who the hello is, if anyone: the session handle and role, and whether this is a fresh start.
+/// Who the hello is, if anyone: the session handle and role, and whether the hub launched it on a
+/// new conversation. A reconnect, a resume and a resume by hand continue one.
 async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String> {
     if hello.ext != PROTOCOL {
         return Err(format!(
@@ -116,7 +117,6 @@ async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String
         return hub
             .links
             .redeem(token)
-            .map(|(h, r)| (h, r, true))
             .ok_or_else(|| "a used or unknown launch token".into());
     }
     if let Some(found) = hello.key.as_deref().and_then(|k| hub.links.by_key(k)) {
@@ -128,7 +128,7 @@ async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String
         && !hello.session.is_empty()
         && s.session_id.as_deref() == Some(hello.session.as_str())
     {
-        return Ok((s.handle.clone(), Role::Lead, true));
+        return Ok((s.handle.clone(), Role::Lead, false));
     }
     Err("not a session of this hub".into())
 }
@@ -292,7 +292,7 @@ pub(crate) async fn serve<R, W>(
         hub.links.open_query(&handle, &key, &raw, tx.clone());
     }
     let writer_task = tokio::spawn(pump(writer, rx));
-    if fresh && role == Role::Lead {
+    if role == Role::Lead && !sub && hub.links.lead_begins(fresh) {
         recap(hub, &handle, "start".into());
     }
     loop {

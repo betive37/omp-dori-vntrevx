@@ -108,7 +108,7 @@ impl Runtime for Headless {
         }
         let deadline = tokio::time::Instant::now() + STARTUP_BUDGET;
         let token = super::random_hex(16);
-        self.links.issue(&token, &spec.handle, spec.role);
+        self.links.issue(&token, &spec);
         if let Some(worker) = spec.worker.clone() {
             return self
                 .start_remote(spec, &worker, &token, deadline, cancel)

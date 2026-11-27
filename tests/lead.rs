@@ -605,12 +605,14 @@ fn quiet_notes_wait_through_a_sleep_and_go_with_the_first_turn() {
     let mut hub = sleepy_hub(&[], "2s", "", "");
     hub.start();
     let first = live(&hub, &Value::Null);
-    // An exit by itself brings the lead back on its session with a quiet resume note.
+    // An exit by itself brings the lead back on its session with a quiet resume note. The bridge
+    // hello of the resumed session is a connection, not a new conversation: the only recap is the
+    // fresh start's, still waiting with the resume note.
     kill(&first["session"]["pid"]);
     let second = live(&hub, &first["session"]["pid"]);
     let file = second["session"]["session_file"].clone();
     let slept = asleep(&hub);
-    assert_eq!(slept["notes"], 1, "{slept}");
+    assert_eq!(slept["notes"], 2, "{slept}");
     assert_eq!(user_entries(&file, "resume note"), 0);
     assert!(hub.cli(&["lead", "send", "WAKE-Q"]).status.success());
     let woke = live(&hub, &second["session"]["pid"]);
@@ -627,10 +629,15 @@ fn quiet_notes_wait_through_a_sleep_and_go_with_the_first_turn() {
         .find(|l| l.contains("\"role\":\"user\"") && l.contains("WAKE-Q"))
         .unwrap();
     assert!(
-        turn.contains("resume note"),
-        "one turn carries both: {turn}"
+        turn.contains("resume note") && turn.contains("[recap]"),
+        "one turn carries all: {turn}"
     );
     assert_eq!(user_entries(&file, "resume note"), 1);
+    assert_eq!(
+        user_entries(&file, "[recap]"),
+        1,
+        "the woken hello adds none"
+    );
     assert!(hub.stop().success());
 }
 
@@ -1013,7 +1020,8 @@ fn a_slow_wake_recovers_the_sleeping_session_and_delivers_once() {
     let mut w = wrapped("", Some("2s"));
     w.hub.start();
     let first = live(&w.hub, &Value::Null);
-    // An exit by itself brings the lead back on A with a quiet resume note.
+    // An exit by itself brings the lead back on A with a quiet resume note, next to the fresh
+    // start's recap; the resumed session's hello adds none.
     kill(&first["session"]["pid"]);
     let second = live(&w.hub, &first["session"]["pid"]);
     let (id, file) = (
@@ -1021,7 +1029,7 @@ fn a_slow_wake_recovers_the_sleeping_session_and_delivers_once() {
         second["session"]["session_file"].clone(),
     );
     assert_eq!(id, first["session"]["session_id"]);
-    assert_eq!(asleep(&w.hub)["notes"], 1);
+    assert_eq!(asleep(&w.hub)["notes"], 2);
 
     w.arm("delay", "20");
     let resumes = w.starts("resume").len();
@@ -1071,6 +1079,7 @@ fn a_slow_wake_recovers_the_sleeping_session_and_delivers_once() {
     assert_eq!(user_entries(&file, "WAKE-SLOW"), 1);
     assert_eq!(user_entries(&file, "WAKE-LATE"), 1);
     assert_eq!(user_entries(&file, "resume note"), 1);
+    assert_eq!(user_entries(&file, "[recap]"), 1, "no wake added a recap");
     assert_eq!(session_files(&file), 1, "no fresh conversation was made");
     assert!(w.hub.stop().success());
     w.no_orphans();

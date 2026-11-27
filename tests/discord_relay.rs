@@ -59,6 +59,25 @@ fn ready(hub: &TestHub) {
     });
 }
 
+/// The lead's start recap (EVR req. 48), which its bridge's hello queued as a quiet note, goes out
+/// with an owner note from the command line, so the next owner message is alone in its wake: the
+/// early wake of decision 15 takes only a batch that carries nothing else.
+fn recap_delivered(hub: &TestHub) {
+    hub.until(WAIT, || {
+        (hub.json(&["lead", "status", "--json"])["notes"] == 1).then_some(())
+    });
+    assert!(hub.cli(&["lead", "send", "warm up"]).status.success());
+    let file = session_file(hub);
+    hub.until(WAIT, || {
+        let text = std::fs::read_to_string(&file).unwrap_or_default();
+        (text.contains("warm up") && text.contains("[recap]")).then_some(())
+    });
+    hub.until(WAIT, || {
+        let v = hub.json(&["lead", "status", "--json"]);
+        (v["notes"] == 0 && v["sent"] == 0 && v["in_doubt"] == 0).then_some(())
+    });
+}
+
 fn session_file(hub: &TestHub) -> PathBuf {
     let lead = hub.json(&["lead", "status", "--json"]);
     PathBuf::from(lead["session"]["session_file"].as_str().unwrap())
@@ -934,6 +953,7 @@ fn crash_at_each_wake_point_delivers_once() {
         hub.env.push(("CATALY_FAULT".into(), PathBuf::from(point)));
         hub.start();
         ready(&hub);
+        recap_delivered(&hub);
         let lead = hub.json(&["lead", "status", "--json"]);
         let file = PathBuf::from(lead["session"]["session_file"].as_str().unwrap());
         let id = 800_000_000_000_000_051 + n as u64;
@@ -983,9 +1003,11 @@ fn crash_at_each_wake_point_delivers_once() {
 #[test]
 fn unconfirmed_hand_offs_resend_once_or_hold_the_room() {
     let fake = FakeDiscord::start();
-    let mut hub = relay_hub(&fake, &["noentry"], "");
+    let mut hub = relay_hub(&fake, &[], "");
     hub.start();
     ready(&hub);
+    recap_delivered(&hub);
+    hub.fixture("omp", "noentry", Some(""));
     fake.say(FakeDiscord::message(
         CH,
         800_000_000_000_000_041,
