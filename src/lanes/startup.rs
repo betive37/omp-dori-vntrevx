@@ -5,7 +5,7 @@ use std::sync::Arc;
 use std::time::Instant;
 
 use super::record::{Record, State};
-use super::{LOOK_ONLY, Lanes, record, supervisor};
+use super::{Lanes, record, supervisor};
 use crate::config::Config;
 use crate::host::inbox::ReceiptState;
 use crate::host::{Role, Runtime, StartError, StartSpec};
@@ -54,7 +54,7 @@ impl<R: Runtime> Lanes<R> {
             expected_id: expected,
             instructions: None,
             max_cost: rec.ceilings.cost,
-            tools: rec.look_only.then(|| LOOK_ONLY.to_string()),
+            look_only: rec.look_only,
             worker: rec.worker.clone(),
         })
     }

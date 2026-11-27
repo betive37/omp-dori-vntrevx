@@ -1323,6 +1323,116 @@ fn question_ask_posts_in_its_thread() {
     hub.stop();
 }
 
+/// Owner-facing inventory uses the accepted bridge, not a local OMP session note.
+#[test]
+fn nonstock_capabilities_reach_status_and_stay_scoped_to_live_connections() {
+    let (mut hub, work) = lane_hub("");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    start(&mut hub);
+    let (mut bridge, meta) = lead_bridge(&hub);
+    let session = meta["session"].as_str().unwrap();
+    let empty = json!({ "session": session, "nonstock": [] });
+    assert_eq!(bridge.call("bridge.capabilities", empty.clone()), json!({}));
+    for args in [&["status"][..], &["lead", "status"][..]] {
+        let output = hub.cli(args);
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line == format!("tools    {session}: non-stock none"))
+        );
+    }
+
+    let report = json!({ "session": session, "nonstock": ["owner_tool", "mcp__owner_search", "owner_tool"] });
+    assert_eq!(
+        bridge.call("bridge.capabilities", report.clone()),
+        json!({})
+    );
+    assert_eq!(bridge.call("bridge.capabilities", report), json!({}));
+    let expected = json!([{ "session": session, "nonstock": ["mcp__owner_search", "owner_tool"] }]);
+    for args in [&["status", "--json"][..], &["lead", "status", "--json"][..]] {
+        assert_eq!(hub.json(args)["tools"], expected);
+    }
+    for args in [&["status"][..], &["lead", "status"][..]] {
+        let output = hub.cli(args);
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line
+                    == format!("tools    {session}: non-stock mcp__owner_search, owner_tool"))
+        );
+    }
+    let log = std::fs::read_to_string(hub.state().join("logs/hub.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("session non-stock tools changed"))
+            .count(),
+        2
+    );
+
+    // Malformed and cross-session reports cannot overwrite the accepted connection's inventory.
+    for bad in [
+        json!({ "session": session, "nonstock": [42] }),
+        json!({ "session": "someone-else", "nonstock": ["wrong"] }),
+    ] {
+        assert_eq!(bridge.call("bridge.capabilities", bad), Value::Null);
+    }
+    assert_eq!(hub.json(&["status", "--json"])["tools"], expected);
+
+    let (mut sub, welcome) = Bridge::connect(
+        &hub,
+        json!({
+            "ext": 1, "session": "sub-session", "agent": "sub", "parent": session
+        }),
+    );
+    assert_eq!(welcome["role"], "lead");
+    assert_eq!(
+        sub.call(
+            "bridge.capabilities",
+            json!({
+                "session": "sub-session", "nonstock": ["sub_tool"]
+            })
+        ),
+        json!({})
+    );
+    let mut both = expected.as_array().unwrap().clone();
+    both.push(json!({ "session": "sub-session", "nonstock": ["sub_tool"] }));
+    both.sort_by(|a, b| a["session"].as_str().cmp(&b["session"].as_str()));
+    assert_eq!(hub.json(&["status", "--json"])["tools"], json!(both));
+    assert_eq!(
+        hub.json(&["lead", "status", "--json"])["tools"],
+        json!(both)
+    );
+    drop(sub);
+    hub.until(WAIT, || {
+        (hub.json(&["status", "--json"])["tools"] == expected).then_some(())
+    });
+
+    // Reconnects replace the old connection's report; its later close cannot remove the new one.
+    let (mut replacement, welcome) = Bridge::connect(
+        &hub,
+        json!({
+            "ext": 1, "session": session, "agent": "main", "key": meta["hello"]["key"]
+        }),
+    );
+    assert_eq!(welcome["role"], "lead");
+    assert_eq!(replacement.call("bridge.capabilities", empty), json!({}));
+    drop(bridge);
+    let expected = json!([{ "session": session, "nonstock": [] }]);
+    assert_eq!(hub.json(&["status", "--json"])["tools"], expected);
+    drop(replacement);
+    hub.until(WAIT, || {
+        (hub.json(&["status", "--json"])["tools"] == json!([])).then_some(())
+    });
+}
+
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
 /// recorded before it), a "no" is stored and not asked again (also after a restart), and messenger
 /// writes from the lead (tool posts and `cataly` commands in its shell) are refused while it runs.

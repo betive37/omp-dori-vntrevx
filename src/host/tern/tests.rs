@@ -198,7 +198,11 @@ fn the_block_runs_omp_with_the_token_and_without_rpc_flags() {
     assert_eq!(argv[at + 2], "CATALY_LAUNCH=tok");
     assert_eq!(argv[at + 3], "CATALY_SOCKET=/run/hub.sock");
     assert_eq!(argv[at + 4], "PI_NOTIFICATIONS=off");
-    assert!(argv[at + 5..].iter().any(|a| a == "/bin/omp"));
+    let exe = argv.iter().position(|a| a == "/bin/omp").unwrap();
+    assert!(exe > at + 4);
+    // The tab's inherited PI_PY/PI_JS (or a `.env` one) must not re-enable eval: pinned last.
+    let pins: Vec<&str> = argv[exe - 2..exe].iter().map(String::as_str).collect();
+    assert_eq!(pins, ["PI_PY=0", "PI_JS=0"]);
     assert!(!argv.iter().any(|a| a == "rpc-ui" || a == "--approval-mode"));
     assert!(argv.iter().any(|a| a == "--model=fake/primary"));
     assert_eq!(block_id(br#"{"id":"b7"}"#).as_deref(), Some("b7"));

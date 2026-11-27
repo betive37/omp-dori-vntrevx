@@ -145,6 +145,23 @@
 - The ops panel's pictures are sharper: the banner is 1024×341 and the thumbnail (also on job
   notifications) 512×512, cut from the same originals with the same framing, instead of 768×256
   and 160×160 at heavy compression.
+- One hosted-tool policy hides and denies `eval` and its unavailable helper instructions, keeps
+  debug/LSP offered, and reports trusted owner-installed MCP/extension tools at startup. Stock-OMP
+  contracts gate PRs and releases against both the minimum and latest versions; the documented shell
+  and reset guards prevent accidents, not arbitrary spending. Thanks to @Momentum96 in
+  [PR #300](https://github.com/vntrevx/Cataly/pull/300) for finding the eval mismatch.
+- Every hosted OMP launch now sets `PI_PY=0` and `PI_JS=0` last. Stock OMP refills unset or empty
+  variables from project, agent and home `.env` files, so a `.env` line could turn the eval
+  kernels back on. The variables come from a table derived from OMP's settings schema, and a stock
+  contract fails when OMP adds or renames a binding for a pinned setting.
+- The OMP probe keeps reading OMP's output until OMP exits. With an MCP server configured, stock
+  OMP 19.1.1 could still write after the probe's last request and then exit with an error on the
+  closed pipe, so the probe failed and the lead never started.
+- A terminal (Tern) lane keeps its `cataly_lane` tool when the hub sets its goal right after the
+  lane connects. Stock OMP's goal mode reads the enabled tools before it switches and sets them
+  after, so a goal entered while the extension was still activating its tool dropped it, and the
+  lane could not report. The extension now finishes activating its tools before it runs any hub
+  command.
 
 ## 0.2.6 (2026-11-27)
 

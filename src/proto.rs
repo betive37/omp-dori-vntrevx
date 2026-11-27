@@ -243,6 +243,16 @@ pub(crate) struct Status {
     /// Every configured worker (docs/design/workers.md); a hub before 0.2.5 sends none.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub(crate) workers: Vec<crate::worker::link::View>,
+    /// Live bridge-reported owner integrations, one entry per reporting session.
+    #[serde(default)]
+    pub(crate) tools: Vec<ToolCapabilities>,
+}
+
+/// Non-stock tools currently active in one hosted session, as reported by OMP's public API.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(crate) struct ToolCapabilities {
+    pub(crate) session: String,
+    pub(crate) nonstock: Vec<String>,
 }
 
 /// The `quota_gate` value older clients parse: open, nothing holding it.

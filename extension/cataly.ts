@@ -87,12 +87,6 @@ function marked(ctx: Ctx): boolean {
 	return branch.some(e => e.type === "custom" && e.customType === MARKER);
 }
 
-function textOf(content: unknown): string {
-	if (typeof content === "string") return content;
-	const blocks = Array.isArray(content) ? (content as Json[]) : [];
-	return blocks.flatMap(b => (b?.type === "text" && typeof b.text === "string" ? [b.text] : [])).join("\n");
-}
-
 /** Drops run timing, job bookkeeping and file locations from result details (EVR req. 13). */
 function stable(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(stable);
@@ -153,7 +147,7 @@ const owners = new Map<string, string>();
 
 /** The bridge state of one OMP process. */
 export class Bridge {
-	wired = false; role = "none"; key: string | undefined;
+	wired = false; role = "none"; key: string | undefined; toolsActive: Promise<unknown> = Promise.resolve();
 	guidance = ""; session = ""; ctx!: Ctx;
 	// The connection, its numbering, its offline buffer and its reconnect state (EXT req. 13-15).
 	wire: Wire | undefined;
@@ -172,6 +166,7 @@ export class Bridge {
 	delivered = new Map<string, { key: string; out: Json }>();
 	forms = new Map<string, (answer: unknown) => void>();
 	token: string | undefined; parent = "";
+	private reportedCapabilities: string | undefined;
 
 	constructor(readonly pi: Pi, readonly deps: Deps) {
 		this.token = deps.env.CATALY_LAUNCH || undefined;
@@ -193,6 +188,7 @@ export class Bridge {
 				owners.set(String(ctx.agent?.id), id);
 				const answer = await this.request("bridge.switch", { session: id, file: this.file(), ...transition }, TOOL_MS);
 				this.apply(answer);
+				this.capabilities();
 			}
 			return;
 		}
@@ -219,14 +215,6 @@ export class Bridge {
 		return { idle: Boolean(safe(() => ctx?.isIdle?.())), model: modelOf(ctx) || undefined, thinking, goal };
 	}
 
-	hello(): Json {
-		const ctx = this.ctx;
-		const [cwd, agent, mode] = [ctx?.cwd ?? "", ctx?.agent?.kind ?? "main", ctx?.mode ?? ""].map(String);
-		const ids = { version: VERSION, token: this.token, key: this.key, session: this.session, file: this.file(), parent: this.parent };
-		const caps = { model_resolution_version: MODEL_RESOLUTION };
-		return { ext: PROTOCOL, ...ids, ...caps, pid: process.pid, cwd, agent, mode, marker: marked(ctx), ...this.facts(ctx) };
-	}
-
 	async connect(): Promise<void> {
 		if (this.connecting || this.shutting) return;
 		this.connecting = true;
@@ -234,7 +222,11 @@ export class Bridge {
 		this.connecting = false;
 		if (!this.wire) return this.retry();
 		this.lastRx = Date.now();
-		const answer = await this.request("bridge.hello", this.hello(), TOOL_MS, true);
+		const [cwd, agent, mode] = [this.ctx.cwd ?? "", this.ctx.agent?.kind ?? "main", this.ctx.mode ?? ""].map(String);
+		const ids = { version: VERSION, token: this.token, key: this.key, session: this.session, file: this.file(), parent: this.parent };
+		const caps = { model_resolution_version: MODEL_RESOLUTION };
+		const hello = { ext: PROTOCOL, ...ids, ...caps, pid: process.pid, cwd, agent, mode, marker: marked(this.ctx), ...this.facts(this.ctx) };
+		const answer = await this.request("bridge.hello", hello, TOOL_MS, true);
 		this.token = undefined;
 		if (!answer) return this.wire?.close();
 		if (answer.role !== "lead" && answer.role !== "lane") {
@@ -248,7 +240,9 @@ export class Bridge {
 		this.apply(answer);
 		if (!this.wired) this.wire_up(answer);
 		else this.resend();
-		if (this.warned) this.status(answer.status as string | undefined);
+		this.reportedCapabilities = undefined; // A new connection needs its own snapshot, including after a hub restart.
+		this.capabilities();
+		this.status(answer.status as string | undefined);
 		this.warned = false;
 	}
 
@@ -258,7 +252,8 @@ export class Bridge {
 		if (typeof answer.guidance === "string") this.guidance = answer.guidance;
 		if (typeof answer.pin === "string") this.pin = answer.pin;
 		if (answer.shell !== undefined) this.shell = Boolean(answer.shell);
-		if (this.role !== "none" && !this.parent) this.mark();
+		if (this.role !== "none" && !this.parent && this.ctx && !marked(this.ctx))
+			safe(() => this.pi.appendEntry(MARKER, { v: PROTOCOL }));
 	}
 
 	/** Reconnect: snapshot first, then what was buffered, then how much was lost (EXT req. 13-14). */
@@ -351,12 +346,25 @@ export class Bridge {
 		safe(() => this.ctx?.ui?.setStatus?.("cataly", text || undefined));
 	}
 
-	/** The session marker, once per branch, so a resume by hand is recognised (EXT req. 6). */
-	mark(): void {
-		if (this.ctx && !marked(this.ctx)) safe(() => this.pi.appendEntry(MARKER, { v: PROTOCOL }));
+	/** Public provenance identifies live integrations; the existing heartbeat also catches delayed MCP registration. */
+	private capabilities(heartbeat = false): void {
+		if (!this.wire || !this.key) return;
+		if (heartbeat && Date.now() - this.lastRx > SILENT_MS) return this.wire.close();
+		const active = new Set(this.pi.getActiveTools());
+		const nonstock = [...new Set(this.pi.getAllTools()
+			.filter(tool => active.has(tool.name) && tool.sourceInfo.source !== "builtin"
+				&& tool.name !== "cataly_lead" && tool.name !== "cataly_lane")
+			.map(tool => tool.name))].sort();
+		const line = this.line("bridge.capabilities", { session: this.session, nonstock });
+		if (line !== this.reportedCapabilities) {
+			this.wire.write(line);
+			this.reportedCapabilities = line;
+		}
+		if (heartbeat) this.send("bridge.ping", {});
 	}
 
-	/** After the first acceptance: handlers, tools and the heartbeat (EXT req. 4, 15, 17). */
+	/** After the first acceptance: handlers, tools and the heartbeat (EXT req. 4, 15, 17). Hub commands wait for the tools'
+	 * activation: OMP's goal mode reads the enabled tools, awaits, then sets them, so it would drop a pending bridge tool. */
 	wire_up(answer: Json): void {
 		this.wired = true;
 		const pi = this.pi;
@@ -374,9 +382,8 @@ export class Bridge {
 			const execute: ToolDefinition["execute"] = (callId, params, _s, _u, ctx) => this.tool(name, ms, callId, params as Json, ctx);
 			pi.registerTool({ name, label, description, parameters, approval, loadMode: "essential", execute });
 		}
-		safe(() => pi.setActiveTools?.([...(pi.getActiveTools?.() ?? []).filter((n: string) => !names.includes(n)), ...names]));
-		this.status(answer.status as string | undefined);
-		this.timer(() => this.beat(), HEARTBEAT_MS, true);
+		this.toolsActive = Promise.resolve(safe(() => pi.setActiveTools?.([...(pi.getActiveTools?.() ?? []).filter((n: string) => !names.includes(n)), ...names]))).catch(() => undefined);
+		this.timer(() => this.capabilities(true), HEARTBEAT_MS, true);
 		pi.on("before_agent_start", async (e, ctx) => (await this.barrier(ctx), this.guide(e, ctx)));
 		// Lane and terminal hooks, added only once the hub said they apply (EXT req. 1, 32, 34, 38, 42).
 		if ((this.shell || this.tern) && !this.parent)
@@ -388,7 +395,7 @@ export class Bridge {
 		pi.on("session_shutdown", (_e, ctx) => this.shutdown(ctx));
 		pi.on("session_branch", (e, ctx) => this.transition("session_branch", e.reason, ctx));
 		pi.on("session_tree", (_e, ctx) => this.transition("session_tree", undefined, ctx));
-		pi.on("turn_start", async (_e, ctx) => void (await this.barrier(ctx), this.main(ctx) && this.event("turn_start")));
+		pi.on("turn_start", async (_e, ctx) => void (this.capabilities(), await this.barrier(ctx), this.main(ctx) && this.event("turn_start")));
 		pi.on("message_end", (e, ctx) => this.message(e, ctx));
 		pi.on("tool_execution_start", (e, ctx) => this.toolStart(e, ctx));
 		pi.on("tool_execution_end", (e, ctx) => this.toolEnd(e, ctx));
@@ -409,18 +416,13 @@ export class Bridge {
 		return this.role !== "none" && ctx?.agent?.kind !== "sub";
 	}
 
-	beat(): void {
-		if (!this.wire) return;
-		if (Date.now() - this.lastRx > SILENT_MS) return this.wire.close();
-		this.send("bridge.ping", {});
-	}
-
 	transition(kind: string, reason: string | undefined, ctx: Ctx): void {
 		if (!this.main(ctx)) return;
 		this.changing = 0;
 		this.calls.clear();
 		this.session = String(ctx.sessionManager?.getSessionId?.() ?? this.session);
 		this.event(kind, { file: this.file(), reason });
+		this.capabilities();
 	}
 
 	/** A user's switch, branch or tree move (EXT req. 31; PATCH-01 rules 6-7): cancelled while a hub command is
@@ -445,7 +447,7 @@ export class Bridge {
 	async command(c: Json): Promise<void> {
 		const current = c.session === this.session && !this.changing;
 		this.applying += Number(current);
-		const out = current ? await this.run(c, this.ctx).catch(e => ({ refused: String(e?.message ?? e) })) : { refused: "not current" };
+		const out = current ? await this.toolsActive.then(() => this.run(c, this.ctx)).catch(e => ({ refused: String(e?.message ?? e) })) : { refused: "not current" };
 		this.applying -= Number(current);
 		this.send("bridge.reply", { n: c.n, ...out });
 	}
@@ -561,7 +563,10 @@ export class Bridge {
 		const m = (ev.message ?? ev) as Json;
 		const role = String(m.role ?? "");
 		if (role !== "user" && role !== "assistant" && !(role === "custom" && m.display)) return;
-		const all = textOf(m.content);
+		const content = m.content;
+		const blocks = Array.isArray(content) ? (content as Json[]) : [];
+		const all = typeof content === "string" ? content
+			: blocks.flatMap(b => (b?.type === "text" && typeof b.text === "string" ? [b.text] : [])).join("\n");
 		const visible = { text: all.slice(0, TEXT_CUT), truncated: all.length > TEXT_CUT };
 		const stop = m.stopReason as string | undefined;
 		if (role === "assistant") this.lastAnswer = visible.text.trim() !== "" && stop === "stop";
@@ -592,20 +597,15 @@ export class Bridge {
 		this.event("tool_execution_end", { call: id, tool: e.toolName, error: Boolean(e.isError), job });
 	}
 
-	/** Facts for the calls a tool names in `calls` (EXT req. 21-22); the hub judges them. */
-	evidence(params: Json): Json[] | undefined {
-		if (!Array.isArray(params?.calls)) return undefined;
-		return params.calls.slice(0, 64).map(raw => {
-			const call = this.calls.get(String(raw));
-			return call ? { call: String(raw), seen: true, ...call, ambiguous: call.starts > 1 } : { call: String(raw), seen: false };
-		});
-	}
-
-	/** Forwards one tool call and returns the hub's text unchanged (EXT req. 18). */
+	/** Forwards one tool call with its recorded call facts (EXT req. 18, 21-22); the hub judges them. */
 	async tool(name: string, ms: number, callId: string, params: Json, ctx: Ctx): Promise<AgentToolResult> {
 		if (!this.main(ctx)) throw new Error(`${name} is not available in this session.`);
+		const facts = Array.isArray(params?.calls) ? params.calls.slice(0, 64).map(raw => {
+			const call = this.calls.get(String(raw));
+			return call ? { call: String(raw), seen: true, ...call, ambiguous: call.starts > 1 } : { call: String(raw), seen: false };
+		}) : undefined;
 		const call = { session: this.session, agent: ctx?.agent?.id, call: callId, tool: name, input: params };
-		const answer = await this.request("bridge.tool", { ...call, facts: this.evidence(params) }, ms);
+		const answer = await this.request("bridge.tool", { ...call, facts }, ms);
 		if (!answer) throw new Error(`Cataly did not answer in time: ${UNSURE}`);
 		const text = String(answer.text ?? "");
 		if (answer.error) throw new Error(text);

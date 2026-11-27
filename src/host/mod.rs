@@ -55,10 +55,20 @@ pub(crate) struct StartSpec {
     pub(crate) instructions: Option<PathBuf>,
     /// `--max-cost` in US dollars: OMP's own backstop to a lane's cost ceiling (WS-18).
     pub(crate) max_cost: Option<f64>,
-    /// `--tools`: the look-only tool set of a review lane (OPC-46).
-    pub(crate) tools: Option<String>,
+    /// The inspection profile of a review lane (OPC-46), rendered by the hosted-tool policy.
+    pub(crate) look_only: bool,
     /// The worker the session runs on (design 2.1); `None` runs it here.
     pub(crate) worker: Option<String>,
+}
+
+impl StartSpec {
+    pub(crate) fn tool_role(&self) -> crate::omp::tools::Role {
+        match self.role {
+            Role::Lead => crate::omp::tools::Role::Lead,
+            Role::Lane if self.look_only => crate::omp::tools::Role::LookOnly,
+            Role::Lane => crate::omp::tools::Role::Lane,
+        }
+    }
 }
 
 /// A bound session (DESIGN 4.1 `Started`).

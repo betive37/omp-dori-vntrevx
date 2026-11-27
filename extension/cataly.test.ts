@@ -147,7 +147,7 @@ test("a lane gets its tool, its shell veto fails closed, and the model barrier a
 
 /** A fake hub for a terminal session: accepts with `tern`, mirrors forms, and lets a test send commands; `first` comes in
  * the same read as the hello answer, as from a hub that queued it while answering. */
-function ternHub(sent: any[], hub: { push?: (cmd: any) => void }, first?: Record<string, unknown>): Deps["connect"] {
+function ternHub(sent: any[], hub: { push?: (cmd: any) => void }, first?: Record<string, unknown>, tools: unknown[] = []): Deps["connect"] {
 	return async (_path, onLine): Promise<Wire> => {
 		hub.push = cmd => onLine(JSON.stringify({ v: 1, id: 0, item: { cmd } }));
 		return {
@@ -155,7 +155,7 @@ function ternHub(sent: any[], hub: { push?: (cmd: any) => void }, first?: Record
 				const msg = JSON.parse(line);
 				sent.push(msg);
 				const reply = (ok: unknown, after = () => {}) => queueMicrotask(() => (onLine(JSON.stringify({ v: 1, id: msg.id, ok })), after()));
-				if (msg.method === "bridge.hello") reply({ role: "lead", key: "k3", tools: [], tern: true }, () => first && hub.push?.(first));
+				if (msg.method === "bridge.hello") reply({ role: "lead", key: "k3", tools, tern: true }, () => first && hub.push?.(first));
 				if (msg.method === "bridge.form") reply({ mirrored: true });
 			},
 			close() {},
@@ -269,6 +269,34 @@ test("a command in the same read as the hello answer runs once the answer is app
 	await pi.emit("session_start", {}, ternCtx(pi, state));
 	await settle();
 	expect(replies(sent)).toMatchObject([{ n: 1, goal: { status: "active", objective: "Do it" } }]);
+});
+
+test("a goal entered right after the hello keeps the bridge tool: commands wait for its activation", async () => {
+	const pi = fakePi();
+	// As stock OMP's TUI: activation settles later, and entering goal mode reads the enabled tools, awaits, then sets them.
+	const set = pi.setActiveTools;
+	const activation = Promise.withResolvers<void>();
+	pi.setActiveTools = (names: string[]) => activation.promise.then(() => set(names));
+	const sent: unknown[] = [];
+	const hub: { push?: (cmd: unknown) => void } = {};
+	const state = { idle: true, aborts: 0, shutdowns: 0, goal: "inactive" };
+	const ctx = ternCtx(pi, state);
+	ctx.sessionModes.set = async () => {
+		const enabled = pi.getActiveTools();
+		await Promise.resolve();
+		set([...enabled, "goal"]);
+		state.goal = "active";
+		return { ok: true, changed: true };
+	};
+	const first = { n: 1, session: "s1", op: "goal", action: "enter", objective: "Do it" };
+	bridge(pi, { env: { CATALY_LAUNCH: "t" }, connect: ternHub(sent, hub, first, [{ name: "cataly_lane" }]), uid: () => 1 });
+	await pi.emit("session_start", {}, ctx);
+	await settle();
+	expect(replies(sent)).toEqual([]);
+	activation.resolve();
+	await settle();
+	expect(replies(sent)).toMatchObject([{ n: 1, goal: { status: "active" } }]);
+	expect(pi.active()).toEqual(["read", "bash", "cataly_lane", "goal"]);
 });
 
 test("a user session switch is fenced: refused while a command runs, deliveries refused while it changes (check 2)", async () => {

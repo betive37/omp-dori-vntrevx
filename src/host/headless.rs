@@ -146,7 +146,7 @@ impl Headless {
         deadline: tokio::time::Instant,
         mut cancel: watch::Receiver<bool>,
     ) -> Result<(Arc<Session>, Started), StartError> {
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let argv = Launch {
             exe: &self.exe,
             model: &spec.model,
@@ -156,10 +156,10 @@ impl Headless {
             instructions: spec.instructions.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .argv();
-        let env = session_env(&self.credentials, &self.socket, token);
+        let env = session_env(&self.credentials, &self.socket, token, spec.tool_role());
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         crate::sys::fs::ensure_private_dir(&self.logs)
             .map_err(|e| StartError::Refused(e.to_string()))?;
@@ -364,7 +364,7 @@ impl Headless {
             root.join("settings")
                 .join(local.file_name().unwrap_or_default())
         };
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let (overlay_there, instructions_there) =
             (there(&overlay), spec.instructions.as_deref().map(there));
         let copies = std::iter::once((&overlay, &overlay_there))
@@ -405,14 +405,12 @@ impl Headless {
             instructions: instructions_there.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .argv();
-        // The worker's own OMP profile and logins: nothing of this machine's environment goes along.
-        let env = [
-            ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
-            ("CATALY_LAUNCH".to_string(), token.to_string()),
-        ];
+        // The worker's own OMP profile and logins: nothing of this machine's environment goes along,
+        // and the role's policy pins outrank the worker's own `.env` files (DESIGN 12.2 A13).
+        let env = worker_env(token, spec.tool_role());
         Ok(PreparedRemote { link, argv, env })
     }
 }
@@ -422,7 +420,7 @@ impl Headless {
 struct PreparedRemote {
     link: Arc<crate::worker::link::Link>,
     argv: Vec<String>,
-    env: [(String, String); 2],
+    env: Vec<(String, String)>,
 }
 
 /// The start error of a `spawn` that gave no attempt to talk to, with what its answer proves about
@@ -1917,10 +1915,38 @@ fn note_cancelled(cancelled: &mut VecDeque<String>, id: &str) -> bool {
     false
 }
 
+/// A remote worker's launch environment: nothing of this machine's, then the role's policy pins
+/// last so they outrank the worker's own `.env` files (DESIGN 12.2 A13).
+fn worker_env(token: &str, role: crate::omp::tools::Role) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
+        ("CATALY_LAUNCH".to_string(), token.to_string()),
+    ];
+    env.extend(
+        crate::omp::launch::policy_env(role)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
+    );
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::testing::{Fake, spec};
+
+    #[test]
+    fn worker_env_ends_with_the_policy_pins() {
+        use crate::omp::tools::Role as ToolRole;
+        for role in [ToolRole::Lead, ToolRole::Lane, ToolRole::LookOnly] {
+            let env = worker_env("PI_PY=1", role);
+            let tail: Vec<(&str, &str)> = env[env.len() - 2..]
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(tail, [("PI_PY", "0"), ("PI_JS", "0")], "{role:?}");
+        }
+    }
 
     #[test]
     fn cancelled_offers_are_bounded_and_repeats_known() {

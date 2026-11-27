@@ -88,7 +88,7 @@ pub(crate) struct Tern {
 impl Tern {
     /// `tern new tab [SESSION] --cwd DIR -- /usr/bin/env CATALY_LAUNCH=.. CATALY_SOCKET=.. omp ..`.
     fn argv(&self, tern: &Path, spec: &StartSpec, token: &str) -> Vec<String> {
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let omp = Launch {
             exe: &self.omp,
             model: &spec.model,
@@ -98,7 +98,7 @@ impl Tern {
             instructions: spec.instructions.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .tui_argv();
         let mut argv = vec![tern.display().to_string(), "new".into(), "tab".into()];
@@ -112,10 +112,13 @@ impl Tern {
             format!("CATALY_LAUNCH={token}"),
             format!("CATALY_SOCKET={}", self.socket.display()),
         ]);
-        // The probe's variables (notifications off, profile overrides), as headless sessions get them.
+        // The probe's variables (notifications off, profile overrides), as headless sessions get them,
+        // then the role's policy pins: the tab inherits the terminal's environment, and OMP ranks a
+        // bound variable above `--config` and fills an unset one from `.env` (DESIGN 12.2 A13).
         argv.extend(
             crate::omp::child_env()
                 .into_iter()
+                .chain(crate::omp::launch::policy_env(spec.tool_role()))
                 .map(|(k, v)| format!("{k}={v}")),
         );
         argv.extend(omp);

@@ -68,7 +68,7 @@ pub(crate) fn spec(handle: &str, expected: Option<(&str, PathBuf)>) -> StartSpec
         expected_id: expected.map(|(id, _)| id.to_string()),
         instructions: None,
         max_cost: None,
-        tools: None,
+        look_only: false,
         worker: None,
     }
 }

@@ -572,6 +572,48 @@ impl Drop for TestHub {
                 tail.len(),
                 tail.join("\n")
             );
+            // What each Tern stand-in block showed: its terminal output, escapes dropped.
+            let blocks = std::fs::read_dir(self.root.join("bin/tern-data"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|e| e.path())
+                .filter(|p| p.extension().is_some_and(|x| x == "out"));
+            for block in blocks {
+                let raw = std::fs::read(&block).unwrap_or_default();
+                let text = plain_screen(&String::from_utf8_lossy(&raw));
+                let lines: Vec<&str> = text.lines().filter(|l| !l.trim().is_empty()).collect();
+                let tail = &lines[lines.len().saturating_sub(40)..];
+                eprintln!(
+                    "---- {} (last {} lines)\n{}",
+                    block.display(),
+                    tail.len(),
+                    tail.join("\n")
+                );
+            }
+            // Each OMP process's own warnings and errors (`~/.omp/logs` under the sandbox home).
+            let logs = std::fs::read_dir(self.root.join("home/.omp/logs"))
+                .into_iter()
+                .flatten()
+                .filter_map(Result::ok)
+                .map(|e| e.path());
+            for log in logs {
+                let text = std::fs::read_to_string(&log).unwrap_or_default();
+                let lines: Vec<&str> = text
+                    .lines()
+                    .filter(|l| {
+                        l.contains("\"level\":\"error\"") || l.contains("\"level\":\"warn\"")
+                    })
+                    .filter(|l| !l.contains("model discovery failed"))
+                    .collect();
+                let tail = &lines[lines.len().saturating_sub(20)..];
+                eprintln!(
+                    "---- {} (last {} problems)\n{}",
+                    log.display(),
+                    tail.len(),
+                    tail.join("\n")
+                );
+            }
         }
         let _ = std::fs::remove_dir_all(&self.root);
         if !left.is_empty() {
@@ -583,6 +625,41 @@ impl Drop for TestHub {
             }
         }
     }
+}
+
+/// Terminal output as plain lines: CSI and OSC escapes dropped, cursor positioning and carriage
+/// returns read as line breaks.
+fn plain_screen(raw: &str) -> String {
+    let mut out = String::with_capacity(raw.len());
+    let mut chars = raw.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\u{1b}' => match chars.next() {
+                Some('[') => {
+                    for f in chars.by_ref() {
+                        if ('@'..='~').contains(&f) {
+                            if matches!(f, 'H' | 'f') {
+                                out.push('\n');
+                            }
+                            break;
+                        }
+                    }
+                }
+                Some(']') => {
+                    while let Some(f) = chars.next() {
+                        if f == '\u{7}' || (f == '\u{1b}' && chars.next_if_eq(&'\\').is_some()) {
+                            break;
+                        }
+                    }
+                }
+                _ => {}
+            },
+            '\r' => out.push('\n'),
+            c if c.is_control() && c != '\n' => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The test's PATH without any directory holding an `omp`: a hub whose config names no OMP must not

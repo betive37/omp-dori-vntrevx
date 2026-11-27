@@ -195,10 +195,23 @@ path = "/home/me/.bun/bin/omp"
 
 Settings for every OMP session the hub starts (lead, lanes and helper roles).
 
+Every OMP session the hub launches (lead, lanes, look-only lanes, worker lanes and the built-in PR
+reviewer, in both runtimes) hides and denies `eval`: its overlay sets `eval.py: false`, `eval.js: false`
+and `archive.enabled: false` (the archive prelude in eval's instructions), and `tools.approval.eval: deny`,
+so neither eval nor its helper instructions are advertised. OMP lets `PI_PY` and `PI_JS` outrank that
+overlay and reads them from `.env` files (the working tree's included) when they are unset, so every
+launch sets `PI_PY=0` and `PI_JS=0` last; a Tern tab's inherited values, a `.env` file or a
+`credentials` entry of the same name cannot turn eval back on. A custom `[coord] reviewer` command is
+your own command and gets none of this. Debug and LSP remain offered when enabled in your OMP
+configuration; your approvals still apply. Owner-installed MCP servers and extensions are trusted, and
+their live non-stock tools are reported at startup.
+These controls are not a sandbox: provider credentials and same-user stored OMP authentication remain
+usable by hosted code. See [the safety limits](../DESIGN.md#92-accidental-spend-guards-fallback-allowed).
+
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `cap` | integer | `8` | 1–32 | Live OMP sessions at most, all roles together. |
-| `credentials` | list of strings | `[]` | environment variable names: upper-case letters, digits, `_`, not starting with a digit, not starting with `CATALY_` | Variables passed from the hub's environment to OMP (provider keys). Nothing else is passed. |
+| `credentials` | list of strings | `[]` | environment variable names: upper-case letters, digits, `_`, not starting with a digit, not starting with `CATALY_` | Variables passed from the hub's environment to OMP (provider keys). Nothing else is passed. A name the hosted policy pins (`PI_PY`, `PI_JS`) gets the policy's value instead. |
 | `extra_flags` | list of strings | `[]` | `--name` or `--name=value` only | Extra OMP command-line flags. Refused: flags the hub sets itself (`--mode`, `--session-dir`, `--resume`/`-r`, `--continue`/`-c`, `--restore`, `--fork`, `--print`/`-p`, `--goal`, `--plan`, `--approval-mode`, `--auto-approve`, `--yolo`, `--cwd`, `--config`, `--model`, `--thinking`, `--append-system-prompt`, `--system-prompt`, `--tools`, `--max-cost`, `--no-session`), `--extension`, and anything starting with `approval` or containing `approve`. |
 | `spend_phrases` | list of strings | `[]` | any; matched case-insensitively, blanks dropped | Extra phrases that mark an OMP dialog as an offer to spend money, beside the built-in ones. Such dialogs are never accepted for you. |
 | `runtime` | string | `"headless"` | `headless`, `tern` | Where new sessions run. A stored session keeps the runtime it started with. |
@@ -262,8 +275,9 @@ Starting and resuming the lead. These limits are fixed, not settings:
 ## `[fallback]`
 
 What OMP may do when a model fails. Written into OMP's settings for hosted sessions only when set;
-unset keeps OMP's own setting. A fallback only ever moves to another configured model; it never
-redeems a reset, buys credits or turns on overage.
+unset keeps OMP's own setting. Fallback moves to another configured model. Cataly's `NO_REDEEM`
+overlay stops only OMP's automatic reset redemption, not explicit CLI/API redemption. Metered
+fallback and already-enabled overage can still cost money; this is not a hard no-spend guarantee.
 
 | Key | Type | Default | Allowed | What it does | Setup |
 |---|---|---|---|---|---|
@@ -292,7 +306,7 @@ when both `owner` and `channels` are set; setting one without the other is an er
 | `channels` | list of strings | `[]` | Discord IDs, at most 256, duplicates dropped | Watched channels, threads, DMs and forums. Can also be set from the [ops panel](#ops)'s 📡 button; a change applies on the running connection. | `#cataly`, found or created |
 | `follow_threads` | boolean | `true` | | Also take threads under watched channels. Answers go into owner-started threads and lead work threads outside lanes. A lane-owned thread keeps its kickoff first and the lead's pointer in the channel. A definite refusal may move the remaining answer to the channel; an uncertain part stays at its saved destination, even after a restart or closure. Off: answers stay in the channel. | |
 | `home` | string | the one watched channel, if there is exactly one | one of `channels` | Where the lead's questions go when they name no room or thread. | `#cataly` when there are several |
-| `remote_approvals` | boolean | `false` | | Let you approve OMP permission requests by button, on a card in `[hub] language` with the command in a code block. Cataly's own tools and a fixed list of read-only commands (`ls`, `cat`, `grep`, `git status`, `git log`, `git diff` and the like) never ask; anything else still does. | `--approvals on\|off` (setup's default: on) |
+| `remote_approvals` | boolean | `false` | | Let you approve OMP permission requests by button, on a card in `[hub] language` with the command in a code block. Cataly's own tools never ask; other approvals follow your OMP settings. Cataly adds no fixed read-only command list. | `--approvals on\|off` (setup's default: on) |
 | `form_default_after` | duration | `"3m"` | 1s–1h | A question from OMP with one recommended choice takes it after this long. A question the lead records (`question.ask`) never takes its recommended option by itself. | |
 | `profile` | boolean | `true` | | `cataly setup` puts Cataly's avatar and banner on the bot where the bot has none (or still has Cataly's older ones); an image you set yourself is kept. Off: setup leaves the profile alone. | `--profile` re-applies them |
 | `away` | duration | `"3h"` | 1s–720h | You count as back when your message comes this long after your previous one. | |
@@ -495,11 +509,12 @@ order: `first_reminder` < `second_reminder` < `stall`.
 | `thread_quiet` | duration | `"20m"` | 1s–24h | A progress report posts to the thread only after this quiet time. |
 
 `[lanes.shell]`: shell rules for lanes. Patterns are regular expressions matched against the whole
-command.
+submitted command. This is an accidental-command guard, not a sandbox: it does not inspect arbitrary
+scripts, subprocesses, debug adapters or language servers.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `deny` | list of patterns | `[]` | Commands no lane may run. |
+| `deny` | list of patterns | `[]` | Submitted shell commands refused for every lane. |
 | `allow` | list of tables | `[]` | Each `{ lanes = "<glob>", patterns = [...] }` lets lanes whose key matches the glob (only `*` is special; `lanes` is required) run matching commands. |
 
 ```toml
