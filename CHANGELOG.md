@@ -21,6 +21,8 @@
   15-second notice, verified process cleanup, and a durable 300-second recovery episode.
   Retain pre-binding ownership evidence across hub crashes; input stays fenced until the
   validated identity is committed.
+  Duplicate same-target starts leave the owned attempt running; a refused busy stop leaves
+  recovery intact. Worker termination receipts must match the exact persisted attempt token.
 - Conversation-safe stores require schema reader 11. Older hubs must not open them and bypass
   the resume anchor; retain the new version, or explicitly restore the pre-upgrade store backup
   before a compatible downgrade.

@@ -20,7 +20,6 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, watch};
-use tokio::time::timeout;
 
 use super::dialogs::{
     self, AnswerFrame, Dialog, Entry, Facts, ReadState, Status, UiFrame, read_state, same_model,
@@ -38,8 +37,6 @@ use crate::sys::command::{self, Attached, Exit, KILL_GRACE, Step};
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
 
-/// Transport and binding share the deadline measured before spawning.
-const READY_WITHIN: Duration = STARTUP_BUDGET;
 /// After end of input before TERM (DESIGN 4.2, decision 8).
 const CLOSE_WAIT: Duration = Duration::from_secs(15);
 /// A forced close waits this long for the interrupted turn to stop (HOST req. 66).
@@ -113,7 +110,9 @@ impl Runtime for Headless {
         let token = super::random_hex(16);
         self.links.issue(&token, &spec.handle, spec.role);
         if let Some(worker) = spec.worker.clone() {
-            return self.start_remote(spec, &worker, &token).await;
+            return self
+                .start_remote(spec, &worker, &token, deadline, cancel)
+                .await;
         }
         let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
         let argv = Launch {
@@ -198,16 +197,108 @@ impl Runtime for Headless {
 }
 
 impl Headless {
-    /// The same start on a worker (design 2.1): its own OMP, spawned over the worker stream, with
-    /// the overlay and instructions copied to its root, its session under `<root>/sessions`, no hub
-    /// credentials, and its bridge on the worker's socket. No PID is adopted: nothing of a remote
-    /// session acts on this machine.
+    /// The same start on a worker (design 2.1): its own OMP, spawned over the worker stream for the
+    /// spec's handle as its attempt token, with the overlay and instructions copied to its root, its
+    /// session under `<root>/sessions`, no hub credentials, and its bridge on the worker's socket.
+    /// No PID is adopted: nothing of a remote session acts on this machine. The shared deadline and
+    /// cancellation govern it end to end; a failure after the spawn waits for the worker's exit
+    /// acknowledgement, which alone proves the attempt ended.
     async fn start_remote(
         &self,
         spec: StartSpec,
         worker: &str,
         token: &str,
+        deadline: tokio::time::Instant,
+        mut cancel: watch::Receiver<bool>,
     ) -> Result<(Arc<Session>, Started), StartError> {
+        let not_spawned = |outcome, detail: String| StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome,
+            cleanup: Cleanup::NotSpawned,
+            detail,
+        };
+        // Nothing runs on the worker before `spawn`, so either ends the preparation outright.
+        let prepared = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err(not_spawned(
+                StartupOutcome::Cancelled,
+                "startup cancelled before spawn".into(),
+            )),
+            prepared = tokio::time::timeout_at(deadline, self.prepare_remote(&spec, worker, token)) => {
+                prepared.unwrap_or_else(|_| Err(not_spawned(
+                    StartupOutcome::Timeout,
+                    format!("{worker}: the startup deadline passed before spawn"),
+                )))
+            }
+        };
+        let PreparedRemote { link, argv, env } = prepared?;
+        let cwd = spec.cwd.display().to_string();
+        // Once the request may have reached the worker, a deadline or cancellation is unknown
+        // ownership, not a refusal. The durable token remains available for reconciliation.
+        let unanswered = |outcome| StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome,
+            cleanup: Cleanup::Unknown,
+            detail: format!(
+                "{worker}: spawn of attempt {} was not acknowledged; held for reconciliation",
+                spec.handle
+            ),
+        };
+        let spawned = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err(unanswered(StartupOutcome::Cancelled)),
+            result = tokio::time::timeout_at(deadline, link.spawn(&argv, &cwd, &env, &spec.handle, spec.expected_id.as_deref())) =>
+                result.map_err(|_| unanswered(StartupOutcome::Timeout))?
+                    .map_err(|error| spawn_failed(worker, error)),
+        }?;
+        let crate::worker::link::Spawned {
+            channel,
+            stream,
+            hold,
+            exit,
+        } = spawned;
+        let remote = Remote {
+            worker: worker.to_string(),
+            channel,
+            hold,
+            exit,
+        };
+        let (read, write) = tokio::io::split(stream);
+        let (tx, rx) = mpsc::channel(EVENT_QUEUE);
+        let rpc = match Rpc::connect_supervised(
+            read,
+            write,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            Some(tx),
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(rpc) => rpc,
+            Err(e) => {
+                let cancelled = *cancel.borrow_and_update();
+                return Err(remote
+                    .finish(local_cleanup::Failure::rpc(&e, cancelled))
+                    .await);
+            }
+        };
+        let settings = Settings {
+            spend_phrases: self.spend_phrases.clone(),
+            agent_start: self.agent_start.clone(),
+            deadline: Some(deadline),
+            cancel: Some(cancel),
+            ownership: None,
+        };
+        Session::bind(rpc, rx, Proc::Remote(Box::new(remote)), spec, settings).await
+    }
+
+    /// What a start on `worker` runs. Nothing runs on the worker yet, so a failure is a refusal.
+    async fn prepare_remote(
+        &self,
+        spec: &StartSpec,
+        worker: &str,
+        token: &str,
+    ) -> Result<PreparedRemote, StartError> {
         let refused = |e: String| StartError::Refused(format!("{worker}: {e}"));
         let link = crate::worker::link::connect(worker)
             .await
@@ -267,26 +358,36 @@ impl Headless {
             ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
             ("CATALY_LAUNCH".to_string(), token.to_string()),
         ];
-        let cwd = spec.cwd.display().to_string();
-        let (channel, stream, hold) = link.spawn(&argv, &cwd, &env).await.map_err(refused)?;
-        let (read, write) = tokio::io::split(stream);
-        let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let rpc = Rpc::connect(read, write, READY_WITHIN, Some(tx))
-            .await
-            .map_err(|e| StartError::Failed(format!("no rpc-ui ready frame from {worker}: {e}")))?;
-        let settings = Settings {
-            spend_phrases: self.spend_phrases.clone(),
-            agent_start: self.agent_start.clone(),
-            deadline: None,
-            cancel: None,
-            ownership: None,
-        };
-        let remote = Remote {
-            worker: worker.to_string(),
-            channel,
-            hold,
-        };
-        Session::bind(rpc, rx, Proc::Remote(Box::new(remote)), spec, settings).await
+        Ok(PreparedRemote { link, argv, env })
+    }
+}
+
+/// A remote start before its spawn: the connection, OMP's argument vector on the worker and its
+/// environment there.
+struct PreparedRemote {
+    link: Arc<crate::worker::link::Link>,
+    argv: Vec<String>,
+    env: [(String, String); 2],
+}
+
+/// The start error of a `spawn` that gave no attempt to talk to, with what its answer proves about
+/// a process for the attempt token.
+fn spawn_failed(worker: &str, error: crate::worker::link::SpawnError) -> StartError {
+    use crate::worker::link::SpawnError;
+    match error {
+        SpawnError::Refused(why) => StartError::Refused(format!("{worker}: {why}")),
+        SpawnError::Ended { detail, state } => StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome: StartupOutcome::Rejected,
+            cleanup: super::lead::ownership::worker_cleanup(&state),
+            detail: format!("{worker}: {detail} ({state:?})"),
+        },
+        SpawnError::Unanswered(why) => StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome: StartupOutcome::Rejected,
+            cleanup: Cleanup::Unknown,
+            detail: format!("{worker}: {why}; only the attempt token can tell whether OMP runs"),
+        },
     }
 }
 
@@ -355,6 +456,51 @@ pub(crate) struct Remote {
     channel: u32,
     /// Keeps the worker connection in use while the session lives.
     hold: crate::worker::link::LaneHold,
+    /// The worker's acknowledgement once it reaped the OMP: the only proof it ended.
+    exit: crate::worker::link::ExitWait,
+}
+
+impl Remote {
+    /// How the worker says the OMP ended, its input already closed: the acknowledgement within the
+    /// stop budget (end of input, 15 s, TERM, 5 s, KILL on the worker), else KILL from here and
+    /// [`KILL_GRACE`] more. Returns the state and whether KILL was needed. A disconnect, an EOF or
+    /// silence is never a reap.
+    async fn reaped(&mut self) -> (crate::worker::attempt::AttemptState, bool) {
+        // Reserve the stdin-shutdown second. Signal delivery and the final acknowledgement
+        // consume the same remaining cleanup budget, never independent trailing timers.
+        let until = tokio::time::Instant::now()
+            + super::startup::STARTUP_CLEANUP_BUDGET.saturating_sub(Duration::from_secs(1));
+        let grace = until - KILL_GRACE;
+        if let Ok(state) = tokio::time::timeout_at(grace, self.exit.wait()).await {
+            return (state, false);
+        }
+        let _ = tokio::time::timeout_at(until, self.hold.link().signal(self.channel, "KILL")).await;
+        let state = tokio::time::timeout_at(until, self.exit.wait())
+            .await
+            .unwrap_or_else(|_| crate::worker::attempt::AttemptState::Unknown {
+                reason: format!(
+                    "no exit acknowledgement from {} within the cleanup budget",
+                    self.worker
+                ),
+            });
+        (state, true)
+    }
+
+    /// A startup failure after the spawn, once the worker answered for the attempt.
+    async fn finish(mut self, failure: local_cleanup::Failure) -> StartError {
+        let (state, _) = self.reaped().await;
+        StartError::Startup {
+            stage: failure.stage,
+            outcome: failure.outcome,
+            cleanup: super::lead::ownership::worker_cleanup(&state),
+            detail: format!(
+                "{} on {} (worker cleanup of attempt {}: {state:?})",
+                failure.detail,
+                self.worker,
+                self.exit.attempt()
+            ),
+        }
+    }
 }
 
 /// The view token: changes with every child start (HOST req. 78).
@@ -370,8 +516,6 @@ struct Inner {
     pid: Option<u32>,
     /// The worker the OMP runs on: its session file is recorded as `worker:<name>:<path>`.
     worker: Option<String>,
-    /// Set when OMP's output has ended.
-    output_closed: watch::Sender<bool>,
     rpc: Rpc,
     proc: AsyncMutex<Option<Proc>>,
     state: Mutex<State>,
@@ -466,7 +610,6 @@ impl Session {
             view: VIEWS.fetch_add(1, Ordering::Relaxed) + 1,
             pid,
             worker,
-            output_closed: watch::channel(false).0,
             rpc,
             proc: AsyncMutex::new(Some(proc)),
             state: Mutex::new(State {
@@ -501,6 +644,13 @@ impl Session {
             result = tokio::time::timeout_at(deadline, session.handshake(&spec, deadline)) => result
                 .unwrap_or(Err(BindFailure::Rpc(RpcError::Timeout("startup deadline")))),
         };
+        let bound = bound.and_then(|started| {
+            if tokio::time::Instant::now() < deadline {
+                Ok(started)
+            } else {
+                Err(BindFailure::Rpc(RpcError::Timeout("startup deadline")))
+            }
+        });
         match bound {
             Ok(started) => Ok((session, started)),
             Err(failure) => {
@@ -1014,21 +1164,30 @@ impl Inner {
                 };
                 (how, detail, cleanup)
             }
-            Some(Proc::Remote(remote)) => {
-                // The worker closes its OMP by the same rule once its input ended; the output
-                // ends with it.
-                let mut closed = self.output_closed.subscribe();
-                let wait = CLOSE_WAIT + KILL_GRACE + Duration::from_secs(5);
-                let ended = timeout(wait, closed.wait_for(|c| *c)).await.is_ok();
-                if ended {
-                    (how.to_string(), detail, Cleanup::Unknown)
-                } else {
-                    let _ = remote.hold.link().signal(remote.channel, "KILL").await;
+            Some(Proc::Remote(mut remote)) => {
+                // The worker closes its OMP by the same rule once its input ended and acknowledges
+                // the reap; the end of its output proves no exit.
+                let (state, killed) = remote.reaped().await;
+                let cleanup = super::lead::ownership::worker_cleanup(&state);
+                if !cleanup.confirmed() {
+                    let state = format!("{state:?}");
+                    log::warn(
+                        "remote session exit not acknowledged",
+                        &[
+                            ("handle", &self.handle),
+                            ("attempt", &remote.exit.attempt()),
+                            ("state", &state),
+                        ],
+                    );
+                }
+                if killed {
                     (
                         "kill".into(),
                         Some(format!("needed KILL on {}", remote.worker)),
-                        Cleanup::Unknown,
+                        cleanup,
                     )
+                } else {
+                    (how.to_string(), detail, cleanup)
                 }
             }
             #[cfg(test)]
@@ -1346,7 +1505,6 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<Value>) {
     while let Some(frame) = events.recv().await {
         inner.on_frame(&frame).await;
     }
-    let _ = inner.output_closed.send(true);
     let asked = inner.lock().stopping;
     if asked {
         return;
@@ -1364,10 +1522,14 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<Value>) {
                 },
             )
         }
-        Some(Proc::Remote(remote)) => (
-            format!("output closed on {}", remote.worker),
-            Cleanup::Unknown,
-        ),
+        Some(Proc::Remote(mut remote)) => {
+            // The worker reaps an OMP whose output ended, and acknowledges it.
+            let (state, _) = remote.reaped().await;
+            (
+                format!("output closed on {}", remote.worker),
+                super::lead::ownership::worker_cleanup(&state),
+            )
+        }
         #[cfg(test)]
         Some(Proc::Fake) => ("output closed".into(), Cleanup::LocalReaped),
         None => ("output closed".into(), Cleanup::Unknown),
@@ -1667,6 +1829,99 @@ mod tests {
         }
         assert_eq!(cancelled.len(), CANCELLED_KEEP);
         assert!(note_cancelled(&mut cancelled, "o999"));
+    }
+
+    /// A failed remote spawn says what its answer proves: a refusal started nothing, a recorded
+    /// failure carries the worker's state, and no answer is unknown ownership.
+    #[test]
+    fn remote_spawn_failures_carry_what_they_prove() {
+        use crate::worker::attempt::{AttemptState, Reaped};
+        use crate::worker::link::SpawnError;
+        assert_eq!(
+            spawn_failed("box", SpawnError::Refused("busy".into())),
+            StartError::Refused("box: busy".into())
+        );
+        let ended = |state| SpawnError::Ended {
+            detail: "no pipes".into(),
+            state,
+        };
+        let cleanup = |error| match spawn_failed("box", error) {
+            StartError::Startup {
+                stage: StartupStage::Spawn,
+                cleanup,
+                ..
+            } => cleanup,
+            other => panic!("{other:?}"),
+        };
+        let reaped = |exit| AttemptState::Reaped {
+            exit,
+            lease: super::super::lead::Lease::Unknown,
+        };
+        assert_eq!(
+            cleanup(ended(reaped(Reaped::NotSpawned))),
+            Cleanup::NotSpawned
+        );
+        assert_eq!(
+            cleanup(ended(reaped(Reaped::Signal(9)))),
+            Cleanup::WorkerReaped
+        );
+        let unreaped = AttemptState::Unknown {
+            reason: "the worker could not reap its OMP after KILL".into(),
+        };
+        assert_eq!(cleanup(ended(unreaped)), Cleanup::Unknown);
+        assert_eq!(
+            cleanup(SpawnError::Unanswered("spawn took longer than 30 s".into())),
+            Cleanup::Unknown
+        );
+    }
+
+    /// A remote session's OMP counts as ended only by the worker's acknowledgement of its reap; a
+    /// disconnect before it stays unknown, and is not taken for a timeout needing KILL.
+    #[tokio::test]
+    async fn a_remote_stop_is_proven_only_by_the_workers_acknowledgement() {
+        use crate::worker::attempt::{AttemptState, Reaped};
+        let root = crate::sys::fs::tests::scratch("headless-remote");
+        let cwd = root.display().to_string();
+        let (link, _serving) = crate::worker::link::tests::served(&root);
+        let argv = ["omp".into(), "-c".into(), "exec cat >/dev/null".into()];
+        let spawned = link.spawn(&argv, &cwd, &[], "r1", None).await.unwrap();
+        // The stream's end is the end of the OMP's input, as `end` closes it.
+        drop(spawned.stream);
+        let mut acknowledged = Remote {
+            worker: "box".into(),
+            channel: spawned.channel,
+            hold: spawned.hold,
+            exit: spawned.exit,
+        };
+        let (state, killed) = acknowledged.reaped().await;
+        assert!(!killed);
+        assert!(matches!(
+            state,
+            AttemptState::Reaped {
+                exit: Reaped::Code(0),
+                ..
+            }
+        ));
+        assert_eq!(
+            super::super::lead::ownership::worker_cleanup(&state),
+            Cleanup::WorkerReaped
+        );
+        let argv = ["omp".into(), "-c".into(), "exec sleep 30".into()];
+        let spawned = link.spawn(&argv, &cwd, &[], "r2", None).await.unwrap();
+        let mut dropped = Remote {
+            worker: "box".into(),
+            channel: spawned.channel,
+            hold: spawned.hold,
+            exit: spawned.exit,
+        };
+        link.mux.close();
+        let (state, killed) = dropped.reaped().await;
+        assert!(!killed, "a disconnect answers at once");
+        assert_eq!(
+            super::super::lead::ownership::worker_cleanup(&state),
+            Cleanup::Unknown
+        );
+        drop(spawned.stream);
     }
 
     async fn started(fake: &Fake) -> Arc<Session> {

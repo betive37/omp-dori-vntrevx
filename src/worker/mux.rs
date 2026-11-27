@@ -3,6 +3,8 @@
 //! protocol; the worker opens every other channel (a bridge connection, a spawned OMP). Each channel
 //! has 1 MiB of credit per direction, so one slow reader cannot stall the others or grow memory.
 //! Both ends ping every 15 s; 45 s without a frame closes the stream, and with it every channel.
+//! A spawned OMP's channel ends with one `exit` frame once the worker reaped it (protocol 2): the
+//! acknowledgement the hub waits for, since the end of the channel's bytes proves no exit.
 
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU8, AtomicU32, Ordering};
@@ -11,7 +13,7 @@ use std::time::Duration;
 
 use serde_json::Value;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt, DuplexStream};
-use tokio::sync::{Semaphore, mpsc, watch};
+use tokio::sync::{Semaphore, mpsc, oneshot, watch};
 
 /// Largest payload of one frame.
 pub(crate) const MAX_PAYLOAD: usize = 1024 * 1024;
@@ -56,6 +58,9 @@ pub(crate) enum Kind {
     /// The channel is gone in both directions.
     Close,
     Ping,
+    /// The worker reaped the channel's OMP: the payload is the JSON acknowledgement. It spends no
+    /// credit and may follow the channel's close.
+    Exit,
 }
 
 impl Kind {
@@ -67,6 +72,7 @@ impl Kind {
             Self::Eof => 4,
             Self::Close => 5,
             Self::Ping => 6,
+            Self::Exit => 7,
         }
     }
 
@@ -78,6 +84,7 @@ impl Kind {
             4 => Self::Eof,
             5 => Self::Close,
             6 => Self::Ping,
+            7 => Self::Exit,
             _ => return None,
         })
     }
@@ -192,7 +199,10 @@ struct Shared {
     channels: Mutex<HashMap<u32, Chan>>,
     next: AtomicU32,
     closed: watch::Sender<bool>,
-    accept: mpsc::Sender<(u32, Value, DuplexStream)>,
+    accept: mpsc::Sender<Accepted>,
+    /// Where each accepted channel's exit acknowledgement goes, until it arrives or its receiver
+    /// is dropped. Kept apart from the table: the acknowledgement may follow the channel's close.
+    exits: Mutex<HashMap<u32, oneshot::Sender<Value>>>,
 }
 
 impl Shared {
@@ -200,12 +210,18 @@ impl Shared {
         self.channels.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Ends the stream: every channel sees its end, every waiter wakes.
+    fn exits(&self) -> std::sync::MutexGuard<'_, HashMap<u32, oneshot::Sender<Value>>> {
+        self.exits.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Ends the stream: every channel sees its end, every waiter wakes, and no acknowledgement
+    /// can arrive any more.
     fn shut(&self) {
         let _ = self.closed.send(true);
         for (_, chan) in self.table().drain() {
             chan.credit.close();
         }
+        self.exits().clear();
     }
 
     fn forget(&self, id: u32) {
@@ -220,6 +236,8 @@ pub(crate) struct Accepted {
     pub(crate) channel: u32,
     pub(crate) header: Value,
     pub(crate) stream: DuplexStream,
+    /// The channel's `exit` frame payload; an error once the stream ended without one.
+    pub(crate) exit: oneshot::Receiver<Value>,
 }
 
 /// One end of a worker-mode stream.
@@ -248,6 +266,7 @@ impl Mux {
             next: AtomicU32::new(1),
             closed: watch::channel(false).0,
             accept,
+            exits: Mutex::new(HashMap::new()),
         });
         let mux = Self { shared };
         let control = mux.attach(CONTROL);
@@ -256,12 +275,7 @@ impl Mux {
         let (tx, rx) = mpsc::channel(ACCEPT_QUEUE);
         let mut incoming = accept_rx;
         tokio::spawn(async move {
-            while let Some((channel, header, stream)) = incoming.recv().await {
-                let accepted = Accepted {
-                    channel,
-                    header,
-                    stream,
-                };
+            while let Some(accepted) = incoming.recv().await {
                 if tx.send(accepted).await.is_err() {
                     break;
                 }
@@ -284,6 +298,19 @@ impl Mux {
             .await
             .map_err(|_| "the worker stream is closed".to_string())?;
         Ok((id, stream))
+    }
+
+    /// Sends the exit acknowledgement of channel `id`, the last frame of a spawned OMP's channel.
+    pub(crate) async fn exit(&self, id: u32, report: &Value) -> Result<(), String> {
+        let payload = serde_json::to_vec(report).map_err(|e| e.to_string())?;
+        if id == CONTROL || payload.len() > MAX_PAYLOAD {
+            return Err("not an acknowledgement this stream carries".into());
+        }
+        self.shared
+            .out
+            .send(Frame::new(id, Kind::Exit, payload))
+            .await
+            .map_err(|_| "the worker stream is closed".to_string())
     }
 
     /// Whether the stream has ended.
@@ -476,7 +503,10 @@ async fn dispatch(shared: &Arc<Shared>, frame: Frame) -> bool {
     match kind {
         Kind::Ping => true,
         Kind::Open => {
-            if shared.table().contains_key(&channel) {
+            if channel == CONTROL
+                || shared.table().contains_key(&channel)
+                || shared.exits().contains_key(&channel)
+            {
                 return false;
             }
             let header = serde_json::from_slice(&payload).unwrap_or(Value::Null);
@@ -484,7 +514,21 @@ async fn dispatch(shared: &Arc<Shared>, frame: Frame) -> bool {
                 shared: Arc::clone(shared),
             };
             let stream = mux.attach(channel);
-            if shared.accept.try_send((channel, header, stream)).is_err() {
+            let (exit_tx, exit) = oneshot::channel();
+            {
+                // Channels whose user dropped the receiver (a bridge) never hold a slot for long.
+                let mut exits = shared.exits();
+                exits.retain(|_, tx| !tx.is_closed());
+                exits.insert(channel, exit_tx);
+            }
+            let accepted = Accepted {
+                channel,
+                header,
+                stream,
+                exit,
+            };
+            if shared.accept.try_send(accepted).is_err() {
+                shared.exits().remove(&channel);
                 let _ = shared
                     .out
                     .send(Frame::new(channel, Kind::Close, Vec::new()))
@@ -530,6 +574,20 @@ async fn dispatch(shared: &Arc<Shared>, frame: Frame) -> bool {
             shared.forget(channel);
             true
         }
+        Kind::Exit => {
+            if channel == CONTROL {
+                return false;
+            }
+            let Ok(report) = serde_json::from_slice::<Value>(&payload) else {
+                return false;
+            };
+            // One acknowledgement per channel: a repeat, or one for a channel this side never
+            // accepted, finds no slot.
+            if let Some(tx) = shared.exits().remove(&channel) {
+                let _ = tx.send(report);
+            }
+            true
+        }
     }
 }
 
@@ -565,6 +623,7 @@ mod tests {
     async fn frames_round_trip_and_oversize_is_refused() {
         for (channel, kind, len) in [
             (0, Kind::Ping, 0),
+            (5, Kind::Exit, 40),
             (7, Kind::Data, 1),
             (u32::MAX, Kind::Open, 300),
             (3, Kind::Data, MAX_PAYLOAD),
@@ -624,6 +683,35 @@ mod tests {
         let mut back = String::new();
         got.stream.read_to_string(&mut back).await.unwrap();
         assert_eq!(back, "pong");
+    }
+
+    /// The exit frame reaches the accepted channel once, after its bytes and even after its
+    /// close; a stream that ends first leaves the waiter with no acknowledgement.
+    #[tokio::test]
+    async fn one_exit_acknowledgement_per_channel_and_none_after_the_end() {
+        let ((worker, _wc), (hub, _hc), mut accepted) = pair(Timing::STANDARD);
+        let (id, mut opened) = worker.open(&json!({ "kind": "spawn" })).await.unwrap();
+        let mut got = accepted.recv().await.unwrap();
+        opened.write_all(b"last").await.unwrap();
+        drop(opened);
+        let mut text = String::new();
+        got.stream.read_to_string(&mut text).await.unwrap();
+        drop(got.stream);
+        assert_eq!(text, "last");
+        worker.exit(id, &json!({ "attempt": "a1" })).await.unwrap();
+        worker
+            .exit(id, &json!({ "attempt": "again" }))
+            .await
+            .unwrap();
+        assert_eq!(got.exit.await.unwrap(), json!({ "attempt": "a1" }));
+        assert!(worker.exit(CONTROL, &json!({})).await.is_err());
+        let (_, _second) = worker.open(&json!({ "kind": "spawn" })).await.unwrap();
+        let pending = accepted.recv().await.unwrap();
+        hub.close();
+        assert!(
+            pending.exit.await.is_err(),
+            "no acknowledgement arrives after the end"
+        );
     }
 
     /// A reader that takes nothing holds the sender at 1 MiB on that channel, while another

@@ -240,6 +240,28 @@ fn lead_spec(
     }
 }
 
+/// Canonical binding path, including OMP's not-yet-created fresh transcript.
+fn binding_file(file: &Path, how: LeadStart) -> Result<PathBuf, String> {
+    // Stock OMP creates a fresh transcript on its first write, after reporting the binding.
+    // Resolve its existing parent, never create a substitute transcript or relax resume checks.
+    match std::fs::canonicalize(file) {
+        Ok(path) => Ok(path),
+        Err(error)
+            if error.kind() == std::io::ErrorKind::NotFound
+                && matches!(how, LeadStart::First | LeadStart::Asked) =>
+        {
+            let parent = file.parent().ok_or("binding transcript has no parent")?;
+            let name = file
+                .file_name()
+                .ok_or("binding transcript has no filename")?;
+            std::fs::canonicalize(parent)
+                .map(|parent| parent.join(name))
+                .map_err(|error| format!("binding transcript parent: {error}"))
+        }
+        Err(error) => Err(format!("binding transcript: {error}")),
+    }
+}
+
 /// The note for a resume after anything but a clean close; a sleep records how its close went.
 fn unclean(row: &SessionRow) -> Option<String> {
     match (
@@ -497,7 +519,8 @@ impl<R: Runtime> Lead<R> {
         for row in rows {
             let update = match &row.session_id {
                 None => {
-                    let cleanup = ownership::reconcile(&self.env.state_dir, &row.handle).await;
+                    let cleanup =
+                        ownership::reconcile_attempt(&self.env.state_dir, &row.handle, None).await;
                     let confirmed = cleanup.as_ref().is_ok_and(|c| c.confirmed());
                     SessionUpdate {
                         state: Some(if confirmed { "failed" } else { "held" }.into()),
@@ -607,8 +630,24 @@ impl<R: Runtime> Lead<R> {
     /// Starts the lead (COORD req. 2): refused when a lead runs; resume or fresh by [`plan`]. Earlier
     /// automatic restarts no longer count.
     pub(crate) async fn start(self: &Arc<Self>, fresh: bool) -> Result<View, String> {
+        let _one = match self.starting.try_lock() {
+            Ok(lock) => lock,
+            Err(_) => {
+                // Only a different, explicit target supersedes an owned startup. A second
+                // same-target request must not turn the first fresh attempt into a held failure.
+                if fresh {
+                    self.startup_cancel.send_replace(true);
+                }
+                let lock = self.starting.lock().await;
+                if !fresh {
+                    return Err(self
+                        .refusal()
+                        .unwrap_or_else(|| "a lead is already running".into()));
+                }
+                lock
+            }
+        };
         self.startup_cancel.send_replace(true);
-        let _one = self.starting.lock().await;
         if self.current().is_some_and(|session| session.alive()) {
             return Err("a lead is already running".into());
         }
@@ -792,7 +831,9 @@ impl<R: Runtime> Lead<R> {
             return Err(reason);
         }
         if !fresh && selected.ever_started && selected.row.is_none() {
-            let reason = "no proven lead anchor; held, never automatically replaced".to_string();
+            let reason = self.refusal().unwrap_or_else(|| {
+                "no proven lead anchor; held, never automatically replaced".into()
+            });
             self.set_phase(Phase::Held, Some(reason.clone()));
             return Err(reason);
         }
@@ -865,8 +906,7 @@ impl<R: Runtime> Lead<R> {
             if let Some(reason) = &started.held {
                 return Err(reason.clone());
             }
-            let canonical = std::fs::canonicalize(&started.file)
-                .map_err(|e| format!("binding transcript: {e}"))?;
+            let canonical = binding_file(Path::new(&started.file), how)?;
             let update = SessionUpdate {
                 handle: handle.clone(),
                 state: Some("live".into()),
@@ -1067,7 +1107,7 @@ impl<R: Runtime> Lead<R> {
             && let Some(row) = &selected.row
             && row.runtime == "headless"
         {
-            match ownership::reconcile(&self.env.state_dir, &row.handle).await {
+            match ownership::reconcile_attempt(&self.env.state_dir, &row.handle, None).await {
                 Ok(cleanup) if cleanup.confirmed() => {}
                 evidence => {
                     selected.hold = Some(format!(
@@ -1744,13 +1784,13 @@ impl<R: Runtime> Lead<R> {
     pub(crate) async fn stop(&self, force: bool) -> Result<View, String> {
         let starting = self.phase().0 == Phase::Starting;
         self.startup_cancel.send_replace(true);
-        self.recovery()
-            .end("cancelled", Some("owner stopped recovery".into()))
-            .await?;
         let _one = self.starting.lock().await;
         let session = match self.live() {
             Ok(session) => session,
             Err(e) => {
+                self.recovery()
+                    .end("cancelled", Some("owner stopped recovery".into()))
+                    .await?;
                 if self.stop_asleep().await {
                     return Ok(self.view().await);
                 }
