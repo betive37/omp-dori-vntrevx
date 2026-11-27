@@ -144,10 +144,15 @@ impl<R: Runtime> Voice<R> {
         let guild = self.guild();
         let mut gate = lock(&self.gate);
         match seen {
-            Seen::Up(bot) => {
+            Seen::Up { bot, resumed } => {
                 gate.bot = Some(bot);
                 gate.up = true;
-                gate.send(GatewayEvent::Ready { bot });
+                if !resumed {
+                    gate.snapshot = false;
+                    gate.states.clear();
+                    gate.channels.clear();
+                }
+                gate.send(GatewayEvent::Ready { bot, resumed });
             }
             Seen::Down => {
                 gate.up = false;
@@ -282,7 +287,7 @@ impl<R: Runtime> Voice<R> {
             let mut gate = lock(&self.gate);
             gate.feed = Some((feed, on.settings.voice_channel));
             if let (true, Some(bot)) = (gate.up, gate.bot) {
-                gate.send(GatewayEvent::Ready { bot });
+                gate.send(GatewayEvent::Ready { bot, resumed: true });
             }
             if gate.snapshot {
                 let event = gate.guild_event(on.settings.voice_channel);
@@ -370,6 +375,40 @@ impl<R: Runtime> Voice<R> {
         }
     }
 
+    /// The Discord connection state, independent of whether a paid session is open.
+    pub(crate) async fn summary(&self) -> Option<crate::jobs::ops::voice::Voice> {
+        use crate::jobs::ops::voice::Voice as Summary;
+        let config = Arc::clone(&self.config.borrow());
+        let VoiceConfig::On(on) = &config.voice else {
+            return None;
+        };
+        match self.host.held().await {
+            Ok(Some(reason)) => return Some(Summary::Held(reason)),
+            Err(e) => return Some(Summary::Held(format!("unreadable: {}", e.0))),
+            Ok(None) => {}
+        }
+        let state = lock(&self.state).clone();
+        if state.state != "running" {
+            return Some(Summary::Stopped(
+                state.reason.unwrap_or_else(|| state.state.into()),
+            ));
+        }
+        let gate = lock(&self.gate);
+        let channel = on.settings.voice_channel;
+        let inside = |user| {
+            gate.states
+                .get(&user)
+                .is_some_and(|(c, _)| *c == Some(channel))
+        };
+        Some(if !inside(on.settings.owner) {
+            Summary::Waiting(channel)
+        } else if gate.up && gate.bot.is_some_and(inside) {
+            Summary::InCall(channel)
+        } else {
+            Summary::Joining(channel)
+        })
+    }
+
     async fn status(&self) -> Value {
         let state = lock(&self.state).clone();
         let mut out = serde_json::Map::new();
@@ -378,6 +417,12 @@ impl<R: Runtime> Voice<R> {
         };
         put("state", json!(state.state));
         put("reason", json!(state.reason));
+        if let Some(summary) = self.summary().await {
+            put(
+                "activity",
+                json!(summary.text(crate::config::Language::English)),
+            );
+        }
         put("gateway", json!(lock(&self.gate).up));
         let config = Arc::clone(&self.config.borrow());
         if let VoiceConfig::On(on) = &config.voice {

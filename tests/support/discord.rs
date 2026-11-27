@@ -57,9 +57,10 @@ struct State {
     scripted: VecDeque<u16>,
     /// Channel -> statuses for its next message creates, used before `scripted`.
     scripted_in: HashMap<String, VecDeque<u16>>,
+    callbacks: VecDeque<u16>,
     /// Path -> the status a GET of it gets, and for how many GETs more (`None`: every one).
     failing_reads: HashMap<String, (u16, Option<usize>)>,
-    nonces: HashMap<String, u64>,
+    nonces: HashMap<(String, String), u64>,
     next_id: u64,
     created: usize,
     /// Channel -> messages, oldest first.
@@ -85,6 +86,8 @@ struct State {
     /// the bot is in, and the bot's avatar and banner hashes with the data each was set from.
     token: Option<String>,
     app_flags: u64,
+    /// The application's interactions endpoint URL; set, buttons do not come over the Gateway.
+    interactions_url: Option<String>,
     guilds: Vec<Value>,
     profile: HashMap<String, (String, String)>,
     /// Channel -> the Discord error code its reads get (50001 or 50013).
@@ -175,6 +178,11 @@ impl FakeDiscord {
             .entry(channel.to_string())
             .or_default()
             .extend(statuses);
+    }
+
+    /// Statuses for interaction acknowledgements; unlike creates these never retry.
+    pub fn script_callbacks(&self, statuses: &[u16]) {
+        self.state.lock().unwrap().callbacks.extend(statuses);
     }
 
     /// Drops the statuses still scripted for one channel.
@@ -321,11 +329,6 @@ impl FakeDiscord {
             .insert(path.into(), (status, Some(times)));
     }
 
-    /// Reads of `path` are answered as usual again.
-    pub fn pass_reads(&self, path: &str) {
-        self.state.lock().unwrap().failing_reads.remove(path);
-    }
-
     /// A message object.
     pub fn message(channel: &str, id: u64, author: &str, content: &str) -> Value {
         json!({"id": id.to_string(), "channel_id": channel, "type": 0, "content": content,
@@ -396,6 +399,11 @@ impl FakeDiscord {
     /// The application's flags (default: the Message Content intent for 100 or more servers).
     pub fn set_app_flags(&self, flags: u64) {
         self.state.lock().unwrap().app_flags = flags;
+    }
+
+    /// Gives the application an interactions endpoint URL, so presses would not reach the Gateway.
+    pub fn set_interactions_url(&self, url: &str) {
+        self.state.lock().unwrap().interactions_url = Some(url.into());
     }
 
     pub fn app_flags(&self) -> u64 {
@@ -580,7 +588,7 @@ async fn gateway(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>, port: 
 
 /// The application object, owned by [`APP_OWNER`].
 fn application(s: &State) -> Value {
-    json!({ "id": APP, "flags": s.app_flags, "interactions_endpoint_url": null,
+    json!({ "id": APP, "flags": s.app_flags, "interactions_endpoint_url": s.interactions_url,
         "icon": s.profile.get("icon").map(|(h, _)| h.clone()),
         "owner": { "id": APP_OWNER, "username": "fake-owner" }, "team": null })
 }
@@ -603,6 +611,33 @@ fn param(query: &str, key: &str) -> Option<u64> {
         .split('&')
         .find_map(|p| p.strip_prefix(&format!("{key}=")))
         .and_then(|v| v.parse().ok())
+}
+
+/// Discord rejects out-of-range page sizes with a field-specific 400/50035, not an empty page.
+fn invalid_limit(query: &str, minimum: i128) -> Option<Response<Full<Bytes>>> {
+    let limit = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("limit="))?
+        .parse::<i128>()
+        .ok()?;
+    let (code, message) = if limit < minimum {
+        (
+            "NUMBER_TYPE_MIN",
+            format!("int value should be greater than or equal to {minimum}."),
+        )
+    } else if limit > 100 {
+        (
+            "NUMBER_TYPE_MAX",
+            "int value should be less than or equal to 100.".into(),
+        )
+    } else {
+        return None;
+    };
+    Some(reply(
+        400,
+        &json!({ "message": "Invalid Form Body", "code": 50035,
+            "errors": { "limit": { "_errors": [{ "code": code, "message": message }] } } }),
+    ))
 }
 
 /// Reads that depend on the bot's access: a denied channel's (50001, no View Channel: every read
@@ -762,6 +797,15 @@ async fn answer(
             &json!({ "message": "401: Unauthorized", "code": 0 }),
         ));
     }
+    // The live archived-thread API requires 2; message history permits 1.
+    let invalid = match (method.as_str(), parts.as_slice()) {
+        ("GET", ["channels", _, "threads", "archived", "public"]) => invalid_limit(&query, 2),
+        ("GET", ["channels", _, "messages"]) => invalid_limit(&query, 1),
+        _ => None,
+    };
+    if let Some(r) = invalid {
+        return Ok(r);
+    }
     let failed = failed_read(&mut s, &method, &path);
     if let Some(r) = failed
         .or_else(|| setup_route(&mut s, &method, &parts, &body))
@@ -811,9 +855,10 @@ async fn answer(
             "PUT",
             ["channels", _, "messages", _, "reactions", _, "@me"]
             | ["channels", _, "messages", "pins", _],
-        ) => reply(204, &Value::Null),
-        ("POST", ["channels", _, "typing"] | ["interactions", _, _, "callback"]) => {
-            reply(204, &Value::Null)
+        )
+        | ("POST", ["channels", _, "typing"]) => reply(204, &Value::Null),
+        ("POST", ["interactions", _, _, "callback"]) => {
+            reply(s.callbacks.pop_front().unwrap_or(204), &Value::Null)
         }
         _ => reply(404, &json!({ "message": "Unknown", "code": 0 })),
     };
@@ -965,7 +1010,9 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
     if !source_exists && body["message_reference"]["fail_if_not_exists"] == true {
         return reply(400, &json!({"message": "Invalid Form Body", "code": 50035}));
     }
-    let existing = s.nonces.get(&nonce).copied().filter(|_| enforced);
+    // A nonce in another destination cannot confirm this post.
+    let nonce_key = (id.to_string(), nonce.clone());
+    let existing = s.nonces.get(&nonce_key).copied().filter(|_| enforced);
     let message = if let Some(m) = existing {
         m
     } else {
@@ -981,7 +1028,7 @@ fn create(s: &mut State, id: &str, body: &Value) -> Response<Full<Bytes>> {
         s.next_id
     };
     if enforced && !nonce.is_empty() {
-        s.nonces.insert(nonce, message);
+        s.nonces.insert(nonce_key, message);
     }
     let mut created = json!({ "id": message.to_string(), "channel_id": id, "content": body["content"],
                 "author": {"id": BOT, "bot": true}, "type": 0, "components": body["components"],

@@ -13,6 +13,7 @@ use std::time::Duration;
 
 use crate::config::voice::TranscribeSettings;
 use crate::relay::http;
+use crate::relay::text::one_line;
 use crate::sys::command::{self, Output, Spec};
 
 /// The transcription command may run this long.
@@ -49,11 +50,6 @@ pub(crate) fn audio_container(head: &[u8]) -> Option<&'static str> {
     } else {
         None
     }
-}
-
-fn short(text: &str) -> String {
-    let one: String = text.split_whitespace().collect::<Vec<_>>().join(" ");
-    one.chars().take(ERROR_MAX).collect()
 }
 
 /// Downloads `url` into `dir`, refusing what VOICE req. 86 refuses.
@@ -116,11 +112,14 @@ pub(crate) async fn transcribe(
     if is_url {
         let _ = std::fs::remove_dir_all(&dir);
     }
-    let finished = result.map_err(|e| short(&e.to_string()))?;
+    let finished = result.map_err(|e| one_line(&e.to_string(), ERROR_MAX))?;
     let out = String::from_utf8_lossy(&finished.stdout).trim().to_string();
     if !finished.success() {
         let err = String::from_utf8_lossy(&finished.stderr).to_string();
-        return Err(short(&format!("the transcription command failed: {err}")));
+        return Err(one_line(
+            &format!("the transcription command failed: {err}"),
+            ERROR_MAX,
+        ));
     }
     if out.is_empty() {
         return Err("the transcription command printed nothing".into());

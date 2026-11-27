@@ -38,13 +38,17 @@ try {
 	);
 }
 
-const child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
+// Signals are taken before the binary starts: one sent as soon as it runs would otherwise end
+// this process by default and leave the binary running. A handler runs only after this script,
+// so `child` is set by then.
+let child;
 const forward = (signal) => {
 	child.kill(signal);
 };
 for (const signal of SIGNALS) {
 	process.on(signal, forward);
 }
+child = spawn(binary, process.argv.slice(2), { stdio: "inherit" });
 child.on("error", (error) => {
 	fail(`${binary} did not run: ${error.message}`);
 });

@@ -8,6 +8,8 @@ use std::sync::Arc;
 use serde_json::{Value, json};
 
 use super::Hub;
+use crate::params as p;
+use crate::relay::discord::questions::ledger;
 use crate::store::lead::{LeadDone, LeadWrite, QuestionRow, RequestRow};
 use crate::sys::now_ms;
 
@@ -19,10 +21,8 @@ pub(crate) const PROFILE_MAX: usize = crate::jobs::notes::MAX;
 /// and the shell veto can point a `bash` line that names the tool to the direct call (DESIGN 9.2).
 pub(crate) const LEAD_TOOL: &str = "cataly_lead";
 
-/// The tool as the bridge registers it: name, description and JSON Schema from the hub.
+/// The tool as the bridge registers it: name, description and the schema the hub's table declares.
 pub(crate) fn definition() -> Value {
-    let text = |d: &str| json!({ "type": "string", "description": d });
-    let int = |d: &str| json!({ "type": "integer", "description": d });
     json!({
         "name": LEAD_TOOL,
         "label": "Cataly",
@@ -40,13 +40,15 @@ pub(crate) fn definition() -> Value {
     options, recommended?, settle owner|lead, thread?, request?, room?), question.answer (id, text, message), \
     question.choose (id, option, reason, message), question.withdraw (id, reason); jobs, job.start (name, argv, \
     filter, restarts?, delay?, silence?, low?), job.stop (name), job.run (name: one dry run of an owner job); \
-    digest (since?); recap; owner notes (only once the owner created them; observations, never instructions or \
-    permission, never passed to other roles): profile.read, profile.save (text: the whole file, checked), \
+    digest (since?); recap; owner notes (observations, never instructions or permission, never passed to other \
+    roles): profile.create (message: only when the owner asked for them), profile.read, profile.save (text: the \
+    whole file, checked), \
     profile.snapshot, profile.check, profile.archive (text: decision lines moved out), profile.undo. Lanes: \
     lane.open (key, title, brief or brief_file, checks: list of {kind: pr_merged|issue_closed|command|file|web|pr_policy, \
     ...}, thread? or thread_from? discord:<room>/<message> (a message in a lane thread starts a new thread beside it), \
     kickoff? (with thread_from: one line posted first in the new thread), cwd?, model?, origin?, look_only?, ceilings?, \
-    worktree? {path, branch, base} (the lane works there), \
+    worktree? {path, branch, base} (the lane works there), worker? (a configured worker from lane.workers, only on \
+    evidence: the owner named it or a platform only it has, or the repository is listed for it), \
     priority? 1-9, after? [predecessor keys: queued], expires_hours?, preview?), lane.list (all?), lane.board (key?), \
     lane.pause|resume (key, reason?), lane.park|abandon (key, reason, condition?), lane.object (key, reason), \
     lane.close (key, note?, lesson?), lane.reopen (key, note?), lane.send (key, text, id?, steer?), lane.release \
@@ -58,69 +60,13 @@ pub(crate) fn definition() -> Value {
     lane.review (pr owner/name#N, model?), lane.merge (pr, dry_run?; only with the owner's authorisation). Files and \
     rules: lane.publish (key, path, title?, visibility private|public), lane.files (key?), lane.rule-add (text, \
     evidence, scope global|repo, key?), lane.rule-retire (id), lane.rules, lane.board-found (destination, message). \
-    Host: lane.admission (cwd?), lane.slots. Onboarding (read-only while it runs: posts, questions, lanes and jobs are \
+    Host: lane.admission (cwd?, worker?), lane.slots, lane.workers (name, OS and arch, state, lanes in use, repos). \
+    Onboarding (read-only while it runs: posts, questions, lanes and jobs are \
     refused): onboarding (state), onboarding.start (reopen?, message?: only when the owner raised it again), \
-    onboarding.consent (answer yes|no, message), onboarding.tool (name, answer allowed|declined, reads, message), \
+    onboarding.consent (reply yes|no, message), onboarding.tool (name, reply allowed|declined, reads, message), \
     onboarding.finish (text: short summary of what is known, tools used or skipped, and gaps).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "op": text("the operation"),
-                "id": text("request-log item number or question ID"),
-                "text": text("the text: next step, note, result, question, answer or profile"),
-                "title": text("one line"),
-                "source": text("where it came from, such as discord:<room>:<message>"),
-                "thread": text("the thread or room it belongs to"),
-                "room": text("question.ask: the Discord channel to post in (default the home channel); answer: another room to post in"),
-                "message": text("the owner's or the announcing message ID; answer: the owner message as discord:<room>/<message>"),
-                "reason": text("why"),
-                "options": { "type": "array", "items": { "type": "string" } },
-                "recommended": int("the recommended option, from 1"),
-                "option": int("the chosen option, from 1"),
-                "settle": text("owner (default) or lead"),
-                "request": int("the request-log item the question belongs to"),
-                "name": text("job name"),
-                "argv": { "type": "array", "items": { "type": "string" } },
-                "filter": text("regular expression an output line must match"),
-                "restarts": int("restarts allowed, 0 to 100 (default 5)"),
-                "delay": int("first restart delay in seconds (default 10)"),
-                "silence": int("alert after this many quiet minutes"),
-                "low": { "type": "boolean", "description": "matches wait for the next wake" },
-                "since": text("ISO instant the digest starts at"),
-                "all": { "type": "boolean" },
-                "calls": { "type": "array", "items": { "type": "string" } },
-                "answer": text("onboarding: yes|no for consent, allowed|declined for a tool"),
-                "reads": text("onboarding: what the tool would read and why"),
-                "reopen": { "type": "boolean", "description": "onboarding.start after the owner raised it again" }
-            },
-            "required": ["op"]
-        }
+        "parameters": crate::params::parameters(crate::params::Tool::Lead),
     })
-}
-
-fn s<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
-    v.get(key).and_then(Value::as_str).map(str::trim)
-}
-
-fn i(v: &Value, key: &str) -> Option<i64> {
-    v.get(key).and_then(|x| {
-        x.as_i64()
-            .or_else(|| x.as_str().and_then(|t| t.trim().parse().ok()))
-    })
-}
-
-/// A required text of 1 to `max` characters; `one_line` refuses line breaks.
-fn need<'a>(v: &'a Value, key: &str, max: usize, one_line: bool) -> Result<&'a str, String> {
-    let text = s(v, key)
-        .filter(|t| !t.is_empty())
-        .ok_or(format!("{key} is required"))?;
-    if text.chars().count() > max {
-        return Err(format!("{key} is longer than {max} characters"));
-    }
-    if one_line && text.contains('\n') {
-        return Err(format!("{key} must be one line"));
-    }
-    Ok(text)
 }
 
 fn done(d: LeadDone, ok: String) -> Result<String, String> {
@@ -130,29 +76,68 @@ fn done(d: LeadDone, ok: String) -> Result<String, String> {
     }
 }
 
+/// `lane.workers`: one line per configured worker, for placement from evidence (design 2.6).
+fn workers(views: &[crate::worker::link::View]) -> String {
+    if views.is_empty() {
+        return "no workers: every lane runs on this machine".into();
+    }
+    views
+        .iter()
+        .map(|v| {
+            let platform = match (&v.os, &v.arch) {
+                (Some(os), Some(arch)) => format!("{os} {arch}"),
+                _ => "platform not seen yet".into(),
+            };
+            let state = serde_json::to_value(v.state)
+                .ok()
+                .and_then(|s| s.as_str().map(str::to_string))
+                .unwrap_or_default();
+            let reason = v
+                .reason
+                .as_deref()
+                .map_or_else(String::new, |r| format!(" ({r})"));
+            let repos = if v.repos.is_empty() {
+                "none listed".into()
+            } else {
+                v.repos.join(", ")
+            };
+            format!(
+                "- {}: {platform}, {state}{reason}, lanes {}/{}, repos {repos}",
+                v.name, v.lanes, v.lanes_max
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+/// One `lane.*` operation: `lane.workers` from the worker table, the rest by the lanes as the lead.
+async fn lane(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, String> {
+    if op == "workers" {
+        return Ok(workers(&hub.workers.list()));
+    }
+    let mut lane_input = input.clone();
+    p::OP.set(&mut lane_input, json!(op));
+    hub.lanes
+        .call(crate::lanes::Caller::Lead, &lane_input)
+        .await
+        .map(|v| match v {
+            Value::String(s) => s,
+            other => other.to_string(),
+        })
+}
+
 /// Runs one call; `Err` is shown to the model as a tool error.
 pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
-    let op = s(input, "op").unwrap_or_default();
+    let op = p::OP.text(input).unwrap_or_default();
     if let Some(reply) = super::onboarding::call(hub, op, input).await {
         return reply;
     }
     if let Some(lane_op) = op.strip_prefix("lane.") {
-        let mut lane_input = input.clone();
-        if let Some(map) = lane_input.as_object_mut() {
-            map.insert("op".into(), json!(lane_op));
-        }
-        return hub
-            .lanes
-            .call(crate::lanes::Caller::Lead, &lane_input)
-            .await
-            .map(|v| match v {
-                Value::String(s) => s,
-                other => other.to_string(),
-            });
+        return lane(hub, lane_op, input).await;
     }
     match op {
         "requests" => {
-            let all = input.get("all").and_then(Value::as_bool).unwrap_or(false);
+            let all = p::ALL.flag(input);
             let rows = hub
                 .store
                 .read(move |r| r.requests(!all))
@@ -162,9 +147,9 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
         }
         "request.add" => {
             let write = LeadWrite::RequestAdd {
-                title: need(input, "title", 200, true)?.into(),
-                source: need(input, "source", 400, true)?.into(),
-                thread: s(input, "thread").map(str::to_string),
+                title: p::TITLE.need(input, 200, true)?.into(),
+                source: p::SOURCE.need(input, 400, true)?.into(),
+                thread: p::THREAD.text(input).map(str::to_string),
             };
             match hub.store.lead(write).await.map_err(|e| e.to_string())? {
                 LeadDone::Id(id) => Ok(format!("request-log item {id} open")),
@@ -172,8 +157,11 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
             }
         }
         "request.next" | "request.note" | "request.close" => {
-            let id = i(input, "id").ok_or("id is required")?;
-            let text = need(input, "text", 1000, false)?.to_string();
+            let id = p::ID
+                .id(input)
+                .and_then(|t| t.parse::<i64>().ok())
+                .ok_or("id is required")?;
+            let text = p::TEXT.need(input, 1000, false)?.to_string();
             let (write, said) = match op {
                 "request.next" => (LeadWrite::RequestNext { id, text }, "next step set"),
                 "request.note" => (LeadWrite::RequestNote { id, text }, "note added"),
@@ -194,9 +182,9 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
         "question.answer" | "question.choose" | "question.withdraw" => settle(hub, op, input).await,
         "jobs" => Ok(hub.streams.list()),
         "job.start" => hub.streams.start(input).await,
-        "job.stop" => hub.streams.stop(need(input, "name", 64, true)?).await,
+        "job.stop" => hub.streams.stop(p::NAME.need(input, 64, true)?).await,
         "job.run" => {
-            let name = need(input, "name", 64, true)?.to_string();
+            let name = p::NAME.need(input, 64, true)?.to_string();
             let events = hub.jobs.run_once(&name).await.map_err(|e| e.to_string())?;
             let lines: Vec<String> = events
                 .iter()
@@ -219,7 +207,7 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
 
 /// The digest of what happened since `since` (default the last 24 hours).
 async fn digest(hub: &Hub, input: &Value) -> Result<String, String> {
-    let since = match s(input, "since") {
+    let since = match p::SINCE.text(input) {
         Some(t) => t
             .parse::<jiff::Timestamp>()
             .map_err(|e| format!("since: {e}"))?
@@ -255,8 +243,8 @@ fn message_ref(text: &str) -> Option<(&str, &str, &str)> {
 
 /// Posts the lead's answer to one owner message through its relay (DISC-OUT req. 21).
 async fn answer(hub: &Hub, input: &Value) -> Result<String, String> {
-    let reference = need(input, "message", 400, true)?;
-    let text = need(input, "text", ANSWER_MAX, false)?;
+    let reference = p::MESSAGE.need(input, 400, true)?;
+    let text = p::TEXT.need(input, ANSWER_MAX, false)?;
     let (relay, room, message) = message_ref(reference).ok_or(
         "message: the owner message as discord:<room>/<message> (the [discord <room>/<message>] tag of the request)",
     )?;
@@ -266,7 +254,7 @@ async fn answer(hub: &Hub, input: &Value) -> Result<String, String> {
         "slack" => &hub.slack,
         other => return Err(format!("message: unknown messenger {other}")),
     };
-    let to = s(input, "room").filter(|r| !r.is_empty());
+    let to = p::ROOM.text(input);
     // Onboarding is read-only, but the lead's replies to the owner still go out (its guidance): an
     // answer in place, as the reply to the owner's message, carries its questions; nothing goes
     // elsewhere.
@@ -287,16 +275,23 @@ fn notes(hub: &Hub, op: &str, input: &Value) -> Result<String, String> {
     let today = crate::jobs::notes::Notes::today();
     match op {
         "profile.read" => notes.show(),
-        "profile.save" => notes.save(need(input, "text", PROFILE_MAX, false)?),
+        // Only on the owner's direct request, named by its message (COORD req. 47).
+        "profile.create" => {
+            let message = p::MESSAGE
+                .need(input, 400, true)
+                .map_err(|_| "message: the owner's message asking for the owner notes")?;
+            notes.create(Some(message))
+        }
+        "profile.save" => notes.save(p::TEXT.need(input, PROFILE_MAX, false)?),
         "profile.snapshot" => notes.snapshot(today),
-        "profile.check" => notes.check_file(today).map(|p| {
-            if p.is_empty() {
+        "profile.check" => notes.check_file(today).map(|problems| {
+            if problems.is_empty() {
                 "the check passes".into()
             } else {
-                p.join("\n")
+                problems.join("\n")
             }
         }),
-        "profile.archive" => notes.archive_add(need(input, "text", PROFILE_MAX, false)?),
+        "profile.archive" => notes.archive_add(p::TEXT.need(input, PROFILE_MAX, false)?),
         "profile.undo" => notes.undo(),
         other => Err(format!("unknown op {other}; see the tool description")),
     }
@@ -304,17 +299,13 @@ fn notes(hub: &Hub, op: &str, input: &Value) -> Result<String, String> {
 
 /// Records a question and posts it, bound to its message (EVR req. 34-36).
 async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
-    let text = need(input, "text", 1000, true)?;
-    let source = need(input, "source", 400, true)?;
-    let options: Vec<String> = input
-        .get("options")
-        .and_then(Value::as_array)
-        .map_or_default(|a| {
-            a.iter()
-                .filter_map(Value::as_str)
-                .map(|o| o.trim().to_string())
-                .collect()
-        });
+    let text = p::TEXT.need(input, 1000, true)?;
+    let source = p::SOURCE.need(input, 400, true)?;
+    let options: Vec<String> = p::OPTIONS
+        .list(input)
+        .iter()
+        .map(|o| o.trim().to_string())
+        .collect();
     if options.is_empty() || options.len() > 9 {
         return Err("options: 1 to 9 are required".into());
     }
@@ -324,45 +315,56 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     {
         return Err("each option is one line of 1 to 200 characters".into());
     }
-    let recommended = i(input, "recommended");
+    let recommended = p::RECOMMENDED.int(input);
     if recommended.is_some_and(|r| r < 1 || r > i64::try_from(options.len()).unwrap_or(0)) {
         return Err("recommended must name one of the options".into());
     }
-    let lead_may = s(input, "settle") == Some("lead");
-    let thread = s(input, "thread").map(str::to_string);
+    let lead_may = p::SETTLE.text(input) == Some("lead");
+    let thread = p::THREAD.text(input).map(str::to_string);
     if lead_may && (options.len() < 2 || thread.is_none()) {
         return Err("a question the lead may settle needs at least 2 options and a thread".into());
     }
     let id = crate::host::random_hex(4);
-    let neutral = crate::relay::discord::questions::neutral;
-    let mut body = format!("**Question {id}**\n{}", neutral(text));
-    for (n, o) in options.iter().enumerate() {
-        let mark = if recommended == i64::try_from(n + 1).ok() {
-            " (recommended)"
-        } else {
-            ""
-        };
-        let _ = write!(body, "\n{}. {}{mark}", n + 1, neutral(o));
-    }
-    body.push_str("\nReply to this message with a number or your answer.");
+    let body = ledger::body(&id, text, &options, recommended);
     let config = hub.config();
-    let room = s(input, "room")
-        .and_then(crate::relay::discord::Snowflake::parse)
-        .or_else(|| config.discord.home());
+    let snowflake = crate::relay::discord::Snowflake::parse;
+    let named = p::ROOM.text(input).map(str::trim).filter(|r| !r.is_empty());
+    let room = match named {
+        Some(r) => Some(snowflake(r).ok_or("room: a Discord channel ID is required")?),
+        None => thread
+            .as_deref()
+            .and_then(|t| t.strip_prefix("discord:"))
+            .and_then(snowflake)
+            .or_else(|| config.discord.home()),
+    };
+    let mut uncertain = false;
     let posted = match (room, hub.discord_rest()) {
         (Some(room), Some(rest)) => {
             let nonce = crate::relay::discord::nonce(&format!("ledger:{id}"), 0);
-            let created = rest
-                .create(room, json!({ "content": body, "nonce": nonce }))
-                .await;
-            created.ok().and_then(|v| {
-                v.get("id")
+            // One button per option when presses reach intake (DISC-OUT req. 67-68).
+            let create = if ledger::buttons_ready(&hub.discord.health()) {
+                let components = ledger::buttons(&id, &options, recommended);
+                json!({ "content": body, "nonce": nonce, "components": components })
+            } else {
+                json!({ "content": body, "nonce": nonce })
+            };
+            match rest.create(room, create).await {
+                Ok(v) => v
+                    .get("id")
                     .and_then(Value::as_str)
-                    .map(|m| (room.to_string(), m.to_string()))
-            })
+                    .map(|m| (room.to_string(), m.to_string())),
+                Err(e) => {
+                    uncertain = e.uncertain;
+                    None
+                }
+            }
         }
         _ => None,
     };
+    // Only a definite rejection permits treating the post as absent (EVR req. 34).
+    if !uncertain && let (Some(r), None) = (named, &posted) {
+        return Err(format!("room: could not post in {r}; nothing recorded"));
+    }
     let row = QuestionRow {
         id: id.clone(),
         text: text.into(),
@@ -371,9 +373,11 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         options,
         recommended,
         lead_may,
-        request: i(input, "request"),
-        room: posted.as_ref().map(|p| p.0.clone()),
-        message: posted.as_ref().map(|p| p.1.clone()),
+        request: p::REQUEST.int(input),
+        room: room
+            .filter(|_| posted.is_some() || uncertain)
+            .map(|room| room.to_string()),
+        message: posted.as_ref().map(|(_, message)| message.clone()),
         state: "open".into(),
         outcome: None,
         created_ms: 0,
@@ -387,6 +391,9 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         Some((room, message)) => {
             format!("question {id} recorded and posted in {room} as message {message}")
         }
+        None if uncertain => {
+            format!("question {id} recorded; its post is in doubt. Do not post it again.")
+        }
         None => format!(
             "question {id} recorded; it could not be posted, so ask it yourself and quote its ID"
         ),
@@ -396,7 +403,7 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
 
 /// Answer by hand, the lead's own choice, or withdrawal (EVR req. 38-40).
 async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, String> {
-    let id = need(input, "id", 16, true)?.to_string();
+    let id = p::ID.need(input, 16, true)?.to_string();
     let q = {
         let id = id.clone();
         hub.store
@@ -405,32 +412,45 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
             .map_err(|e| e.to_string())?
     }
     .ok_or(format!("no question {id}"))?;
-    let (state, outcome) = match op {
+    let (state, outcome, status) = match op {
         "question.answer" => {
-            let message = need(input, "message", 64, true)?;
-            let text = need(input, "text", 1000, false)?;
-            ("answered", format!("owner message {message}: {text}"))
+            let message = p::MESSAGE.need(input, 64, true)?;
+            let text = p::TEXT.need(input, 1000, false)?;
+            (
+                "answered",
+                format!("owner message {message}: {text}"),
+                "Answered by the owner.".to_string(),
+            )
         }
         "question.choose" => {
             if !q.lead_may {
                 return Err(format!("question {id} is the owner's to settle"));
             }
-            let option = i(input, "option").ok_or("option is required")?;
-            let picked = usize::try_from(option - 1)
+            let option = p::OPTION.int(input).ok_or("option is required")?;
+            let n = usize::try_from(option)
                 .ok()
-                .and_then(|n| q.options.get(n))
+                .filter(|n| (1..=q.options.len()).contains(n))
                 .ok_or(format!("option must be 1 to {}", q.options.len()))?;
-            let reason = need(input, "reason", 1000, false)?;
-            let message = need(input, "message", 64, true)?;
-            if s(input, "thread").is_some_and(|t| Some(t) != q.thread.as_deref()) {
+            let picked = ledger::picked(&q, n);
+            let reason = p::REASON.need(input, 1000, false)?;
+            let message = p::MESSAGE.need(input, 64, true)?;
+            if p::THREAD
+                .text(input)
+                .is_some_and(|t| Some(t) != q.thread.as_deref())
+            {
                 return Err("the choice must be announced in the question's own thread".into());
             }
             (
                 "chosen",
-                format!("option {option} ({picked}) by the lead, announced in {message}: {reason}"),
+                format!("{picked} by the lead, announced in {message}: {reason}"),
+                format!("Chosen by the lead: {}", ledger::shown(&q, n)),
             )
         }
-        _ => ("withdrawn", need(input, "reason", 1000, false)?.to_string()),
+        _ => (
+            "withdrawn",
+            p::REASON.need(input, 1000, false)?.to_string(),
+            "Withdrawn.".to_string(),
+        ),
     };
     let d = hub
         .store
@@ -441,6 +461,11 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
         })
         .await
         .map_err(|e| e.to_string())?;
+    if matches!(d, LeadDone::Done)
+        && let Some(rest) = hub.discord_rest()
+    {
+        ledger::close(rest, &q, &status);
+    }
     done(d, format!("question {id} {state}"))
 }
 

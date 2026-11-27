@@ -27,12 +27,7 @@ pub use host::{
 };
 pub use ledger::{Caps, Day, Spend};
 pub use settings::{Prices, Settings, Transport};
-pub use text::{clean_note, clean_request};
-pub use tools::{LANES_MAX, REPORT_MAX};
+pub use tools::REPORT_MAX;
 
-/// Discord audio: 48 kHz stereo, 20 ms frames of 960 samples per channel.
-pub const DISCORD_RATE: u32 = 48_000;
-/// Provider audio: 24 kHz mono 16-bit PCM.
-pub const MODEL_RATE: u32 = 24_000;
 /// Bytes of one second of provider audio.
 pub const MODEL_BYTES_PER_SECOND: usize = 48_000;

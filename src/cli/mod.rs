@@ -11,6 +11,7 @@ mod setup_discord;
 mod setup_voice;
 mod slot;
 mod transcribe;
+mod worker;
 
 use std::fmt::Write as _;
 use std::path::Path;
@@ -160,15 +161,23 @@ fn execute(p: &Parsed, paths: &Paths) -> Result<(), Failure> {
     }
     if matches!(
         p.spec.path,
-        ["install" | "update" | "rollback" | "uninstall"] | ["service", _]
+        ["install" | "update" | "rollback" | "uninstall"]
+            | ["service", _]
+            | ["worker", "add" | "init"]
     ) {
         owner_only(paths)?;
+    }
+    if let Some(done) = worker::local(p, paths) {
+        return done;
     }
     if let Some(done) = install::run(p, paths) {
         return done;
     }
     let mut hub = Client::connect(&paths.socket)?;
     if let Some(done) = owner_verbs(p, &mut hub, as_json) {
+        return done;
+    }
+    if let Some(done) = worker::remote(p, &mut hub, as_json) {
         return done;
     }
     match p.spec.path {
@@ -478,6 +487,9 @@ fn print_status(s: &Status) {
             s.task_restarts, s.panics
         ));
     }
+    for w in &s.workers {
+        out::line(&format!("worker   {}", worker::describe(w)));
+    }
 }
 
 /// `cataly lane <op> [--params <json>]`: one request per lane operation; `op` and the JSON object's
@@ -532,7 +544,12 @@ fn voice(hub: &mut Client, p: &Parsed, verb: &str, as_json: bool) -> Result<(), 
     };
     match verb {
         "status" => {
-            out::line(&format!("voice    {}", field("state")));
+            let activity = if v.get("activity").is_some_and(Value::is_string) {
+                "activity"
+            } else {
+                "state"
+            };
+            out::line(&format!("voice    {}", field(activity)));
             if v.get("reason").is_some_and(|r| !r.is_null()) {
                 out::line(&format!("reason   {}", field("reason")));
             }

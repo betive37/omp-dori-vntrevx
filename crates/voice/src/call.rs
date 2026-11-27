@@ -60,7 +60,7 @@ pub enum Control {
 /// What `cataly voice status` shows.
 #[derive(Debug, Clone, PartialEq)]
 pub struct VoiceStatus {
-    /// `idle` or the session state.
+    /// `waiting`, `idle` in Discord, or the session state.
     pub state: String,
     /// Why voice is held, if it is.
     pub held: Option<String>,
@@ -89,9 +89,7 @@ pub async fn run<H: VoiceHost>(
     let (owner_tx, owner) = mpsc::channel(256);
     let (play, play_rx) = mpsc::channel(16);
     let discord = crate::discord::Voice::new(Arc::clone(&settings), Arc::clone(&host));
-    let mut stop = shutdown.clone();
-    let connection =
-        tokio::spawn(discord.run(gateway, presence_tx, owner_tx, play_rx, shutdown.clone()));
+    let connection = discord.run(gateway, presence_tx, owner_tx, play_rx, shutdown.clone());
     let call = run_with_audio(
         Arc::clone(&settings),
         key,
@@ -101,14 +99,10 @@ pub async fn run<H: VoiceHost>(
         control,
         shutdown,
     );
-    tokio::select! {
-        r = call => r,
-        r = connection => match r {
-            Ok(r) => r,
-            Err(e) => Err(format!("voice connection task failed: {e}")),
-        },
-        _ = stop.changed() => Ok(()),
-    }
+    // Both sides must finish cleanup; dropping either future can strand a Discord connection
+    // or skip the provider close and accounting on a hub restart.
+    let (connection, call) = tokio::join!(connection, call);
+    connection.and(call)
 }
 
 struct Core<H: VoiceHost> {
@@ -173,25 +167,19 @@ pub async fn run_with_audio<H: VoiceHost>(
     };
     let mut tick = interval(Duration::from_millis(20));
     tick.set_missed_tick_behavior(MissedTickBehavior::Delay);
-    loop {
+    let result = loop {
         tokio::select! {
-            _ = shutdown.changed() => {
-                if let Some(s) = core.session.as_mut() {
-                    s.close("shutdown");
-                }
-                core.settle().await;
-                return Ok(());
-            }
+            _ = shutdown.changed() => break Ok(()),
             changed = presence.changed() => {
                 if changed.is_err() {
-                    return Err("the voice connection ended".into());
+                    break Err("the voice connection ended".into());
                 }
                 let now_present = *presence.borrow_and_update();
                 core.presence(now_present).await;
             }
             frame = audio.owner.recv() => {
                 let Some(frame) = frame else {
-                    return Err("the voice connection ended".into());
+                    break Err("the voice connection ended".into());
                 };
                 core.owner(&frame).await;
             }
@@ -222,7 +210,7 @@ pub async fn run_with_audio<H: VoiceHost>(
                 }
             }
             c = control.recv() => match c {
-                None => return Ok(()),
+                None => break Ok(()),
                 Some(Control::Restart) => {
                     core.held = None;
                     core.failed = None;
@@ -240,7 +228,12 @@ pub async fn run_with_audio<H: VoiceHost>(
                 }
             },
         }
+    };
+    if let Some(s) = core.session.as_mut() {
+        s.close(result.as_ref().err().map_or("shutdown", String::as_str));
     }
+    core.settle().await;
+    result
 }
 
 async fn recv<H: VoiceHost>(session: &mut Option<Session<H>>) -> crate::link::LinkEvent {
@@ -256,7 +249,9 @@ impl<H: VoiceHost> Core<H> {
             state: self
                 .session
                 .as_ref()
-                .map_or("idle", |s| s.state().name())
+                .map_or(if self.present { "idle" } else { "waiting" }, |s| {
+                    s.state().name()
+                })
                 .to_string(),
             held: self.held.clone(),
             transport: self.settings.transport.name().to_string(),

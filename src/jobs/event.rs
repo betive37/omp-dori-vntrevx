@@ -99,10 +99,16 @@ pub(crate) enum EventKind {
     LaneRecap,
     /// A queued launch became ready, held or expired (LANE req. 25).
     LaneQueued,
+    /// A worker's connection dropped or failed (docs/design/workers.md 2.9); once per change.
+    WorkerOffline,
+    /// A worker answers again after it was offline; once per change.
+    WorkerOnline,
     /// A planner pass summary (COORD req. 34).
     PlannerRun,
     /// An item question for the owner, through the lead (COORD req. 32).
     ItemQuestion,
+    /// The owner answered a question the lead recorded by pressing one of its buttons (EVR req. 37).
+    QuestionAnswered,
     /// The daily owner-notes refresh request (COORD req. 49).
     NotesRefresh,
     /// A newer stable release is out (IR req. 37).
@@ -121,7 +127,7 @@ type KindRow = (
     &'static str,
 );
 
-const KINDS: [KindRow; 66] = [
+const KINDS: [KindRow; 69] = [
     (
         EventKind::HubStarted,
         "hub.started",
@@ -494,6 +500,18 @@ const KINDS: [KindRow; 66] = [
         "queued launch {lane} {detail}",
     ),
     (
+        EventKind::WorkerOffline,
+        "worker.offline",
+        &["worker", "detail"],
+        "worker {worker} is offline: {detail}",
+    ),
+    (
+        EventKind::WorkerOnline,
+        "worker.online",
+        &["worker"],
+        "worker {worker} is back online",
+    ),
+    (
         EventKind::PlannerRun,
         "planner.run",
         &["summary"],
@@ -504,6 +522,12 @@ const KINDS: [KindRow; 66] = [
         "item.question",
         &["item", "question"],
         "item {item}: {question}",
+    ),
+    (
+        EventKind::QuestionAnswered,
+        "question.answered",
+        &["question", "text", "outcome"],
+        "the owner's button answers question {question}: {outcome} — {text}",
     ),
     (
         EventKind::NotesRefresh,

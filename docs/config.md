@@ -266,10 +266,10 @@ when both `owner` and `channels` are set; setting one without the other is an er
 | `api_base` | string | Discord's API | `http(s)://` on localhost only | Test override of the API address. | |
 | `owner` | string | none | Discord user ID | Your account. | `--owner` (default: the application's owner) |
 | `channels` | list of strings | `[]` | Discord IDs, at most 256, duplicates dropped | Watched channels, threads, DMs and forums. Can also be set from the [ops panel](#ops)'s 📡 button; a change applies on the running connection. | `#cataly`, found or created |
-| `follow_threads` | boolean | `true` | | Also take threads under watched channels. When a thread was started from your message (by you, by the lead through the bot, or by a lane), the lead's answer to that message goes into the thread (all of it, no reply link) instead of a reply in the channel; if a lane owns that thread, your later messages there still go to the lane. If the thread is locked, cannot be looked up (three tries) or refuses the first part, the answer is the reply in the channel as before; if it is locked or deleted in the middle of an answer, the rest goes to the channel, after a short note that points back to the thread. Off: answers stay in the channel. | |
-| `home` | string | the one watched channel, if there is exactly one | one of `channels` | Where the lead's questions go. | `#cataly` when there are several |
+| `follow_threads` | boolean | `true` | | Also take threads under watched channels. Answers go into owner-started threads and lead work threads outside lanes. A lane-owned thread keeps its kickoff first and the lead's pointer in the channel. A definite refusal may move the remaining answer to the channel; an uncertain part stays at its saved destination, even after a restart or closure. Off: answers stay in the channel. | |
+| `home` | string | the one watched channel, if there is exactly one | one of `channels` | Where the lead's questions go when they name no room or thread. | `#cataly` when there are several |
 | `remote_approvals` | boolean | `false` | | Let you approve OMP permission requests by button, on a card in `[hub] language` with the command in a code block. Cataly's own tools and a fixed list of read-only commands (`ls`, `cat`, `grep`, `git status`, `git log`, `git diff` and the like) never ask; anything else still does. | `--approvals on\|off` (setup's default: on) |
-| `form_default_after` | duration | `"3m"` | 1s–1h | A question with one recommended choice takes it after this long. | |
+| `form_default_after` | duration | `"3m"` | 1s–1h | A question from OMP with one recommended choice takes it after this long. A question the lead records (`question.ask`) never takes its recommended option by itself. | |
 | `profile` | boolean | `true` | | `cataly setup` puts Cataly's avatar and banner on the bot where the bot has none (or still has Cataly's older ones); an image you set yourself is kept. Off: setup leaves the profile alone. | `--profile` re-applies them |
 | `away` | duration | `"3h"` | 1s–720h | You count as back when your message comes this long after your previous one. | |
 | `others` | list of strings | `[]` | subset of `channels` | Watched rooms where you talk with other people. | |
@@ -348,6 +348,12 @@ When enabled, a missing or invalid voice key turns voice off and names the
 field, but the rest of the configuration still applies. A build without the `voice` feature refuses
 `enabled = true` the same way. Voice also needs `[discord] guild` and `[discord] owner`.
 
+The bot joins `voice_channel` when you join it and leaves when you leave. At hub start, after
+an update, or after `cataly voice restart`, it joins only if the Gateway shows you there; otherwise
+it waits for you. Silence closes only the paid provider session: while you remain in the channel,
+the bot stays connected so your next speech can wake it. Holds and minute and spending caps still
+govern whether a paid session can start.
+
 `cataly setup --voice on` writes `enabled = true` and fills in what the file does not set; keys you
 set are kept, and a later run changes only what a voice flag names:
 
@@ -383,7 +389,7 @@ it names the channel and whose overwrite denies them.
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `enabled` | boolean | `false` | | Turns voice on. |
-| `voice_channel` | string | **required** | Discord ID | Voice channel to join. |
+| `voice_channel` | string | **required** | Discord ID | Voice channel to join while you are there. |
 | `text_channel` | string | **required** | Discord ID | Text channel for the call's text. |
 | `speech_model` | string | **required** | 1–64 letters, digits, `.`, `-`, `_` | Realtime speech model. |
 | `backend_model` | string | **required** | same | Model that answers. |
@@ -399,7 +405,7 @@ it names the channel and whose overwrite denies them.
 | `daily_minutes` | integer | `30` | 1–1440 | Call minutes per day. |
 | `total_minutes` | integer | `0` (no total cap) | 0–4294967295 | Call minutes in all. |
 | `spending_cap_usd` | number | `3.0` | above 0 | Spending cap. |
-| `idle_close_seconds` | integer | `120` | 1–3600 | Leave the call after this much silence. |
+| `idle_close_seconds` | integer | `120` | 1–3600 | Close the paid session after this much silence, staying in Discord while you are there so speech can wake it. |
 | `wake_dbfs` | number | `-45.0` | between -120 and 0, exclusive | Sound level that counts as speech. |
 | `transport` | string | `"websocket"` | `websocket`, `webrtc` | Connection to the speech provider. |
 | `api_base` | string | `"https://api.openai.com"` | URL | Speech provider address. |
@@ -728,6 +734,44 @@ they only change the panel.
 [ops]
 mute = "30m"
 alerts = { github = false }
+```
+
+---
+
+## `[workers.<name>]`
+
+Other machines (or other OS users) that run lanes for this hub over SSH. `cataly worker add`
+writes a section; `cataly worker remove` takes it out. Enrolment, the forced command and the
+security boundary are described in `docs/design/workers.md`.
+
+| Key | Type | Default | Meaning |
+| --- | --- | --- | --- |
+| `destination` | string | required | `user@host`; with `tailscale`, the host is the tailnet IP |
+| `port` | integer 1-65535 | `22` | The worker's sshd port; a pin on another port is `[host]:port` |
+| `name` | string | the section name | The name shown (the tailnet machine name with `tailscale`) |
+| `tailscale` | bool | `false` | `worker doctor` checks the address again with `tailscale ip` |
+| `repos` | list of strings | `[]` | Git origins (normalised to `host/owner/name`): placement evidence and doctor checks |
+| `lanes` | integer 1-8 | `1` | Remote lanes at once |
+
+Files: the hub's key `<config>/secrets/worker-<name>` (0600), the pins `<config>/known_hosts`,
+the hub ID `<config>/hub-id`. On the worker: `<config>/worker.toml` (`omp` path and `PATH`, written
+by `worker init`) and the root `<state>/worker/<hub id>/`. Worker states are kept in the store as
+coordination documents of kind `worker` (no schema migration).
+
+Lanes on a worker: `lane.open` takes `worker = <name>` (the lead sets it only from evidence). The
+worker keeps one bare clone per Git origin under `<root>/repos/` and a worktree per lane under
+`<root>/lanes/<key>`, at a commit that must be on the origin; the session file stays under
+`<root>/sessions/`. A remote lane counts toward `[lanes] max` and the worker's `lanes`, not toward
+`[sessions] cap`; it runs headless only. `repos` is placement evidence, not an allow-list.
+
+```toml
+[workers.linux-box]
+destination = "dev@100.101.102.103"
+port = 2222
+name = "linux-box"
+tailscale = true
+repos = ["github.com/vntrevx/cataly-core"]
+lanes = 1
 ```
 
 ---

@@ -3,6 +3,10 @@
 //! launch token, reconnect key or the lead's session identity; anything else is told `none` and
 //! stays inert. Over an accepted connection the bridge sends events, tool calls and the stop
 //! question; the hub sends heartbeats and answers. Headless sessions are never controlled from here.
+//!
+//! A worker carries its sessions' bridge connections as channels of its stream
+//! (docs/design/workers.md 2.5). Such a channel speaks only the bridge, and its hello is accepted
+//! only for a lane that runs on that worker: never the lead, never another worker's lane.
 
 use std::fmt::Write as _;
 use std::sync::Arc;
@@ -10,8 +14,7 @@ use std::time::Duration;
 
 use serde::Deserialize;
 use serde_json::{Value, json};
-use tokio::io::{AsyncBufRead, AsyncWriteExt};
-use tokio::net::unix::OwnedWriteHalf;
+use tokio::io::{AsyncBufRead, AsyncWrite, AsyncWriteExt, BufReader};
 use tokio::sync::mpsc;
 
 use super::Hub;
@@ -90,9 +93,6 @@ const LANE_TOOL: &str = "cataly_lane";
 
 /// The lane's tool (EVR req. 1, 30; LANE req. 53, 61).
 fn lane_tool() -> Value {
-    let text = |d: &str| json!({ "type": "string", "description": d });
-    let list =
-        |d: &str| json!({ "type": "array", "items": { "type": "string" }, "description": d });
     json!({
         "name": LANE_TOOL,
         "label": "Cataly lane",
@@ -101,24 +101,10 @@ fn lane_tool() -> Value {
         "description": "Report to Cataly as this lane. op report: kind (progress, stuck, waiting, stopped, finished), \
     text, summary? (for the owner, at most 500 characters), files? and calls? as evidence. op step: name, result, \
     evidence (a link or path), receipts? (push commit, merge link, deploy ID), files?, calls?. op steps: list recorded \
-    steps. op claim: evidence (report IDs and shareable receipts). op worktree: path (a worktree you created).",
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "op": text("report, step, steps, claim or worktree"),
-                "kind": text("report kind"),
-                "text": text("what happened, finished and next"),
-                "summary": text("one short line for the owner"),
-                "files": list("files whose content is evidence, relative to the working directory"),
-                "calls": list("tool call IDs whose results are evidence"),
-                "name": text("step name, unique in the lane"),
-                "result": text("step result"),
-                "evidence": text("step evidence or claim evidence"),
-                "receipts": list("remote-effect receipts"),
-                "path": text("worktree path")
-            },
-            "required": ["op"]
-        }
+    steps. op claim: evidence (report IDs and shareable receipts). op worktree: path (a worktree you created). \
+    op publish: key, path, title?, visibility private|public. op rule-add: text, evidence, scope global|repo; \
+    op rule-retire: id; op rules.",
+        "parameters": crate::params::parameters(crate::params::Tool::Lane),
     })
 }
 
@@ -180,7 +166,57 @@ fn root_session(parent: &str) -> &str {
         .unwrap_or(parent)
 }
 
-async fn write(writer: &mut OwnedWriteHalf, response: &Response) -> bool {
+/// Whether a session may say hello where it does (docs/design/workers.md 2.5, 2.9): a lane on a
+/// worker only through that worker's stream, anything else only through this machine's socket.
+async fn placed(hub: &Hub, handle: &str, role: Role, worker: Option<&str>) -> Result<(), String> {
+    let runs_on = match role {
+        Role::Lane => hub.lanes.worker_of(handle).await,
+        Role::Lead => None,
+    };
+    match (worker, runs_on.as_deref()) {
+        (None, None) => Ok(()),
+        (Some(from), Some(on)) if from == on => Ok(()),
+        (Some(from), _) => Err(format!("not a lane that runs on {from}")),
+        (None, Some(on)) => Err(format!("a lane on {on} connects only through {on}")),
+    }
+}
+
+/// One bridge connection a worker opened as a channel of its stream: its first line must be the
+/// hello; nothing but the bridge is spoken here, and nothing of the control protocol.
+pub(crate) async fn from_worker(hub: Arc<Hub>, worker: String, stream: tokio::io::DuplexStream) {
+    let (read, mut writer) = tokio::io::split(stream);
+    let mut reader = BufReader::new(read);
+    let Ok(Line::Text(line)) = tokio::time::timeout(SILENT, read_line(&mut reader)).await else {
+        return;
+    };
+    match crate::proto::decode(&line) {
+        Ok(request) if request.method == HELLO => {
+            serve(
+                &hub,
+                request.id,
+                request.params,
+                &mut reader,
+                writer,
+                None,
+                Some(&worker),
+            )
+            .await;
+        }
+        Ok(request) => {
+            let reply = Response::err(
+                request.id,
+                code::UNKNOWN_METHOD,
+                "a worker's channel carries only the bridge",
+            );
+            let _ = write(&mut writer, &reply).await;
+        }
+        Err(reply) => {
+            let _ = write(&mut writer, &reply).await;
+        }
+    }
+}
+
+async fn write<W: AsyncWrite + Unpin>(writer: &mut W, response: &Response) -> bool {
     let line = response.to_line();
     matches!(
         tokio::time::timeout(WRITE_TIMEOUT, writer.write_all(line.as_bytes())).await,
@@ -190,18 +226,28 @@ async fn write(writer: &mut OwnedWriteHalf, response: &Response) -> bool {
 
 /// Serves one bridge connection from its hello until it closes or falls silent (EXT req. 15). `pid`
 /// is the connecting process (OMP itself): once accepted, its descendants act in the session's role.
+/// `worker` names the worker whose stream carries the connection, if one does.
 #[allow(clippy::too_many_lines)]
-pub(crate) async fn serve<R: AsyncBufRead + Unpin>(
+pub(crate) async fn serve<R, W>(
     hub: &Arc<Hub>,
     id: u64,
     params: Value,
     reader: &mut R,
-    mut writer: OwnedWriteHalf,
+    mut writer: W,
     pid: Option<i32>,
-) {
+    worker: Option<&str>,
+) where
+    R: AsyncBufRead + Unpin,
+    W: AsyncWrite + Unpin + Send + 'static,
+{
     let raw = params.clone();
     let hello: Hello = serde_json::from_value(params).unwrap_or_default();
-    let decided = decide(hub, &hello).await;
+    let decided = match decide(hub, &hello).await {
+        Ok((handle, role, fresh)) => placed(hub, &handle, role, worker)
+            .await
+            .map(|()| (handle, role, fresh)),
+        Err(e) => Err(e),
+    };
     let lane_pin = match &decided {
         Ok((handle, Role::Lane, _)) => hub.lanes.hello(handle).await,
         _ => None,
@@ -316,7 +362,13 @@ pub(crate) async fn serve<R: AsyncBufRead + Unpin>(
 }
 
 /// Tells a refused hello `none`; a protocol mismatch is also recorded (EXT req. 4).
-async fn refuse(hub: &Hub, writer: &mut OwnedWriteHalf, id: u64, mismatch: bool, reason: String) {
+async fn refuse<W: AsyncWrite + Unpin>(
+    hub: &Hub,
+    writer: &mut W,
+    id: u64,
+    mismatch: bool,
+    reason: String,
+) {
     if mismatch {
         let emit = Emit::new(EventKind::BridgeRefused, Severity::Warning, false, "bridge")
             .with("reason", &reason);
@@ -346,7 +398,7 @@ fn terminal(
 }
 
 /// Writes queued responses to the bridge, with a heartbeat while nothing else is queued.
-async fn pump(mut writer: OwnedWriteHalf, mut rx: mpsc::Receiver<Response>) {
+async fn pump<W: AsyncWrite + Unpin>(mut writer: W, mut rx: mpsc::Receiver<Response>) {
     let mut beat = tokio::time::interval(HEARTBEAT);
     beat.tick().await;
     loop {
@@ -401,10 +453,7 @@ fn answer_later(
     request: crate::proto::Incoming,
 ) {
     let (hub, tx) = (Arc::clone(hub), tx.clone());
-    let caller = (role == Role::Lane).then(|| crate::lanes::Caller::Lane {
-        handle: handle.to_string(),
-        session: session.to_string(),
-    });
+    let lane = (role == Role::Lane).then(|| (handle.to_string(), session.to_string()));
     let own_tool = match (sub, role) {
         (true, _) => None,
         (false, Role::Lane) => Some(LANE_TOOL),
@@ -418,7 +467,7 @@ fn answer_later(
             param("tool") == Some("bash")
                 && param("command").is_some_and(|c| shell::runs_tool(c, t))
         });
-        let reply = match (request.method.as_str(), &caller) {
+        let reply = match (request.method.as_str(), &lane) {
             ("bridge.model", None) => verdict((true, String::new())),
             ("bridge.shell", _) if tool_line.is_some() => {
                 verdict((false, tool_line.map_or_else(String::new, own_tool_in_shell)))
@@ -434,7 +483,10 @@ fn answer_later(
             ("bridge.model", Some(_)) => {
                 verdict(hub.lanes.model_check(&handle, &request.params).await)
             }
-            ("bridge.tool", _) => tool(&hub, caller, &request.params).await,
+            ("bridge.tool", _) => {
+                let pair = lane.as_ref().map(|(h, s)| (h.as_str(), s.as_str()));
+                tool(&hub, pair, &request.params).await
+            }
             (_, Some(_)) => json!({}),
             (_, None) => {
                 // A final message answers nothing when only `answer` calls post (DISC-OUT req. 21).
@@ -467,7 +519,7 @@ fn event(hub: &Arc<Hub>, handle: &str, role: Role, params: &Value) {
 }
 
 /// One tool call, answered once per call ID (EXT req. 18).
-async fn tool(hub: &Arc<Hub>, caller: Option<crate::lanes::Caller>, params: &Value) -> Value {
+async fn tool(hub: &Arc<Hub>, lane: Option<(&str, &str)>, params: &Value) -> Value {
     let call = params
         .get("call")
         .and_then(Value::as_str)
@@ -479,16 +531,20 @@ async fn tool(hub: &Arc<Hub>, caller: Option<crate::lanes::Caller>, params: &Val
         return json!({ "text": text });
     }
     let mut input = params.get("input").cloned().unwrap_or(Value::Null);
-    let result = match caller {
-        Some(caller) => {
-            // The bridge's facts about the named calls travel with the input (EXT req. 22).
-            if let (Some(map), Some(facts)) = (input.as_object_mut(), params.get("evidence")) {
-                map.insert("evidence".into(), facts.clone());
+    let result = match lane {
+        Some((handle, session)) => {
+            // The bridge's facts about the named calls travel with the input (EXT req. 22). They go
+            // under the hub's own key, so they never take a parameter's place.
+            if let Some(facts) = params.get("facts") {
+                crate::params::FACTS.set(&mut input, facts.clone());
             }
-            hub.lanes.call(caller, &input).await.map(|v| match v {
-                Value::String(s) => s,
-                other => other.to_string(),
-            })
+            hub.lanes
+                .lane_call(handle, session, &input)
+                .await
+                .map(|v| match v {
+                    Value::String(s) => s,
+                    other => other.to_string(),
+                })
         }
         None => super::tool::call(hub, &input).await,
     };

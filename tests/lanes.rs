@@ -966,6 +966,230 @@ fn lead_tool(bridge: &mut Bridge, session: &Value, call: &str, input: Value) -> 
     )
 }
 
+/// COORD req. 47: the lead creates the owner notes only with the owner's message, once; a save
+/// before that is refused and one after it passes the check.
+#[test]
+fn lead_creates_owner_notes_on_the_owners_request() {
+    let (mut hub, work) = lane_hub("");
+    let text = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{text}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    start(&mut hub);
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    let save = json!({ "op": "profile.save", "text": "# Owner notes\n" });
+    let (why, err) = lead_tool(&mut b, &s, "p1", save);
+    assert!(err && why.contains("profile.create"), "{why}");
+    let (why, err) = lead_tool(&mut b, &s, "p2", json!({ "op": "profile.create" }));
+    assert!(err && why.contains("message"), "{why}");
+    assert!(!hub.state().join("profile.md").exists());
+    for (n, message) in [
+        json!(null),
+        json!(42),
+        json!(" "),
+        json!("first\nsecond"),
+        json!("x".repeat(401)),
+        json!("someone@example.org"),
+        json!(format!("ghp_{}", "a1".repeat(18))),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (why, err) = lead_tool(
+            &mut b,
+            &s,
+            &format!("invalid-{n}"),
+            json!({ "op": "profile.create", "message": message }),
+        );
+        assert!(err, "invalid citation {n} was accepted: {why}");
+        assert!(!hub.state().join("profile.md").exists());
+    }
+    let create = json!({ "op": "profile.create", "message": "discord:1/2" });
+    let (why, err) = lead_tool(&mut b, &s, "p3", create.clone());
+    assert!(!err, "{why}");
+    let (why, err) = lead_tool(&mut b, &s, "p4", create);
+    assert!(err && why.contains("already exist"), "{why}");
+    let (shown, err) = lead_tool(&mut b, &s, "p5", json!({ "op": "profile.read" }));
+    assert!(!err, "{shown}");
+    assert!(
+        shown.contains("on the owner's request (message discord:1/2)"),
+        "the create keeps the owner's message: {shown}"
+    );
+    let mut notes = shown.trim_end().to_string();
+    notes = notes.replacen(
+        "## Standing decisions",
+        "## Standing decisions\n\n- (2026-01-01) All pull requests come from one account.",
+        1,
+    );
+    let (why, err) = lead_tool(
+        &mut b,
+        &s,
+        "p6",
+        json!({ "op": "profile.save", "text": format!("{notes}\n") }),
+    );
+    assert!(!err, "{why}");
+}
+
+fn question_hub() -> (FakeDiscord, TestHub, PathBuf) {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    fake.thread(THREAD, CH);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}{}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        fake.config(&token, OWNER, &[CH]),
+        work.display()
+    ));
+    start(&mut hub);
+    hub.until(WAIT, || {
+        (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
+    });
+    (fake, hub, work)
+}
+
+fn question_input(thread: Option<String>, room: Option<&str>) -> Value {
+    let mut v = json!({ "op": "question.ask", "text": "Which?", "source": "discord:1:2",
+        "options": ["a", "b"] });
+    if let Some(t) = thread {
+        v["thread"] = json!(t);
+    }
+    if let Some(r) = room {
+        v["room"] = json!(r);
+    }
+    v
+}
+
+/// Destination precedence and explicit refusals use the same posting path as lane questions.
+#[test]
+fn question_destinations_follow_parameters_and_refuse_invalid_rooms() {
+    let (fake, mut hub, _work) = question_hub();
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    for (n, (thread, room, expected)) in [
+        (Some(format!("discord:{THREAD}")), Some(CH), CH),
+        (Some(format!("discord:{THREAD}")), Some(" "), THREAD),
+        (Some("telegram:5".into()), None, CH),
+        (None, None, CH),
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        let (said, err) = lead_tool(&mut b, &s, &format!("q{n}"), question_input(thread, room));
+        assert!(
+            !err && said.contains(&format!("posted in {expected}")),
+            "{said}"
+        );
+    }
+    assert_eq!(
+        (fake.bot_messages(THREAD).len(), fake.bot_messages(CH).len()),
+        (1, 3)
+    );
+    let (before, _) = lead_tool(&mut b, &s, "before", json!({ "op": "questions" }));
+    let denied = "123456789012345678";
+    fake.script_in(denied, &[403]);
+    for (n, room) in [format!("discord:{CH}"), denied.into()].iter().enumerate() {
+        let input = question_input(Some(format!("discord:{THREAD}")), Some(room));
+        let (why, err) = lead_tool(&mut b, &s, &format!("bad{n}"), input);
+        assert!(err && why.contains("room"), "{why}");
+    }
+    let (after, _) = lead_tool(&mut b, &s, "after", json!({ "op": "questions" }));
+    assert_eq!(before, after, "nothing recorded");
+    assert_eq!(
+        (fake.bot_messages(THREAD).len(), fake.bot_messages(CH).len()),
+        (1, 3)
+    );
+    drop(b);
+    hub.stop();
+}
+
+/// Both typed and button answers in a lane's thread reach the lead; later ordinary replies do not.
+#[test]
+fn question_ask_posts_in_its_thread() {
+    let (fake, mut hub, work) = question_hub();
+    open(
+        &hub,
+        "q-1",
+        &json!({ "thread": format!("discord:{THREAD}"), "cwd": work }),
+    );
+    let rec = record(&hub, "q-1");
+    let lane_file = || std::fs::read_to_string(rec["session_file"].as_str().unwrap()).unwrap();
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    let lead = hub.json(&["lead", "status", "--json"]);
+    let lead_file = PathBuf::from(lead["session"]["session_file"].as_str().unwrap());
+    let in_thread = || Some(format!("discord:{THREAD}"));
+    let posts = |room: &str| fake.bot_messages(room).len();
+    // The thread, when no room is given.
+    let (said, err) = lead_tool(&mut b, &s, "q1", question_input(in_thread(), None));
+    assert!(
+        !err && said.contains(&format!("posted in {THREAD}")),
+        "{said}"
+    );
+    assert_eq!((posts(THREAD), posts(CH)), (1, 0));
+    let asked = fake.bot_messages(THREAD)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // The owner answers the lead's question in the lane's thread: the lead gets it, the lane not.
+    let mut reply = FakeDiscord::message(THREAD, 700_000_000_000_000_001, OWNER, "1");
+    reply["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
+    fake.say(reply);
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&lead_file)
+            .unwrap()
+            .contains("answers question")
+            .then_some(())
+    });
+    assert!(
+        !lane_file().contains("answers question"),
+        "the lane does not get it"
+    );
+    // A later reply to the settled question is the lane's again.
+    let mut later = FakeDiscord::message(THREAD, 700_000_000_000_000_002, OWNER, "late follow-up");
+    later["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
+    fake.say(later);
+    hub.until(WAIT, || {
+        lane_file().contains("late follow-up").then_some(())
+    });
+    // A reply to any other message in the lane's thread is still the lane's.
+    let mut other = FakeDiscord::message(THREAD, 700_000_000_000_000_004, OWNER, "lane reply");
+    other["message_reference"] =
+        json!({ "message_id": "700000000000000001", "channel_id": THREAD });
+    fake.say(other);
+    hub.until(WAIT, || lane_file().contains("lane reply").then_some(()));
+    // A second question in the same lane thread is answered by button, not handed to the lane.
+    let (said, err) = lead_tool(&mut b, &s, "q-button", question_input(in_thread(), None));
+    assert!(!err, "{said}");
+    let id = said.split_whitespace().nth(1).unwrap();
+    let message = said.split_whitespace().last().unwrap();
+    fake.press(OWNER, THREAD, message, &format!("cy:{id}:1"));
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&lead_file)
+            .unwrap()
+            .contains(&format!("question {id}"))
+            .then_some(())
+    });
+    let edited = fake.wait(WAIT, |f| {
+        f.bot_messages(THREAD)
+            .into_iter()
+            .find(|m| m["id"] == message && m["components"].as_array().is_some_and(Vec::is_empty))
+    });
+    assert!(
+        edited["content"].as_str().unwrap().contains("2. b"),
+        "{edited}"
+    );
+    assert!(
+        !lane_file().contains(id),
+        "the button answer belongs to the lead"
+    );
+    drop(b);
+    hub.stop();
+}
+
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
 /// recorded before it), a "no" is stored and not asked again (also after a restart), and messenger
 /// writes from the lead (tool posts and `cataly` commands in its shell) are refused while it runs.
@@ -987,7 +1211,7 @@ fn onboarding_consent_is_stored_and_writes_wait() {
     let (_, err) = lead_tool(&mut b, &s, "o2", json!({ "op": "onboarding.start" }));
     assert!(!err);
     // Nothing is read before the consent answer.
-    let early = json!({ "op": "onboarding.tool", "name": "mail", "answer": "allowed", "reads": "subjects", "message": "m1" });
+    let early = json!({ "op": "onboarding.tool", "name": "mail", "reply": "allowed", "reads": "subjects", "message": "m1" });
     let (_, err) = lead_tool(&mut b, &s, "o3", early);
     assert!(err, "a tool before consent is refused");
     // Writes wait while onboarding runs.
@@ -1033,7 +1257,7 @@ fn onboarding_consent_is_stored_and_writes_wait() {
     );
     assert_eq!(shell(&mut b, "ls ~/.config")["allow"], true);
     // A "no" is stored and ends onboarding; it is not asked again.
-    let no = json!({ "op": "onboarding.consent", "answer": "no", "message": "owner-msg-1" });
+    let no = json!({ "op": "onboarding.consent", "reply": "no", "message": "owner-msg-1" });
     let (_, err) = lead_tool(&mut b, &s, "o7", no);
     assert!(!err);
     let (why, err) = lead_tool(&mut b, &s, "o8", json!({ "op": "onboarding.start" }));
@@ -1074,11 +1298,9 @@ fn holds(file: &Value, text: &str) -> bool {
 }
 
 /// The lead delegates: an owner message in a watched channel, the lead's `lane.open` with
-/// `thread_from` that message and a worktree, the thread under it with its kickoff line and then the
-/// lead's answer to the message (not in the channel), the lane's session in its worktree, a report
-/// in the thread under the status word, owner thread messages to the lane and not the lead, a split
-/// asked for in the thread opening a second lane in a thread of its own while the first keeps its
-/// scope, and `lane.close` marking the thread done.
+/// `thread_from` that message and a worktree, the kickoff first in the thread and the lead's pointer
+/// in the channel, the lane's session in its worktree, reports and later owner messages in its
+/// thread, and a split opening a separate lane without changing the first lane's scope.
 #[test]
 #[allow(clippy::too_many_lines)]
 fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
@@ -1150,18 +1372,19 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
         kickoff[0]["content"], "Fixing the login bug; done when the check true passes.",
         "the kickoff line comes first"
     );
-    // The lead's answer to the request goes into the lane's thread, started from that message,
-    // not into the channel.
+    // The lane owns the thread, so the lead's pointer stays visible in the channel.
     std::fs::write(data(&hub).join("release"), "").unwrap();
     let answer = hub.until(WAIT, || {
-        fake.bot_messages(&thread_a)
+        fake.bot_messages(CH)
             .into_iter()
             .find(|m| m["content"] == "ok")
     });
-    assert!(answer.get("message_reference").is_none(), "{answer}");
+    assert_eq!(answer["message_reference"]["message_id"], asked.to_string());
     assert!(
-        fake.bot_messages(CH).iter().all(|m| m["content"] != "ok"),
-        "the answer is not in the channel"
+        fake.bot_messages(&thread_a)
+            .iter()
+            .all(|m| m["content"] != "ok"),
+        "the thread keeps only its kickoff until the lane reports"
     );
     // A lane report reaches the thread.
     let (mut lb, _) = hello(&hub, &a);
@@ -1172,10 +1395,10 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
     );
     let posts = hub.until(WAIT, || {
         let p = fake.bot_messages(&thread_a);
-        (p.len() >= 3).then_some(p)
+        (p.len() >= 2).then_some(p)
     });
     assert_eq!(
-        posts[2]["content"],
+        posts[1]["content"],
         "Lane update: the login test needs a fixture"
     );
     // An owner message in the thread reaches the lane, not the lead.

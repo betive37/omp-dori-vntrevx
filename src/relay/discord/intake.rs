@@ -26,7 +26,7 @@ pub(crate) use crate::relay::intake::Shared;
 use crate::relay::intake::{Stop, supervise};
 use crate::relay::pipeline::{Arrival, Pipeline, Step};
 use crate::relay::text::{self, Checks, DISCORD_LIMIT};
-use crate::relay::{Facts, Inbound, PartOutcome, Relay, Resume};
+use crate::relay::{Facts, Inbound, PartOutcome, Relay};
 use crate::store::Store;
 use crate::store::relay::{QueueRow, RelayDone, RelayWrite};
 use crate::sys::now_ms;
@@ -124,37 +124,6 @@ impl Relay for DiscordRelay {
         Some(format!("-# continued from <#{from}>"))
     }
 
-    /// Where the first part of a half-posted answer is (DISC-OUT req. 25). Only reading the part
-    /// itself says so: the channel, else the thread started from the request (it has the request's
-    /// ID). When the channel definitely lacks it (unknown message) and the thread definitely takes
-    /// nothing from the bot (closed: no access, gone, archived) or lacks it too, the rest moves to
-    /// the channel, its first part as the reply. A read that fails for now says nothing, and the
-    /// rest waits.
-    async fn resume_room(&self, room: &str, source: &str, posted: &str) -> Result<Resume, String> {
-        let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
-            log::debug(
-                "not a Discord room or message; the rest follows the request's room",
-                &[("room", &room), ("message", &source)],
-            );
-            return Ok(Resume::Here);
-        };
-        let posted = id(posted)?;
-        let in_channel = match self.read_part(channel, posted).await {
-            Ok(()) => return Ok(Resume::Here),
-            Err(e) => e,
-        };
-        match self.read_part(message, posted).await {
-            Ok(()) => Ok(Resume::Bound(source.to_string())),
-            Err(e) if in_channel.unknown_message() && (e.closed() || e.unknown_message()) => {
-                Ok(Resume::Moved(source.to_string()))
-            }
-            Err(e) => Err(format!(
-                "the first part is not readable in the channel ({}) or in the thread ({})",
-                in_channel.why, e.why
-            )),
-        }
-    }
-
     async fn post(
         &self,
         room: &str,
@@ -194,22 +163,6 @@ impl Relay for DiscordRelay {
                 .map(str::to_string),
             dm: matches!(kind, Some(1 | 3)),
         })
-    }
-}
-
-impl DiscordRelay {
-    /// Reads one message of `channel` within 5 s.
-    async fn read_part(&self, channel: Snowflake, message: Snowflake) -> Result<(), RestError> {
-        match tokio::time::timeout(LOOKUP_TIMEOUT, self.rest.message(channel, message)).await {
-            Ok(Ok(_)) => Ok(()),
-            Ok(Err(e)) => Err(e),
-            Err(_) => Err(RestError {
-                status: None,
-                code: None,
-                why: "no answer within 5 s".into(),
-                uncertain: false,
-            }),
-        }
     }
 }
 
@@ -402,14 +355,13 @@ impl<T: Runtime> Intake<T> {
             WsUrl::parse("wss://gateway.discord.gg").map_err(Stop::Fatal)?
         };
         let token = rest.token().to_string();
-        let relay = Arc::new(DiscordRelay {
-            rest: Arc::clone(&rest),
-            bot,
-            checks: config.outgoing.clone(),
-            follow_threads: settings.follow_threads,
-        });
         let pipeline = Arc::new(Pipeline::new(
-            relay,
+            Arc::new(DiscordRelay {
+                rest: Arc::clone(&rest),
+                bot,
+                checks: config.outgoing.clone(),
+                follow_threads: settings.follow_threads,
+            }),
             crate::relay::pipeline::Parts {
                 store: env.store.clone(),
                 lead: Arc::clone(&env.lead),
@@ -430,7 +382,7 @@ impl<T: Runtime> Intake<T> {
             token_intents: (token, gateway::intents(settings.follow_threads, voice)),
             tap: (env.tap.clone(), voice),
             events: Arc::clone(&env.events),
-            settings: Mutex::new(settings.clone()),
+            settings: Mutex::new(settings),
             language: config.hub.language,
             rest,
             bot,
@@ -457,6 +409,9 @@ impl<T: Runtime> Intake<T> {
             intake.unlist(*channel, e);
         }
         intake.close_left_open().await;
+        if !shared.presses_recovered.swap(true, Ordering::SeqCst) {
+            intake.tell_untold_presses().await;
+        }
         intake.baseline_listed().await?;
         // A queue left from before is drained after a full catch-up read (DISC-IN req. 28).
         let queued = env
@@ -766,7 +721,7 @@ impl<T: Runtime> Intake<T> {
     }
 
     /// Renews the typing indicator while a lead turn runs (DESIGN 12.2 C4).
-    async fn typing(&self) {
+    async fn typing(self: &Arc<Self>) {
         if !self.turn_running.load(Ordering::Acquire) {
             return;
         }
@@ -781,7 +736,7 @@ impl<T: Runtime> Intake<T> {
         let Some((room, message)) = self.pipeline.typing_room().await else {
             return;
         };
-        // Not known yet: the next round (at most 3 s on) shows it.
+        // A pending lookup wakes the handling round as soon as its destination is known.
         let Some(room) = self.typing_target(room, message) else {
             return;
         };
@@ -795,7 +750,7 @@ impl<T: Runtime> Intake<T> {
     /// (DISC-OUT req. 25). Only a followed thread with the request's ID (a thread started from a
     /// message takes its ID) needs the answer's own lookup, shared with posting and run off the
     /// handling round; `None` while it runs or after it failed (a later round looks again).
-    fn typing_target(&self, room: String, message: String) -> Option<String> {
+    fn typing_target(self: &Arc<Self>, room: String, message: String) -> Option<String> {
         let followed = Snowflake::parse(&message).is_some_and(|m| {
             self.scope()
                 .threads
@@ -808,10 +763,12 @@ impl<T: Runtime> Intake<T> {
         if let Some(known) = self.pipeline.known_answer_room(&room, &message) {
             return Some(known);
         }
-        let pipeline = Arc::clone(&self.pipeline);
+        let intake = Arc::clone(self);
         tokio::spawn(async move {
-            // A failure is logged and counted by the pipeline.
-            let _ = pipeline.answer_room(&room, &message).await;
+            // A failure is logged and counted by the pipeline; only success wakes immediately.
+            if intake.pipeline.answer_room(&room, &message).await.is_ok() {
+                intake.wake.notify_one();
+            }
         });
         None
     }
@@ -1386,7 +1343,7 @@ impl<T: Runtime> Handler for Arc<Intake<T>> {
         });
         log::info("Discord Gateway ready", &[("resumed", &resumed)]);
         if let (Some(tap), Ok(bot)) = (self.active_tap(), self.bot.to_string().parse::<u64>()) {
-            (tap.seen)(Seen::Up(bot));
+            (tap.seen)(Seen::Up { bot, resumed });
         }
         self.wake.notify_one();
     }

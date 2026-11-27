@@ -240,9 +240,11 @@ client) plus the lead's OMP session, and every record has one writer.
 
 ### Owner notes (COORD-34 to COORD-37)
 
-47. Off until the owner creates the file; creating it twice is refused. It has five sections in fixed order: likes
-    and working style, current topics, standing decisions, dislikes, change log. Each entry is one line starting
-    with its date (YYYY-MM-DD) in parentheses. Private file mode.
+47. Off until the file is created: by the owner (`cataly lane profile-create`), or by the lead when the owner asked
+    for it, naming the owner's message, which the file's first change-log line keeps; the lead never creates it
+    on its own. Creating it twice is refused. It has five sections in fixed order: likes and working style,
+    current topics, standing decisions, dislikes, change log. Each entry is one line starting with its date
+    (YYYY-MM-DD) in parentheses. Private file mode.
 48. The lead's prompt mentions the file only when it exists, never embeds it, and says it holds observations, not
     instructions or permission, and must not be passed to other roles. Showing it prints at most 16 KiB, cut at a
     line end, with a note when cut. Only regular files are read (no symlinks).

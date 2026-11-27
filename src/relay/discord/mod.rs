@@ -718,13 +718,13 @@ impl Rest {
     }
 
     /// Whether the bot may view the channel and read its history: one listing of its public
-    /// archived threads, which needs both, for text and forum channels alike. `Err` carries the
-    /// permission that is missing when Discord names it ([`RestError::missing_permission`]).
+    /// archived threads, which needs both, for text and forum channels alike. Two is Discord's
+    /// minimum page size. `Err` names the missing permission ([`RestError::missing_permission`]).
     pub(crate) async fn readable(&self, channel: Snowflake) -> Result<(), RestError> {
         self.call(
             "GET channels/threads/archived",
             Method::GET,
-            &format!("/channels/{channel}/threads/archived/public?limit=1"),
+            &format!("/channels/{channel}/threads/archived/public?limit=2"),
             None,
             Kind::Read,
         )
@@ -949,6 +949,35 @@ impl Rest {
                 status: None,
                 code: None,
                 why: "no answer within 2.5 s".into(),
+                uncertain: true,
+            }),
+        }
+    }
+
+    /// Sends a follow-up message to an acknowledged interaction with its token (valid 15 minutes);
+    /// `flags` 64 in `body` keeps it private to the user who pressed.
+    pub(crate) async fn follow_up(
+        &self,
+        application: Snowflake,
+        token: &str,
+        body: Value,
+    ) -> Result<(), RestError> {
+        let path = format!("/webhooks/{application}/{token}");
+        let call = self.request_as(
+            "POST webhooks",
+            Method::POST,
+            &path,
+            Some(Body::Json(body)),
+            Kind::Once,
+            false,
+        );
+        match tokio::time::timeout(Duration::from_secs(5), call).await {
+            Ok(Outcome::Done(_)) => Ok(()),
+            Ok(other) => Err(RestError::from_outcome(other)),
+            Err(_) => Err(RestError {
+                status: None,
+                code: None,
+                why: "no answer within 5 s".into(),
                 uncertain: true,
             }),
         }

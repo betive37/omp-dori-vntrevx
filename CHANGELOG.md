@@ -1,12 +1,7 @@
 # Changelog
 
-## 0.2.5 (Unreleased)
+## 0.2.7 (Unreleased)
 
-- A Telegram, Slack or Discord message read live is no longer handed to the lead by a round that
-  finds it queued before its arrival finished. Such a hand-off lost the message's wake from
-  `cataly stats` (`*_wake_latency`) and left its read time in the hub's memory for good. The
-  round now waits for the arrival, and no read time outlives its message, also when the message
-  leaves the queue without a hand-off (a reset, a channel leaving scope).
 - `[lead] answers = "tool"` lets the lead choose its answers: Cataly then posts no turn text by
   itself, and the lead answers each owner message with its tool (`cataly_lead` op `answer`,
   naming the message as `discord:<room>/<message>`). The answer is posted like an automatic one
@@ -23,18 +18,106 @@
   has not answered: while such a message still has a reminder to come (1, 4 and 16 minutes after
   it arrived), the lead stays awake, with either `answers` mode. Once the message is answered or
   its three reminders are used, the lead may sleep as before.
-- An answer part posted outside the request's channel (a thread, another room) is now stored with
-  its room, so a restart and later follow-ups find it. An older version cannot read that: roll back
-  only while no answer is being posted.
-- When a Discord thread was started from your message (by you, by the lead through the bot, or by
-  a lane), the lead's answer to it goes into that thread instead of a reply in the channel: every
-  part of a long answer, with the same once-only posting, and the owed reply counts as answered.
-  Typing shows there while the lead works. If a lane owns the thread, your later messages there
-  still go to the lane. With no such thread, a locked one, a thread that refuses the first part,
-  a lookup that failed three times (logged; one failure only delays the answer a few seconds) or
-  `[discord] follow_threads = false`, the answer is the reply in the channel as before; a thread
-  locked or deleted in the middle of an answer gets nothing more, and the rest goes to the
-  channel as a reply, after a short note pointing back to the thread.
+
+## 0.2.6 (2026-11-27)
+
+- The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
+  stop signal sent right after the start (as a service manager or a terminal's Ctrl-C may do) could
+  end the launcher by default, leaving the binary running without its parent (#297, @betive37).
+- The lead can create the owner notes with `profile.create` when the owner asks for them. The op
+  takes the owner's message and is refused without one; the message becomes the first change-log
+  line of the new file. The notes check refuses email or token-shaped citations before any file
+  is created. Creating them twice is still refused (#295, @tknmaxxer).
+  Before, `profile.save` refused until the owner ran `cataly lane profile-create` in a terminal,
+  even after asking the lead to make them.
+- The lead's `question.ask` posts in the Discord thread it names (`thread: "discord:<id>"`) when
+  no `room` is given, instead of the home channel. A `room` that is not a Discord channel ID is
+  refused instead of silently posting in the home channel, and so is a definitely rejected post.
+  An uncertain post stays in the ledger and is reported as in doubt, never as a reason to post
+  again. The owner's reply to the lead's open question goes to the lead even in a thread an open
+  lane owns (#281, @betive37).
+- A question the lead records (`cataly_lead` op `question.ask`) now has one button per option
+  on Discord, labelled with its number; the recommended one is highlighted but never chosen by
+  itself. Your press answers the question exactly like a reply with that number: the ledger
+  records it and the lead is told which question and option (event `question.answered`). Anyone
+  else's press, and a press on a question already answered or withdrawn, gets a private refusal.
+  However the question is settled (button, reply, or the lead's `question.answer`, `choose` or
+  `withdraw`), its message then says so and loses its buttons. Replying with a number or free
+  text works as before. Buttons come only when presses reach Cataly over the Gateway (the same
+  condition as for OMP's questions); otherwise the question is text only, as before (#292, @betive37).
+- The Watched channels picker accepts readable channels again: its single bounded permission
+  check now requests two archived threads, Discord's minimum, instead of one (which Discord
+  rejects with HTTP 400 / error 50035). The fake Discord enforces archived-thread limits of
+  2–100 and message-history limits of 1–100 so invalid page sizes fail in CI.
+- Discord voice now joins when you enter the configured voice channel and leaves when you leave,
+  including after hub starts, updates and voice restarts. Silence closes only the paid session
+  while you remain; status and the ops panel distinguish waiting for you, in the call and held.
+- Answers go into owner-started Discord threads and lead work threads outside lanes, with typing
+  in the same destination. Lane-owned threads keep the kickoff first and the lead's pointer in the
+  channel. Each part's destination and uncertainty are durable before posting: restart resumes at
+  the current destination, and an uncertain part never moves even when its thread closes. Only a
+  definite refusal permits fallback, with a continuation note for a partially moved answer
+  (#284, @betive37).
+
+## 0.2.5 (2026-11-27)
+
+- The lead can open lanes again: `cataly_lead` now declares every parameter its operations read,
+  with its real JSON type, so a model that follows the schema sends `checks` as a list of signal
+  objects, `worktree` as `{path, branch, base}`, `ceilings` as an object and the lane fields
+  (`key`, `brief`, `brief_file`, `thread_from`, `kickoff`, `cwd`, `model`, `origin`, `look_only`,
+  `worker`, `priority`, `after`, `expires_hours`, `preview`, `request_id`) typed. One table in
+  `src/params.rs` builds both tools' schemas and every operation reads its input through it, so the
+  schema cannot fall behind the operations; a test walks each tool's operations from its entry and
+  fails on a parameter that is read but not declared, declared with another type, or offered and
+  never read. Onboarding's consent and tool answer is now `reply`, because the lane dialog's
+  `answer` is an object and one name cannot be two types. The bridge's facts about a report's calls
+  travel under `facts`, so they no longer overwrite a step's `evidence`.
+- **Remote workers, phase 1 (enrolment and connection).** `cataly worker add user@host[:port]`
+  makes one ed25519 key for that machine and prints the `cataly worker init --hub-key '…'` line
+  to run there. `worker init` writes a `restrict,command="… cataly worker serve --hub <id>"` line
+  into the worker's `~/.ssh/authorized_keys` (with `from=` when given), checks `omp`, `git` and the
+  bridge link, says plainly that lanes run tools with that user's rights, and prints the host-key
+  fingerprint. `worker add … --host-key SHA256:…` pins that key in Cataly's own `known_hosts`,
+  connects with `ssh -F none` (no agent, no forwarding, no config file, no ProxyJump), refuses a
+  worker where the forced command did not apply (the marker command `cataly-worker-v1` ran), and
+  writes `[workers.<name>]` through the shared config writer. `--tailscale` resolves the machine
+  with `tailscale ip` and refuses addresses off the tailnet. `worker list`, `worker doctor` and
+  `worker remove` ask the hub; `cataly status` and the ops panel show each worker's state. A
+  worker with another worker or bridge protocol is refused as incompatible, naming
+  `cataly update` on that machine.
+- **Remote workers, phase 2 (lanes on workers).** `lane.open` takes `worker` (a configured
+  name) and the lane record keeps it; `lane.workers` lists each worker's platform, state, lanes in
+  use and repositories. The lead sets `worker` only from evidence: the owner names the machine or
+  a platform only it has, or the repository's origin is listed for that worker; never by default.
+  The worker keeps its own bare clone per Git origin under its root (never a folder of its user),
+  fetches, checks that the commit is on the origin ("push it first, or open the lane here") and
+  adds a worktree per lane at that commit. Uncommitted edits of the hub checkout stay behind; the
+  open's reply and the thread's kickoff line say where the lane runs, at which commit, and that.
+  The worker's own OMP runs the session over the worker stream (no hub credentials, its own
+  logins), its session file stays on the worker, and delivery and resume checks of that file run
+  there with the hub's parsers. `command` and `file` checks run on the worker, `pr_merged`,
+  `issue_closed`, `web` and `pr_policy` on the hub; a worker lane's receipt names where each ran.
+  Bridge connections travel as channels of the worker stream and are accepted only for lanes on
+  that worker: never the lead, never another worker's lane, never the control protocol. A lane
+  whose worker drops is lost; its OMP ends there, and the lane comes back by itself on the same
+  session file through the hub-restart path once the worker answers. A message the drop left
+  unconfirmed is then found in that file or ends in doubt: never resent (a local lane's message
+  whose process ended is resent once; a worker's process ends out of the hub's sight), the lane's
+  `lane.send` fenced until the lead releases it, and the lead and the owner told once. A lane for
+  an offline worker is queued and starts by itself once the worker is reachable. The ops panel's
+  worker line shows each worker online, idle, offline, reconnecting (lost lanes wait for it),
+  refused or incompatible, with its lanes in use. Remote lanes are headless only and count toward
+  `[lanes] max` and the worker's `lanes`, not toward `[sessions] cap`; their spend is not read on
+  the hub yet.
+- A lane message that ends in doubt after it was written (no session-file entry within 30 s, or
+  an unanswered write) now fences the lane and tells the lead and the owner; before, only the
+  delivery record said so.
+- One base64 encoder and decoder (`sys::base64`) replaces the two copies.
+- A Telegram, Slack or Discord message read live is no longer handed to the lead by a round that
+  finds it queued before its arrival finished. Such a hand-off lost the message's wake from
+  `cataly stats` (`*_wake_latency`) and left its read time in the hub's memory for good. The
+  round now waits for the arrival, and no read time outlives its message, also when the message
+  leaves the queue without a hand-off (a reset, a channel leaving scope).
 
 ## 0.2.4 (2026-11-27)
 

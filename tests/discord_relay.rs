@@ -12,6 +12,8 @@
 
 mod support;
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -583,11 +585,9 @@ fn a_restart_mid_answer_keeps_the_rest_with_its_first_part() {
     assert!(hub.stop().success());
 }
 
-/// After a restart in the middle of an answer whose first part is in the thread, the rest follows
-/// it into the thread from the stored part alone: no read of Discord is needed (here every read of
-/// that part fails), and nothing goes to the channel.
+/// Restart uses the durable destination even when remote message reads are unavailable.
 #[test]
-fn a_restart_mid_answer_in_a_thread_keeps_the_rest_there() {
+fn a_saved_destination_survives_failed_reads_after_restart() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     hub.fixture(
@@ -618,9 +618,17 @@ fn a_restart_mid_answer_in_a_thread_keeps_the_rest_there() {
     fake.fail_reads(&read_back, 503);
     let before = in_thread();
     hub.start();
-    fake.wait(WAIT, |_| (in_thread() > before).then_some(()));
-    settled(&hub);
-    assert!(fake.calls("GET", &read_back).is_empty(), "no read back");
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    assert!(
+        in_thread() > before,
+        "the pending part resumes at its saved destination"
+    );
+    assert!(
+        fake.calls("GET", &read_back).is_empty(),
+        "no destination rediscovery"
+    );
     assert_eq!(
         fake.bot_messages(source).len(),
         2,
@@ -634,10 +642,7 @@ fn a_restart_mid_answer_in_a_thread_keeps_the_rest_there() {
     assert!(hub.stop().success());
 }
 
-/// After a restart in the middle of an answer whose first part is in a thread that has since been
-/// deleted (404, unknown channel) or shut to the bot (403), the thread refuses the next part and
-/// the rest moves to the channel, its first part as the reply to the request, as when the thread
-/// closes while the hub runs; later answers are not held up.
+/// A definitely rejected pending part may move after restart when its saved thread refuses it.
 #[test]
 fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
     for (message, refusal) in [
@@ -701,20 +706,18 @@ fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
             "{refusal}: the part as stored: {text}"
         );
         assert_eq!(
-            fake.bot_messages(&source).len(),
-            1,
-            "{refusal}: the thread keeps part 1"
+            in_thread(),
+            before + 1,
+            "{refusal}: the saved destination is tried once before the definite fallback"
         );
         settled(&hub);
         assert!(hub.stop().success());
     }
 }
 
-/// A thread the lead started from the request with the bot (the work thread), here claimed by a
-/// lane, takes the answer like any thread started from it; the owner's next message in that
-/// thread goes to the lane, as lane-thread routing does, not to the lead.
+/// A lane-owned thread keeps the lead's pointer in the channel; later thread messages go to the lane.
 #[test]
-fn an_answer_goes_into_a_lane_thread_started_from_the_request() {
+fn a_lane_thread_keeps_the_leads_answer_in_the_channel() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     let work = hub.root.join("work");
@@ -756,14 +759,17 @@ fn an_answer_goes_into_a_lane_thread_started_from_the_request() {
             .filter(|m| m["content"] == "lead answer")
             .collect::<Vec<_>>()
     };
-    let answer = answers(source);
+    let answer = answers(CH);
     assert_eq!(
         answer.len(),
         1,
-        "the answer is in the lane's thread: {answer:?}"
+        "the owner sees the lead's pointer in the channel"
     );
-    assert!(answer[0].get("message_reference").is_none());
-    assert!(answers(CH).is_empty(), "nothing in the channel");
+    assert_eq!(answer[0]["message_reference"]["message_id"], source);
+    assert!(
+        answers(source).is_empty(),
+        "no duplicate pointer in the lane thread"
+    );
     // The owner follows up in the thread: the lane takes it, the lead does not. A thread that
     // appears while the hub runs is read from the hub's start on, so the message is made now.
     let since_epoch = std::time::SystemTime::now()
@@ -1529,6 +1535,714 @@ fn owed_messages_bring_a_reminder_after_a_minute() {
     assert!(hub.stop().success());
 }
 
+/// The lead's side of the bridge, as its OMP extension speaks it, for calls of its tool.
+struct ToolBridge {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+    session: Value,
+    next: u64,
+}
+
+impl ToolBridge {
+    /// Connects as the live lead with its launch token.
+    fn connect(hub: &TestHub) -> Self {
+        let session = hub.until(WAIT, || {
+            let v = hub.json(&["lead", "status", "--json"]);
+            (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
+        });
+        let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
+        let token = launch
+            .lines()
+            .rfind(|l| l.split(' ').nth(1) == session.as_str())
+            .and_then(|l| l.split(' ').next())
+            .unwrap()
+            .to_string();
+        let writer = UnixStream::connect(hub.socket()).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(180)))
+            .unwrap();
+        let reader = BufReader::new(writer.try_clone().unwrap());
+        let mut bridge = Self {
+            reader,
+            writer,
+            session: session.clone(),
+            next: 1,
+        };
+        bridge.call(
+            "bridge.hello",
+            &json!({ "ext": 1, "token": token, "session": session, "agent": "main" }),
+        );
+        bridge
+    }
+
+    fn call(&mut self, method: &str, params: &Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        let line = json!({ "v": 1, "id": id, "method": method, "params": params });
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        loop {
+            let mut reply = String::new();
+            self.reader.read_line(&mut reply).unwrap();
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            if v["id"] == id {
+                return v["ok"].clone();
+            }
+        }
+    }
+
+    /// One `cataly_lead` call: its text and whether it is an error.
+    fn tool(&mut self, input: &Value) -> (String, bool) {
+        let call = format!("call-{}", self.next);
+        let params =
+            json!({ "call": call, "tool": "cataly_lead", "session": self.session, "input": input });
+        let v = self.call("bridge.tool", &params);
+        (
+            v["text"].as_str().unwrap_or_default().to_string(),
+            v["error"] == true,
+        )
+    }
+}
+
+/// Records a question with `question.ask` in `CH`; its ID and the ID of its message.
+fn record_question(lead: &mut ToolBridge, input: &Value) -> (String, String) {
+    let mut input = input.clone();
+    input["op"] = json!("question.ask");
+    input["source"] = json!(format!("discord:{CH}/800000000000000001"));
+    input["room"] = json!(CH);
+    let (said, error) = lead.tool(&input);
+    assert!(!error && said.contains("posted in"), "{said}");
+    let id = said.split_whitespace().nth(1).unwrap().to_string();
+    let message = said.split_whitespace().last().unwrap().to_string();
+    (id, message)
+}
+
+/// A recorded question's state and outcome in the ledger.
+fn ledger(hub: &TestHub, id: &str) -> (String, Option<String>) {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT state, outcome FROM questions WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// The bot's message `id` in `CH` once it has no buttons any more.
+fn closed(fake: &FakeDiscord, id: &str) -> Value {
+    fake.wait(WAIT, |f| {
+        f.bot_messages(CH)
+            .into_iter()
+            .find(|m| m["id"] == id && m["components"].as_array().is_none_or(Vec::is_empty))
+    })
+}
+
+/// The `n`-th interaction callback, once it was answered.
+fn callback(fake: &FakeDiscord, n: usize) -> support::discord::Seen {
+    callbacks(fake, n + 1).swap_remove(n)
+}
+
+/// An owner reply to message `to` in `CH`.
+fn reply_to(id: u64, to: &str, text: &str) -> Value {
+    let mut m = FakeDiscord::message(CH, id, OWNER, text);
+    m["message_reference"] = json!({ "message_id": to, "channel_id": CH });
+    m
+}
+
+/// A question the lead records with `question.ask` gets one button per option, the recommended
+/// one styled primary. Someone else's press is refused and records nothing; the owner's press
+/// records the option like a reply naming it, tells the lead which question it answered and
+/// closes the buttons; a later press is refused and a later reply is not recorded again.
+#[test]
+fn a_question_button_answers_the_recorded_question_once() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Ship it?", "options": ["yes", "no", "later"], "recommended": 2 }),
+    );
+    let posted = fake
+        .bot_messages(CH)
+        .into_iter()
+        .find(|m| m["id"] == message.as_str())
+        .unwrap();
+    let content = posted["content"].as_str().unwrap();
+    assert!(content.contains(&format!("**Question {id}**")), "{content}");
+    assert!(content.contains("Reply to this message with a number or your answer."));
+    let row = &posted["components"][0]["components"];
+    assert_eq!(row.as_array().unwrap().len(), 3, "{posted}");
+    assert_eq!(row[0]["label"], "1. yes");
+    assert_eq!(row[1]["custom_id"], format!("cy:{id}:1"));
+    assert_eq!(row[1]["style"], 1, "recommended is primary");
+    assert_eq!(row[0]["style"], 2);
+
+    fake.press(OTHER, CH, &message, &format!("cy:{id}:0"));
+    let refusal = callback(&fake, 0);
+    assert_eq!(refusal.body["type"], 4);
+    assert_eq!(refusal.body["data"]["flags"], 64);
+    assert_eq!(ledger(&hub, &id), ("open".into(), None));
+
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
+    assert_eq!(callback(&fake, 1).body["type"], 6, "deferred update");
+    let (state, outcome) = hub.until(WAIT, || {
+        let l = ledger(&hub, &id);
+        (l.0 != "open").then_some(l)
+    });
+    assert_eq!(state, "answered");
+    let outcome = outcome.unwrap();
+    assert!(outcome.ends_with(": option 2 (no)"), "{outcome}");
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("Answered by the owner: 2. no"),
+        "{edited}"
+    );
+    let told = hub.until(WAIT, || {
+        hub.events()
+            .into_iter()
+            .find(|e| e["kind"] == "question.answered")
+    });
+    assert_eq!(told["urgent"], true, "{told}");
+    let said = format!("question {id}: option 2 (no) — Ship it?");
+    assert!(told["text"].as_str().unwrap().contains(&said), "{told}");
+    hub.until(WAIT, || {
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        (text.contains("[event question.answered]") && text.contains(&said)).then_some(())
+    });
+
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
+    let late = callback(&fake, 2);
+    assert_eq!(late.body["type"], 4, "a press after the answer is refused");
+    assert_eq!(late.body["data"]["flags"], 64);
+    fake.say(reply_to(800_000_000_000_000_401, &message, "1"));
+    hub.until(WAIT, || {
+        requests(&hub)
+            .into_iter()
+            .find(|r| r.contains("800000000000000401"))
+    });
+    assert!(
+        !requests(&hub)
+            .iter()
+            .any(|r| r.contains("answers question")),
+        "the reply is an ordinary message"
+    );
+    assert_eq!(ledger(&hub, &id), ("answered".into(), Some(outcome)));
+    assert_eq!(
+        hub.events()
+            .iter()
+            .filter(|e| e["kind"] == "question.answered")
+            .count(),
+        1
+    );
+    assert!(hub.stop().success());
+}
+
+/// A recommended option is never chosen by itself, whatever the quiet time of OMP's questions. A
+/// reply naming an option answers the question and closes its buttons; a press after that is
+/// refused and records nothing.
+#[test]
+fn a_reply_closes_the_question_buttons_and_nothing_is_chosen_by_itself() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "form_default_after = \"1s\"\n");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Which?", "options": ["a", "b"], "recommended": 1 }),
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(ledger(&hub, &id), ("open".into(), None));
+    let posted = fake
+        .bot_messages(CH)
+        .into_iter()
+        .find(|m| m["id"] == message.as_str())
+        .unwrap();
+    assert_eq!(posted["components"][0]["components"][0]["style"], 1);
+    assert!(fake.calls("POST", "/callback").is_empty());
+    assert!(
+        hub.events()
+            .iter()
+            .all(|e| e["kind"] != "question.answered")
+    );
+
+    fake.say(reply_to(800_000_000_000_000_411, &message, "2"));
+    let request = hub.until(WAIT, || {
+        requests(&hub)
+            .into_iter()
+            .find(|r| r.contains("800000000000000411"))
+    });
+    assert!(
+        request.contains(&format!(
+            "this message answers question {id} (Which?): option 2 (b)"
+        )),
+        "{request}"
+    );
+    let (state, outcome) = ledger(&hub, &id);
+    assert_eq!(state, "answered");
+    assert!(
+        outcome
+            .as_deref()
+            .unwrap()
+            .ends_with("800000000000000411: option 2 (b)")
+    );
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("Answered by the owner: 2. b"),
+        "{edited}"
+    );
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
+    assert_eq!(callback(&fake, 0).body["type"], 4);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(ledger(&hub, &id), (state, outcome));
+    assert!(
+        hub.events()
+            .iter()
+            .all(|e| e["kind"] != "question.answered")
+    );
+    assert!(hub.stop().success());
+}
+
+/// Settling a question with the lead's tool (an answer recorded by hand, a withdrawal) closes its
+/// buttons too, and a press after that is refused.
+#[test]
+fn settling_a_question_by_tool_closes_its_buttons() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (first, first_message) =
+        record_question(&mut lead, &json!({ "text": "One?", "options": ["a", "b"] }));
+    let (second, second_message) =
+        record_question(&mut lead, &json!({ "text": "Two?", "options": ["c", "d"] }));
+    let (said, error) =
+        lead.tool(&json!({ "op": "question.withdraw", "id": first, "reason": "moot" }));
+    assert!(!error, "{said}");
+    let edited = closed(&fake, &first_message);
+    assert!(
+        edited["content"].as_str().unwrap().contains("Withdrawn"),
+        "{edited}"
+    );
+    let (said, error) = lead.tool(&json!({
+        "op": "question.answer", "id": second, "text": "d", "message": "800000000000000421"
+    }));
+    assert!(!error, "{said}");
+    let edited = closed(&fake, &second_message);
+    assert!(
+        edited["content"].as_str().unwrap().contains("Answered"),
+        "{edited}"
+    );
+    fake.press(OWNER, CH, &first_message, &format!("cy:{first}:0"));
+    assert_eq!(callback(&fake, 0).body["type"], 4);
+    assert_eq!(ledger(&hub, &first).0, "withdrawn");
+    let (third, third_message) = record_question(
+        &mut lead,
+        &json!({ "text": "Three?", "options": ["e", "f"],
+            "settle": "lead", "thread": format!("discord:{CH}") }),
+    );
+    let (said, error) = lead.tool(&json!({
+        "op": "question.choose", "id": third, "option": 2,
+        "reason": "the agreed default", "message": "800000000000000422"
+    }));
+    assert!(!error, "{said}");
+    let edited = closed(&fake, &third_message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("Chosen by the lead: 2. f"),
+        "{edited}"
+    );
+    assert_eq!(ledger(&hub, &third).0, "chosen");
+    assert!(hub.stop().success());
+}
+
+/// Without buttons over the Gateway (the application has an interactions endpoint URL) a question
+/// is posted as text only, as before; a reply still answers it.
+#[test]
+fn without_gateway_buttons_a_question_is_text_only() {
+    let fake = FakeDiscord::start();
+    fake.set_interactions_url("https://example.org/interactions");
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Which?", "options": ["a", "b"] }),
+    );
+    let posted = fake
+        .bot_messages(CH)
+        .into_iter()
+        .find(|m| m["id"] == message.as_str())
+        .unwrap();
+    assert!(
+        posted["components"].as_array().is_none_or(Vec::is_empty),
+        "{posted}"
+    );
+    assert!(
+        posted["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Reply to this message with a number or your answer.")
+    );
+    fake.say(reply_to(800_000_000_000_000_431, &message, "1"));
+    let (state, _) = hub.until(WAIT, || {
+        let l = ledger(&hub, &id);
+        (l.0 != "open").then_some(l)
+    });
+    assert_eq!(state, "answered");
+    assert!(hub.stop().success());
+}
+
+/// A press on a question near Discord's size limit (1000 characters, four options of 200): the
+/// lead's event still names the whole chosen option, and the closed message still says which
+/// option the owner chose, its question cut short to make room.
+#[test]
+fn a_press_on_a_long_question_keeps_the_choice_in_view() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let options: Vec<String> = ["a", "b", "c", "d"].iter().map(|c| c.repeat(200)).collect();
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "q".repeat(1000), "options": options, "recommended": 1 }),
+    );
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
+    let told = hub.until(WAIT, || {
+        hub.events()
+            .into_iter()
+            .find(|e| e["kind"] == "question.answered")
+    });
+    let text = told["text"].as_str().unwrap();
+    let chosen = format!("question {id}: option 2 ({})", options[1]);
+    assert!(text.contains(&chosen), "{text}");
+    let edited = closed(&fake, &message);
+    let content = edited["content"].as_str().unwrap();
+    assert!(content.encode_utf16().count() <= 2000, "{content}");
+    assert!(
+        content.ends_with(&format!("…\n\nAnswered by the owner: 2. {}", options[1])),
+        "{content}"
+    );
+    assert!(hub.stop().success());
+}
+
+/// Presses recorded just before the hub stopped, their events not yet written: the next start
+/// tells the lead about each (more than one page of them) and closes the question's buttons, once.
+/// An outcome in other words than today's is passed on as recorded.
+#[test]
+fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Which?", "options": ["a", "b"] }),
+    );
+    drop(lead);
+    assert!(hub.stop().success());
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    let settled = db
+        .execute(
+            "UPDATE questions SET state = 'answered', outcome = 'owner press 7: option 2 (b)', \
+             settled_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    assert_eq!(settled, 1);
+    let copies = "INSERT INTO questions (id, text, source, options, state, outcome, created_ms, \
+                  settled_ms) SELECT ?1, text, source, options, state, ?2, created_ms, settled_ms \
+                  FROM questions WHERE id = ?3";
+    for n in 0..60 {
+        let outcome = "owner press 8: option 1 (a)";
+        db.execute(copies, [&format!("copy{n:02}"), outcome, &id])
+            .unwrap();
+    }
+    db.execute(copies, ["older", "owner press 9: an older wording", &id])
+        .unwrap();
+    drop(db);
+    hub.start();
+    ready(&hub);
+    let answered = |hub: &TestHub| -> Vec<Value> {
+        hub.events()
+            .into_iter()
+            .filter(|e| e["kind"] == "question.answered")
+            .collect()
+    };
+    let all = hub.until(WAIT, || Some(answered(&hub)).filter(|a| a.len() == 62));
+    let told = all.iter().find(|e| e["subject"] == id.as_str()).unwrap();
+    let older = all.iter().find(|e| e["subject"] == "older").unwrap();
+    assert!(
+        older["text"]
+            .as_str()
+            .unwrap()
+            .contains(": an older wording — Which?"),
+        "{older}"
+    );
+    let said = format!("question {id}: option 2 (b) — Which?");
+    assert!(told["text"].as_str().unwrap().contains(&said), "{told}");
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Answered by the owner: 2. b"),
+        "{edited}"
+    );
+    assert!(hub.stop().success());
+    hub.start();
+    ready(&hub);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(answered(&hub).len(), 62, "told once");
+    assert!(hub.stop().success());
+}
+
+/// A failed callback cannot settle a question; a later acknowledged choice wins instead.
+#[test]
+fn a_failed_question_acknowledgement_keeps_the_question_open() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) =
+        record_question(&mut lead, &json!({ "text": "Ack?", "options": ["a", "b"] }));
+    fake.script_callbacks(&[500]);
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
+    callback(&fake, 0);
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
+    callback(&fake, 1);
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"].as_str().unwrap().contains("2. b"),
+        "{edited}"
+    );
+    let (state, outcome) = ledger(&hub, &id);
+    assert_eq!(state, "answered");
+    assert!(outcome.unwrap().ends_with("option 2 (b)"));
+    assert_eq!(
+        fake.calls("POST", "/callback").len(),
+        2,
+        "no callback retry"
+    );
+    assert!(hub.stop().success());
+}
+
+/// An accepted POST with lost acknowledgements is retained, not offered for another post.
+#[test]
+fn an_unacknowledged_question_post_remains_in_the_ledger() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    fake.script_in(CH, &[500; 4]);
+    let (said, error) = lead.tool(&json!({
+        "op": "question.ask", "text": "Uncertain?", "options": ["a", "b"],
+        "source": "discord:1/2", "room": CH
+    }));
+    assert!(!error && said.contains("in doubt"), "{said}");
+    assert!(!said.contains("ask it yourself"), "{said}");
+    let id = said.split_whitespace().nth(1).unwrap();
+    assert_eq!(ledger(&hub, id), ("open".into(), None));
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        1,
+        "one nonce, one visible question"
+    );
+    let (said, error) = lead.tool(&json!({
+        "op": "question.withdraw", "id": id, "reason": "resolve the uncertain question"
+    }));
+    assert!(!error, "{said}");
+    assert_eq!(ledger(&hub, id).0, "withdrawn");
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        1,
+        "settlement never posts again"
+    );
+    assert!(hub.stop().success());
+}
+
+fn answer_state(hub: &TestHub, source: &str) -> String {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT answer FROM handoffs WHERE relay = 'discord' AND message = ?1",
+        [source],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+#[test]
+fn review_restart_follows_the_last_confirmed_parts_destination() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(1000)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000301";
+    fake.script_in(source, &[0, 403]);
+    let mut channel = vec![0, 0]; // continuation note, confirmed second part
+    channel.extend([400; 64]); // third part definitely not accepted yet
+    fake.script_in(CH, &channel);
+    ask_with_thread(&fake, 800_000_000_000_000_301, "three parts, then restart");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() >= 3).then_some(())
+    });
+    assert!(hub.stop().success());
+    fake.unscript_in(CH);
+    hub.start();
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    assert_eq!(
+        fake.bot_messages(source).len(),
+        1,
+        "never return to part one's room"
+    );
+    assert_eq!(
+        fake.bot_messages(CH).len(),
+        3,
+        "note and parts two and three"
+    );
+    assert!(hub.stop().success());
+}
+
+#[test]
+fn review_an_uncertain_part_is_not_moved_when_its_thread_closes() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000302";
+    let mut thread = vec![0];
+    thread.extend([500; 4]); // accepted part, no acknowledgement
+    thread.extend([403; 64]);
+    fake.script_in(source, &thread);
+    ask_with_thread(&fake, 800_000_000_000_000_302, "uncertain then closed");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{source}/messages"))
+            .len()
+            >= 6)
+            .then_some(())
+    });
+    assert!(hub.stop().success());
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "no cross-destination resend after uncertainty"
+    );
+    assert_eq!(fake.bot_messages(source).len(), 2);
+    assert_eq!(
+        answer_state(&hub, source),
+        "posting",
+        "the answer stays in doubt"
+    );
+}
+
+#[test]
+fn review_an_uncertain_first_part_keeps_its_destination_after_restart() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000303";
+    fake.script_in(source, &[500; 64]);
+    ask_with_thread(&fake, 800_000_000_000_000_303, "uncertain first part");
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{source}/messages"))
+            .len()
+            >= 2)
+            .then_some(())
+    });
+    assert!(hub.stop().success());
+    // A fresh lookup would now select the channel, but the accepted part is already in the thread.
+    fake.lock_thread(CH, source);
+    fake.unscript_in(source);
+    hub.start();
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "a changed lookup must not duplicate an uncertain first part"
+    );
+    assert_eq!(fake.bot_messages(source).len(), 1);
+    assert!(hub.stop().success());
+}
+
+#[test]
+fn review_a_moved_part_restores_its_reply_link_after_restart() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some(&json!("word ".repeat(600)).to_string()),
+    );
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000304";
+    fake.script_in(source, &[0, 403]);
+    let mut channel = vec![0];
+    channel.extend([400; 64]);
+    fake.script_in(CH, &channel);
+    ask_with_thread(
+        &fake,
+        800_000_000_000_000_304,
+        "move then restart before confirmation",
+    );
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() >= 2).then_some(())
+    });
+    assert!(hub.stop().success());
+    fake.unscript_in(CH);
+    hub.start();
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    let messages = fake.bot_messages(CH);
+    assert_eq!(
+        messages.len(),
+        2,
+        "one continuation note and one moved part"
+    );
+    assert_eq!(messages[1]["message_reference"]["message_id"], source);
+    assert!(hub.stop().success());
+}
+
 /// A hub whose lead answers only with its tool (`[lead] answers = "tool"`).
 fn tool_hub(fake: &FakeDiscord, fixtures: &[&str]) -> TestHub {
     let hub = relay_hub(fake, fixtures, "");
@@ -1939,81 +2653,36 @@ fn onboarding_lets_answers_in_place_through_and_nothing_else() {
     assert!(hub.stop().success());
 }
 
-/// Turns the stored parts of one source back into the form an earlier version wrote: the remote
-/// ID alone, without the room. The hub must be stopped.
-fn as_legacy_rows(hub: &TestHub, source: &str) {
-    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
-    let n = db
-        .execute(
-            "UPDATE outbox_parts SET remote = substr(remote, instr(remote, '/') + 1) \
-             WHERE relay = 'discord' AND source = ?1 AND remote LIKE '%/%'",
-            [source],
-        )
-        .unwrap();
-    assert!(n > 0, "rows rewritten");
-}
-
-/// A follow-up to an answer an earlier version posted in the thread (its stored part names no
-/// room) goes to that thread: the hub reads the part back to find it.
+/// An answer sent to another room whose first part was in doubt at a restart stays pinned to that
+/// room: once the room takes posts again the part goes there, and nothing goes to the channel.
 #[test]
-fn a_follow_up_to_an_answer_stored_without_its_room_finds_the_thread() {
-    let fake = FakeDiscord::start();
-    let mut hub = tool_hub(&fake, &[]);
-    hub.start();
-    ready(&hub);
-    let thread = ask_with_thread(&fake, 800_000_000_000_000_361, "legacy row");
-    hub.until(WAIT, || (requests(&hub).len() == 1).then_some(()));
-    let message = format!("discord:{CH}/{thread}");
-    let (mut lead, _) = LeadBridge::connect(&hub);
-    let (said, error) = lead.tool(&json!({ "op": "answer", "message": message, "text": "first" }));
-    assert!(!error && said.contains("posted as its reply"), "{said}");
-    drop(lead);
-    assert!(hub.stop().success());
-    as_legacy_rows(&hub, &thread);
-    hub.start();
-    ready(&hub);
-    let (mut lead, _) = LeadBridge::connect(&hub);
-    let (said, error) = lead.tool(&json!({ "op": "answer", "message": message, "text": "later" }));
-    assert!(!error && said.contains("follow-up"), "{said}");
-    let posted = fake.bot_messages(&thread);
-    assert_eq!(posted.len(), 2, "{posted:?}");
-    assert_eq!(posted[1]["content"], "later");
-    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
-    assert!(hub.stop().success());
-}
-
-/// An answer sent to another room whose first part was still out in the open at a restart may
-/// still go to the request's room when that room refuses it afterwards, as before the restart.
-#[test]
-fn an_answer_in_another_room_refused_after_a_restart_replies_in_the_channel() {
+fn an_answer_in_another_room_in_doubt_at_a_restart_stays_there() {
     const ROOM: &str = "600000000000000079";
     let fake = FakeDiscord::start();
     let mut hub = tool_hub(&fake, &[]);
     fake.channel(ROOM, 0, None);
     hub.start();
     ready(&hub);
-    let source = ask_tool_lead(
-        &hub,
-        &fake,
-        800_000_000_000_000_371,
-        "refused after restart",
-    );
+    let source = ask_tool_lead(&hub, &fake, 800_000_000_000_000_371, "in doubt at restart");
     let message = format!("discord:{CH}/{source}");
-    // One call's four attempts end uncertain without reaching Discord; every later one is refused
-    // for its own sake.
-    let mut script = vec![502; 4];
-    script.extend([400; 64]);
-    fake.script_in(ROOM, &script);
+    // Every attempt before the restart ends uncertain without reaching Discord.
+    fake.script_in(ROOM, &[502; 64]);
     let (mut lead, _) = LeadBridge::connect(&hub);
     let (said, error) =
         lead.tool(&json!({ "op": "answer", "message": message, "text": "x", "room": ROOM }));
     assert!(!error && said.contains("retried by itself"), "{said}");
     drop(lead);
     assert!(hub.stop().success());
+    fake.unscript_in(ROOM);
     hub.start();
-    let reply = fake.wait(WAIT, |f| f.bot_messages(CH).pop());
-    assert_eq!(reply["message_reference"]["message_id"], source.as_str());
+    let posted = fake.wait(WAIT, |f| {
+        let posted = f.bot_messages(ROOM);
+        (!posted.is_empty()).then_some(posted)
+    });
+    assert_eq!(posted.len(), 1, "{posted:?}");
+    assert_eq!(posted[0]["content"], "x");
     settled(&hub);
+    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
     assert!(hub.stop().success());
 }
 

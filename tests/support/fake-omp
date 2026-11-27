@@ -16,15 +16,16 @@
 #                               prompt_result and session_settled. omp-data/slow makes the turn take 2 s
 #                               in the background (get_state then reports streaming, and a prompt or
 #                               follow-up meanwhile waits for the turn end, as OMP's follow-up does);
-#                               omp-data/followup (a JSON string) adds a background result after the
-#                               answer and a second turn ending with that text;
 #                               with omp-data/hold (a text) a message containing that text waits for
 #                               omp-data/release before its answer;
+#                               omp-data/followup (a JSON string) adds a background result after the
+#                               answer and a second turn ending with that text;
 #                               omp-data/noentry answers the prompt and writes nothing; with omp-data/ask
 #                               a message containing ASK opens the HTML `form` dialog stock OMP's ask
 #                               tool sends, and the turn ends when it is answered: "picked <choice>";
 #                               with omp-data/approve a message containing APPROVE opens the approval
 #                               select stock OMP sends under always-ask, ended the same way.
+#                               Every prompt, follow-up and steer line is appended to omp-data/prompts.
 #   with omp-data/slow-start     the first rpc-ui start answers nothing until its input closes, then
 #                               exits 1 (a start slower than the probe allows, as after an OMP update
 #                               under load); the fixture is used up and later starts are normal.
@@ -212,7 +213,9 @@ rpc() {
         fi
         printf '{"type":"response","id":"%s","command":"%s","success":%s,"data":%s}\n' "$cid" "$kind" "$ok" "$data"
         case "$kind" in
-        prompt | follow_up | steer) [ -f "$dir/turns" ] && turn "$line" "$cid" ;;
+        prompt | follow_up | steer)
+            printf '%s\n' "$line" >> "$dir/prompts"
+            [ -f "$dir/turns" ] && turn "$line" "$cid" ;;
         esac
     done
 }

@@ -42,7 +42,6 @@ pub(crate) struct Limit {
     pub(crate) reset_ms: Option<i64>,
     /// Window length in ms (unverified field names; falls back to the label, like "5h" or "7d").
     pub(crate) window_ms: Option<i64>,
-    pub(crate) fetched_ms: Option<i64>,
     /// The limit counts money, not quota: Claude's extra usage (window `extra`) or a prepaid extra
     /// balance (unit `usd`). OMP lists it only while the account has paid extra usage enabled.
     pub(crate) paid: bool,
@@ -58,7 +57,6 @@ impl Limit {
 /// A parsed usage answer.
 #[derive(Debug, Clone, PartialEq, Default)]
 pub(crate) struct Usage {
-    pub(crate) generated_ms: Option<i64>,
     pub(crate) limits: Vec<Limit>,
     /// Accounts OMP lists without usage data (count only; names are never kept).
     pub(crate) accounts_without_data: usize,
@@ -117,7 +115,6 @@ pub(crate) fn parse_usage(bytes: &[u8]) -> Result<Usage, String> {
         .ok_or("usage output has no reports list")?;
     let count = |key: &str| root.get(key).and_then(Value::as_array).map_or(0, Vec::len);
     let mut usage = Usage {
-        generated_ms: root.get("generatedAt").and_then(instant_ms),
         limits: Vec::new(),
         accounts_without_data: count("accountsWithoutUsage"),
         disabled_credentials: count("disabledCredentials"),
@@ -136,7 +133,6 @@ pub(crate) fn parse_usage(bytes: &[u8]) -> Result<Usage, String> {
             ordinals.push((provider.clone(), 1));
             1
         };
-        let fetched_ms = report.get("fetchedAt").and_then(instant_ms);
         let limits = report
             .get("limits")
             .and_then(Value::as_array)
@@ -190,7 +186,6 @@ pub(crate) fn parse_usage(bytes: &[u8]) -> Result<Usage, String> {
                 used_percent,
                 reset_ms,
                 window_ms,
-                fetched_ms,
                 paid: first(limit, &[&["scope", "windowId"]]).and_then(Value::as_str)
                     == Some("extra")
                     || first(limit, &[&["amount", "unit"]]).and_then(Value::as_str) == Some("usd"),
@@ -380,7 +375,6 @@ pub(crate) mod tests {
     #[test]
     fn parses_the_verified_shape() {
         let u = parse_usage(VERIFIED.as_bytes()).unwrap();
-        assert_eq!(u.generated_ms, Some(1_795_554_930_728));
         assert_eq!(u.limits.len(), 1);
         let l = &u.limits[0];
         assert_eq!(l.key(), "cyfake#1/five");
