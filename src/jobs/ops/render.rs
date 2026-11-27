@@ -90,6 +90,8 @@ pub(crate) enum LeadState {
     Blocked,
     Error,
     Starting,
+    /// Its start passed the 15 s notice or waits for a retry; the conversation is kept.
+    Recovering,
     Stopped,
     Held,
     /// Its OMP stopped after a long idle; a normal state that wakes on the next message.
@@ -339,6 +341,7 @@ impl Panel {
             || high
             || !self.issues.is_empty()
             || self.people.lead == LeadState::Error
+            || self.people.lead == LeadState::Recovering
         {
             Level::Watch
         } else {
@@ -459,6 +462,7 @@ fn people_value(p: &People, lang: Language) -> String {
         LeadState::Blocked => t(lang, "답 기다림", "waiting for you"),
         LeadState::Error => t(lang, "오류", "error"),
         LeadState::Starting => t(lang, "시작 중", "starting"),
+        LeadState::Recovering => t(lang, "복구 중(대화 보존)", "recovering, conversation kept"),
         LeadState::Stopped => t(lang, "멈춤", "stopped"),
         LeadState::Held => t(lang, "보류", "held"),
         LeadState::Asleep => t(lang, "쉬는 중", "asleep"),

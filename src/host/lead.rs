@@ -14,6 +14,7 @@
 //! 300-second episode. A lead idle for `[lead] idle_sleep` is woken on the same session
 //! when a message needs it ([`sleep`]).
 
+mod notice;
 pub(crate) mod ownership;
 mod sleep;
 
@@ -103,6 +104,138 @@ pub(crate) struct View {
     pub(crate) asleep: Option<Asleep>,
     pub(crate) anchor: Option<AnchorView>,
     pub(crate) recovery: Option<crate::store::host::episode::Episode>,
+    /// The attempt starting now and how the last one ended, with the last lease answer.
+    pub(crate) attempt: Attempt,
+    /// A start is in its recovery: past the 15 s notice, or a retry is planned.
+    pub(crate) recovering: bool,
+    /// While held: the text the owner was told, in his language.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub(crate) notice: Option<String>,
+    /// The target, startup and recovery evidence as `cataly lead status` prints it.
+    pub(crate) startup: Vec<String>,
+}
+
+impl View {
+    /// The target's ID and path, the startup phase with its elapsed time, the attempt count and
+    /// next retry, how the last attempt ended with its cleanup, and the last lease answer.
+    fn startup_lines(&self, now: i64) -> Vec<String> {
+        let ago = |ms: i64| (now - ms).max(0) / 1000;
+        let until = |ms: i64| ((ms - now).max(0) + 999) / 1000;
+        let attempts = 1 + super::startup::RETRY_DELAYS.len();
+        let mut lines = Vec::new();
+        if let Some(a) = &self.anchor {
+            lines.push(format!("target   {} {}", a.session_id, a.session_file));
+        }
+        let episode = self.recovery.as_ref();
+        let attempt = episode
+            .filter(|e| e.state == "active")
+            .map_or(1, |e| e.retries.saturating_add(1));
+        if let (Phase::Starting, Some(started)) = (&self.phase, self.attempt.started_ms) {
+            lines.push(format!(
+                "startup  starting for {} s, attempt {attempt} of up to {attempts}; notice at {} s, attempt deadline {} s",
+                ago(started),
+                super::startup::STARTUP_NOTICE.as_secs(),
+                super::startup::STARTUP_BUDGET.as_secs()
+            ));
+        }
+        if let Some(e) = episode {
+            match e.state.as_str() {
+                "active" => {
+                    let next = e
+                        .next_ms
+                        .map_or_else(String::new, |n| format!("; next retry in {} s", until(n)));
+                    lines.push(format!(
+                        "recovery {} retr{} of {}{next}; the {} s recovery ends in {} s",
+                        e.retries,
+                        if e.retries == 1 { "y" } else { "ies" },
+                        super::startup::RETRY_DELAYS.len(),
+                        super::startup::EPISODE_BUDGET.as_secs(),
+                        until(e.deadline_ms)
+                    ));
+                }
+                "bound" => {}
+                state => lines.push(format!(
+                    "recovery {state} after {} retr{}: {}",
+                    e.retries,
+                    if e.retries == 1 { "y" } else { "ies" },
+                    e.detail.as_deref().unwrap_or("-")
+                )),
+            }
+        }
+        let name = |value: serde_json::Result<Value>| {
+            value
+                .ok()
+                .and_then(|v| v.as_str().map(str::to_string))
+                .unwrap_or_default()
+        };
+        if let Some(f) = &self.attempt.failed {
+            let how = match (f.stage, f.outcome) {
+                (Some(stage), Some(outcome)) => format!(
+                    "{} {}",
+                    name(serde_json::to_value(stage)),
+                    name(serde_json::to_value(outcome))
+                ),
+                _ => "failed".into(),
+            };
+            let cleanup = f.cleanup.map_or_else(String::new, |c| {
+                format!("; cleanup {}", name(serde_json::to_value(c)))
+            });
+            lines.push(format!(
+                "last     {how} {} s ago{cleanup}: {}",
+                ago(f.at_ms),
+                f.detail
+            ));
+        }
+        if let Some(l) = &self.attempt.lease {
+            lines.push(format!(
+                "lease    {} for {}, checked {} s ago",
+                name(serde_json::to_value(l.lease)),
+                l.session_id,
+                ago(l.at_ms)
+            ));
+        }
+        lines
+    }
+}
+
+/// The start attempt evidence `cataly lead status` and `cataly health` show.
+#[derive(Clone, Debug, Default, Serialize)]
+pub(crate) struct Attempt {
+    /// When the attempt starting now began (ms); `None` while none starts.
+    pub(crate) started_ms: Option<i64>,
+    /// How the last attempt that did not bind ended.
+    pub(crate) failed: Option<Failed>,
+    /// The last lease answer for the lead's session.
+    pub(crate) lease: Option<LeaseSeen>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct Failed {
+    pub(crate) at_ms: i64,
+    pub(crate) stage: Option<super::startup::StartupStage>,
+    pub(crate) outcome: Option<super::startup::StartupOutcome>,
+    /// The process-ownership evidence of the attempt's cleanup.
+    pub(crate) cleanup: Option<super::startup::Cleanup>,
+    pub(crate) detail: String,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub(crate) struct LeaseSeen {
+    pub(crate) session_id: String,
+    pub(crate) lease: Lease,
+    pub(crate) at_ms: i64,
+}
+
+/// The anchor of a target selection, as status shows it.
+fn anchor_view(selected: crate::store::host::anchor::Selection) -> Option<AnchorView> {
+    let row = selected.row?;
+    Some(AnchorView {
+        session_id: row.session_id?,
+        session_file: row.session_file?,
+        cwd: row.cwd,
+        runtime: row.runtime,
+        provenance: selected.provenance,
+    })
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -160,7 +293,8 @@ impl Chosen {
 }
 
 /// The lease answer for one session ID.
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
 pub(crate) enum Lease {
     Free,
     Held,
@@ -324,6 +458,9 @@ pub(crate) struct Lead<R: Runtime> {
     asleep: Mutex<Option<Asleep>>,
     /// The lead's last activity: a session event, a delivery, a start or a busy idle check.
     active: Mutex<Instant>,
+    /// What the owner is told directly ([`notice`]).
+    notices: notice::Notices,
+    attempt: Mutex<Attempt>,
 }
 
 impl<R: Runtime> Lead<R> {
@@ -353,6 +490,8 @@ impl<R: Runtime> Lead<R> {
             came: OnceLock::new(),
             asleep: Mutex::new(None),
             active: Mutex::new(Instant::now()),
+            notices: notice::Notices::default(),
+            attempt: Mutex::new(Attempt::default()),
         })
     }
 
@@ -373,8 +512,37 @@ impl<R: Runtime> Lead<R> {
     }
 
     fn set_phase(&self, phase: Phase, reason: Option<String>) {
+        match &phase {
+            Phase::Held => self
+                .notices
+                .send(notice::Notice::Held(reason.clone().unwrap_or_default())),
+            Phase::Live => self.notices.send(notice::Notice::Bound),
+            _ => {}
+        }
+        if phase != Phase::Starting {
+            self.attempt().started_ms = None;
+        }
         *self.phase() = (phase, reason);
         *self.sleep() = None;
+    }
+
+    fn attempt(&self) -> MutexGuard<'_, Attempt> {
+        self.attempt.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// A start is in its recovery: a retry or restart is planned, or the start passed the 15 s
+    /// notice. Not final for an update's report.
+    pub(crate) fn recovering(&self) -> bool {
+        if self.restarts().due.is_some() {
+            return true;
+        }
+        let phase = self.phase();
+        phase.0 == Phase::Starting && phase.1.is_some()
+    }
+
+    /// Held until the owner acts.
+    pub(crate) fn held(&self) -> bool {
+        self.phase().0 == Phase::Held
     }
 
     /// Why the lead is not running, while no session runs and the hub recorded a reason.
@@ -401,6 +569,16 @@ impl<R: Runtime> Lead<R> {
     ) -> Result<(), String> {
         let mut last_refusal: Option<String> = None;
         let mut probed = self.env.omp.report_changes();
+        if let Some(rx) = self.notices.take() {
+            tokio::spawn(notice::serve(
+                rx,
+                notice::Env {
+                    store: self.env.store.clone(),
+                    config: self.env.config.clone(),
+                    events: Arc::clone(&self.env.events),
+                },
+            ));
+        }
         loop {
             if *shutdown.borrow() {
                 return Ok(());
@@ -550,7 +728,7 @@ impl<R: Runtime> Lead<R> {
         let Some(path) = self.env.omp.path() else {
             return Lease::Unknown;
         };
-        match crate::omp::usage::lease(&path, &[id]).await {
+        let lease = match crate::omp::usage::lease(&path, &[id]).await {
             Ok(lease) if lease.held.iter().any(|h| h == id) => Lease::Held,
             Ok(lease) if lease.unknown.iter().any(|u| u == id) => Lease::Unknown,
             Ok(_) => Lease::Free,
@@ -558,7 +736,13 @@ impl<R: Runtime> Lead<R> {
                 log::warn("lease check failed", &[("error", &e)]);
                 Lease::Unknown
             }
-        }
+        };
+        self.attempt().lease = Some(LeaseSeen {
+            session_id: id.to_string(),
+            lease,
+            at_ms: now_ms(),
+        });
+        lease
     }
 
     /// Why a start must wait now, if it must (HOST req. 89-90; DESIGN 3.4).
@@ -701,6 +885,7 @@ impl<R: Runtime> Lead<R> {
         let spec = lead_spec(handle.clone(), &settings, cwd, target, expected);
         self.record_attempt(&spec, runtime.kind()).await?;
         self.set_phase(Phase::Starting, None);
+        self.attempt().started_ms = Some(now_ms());
         let retry = match (&spec.target, &spec.expected_id) {
             (Target::Resume(file), Some(id)) => Some((id.clone(), file.clone())),
             _ => None,
@@ -708,11 +893,12 @@ impl<R: Runtime> Lead<R> {
         let result = if self.shutting_down.load(Ordering::Acquire) {
             Err(StartError::Refused("the hub is stopping".into()))
         } else {
-            let existing = spec.expected_id.is_some();
+            let existing = spec.expected_id.clone();
+            let attempt = spec.handle.clone();
             super::startup::with_notice(
                 runtime.start_supervised(spec, self.startup_cancel.subscribe()),
                 || {
-                    let reason = if existing {
+                    let reason = if existing.is_some() {
                         "still starting existing session; conversation and queued input retained"
                     } else {
                         "still starting the requested fresh session; queued input retained"
@@ -722,6 +908,10 @@ impl<R: Runtime> Lead<R> {
                         Emit::new(EventKind::LeadNotStarted, Severity::Warning, true, "lead")
                             .with("reason", reason),
                     );
+                    self.notices.send(notice::Notice::Slow {
+                        handle: attempt,
+                        session: existing,
+                    });
                 },
             )
             .await
@@ -965,6 +1155,27 @@ impl<R: Runtime> Lead<R> {
         resume: Option<(String, PathBuf)>,
     ) -> String {
         let detail = e.to_string();
+        self.attempt().failed = Some(match e {
+            StartError::Startup {
+                stage,
+                outcome,
+                cleanup,
+                detail,
+            } => Failed {
+                at_ms: now_ms(),
+                stage: Some(*stage),
+                outcome: Some(*outcome),
+                cleanup: Some(*cleanup),
+                detail: detail.clone(),
+            },
+            StartError::Refused(why) | StartError::Failed(why) => Failed {
+                at_ms: now_ms(),
+                stage: None,
+                outcome: None,
+                cleanup: None,
+                detail: why.clone(),
+            },
+        });
         self.update(SessionUpdate {
             handle,
             state: Some(
@@ -1585,9 +1796,9 @@ impl<R: Runtime> Lead<R> {
         for file in files {
             match transcript::search(PathBuf::from(&file), marker.clone()).await {
                 Ok(transcript::Found::Yes) => return Ok(Some(true)),
-                Ok(transcript::Found::No | transcript::Found::Missing) => {}
-                Ok(transcript::Found::OutOfTime) => {
-                    return Err(format!("the search of {file} ran out of time"));
+                Ok(transcript::Found::Absent | transcript::Found::Missing) => {}
+                Ok(transcript::Found::Unknown(why)) => {
+                    return Err(format!("{file} could not be searched completely: {why}"));
                 }
                 Err(e) => return Err(format!("{file}: {e}")),
             }
@@ -1626,13 +1837,17 @@ impl<R: Runtime> Lead<R> {
 
     pub(crate) async fn view(&self) -> View {
         let (phase, mut reason) = self.phase().clone();
-        let pin = self
-            .env
-            .config
-            .borrow()
-            .lead
-            .as_ref()
-            .and_then(|settings| settings.session_id.clone());
+        let recovering = self.recovering();
+        let (pin, language) = {
+            let config = self.env.config.borrow();
+            (
+                config
+                    .lead
+                    .as_ref()
+                    .and_then(|settings| settings.session_id.clone()),
+                config.hub.language,
+            )
+        };
         let metadata = self
             .env
             .store
@@ -1644,23 +1859,16 @@ impl<R: Runtime> Lead<R> {
             })
             .await;
         let (anchor, recovery) = match metadata {
-            Ok((selected, recovery)) => (
-                selected.row.and_then(|row| {
-                    Some(AnchorView {
-                        session_id: row.session_id?,
-                        session_file: row.session_file?,
-                        cwd: row.cwd,
-                        runtime: row.runtime,
-                        provenance: selected.provenance,
-                    })
-                }),
-                recovery,
-            ),
+            Ok((selected, recovery)) => (anchor_view(selected), recovery),
             Err(error) => {
                 reason = Some(format!("identity/recovery status unavailable: {error}"));
                 (None, None)
             }
         };
+        let notice = (phase == Phase::Held).then(|| {
+            let (_, why) = notice::hold(recovery.as_ref(), reason.as_deref().unwrap_or("held"));
+            notice::held_text(language, &why, anchor.as_ref())
+        });
         let entries = self.mailbox.list().await.unwrap_or_default();
         let count = |s: &str| entries.iter().filter(|(l, _)| l.state == s).count();
         let pending = |wakes: bool| {
@@ -1669,7 +1877,7 @@ impl<R: Runtime> Lead<R> {
                 .filter(|(l, _)| l.state == "pending" && l.wakes == wakes)
                 .count()
         };
-        View {
+        let mut view = View {
             phase,
             reason,
             session: self.current().map(|s| (*s.snapshot()).clone()),
@@ -1680,7 +1888,13 @@ impl<R: Runtime> Lead<R> {
             asleep: self.asleep(),
             anchor,
             recovery,
-        }
+            attempt: self.attempt().clone(),
+            recovering,
+            notice,
+            startup: Vec::new(),
+        };
+        view.startup = view.startup_lines(now_ms());
+        view
     }
 
     pub(crate) async fn inbox(&self) -> Result<Vec<Listed>, String> {

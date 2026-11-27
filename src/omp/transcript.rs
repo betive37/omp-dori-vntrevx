@@ -1,9 +1,9 @@
 //! OMP session-file reader (DESIGN 3.3, 7.1; PATCH-01 rules 8-10, HOST req. 9-10): whether a saved
-//! session file may be resumed exactly and which model OMP will restore from it, and the bounded search
-//! for a delivery marker in a user entry. Session files belong to OMP; the hub only reads them, with
-//! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), the last 8 MiB and
-//! 2 s for a search, and nothing over 64 MiB. Every read here blocks; callers use the async wrappers,
-//! which run on the blocking pool.
+//! session file may be resumed exactly and which model OMP will restore from it, and the search for
+//! a delivery marker in a user entry. Session files belong to OMP; the hub only reads them, with
+//! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), the last 8 MiB
+//! and 2 s for a reply read, the whole file within 10 s for a marker search, and nothing over
+//! 64 MiB. Every read here blocks; callers use the async wrappers, which run on the blocking pool.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -21,10 +21,13 @@ const HEADER_BYTES: u64 = 64 * 1024;
 const REOPEN_HEADER_BYTES: u64 = 1024 * 1024;
 /// Largest session file read at all.
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
-/// A delivery search reads at most this much from the end of the file.
+/// A reply read covers at most this much from the end of the file; it is also the longest entry a
+/// marker search parses.
 const SEARCH_TAIL: u64 = 8 * 1024 * 1024;
 /// And takes at most this long.
 const SEARCH_BUDGET: Duration = Duration::from_secs(2);
+/// A marker search reads the whole file within this time, or proves nothing.
+pub(crate) const MARKER_BUDGET: Duration = Duration::from_secs(10);
 
 /// A session file could not be read safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -467,21 +470,24 @@ fn trim_newline(line: &mut Vec<u8>) {
     }
 }
 
-/// What a delivery search found (PATCH-01 rule 10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a delivery search proved (PATCH-01 rule 10). Only `Yes` and `Absent` are evidence: anything
+/// the search could not read completely is `Unknown`, never absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Found {
     /// A user message entry carries the marker.
     Yes,
-    /// The searched part of the file has no such entry.
-    No,
+    /// Every entry of the whole file was read and parsed, and none carries the marker.
+    Absent,
     /// The file does not exist (yet).
     Missing,
-    /// The search ran out of its 2 s budget.
-    OutOfTime,
+    /// Part of the file could not be checked (a partial or unparsable entry, an entry longer than
+    /// 8 MiB, the time budget): whether it holds the marker is not known.
+    Unknown(String),
 }
 
-/// Looks for `marker` in the text of a user `message` entry within the last 8 MiB of `path`. A marker
-/// quoted by the assistant or a tool does not count.
+/// Looks for `marker` in the text of a user `message` entry anywhere in `path`: the newest 8 MiB
+/// first, where a delivery usually is, then the rest. A marker quoted by the assistant or a tool
+/// does not count. Absence needs every line of the file read and parsed within [`MARKER_BUDGET`].
 pub(crate) fn find_marker(path: &Path, marker: &str) -> Result<Found> {
     let started = Instant::now();
     let mut file = match read_only(path) {
@@ -498,37 +504,93 @@ pub(crate) fn find_marker(path: &Path, marker: &str) -> Result<Found> {
     }
     let start = info.len().saturating_sub(SEARCH_TAIL);
     file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut first = start > 0;
-    loop {
-        if started.elapsed() > SEARCH_BUDGET {
-            return Ok(Found::OutOfTime);
+    let mut tail = BufReader::new(file);
+    // A tail that starts mid-file begins inside a line; the head part reads that line whole.
+    let boundary = if start > 0 {
+        start + u64::try_from(tail.skip_until(b'\n')?).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let mut scan = MarkerScan {
+        marker: marker.as_bytes(),
+        text: marker,
+        started,
+        doubt: None,
+    };
+    if let Some(found) = scan.lines(&mut tail)? {
+        return Ok(found);
+    }
+    if boundary > 0 {
+        let mut file = tail.into_inner();
+        file.seek(SeekFrom::Start(0))?;
+        if let Some(found) = scan.lines(&mut BufReader::new(file.take(boundary)))? {
+            return Ok(found);
         }
-        line.clear();
-        if reader
-            .by_ref()
-            .take(SEARCH_TAIL + 1)
-            .read_until(b'\n', &mut line)?
-            == 0
-        {
-            return Ok(Found::No);
+    }
+    Ok(scan.doubt.map_or(Found::Absent, Found::Unknown))
+}
+
+/// One marker search: the first doubt is kept while the search goes on, since a later entry may
+/// still prove the marker there.
+struct MarkerScan<'a> {
+    marker: &'a [u8],
+    text: &'a str,
+    started: Instant,
+    doubt: Option<String>,
+}
+
+impl MarkerScan<'_> {
+    /// Reads `reader` to its end: `Some` for a found marker or a spent budget.
+    fn lines(&mut self, reader: &mut impl std::io::BufRead) -> Result<Option<Found>> {
+        let limit = usize::try_from(SEARCH_TAIL).unwrap_or(usize::MAX);
+        let mut line = Vec::new();
+        loop {
+            if self.started.elapsed() > MARKER_BUDGET {
+                return Ok(Some(Found::Unknown(format!(
+                    "the search ran out of its {} s budget",
+                    MARKER_BUDGET.as_secs()
+                ))));
+            }
+            line.clear();
+            if reader
+                .by_ref()
+                .take(SEARCH_TAIL + 1)
+                .read_until(b'\n', &mut line)?
+                == 0
+            {
+                return Ok(None);
+            }
+            let complete = line.last() == Some(&b'\n');
+            if !complete && line.len() > limit {
+                reader.skip_until(b'\n')?;
+                self.doubt("an entry is longer than 8 MiB and was not checked");
+                continue;
+            }
+            trim_newline(&mut line);
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if contains(&line, self.marker) {
+                match serde_json::from_slice::<Value>(&line) {
+                    Ok(entry) if user_text_has(&entry, self.text) => return Ok(Some(Found::Yes)),
+                    Ok(_) => {}
+                    Err(_) if complete => {
+                        self.doubt("an entry carrying the marker is not valid JSON");
+                    }
+                    Err(_) => self.doubt("the file ends inside an entry carrying the marker"),
+                }
+            } else if serde_json::from_slice::<serde::de::IgnoredAny>(&line).is_err() {
+                self.doubt(if complete {
+                    "an entry is not valid JSON"
+                } else {
+                    "the file ends inside an unfinished entry"
+                });
+            }
         }
-        // A tail that starts mid-file begins inside a line; that partial line is skipped.
-        if std::mem::take(&mut first) {
-            continue;
-        }
-        if !contains(&line, marker.as_bytes()) {
-            continue;
-        }
-        trim_newline(&mut line);
-        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
-            // The last line may still be being written.
-            continue;
-        };
-        if user_text_has(&entry, marker) {
-            return Ok(Found::Yes);
-        }
+    }
+
+    fn doubt(&mut self, why: &str) {
+        self.doubt.get_or_insert_with(|| why.to_string());
     }
 }
 
@@ -762,11 +824,22 @@ pub(crate) async fn search(path: PathBuf, marker: String) -> Result<Found> {
             .find(file, &marker)
             .await
             .map_err(TranscriptError::Io)?;
+        let reason = || {
+            answer
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the worker could not read the whole file")
+                .to_string()
+        };
+        // A worker before 0.2.7 searched only the newest 8 MiB: its "no" proves nothing.
         return match answer.get("found").and_then(Value::as_str) {
             Some("yes") => Ok(Found::Yes),
-            Some("no") => Ok(Found::No),
+            Some("absent") => Ok(Found::Absent),
             Some("missing") => Ok(Found::Missing),
-            Some("out_of_time") => Ok(Found::OutOfTime),
+            Some("unknown") => Ok(Found::Unknown(reason())),
+            Some("no" | "out_of_time") => Ok(Found::Unknown(
+                "the worker's older search does not cover the whole file".into(),
+            )),
             _ => Err(TranscriptError::Io(
                 "the worker's search answer is unknown".into(),
             )),
@@ -1145,10 +1218,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(find_marker(&path, "[cataly:aaa]").unwrap(), Found::Yes);
-        assert_eq!(find_marker(&path, "[cataly:bbb]").unwrap(), Found::No);
+        // A file that ends inside an entry proves nothing about a marker it does not show.
+        assert!(matches!(
+            find_marker(&path, "[cataly:bbb]").unwrap(),
+            Found::Unknown(_)
+        ));
+        let whole = fs::read_to_string(&path).unwrap();
+        let complete = &whole[..=whole.rfind('\n').unwrap()];
+        fs::write(&path, complete).unwrap();
+        assert_eq!(find_marker(&path, "[cataly:bbb]").unwrap(), Found::Absent);
         let string_content = serde_json::json!({"type": "message", "message": {"role": "user", "content": "[cataly:ccc] x"}});
         fs::write(&path, format!("{string_content}\n")).unwrap();
         assert_eq!(find_marker(&path, "[cataly:ccc]").unwrap(), Found::Yes);
+    }
+
+    /// A delivery marker older than the newest 8 MiB is found; absence is proved only by reading
+    /// the whole file, so a long transcript is not mistaken for one without the entry.
+    #[test]
+    fn a_marker_outside_the_newest_8_mib_is_found() {
+        let dir = crate::sys::fs::tests::scratch("transcript-old-marker");
+        let path = dir.join("s.jsonl");
+        let user = |text: &str| {
+            serde_json::json!({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+                .to_string()
+        };
+        let filler = serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "x".repeat(64 * 1024)}]}}).to_string();
+        let mut text = format!(
+            "{{\"type\":\"session\",\"id\":\"x\"}}\n{}\n",
+            user("[cataly:old] owner\nhi")
+        );
+        while u64::try_from(text.len()).unwrap() < SEARCH_TAIL + 2 * 1024 * 1024 {
+            text.push_str(&filler);
+            text.push('\n');
+        }
+        text.push_str(&user("[cataly:new] owner\nlater"));
+        text.push('\n');
+        fs::write(&path, &text).unwrap();
+        assert_eq!(find_marker(&path, "[cataly:old]").unwrap(), Found::Yes);
+        assert_eq!(find_marker(&path, "[cataly:new]").unwrap(), Found::Yes);
+        assert_eq!(find_marker(&path, "[cataly:none]").unwrap(), Found::Absent);
+        // The entry the tail starts inside is read whole by the head part.
+        let edge = user(&format!("[cataly:edge] {}", "y".repeat(64)));
+        let assistant = |text: &str| {
+            serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+                .to_string()
+        };
+        let suffix = usize::try_from(SEARCH_TAIL).unwrap() - (edge.len() + 1) / 2;
+        let pad = assistant(&"x".repeat(suffix - 1 - assistant("").len()));
+        assert_eq!(pad.len() + 1, suffix);
+        fs::write(
+            &path,
+            format!("{{\"type\":\"session\",\"id\":\"x\"}}\n{edge}\n{pad}\n"),
+        )
+        .unwrap();
+        assert_eq!(find_marker(&path, "[cataly:edge]").unwrap(), Found::Yes);
+        assert_eq!(find_marker(&path, "[cataly:none]").unwrap(), Found::Absent);
+    }
+
+    /// An unparsable line, an entry over 8 MiB or a partial last entry leaves absence unknown; a
+    /// marker found elsewhere is still found.
+    #[test]
+    fn unreadable_parts_leave_absence_unknown() {
+        let dir = crate::sys::fs::tests::scratch("transcript-unknown");
+        let path = dir.join("s.jsonl");
+        let user = |text: &str| {
+            serde_json::json!({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+                .to_string()
+        };
+        fs::write(&path, format!("{}\nnot json\n", user("[cataly:a] x"))).unwrap();
+        assert_eq!(find_marker(&path, "[cataly:a]").unwrap(), Found::Yes);
+        assert!(
+            matches!(find_marker(&path, "[cataly:b]").unwrap(), Found::Unknown(r) if r.contains("not valid JSON"))
+        );
+        let long = format!(
+            "{}\n{}\n",
+            user("[cataly:a] x"),
+            user(&"z".repeat(usize::try_from(SEARCH_TAIL).unwrap() + 16))
+        );
+        fs::write(&path, long).unwrap();
+        assert!(
+            matches!(find_marker(&path, "[cataly:b]").unwrap(), Found::Unknown(r) if r.contains("8 MiB"))
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"message\",\"message\":{{\"content\":\"[cataly:b]",
+                user("x")
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(find_marker(&path, "[cataly:b]").unwrap(), Found::Unknown(r) if r.contains("ends inside"))
+        );
     }
 
     /// The owner's layout after a 0.1.0 lead: a title line first, the header cwd `<home>/tmp` while the

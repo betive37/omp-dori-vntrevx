@@ -270,6 +270,26 @@ pub(crate) struct Resumed {
     /// `lead_reason`.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub(crate) lead_asleep_ms: Option<i64>,
+    /// The lead's start is still recovering (past its 15 s notice, or a retry is planned): not a
+    /// final answer. `lead_start` then says not running, with a reason an older CLI shows.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) lead_recovering: bool,
+    /// The lead is held until the owner runs `cataly lead start`; `lead_reason` says why.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub(crate) lead_held: bool,
+    /// Lanes whose resume is still recovering, by name (filled in by the hub's update message).
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) lanes_recovering: Vec<String>,
+    /// Lanes whose resume ended held, work kept, by name.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub(crate) lanes_held: Vec<String>,
+}
+
+impl Resumed {
+    /// Nothing is still recovering: what this says is final.
+    pub(crate) fn settled(&self) -> bool {
+        !self.lead_recovering && self.lanes_recovering.is_empty()
+    }
 }
 
 /// How the lead came back when the hub started.

@@ -91,6 +91,26 @@ impl Reads {
             "SELECT target, session_id, started_ms, deadline_ms, retries, next_ms, state, detail FROM startup_episodes WHERE target = ?1",
             [target], |r| Ok(Episode { target: r.get(0)?, session_id: r.get(1)?, started_ms: r.get(2)?, deadline_ms: r.get(3)?, retries: r.get(4)?, next_ms: r.get(5)?, state: r.get(6)?, detail: r.get(7)? })).optional()
     }
+
+    /// Every target's episode, by target.
+    pub(crate) fn startup_episodes(&self) -> rusqlite::Result<Vec<Episode>> {
+        let mut stmt = self.0.prepare(
+            "SELECT target, session_id, started_ms, deadline_ms, retries, next_ms, state, detail FROM startup_episodes ORDER BY target",
+        )?;
+        stmt.query_map([], |r| {
+            Ok(Episode {
+                target: r.get(0)?,
+                session_id: r.get(1)?,
+                started_ms: r.get(2)?,
+                deadline_ms: r.get(3)?,
+                retries: r.get(4)?,
+                next_ms: r.get(5)?,
+                state: r.get(6)?,
+                detail: r.get(7)?,
+            })
+        })?
+        .collect()
+    }
 }
 
 #[cfg(test)]
