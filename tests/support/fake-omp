@@ -111,7 +111,6 @@ rpc() {
             cat > /dev/null
             exit 1
         fi
-        [ -f "$dir/fail-resume" ] && exit 7
     fi
     umask 077
     if [ -n "$resume" ]; then
