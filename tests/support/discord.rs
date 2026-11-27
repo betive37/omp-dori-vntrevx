@@ -546,6 +546,33 @@ fn param(query: &str, key: &str) -> Option<u64> {
         .and_then(|v| v.parse().ok())
 }
 
+/// Discord rejects out-of-range page sizes with a field-specific 400/50035, not an empty page.
+fn invalid_limit(query: &str, minimum: i128) -> Option<Response<Full<Bytes>>> {
+    let limit = query
+        .split('&')
+        .find_map(|p| p.strip_prefix("limit="))?
+        .parse::<i128>()
+        .ok()?;
+    let (code, message) = if limit < minimum {
+        (
+            "NUMBER_TYPE_MIN",
+            format!("int value should be greater than or equal to {minimum}."),
+        )
+    } else if limit > 100 {
+        (
+            "NUMBER_TYPE_MAX",
+            "int value should be less than or equal to 100.".into(),
+        )
+    } else {
+        return None;
+    };
+    Some(reply(
+        400,
+        &json!({ "message": "Invalid Form Body", "code": 50035,
+            "errors": { "limit": { "_errors": [{ "code": code, "message": message }] } } }),
+    ))
+}
+
 /// Reads that depend on the bot's access: a denied channel's (50001, no View Channel: every read
 /// of it; 50013, no Read Message History: its history and threads) are refused, and a readable
 /// channel's public archived threads are none.
@@ -674,6 +701,15 @@ async fn answer(
             401,
             &json!({ "message": "401: Unauthorized", "code": 0 }),
         ));
+    }
+    // The live archived-thread API requires 2; message history permits 1.
+    let invalid = match (method.as_str(), parts.as_slice()) {
+        ("GET", ["channels", _, "threads", "archived", "public"]) => invalid_limit(&query, 2),
+        ("GET", ["channels", _, "messages"]) => invalid_limit(&query, 1),
+        _ => None,
+    };
+    if let Some(r) = invalid {
+        return Ok(r);
     }
     if let Some(r) =
         setup_route(&mut s, &method, &parts, &body).or_else(|| access(&s, &method, &parts))

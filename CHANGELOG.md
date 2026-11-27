@@ -26,6 +26,10 @@
   `withdraw`), its message then says so and loses its buttons. Replying with a number or free
   text works as before. Buttons come only when presses reach Cataly over the Gateway (the same
   condition as for OMP's questions); otherwise the question is text only, as before (#292, @betive37).
+- The Watched channels picker accepts readable channels again: its single bounded permission
+  check now requests two archived threads, Discord's minimum, instead of one (which Discord
+  rejects with HTTP 400 / error 50035). The fake Discord enforces archived-thread limits of
+  2–100 and message-history limits of 1–100 so invalid page sizes fail in CI.
 
 ## 0.2.5 (2026-11-27)
 
