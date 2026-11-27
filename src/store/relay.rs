@@ -16,6 +16,14 @@ const KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
 const OWED_KEEP: i64 = 200;
 /// Owed replies older than this are no longer reported (DISC-OUT req. 34).
 pub(crate) const OWED_WINDOW_MS: i64 = 30 * 60 * 1000;
+/// A request's done mark is recorded as a read mark under the request's message with this suffix,
+/// which no platform's message ID carries (MSG-04).
+const DONE_MARK: &str = ":done";
+
+/// The read-mark key of the done mark of the request `message`.
+pub(crate) fn done_mark(message: &str) -> String {
+    format!("{message}{DONE_MARK}")
+}
 
 /// A room's read position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1058,6 +1066,27 @@ impl Reads {
         )
     }
 
+    /// Hand-offs whose answer was posted since `since_ms` and whose done mark is not recorded. The
+    /// answer is posted once its own parts are, whatever later turn still waits to follow it.
+    pub(crate) fn done_owed(
+        &self,
+        relay: &str,
+        since_ms: i64,
+    ) -> rusqlite::Result<Vec<HandoffRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT {HANDOFF_COLUMNS} FROM handoffs h WHERE relay = ?1 AND updated_ms >= ?2 \
+             AND (answer = 'posted' OR (answer = 'posting' \
+             AND EXISTS (SELECT 1 FROM outbox_parts o WHERE o.relay = h.relay AND o.room = h.room \
+             AND o.source = h.message AND o.turn = 0 AND o.state = 'confirmed') \
+             AND NOT EXISTS (SELECT 1 FROM outbox_parts o WHERE o.relay = h.relay AND o.room = h.room \
+             AND o.source = h.message AND o.turn = 0 AND o.state = 'pending'))) \
+             AND NOT EXISTS (SELECT 1 FROM read_marks m WHERE m.relay = h.relay \
+             AND m.room = h.room AND m.message = h.message || ?3) ORDER BY created_ms, seq"
+        ))?;
+        stmt.query_map(params![relay, since_ms, DONE_MARK], handoff_from_row)?
+            .collect()
+    }
+
     /// Owed replies admitted since `since_ms`, newest first.
     pub(crate) fn owed(&self, relay: &str, since_ms: i64) -> rusqlite::Result<Vec<OwedRow>> {
         let mut stmt = self.0.prepare(
@@ -1301,6 +1330,16 @@ mod tests {
         })
         .await
         .unwrap();
+        let owed = || async {
+            store
+                .read(|q| q.done_owed("discord", 0))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|h| h.message)
+                .collect::<Vec<_>>()
+        };
+        assert!(owed().await.is_empty(), "the answer is not posted yet");
         r(RelayWrite::PartDone {
             relay: "discord".into(),
             room: "c".into(),
@@ -1328,6 +1367,11 @@ mod tests {
             answer().await,
             "posting",
             "posting again for the later turn"
+        );
+        assert_eq!(
+            owed().await,
+            ["12"],
+            "a later turn still to post never holds up the answer's done mark"
         );
         let parts = store.read(|q| q.parts("discord", "c", "12")).await.unwrap();
         let kept: Vec<(i64, i64, &str)> = parts

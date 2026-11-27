@@ -47,6 +47,10 @@ const UNKNOWN_CHANNEL: u64 = 10_003;
 const ARCHIVED_THREAD: u64 = 50_083;
 /// Discord's epoch, in Unix milliseconds.
 const EPOCH_MS: u64 = 1_420_070_400_000;
+/// The seen mark, eyes (U+1F440), URL-encoded for the reaction route (DISC-OUT req. 30).
+pub(crate) const SEEN: &str = "%F0%9F%91%80";
+/// The done mark once the answer is posted, a white heavy check mark (U+2705) (DISC-OUT req. 30).
+pub(crate) const DONE: &str = "%E2%9C%85";
 
 /// A Discord ID.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, PartialOrd, Ord)]
@@ -777,21 +781,46 @@ impl Rest {
         .await
     }
 
-    /// The bot's eyes reaction on a message (DISC-OUT req. 30); adding it again changes nothing.
-    pub(crate) async fn react_seen(
+    /// The bot's reaction with `emoji` (URL-encoded: [`SEEN`], [`DONE`]) on a message (DISC-OUT
+    /// req. 30); adding it again changes nothing.
+    pub(crate) async fn react(
         &self,
         channel: Snowflake,
         message: Snowflake,
+        emoji: &str,
     ) -> Result<(), RestError> {
         self.call(
             "PUT channels/messages/reactions",
             Method::PUT,
-            &format!("/channels/{channel}/messages/{message}/reactions/%F0%9F%91%80/@me"),
+            &format!("/channels/{channel}/messages/{message}/reactions/{emoji}/@me"),
             None,
             Kind::Idempotent,
         )
         .await
         .map(drop)
+    }
+
+    /// Removes the bot's reaction with `emoji` from a message (DISC-OUT req. 30); a 404 (the
+    /// reaction or the message is gone) counts as removed.
+    pub(crate) async fn unreact(
+        &self,
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: &str,
+    ) -> Result<(), RestError> {
+        match self
+            .call(
+                "DELETE channels/messages/reactions",
+                Method::DELETE,
+                &format!("/channels/{channel}/messages/{message}/reactions/{emoji}/@me"),
+                None,
+                Kind::Idempotent,
+            )
+            .await
+        {
+            Err(e) if e.status == Some(404) => Ok(()),
+            other => other.map(drop),
+        }
     }
 
     /// The typing indicator (about 10 s on Discord's side).

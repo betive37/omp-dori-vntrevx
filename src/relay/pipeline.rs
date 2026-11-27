@@ -27,7 +27,7 @@ use crate::log;
 use crate::omp::transcript::{self, Reply};
 use crate::store::Store;
 use crate::store::relay::{
-    Arrived, HandoffRow, OWED_WINDOW_MS, PartRow, QueueRow, RelayDone, RelayWrite,
+    Arrived, HandoffRow, OWED_WINDOW_MS, PartRow, QueueRow, RelayDone, RelayWrite, done_mark,
 };
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
@@ -261,6 +261,12 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     later: Mutex<LaterTurns>,
     /// A failed seen mark is logged once per run (MSG-04).
     seen_failed: AtomicBool,
+    /// A failed done mark is logged once per run (MSG-04).
+    done_failed: AtomicBool,
+    /// Requests whose done mark is being added, so it is added once.
+    marking: Mutex<HashSet<Key>>,
+    /// The done marks owed from before this run were looked for.
+    swept: AtomicBool,
     /// Live messages not handed off yet.
     live: Mutex<LiveMessages>,
     /// Frame read time of a wake still waiting for its turn to start.
@@ -295,6 +301,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             lookups: Mutex::default(),
             later: Mutex::default(),
             seen_failed: AtomicBool::new(false),
+            done_failed: AtomicBool::new(false),
+            marking: Mutex::default(),
+            swept: AtomicBool::new(false),
             live: Mutex::default(),
             wake: Mutex::new(None),
             wake_latency,
@@ -678,6 +687,53 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         });
     }
 
+    fn marking(&self) -> MutexGuard<'_, HashSet<Key>> {
+        self.marking.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Replaces the seen mark with the done mark in the background once the answer to a request
+    /// was posted, and records it (MSG-04, DISC-OUT req. 30): after the answer, never holding it
+    /// up, and once per request, also across a restart, which repeats both steps when a stop came
+    /// before the record. A failure is logged once per run and recorded all the same, so it is
+    /// never tried again.
+    fn mark_done(self: &Arc<Self>, room: &str, message: &str) {
+        let key = (room.to_string(), message.to_string());
+        if !self.marking().insert(key.clone()) {
+            return;
+        }
+        let me = Arc::clone(self);
+        tokio::spawn(async move {
+            let (room, message) = &key;
+            let mark = done_mark(message);
+            let marked = {
+                let (room, mark) = (room.clone(), mark.clone());
+                me.store
+                    .read(move |r| r.read_marked(R::NAME, &room, &mark))
+                    .await
+                    .unwrap_or(false)
+            };
+            if !marked {
+                // Debug builds only: the crash test of a restart between the answer and its mark.
+                #[cfg(debug_assertions)]
+                crate::sys::fault::point("answer_before_done");
+                if let Err(e) = me.relay.done(room, message).await
+                    && !me.done_failed.swap(true, Ordering::AcqRel)
+                {
+                    log::warn("done mark failed", &[("relay", &R::NAME), ("error", &e)]);
+                }
+                let write = RelayWrite::ReadMark {
+                    relay: R::NAME.into(),
+                    room: room.clone(),
+                    message: mark,
+                };
+                if let Err(e) = me.store.relay(write).await {
+                    log::warn("done mark not recorded", &[("error", &e)]);
+                }
+            }
+            me.marking().remove(&key);
+        });
+    }
+
     /// A queued message taken by another route (an answer to a question): finished, marked seen.
     pub(crate) async fn taken(self: &Arc<Self>, row: &QueueRow) -> Result<(), String> {
         self.mark_seen(&row.room, &row.message);
@@ -1027,8 +1083,21 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     /// Reads finished answers from the lead's session file and posts them (DISC-OUT req. 21-28),
     /// and after each answer the final text of every later turn OMP started by itself.
     /// `turn_over` is true when the lead's last turn ended and nothing started since, which the
-    /// idle readback may not show yet.
-    pub(crate) async fn answers(&self, turn_over: bool) -> Result<(), String> {
+    /// idle readback may not show yet. The first call of a run adds the done marks that a stop
+    /// left owed on answers posted within the owed window.
+    pub(crate) async fn answers(self: &Arc<Self>, turn_over: bool) -> Result<(), String> {
+        if !self.swept.load(Ordering::Acquire) {
+            let since = now_ms() - OWED_WINDOW_MS;
+            let owed = self
+                .store
+                .read(move |r| r.done_owed(R::NAME, since))
+                .await
+                .map_err(|e| e.to_string())?;
+            for h in owed {
+                self.mark_done(&h.room, &h.message);
+            }
+            self.swept.store(true, Ordering::Release);
+        }
         let open = self
             .store
             .read(|r| r.answers_open(R::NAME))
@@ -1521,8 +1590,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
     }
 
-    /// Posts the pending parts of one answer in order; `false` when it stopped on a failure.
-    async fn post_parts(&self, h: &HandoffRow) -> Result<bool, String> {
+    /// Posts the pending parts of one answer in order; `false` when it stopped on a failure. The
+    /// answer's last part confirmed adds the done mark.
+    async fn post_parts(self: &Arc<Self>, h: &HandoffRow) -> Result<bool, String> {
         let parts = {
             let (room, source) = (h.room.clone(), h.message.clone());
             self.store
@@ -1559,6 +1629,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         })
                         .await
                         .map_err(|e| e.to_string())?;
+                    if answered(&parts, part.idx) {
+                        self.mark_done(&h.room, &h.message);
+                    }
                 }
                 PartOutcome::SourceGone => {
                     log::info(
@@ -1628,6 +1701,14 @@ fn keep_only(stuck: &Mutex<HashSet<String>>, still: &HashSet<&str>) {
         .retain(|m| still.contains(m.as_str()));
 }
 
+/// Whether the answer is posted once its parts up to `idx` are: none of the answer's parts after it
+/// is still pending. A later turn's parts follow the answer and never hold up its done mark.
+fn answered(parts: &[PartRow], idx: i64) -> bool {
+    !parts
+        .iter()
+        .any(|p| p.idx > idx && p.state == "pending" && p.turn == 0)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1643,6 +1724,26 @@ mod tests {
         assert_eq!(stuck.lock().unwrap().len(), 1);
         keep_only(&stuck, &HashSet::new());
         assert!(stuck.lock().unwrap().is_empty());
+    }
+
+    fn part(idx: i64, turn: i64) -> PartRow {
+        PartRow {
+            idx,
+            text: String::new(),
+            nonce: format!("n{idx}"),
+            destination: None,
+            state: "pending".into(),
+            uncertain: false,
+            turn,
+        }
+    }
+
+    #[test]
+    fn the_done_mark_never_waits_behind_a_later_turn() {
+        let parts = [part(0, 0), part(1, 0), part(2, 1), part(3, 2)];
+        assert!(!answered(&parts, 0), "the answer's second part is pending");
+        assert!(answered(&parts, 1), "only later turns are still to post");
+        assert!(answered(&parts, 2));
     }
 
     fn key(message: &str) -> Key {

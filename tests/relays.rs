@@ -111,8 +111,8 @@ fn slack_posts_in(slack: &FakeSlack, channel: &str, thread: &str) -> Vec<fake_sl
         .collect()
 }
 
-/// Check 5: a Telegram and a Slack request each get the lead's answer in place with a seen mark.
-/// Also measures intake latency per relay and Telegram receive lag.
+/// Check 5: a Telegram and a Slack request each get the lead's answer in place with a seen mark,
+/// then a done mark. Also measures intake latency per relay and Telegram receive lag.
 #[test]
 fn telegram_and_slack_requests_are_answered_in_place_with_seen_marks() {
     let tg = FakeTelegram::start();
@@ -132,18 +132,39 @@ fn telegram_and_slack_requests_are_answered_in_place_with_seen_marks() {
         answer.body["reply_parameters"]["allow_sending_without_reply"],
         false
     );
-    let marks = tg.calls("setMessageReaction");
-    assert_eq!(marks.len(), 1, "one seen mark");
+    // The done mark replaces the seen mark: ✅ is not a reaction bots may set, 👌 is.
+    let marks = tg.wait(WAIT, |f| {
+        let m = f.calls("setMessageReaction");
+        (m.len() >= 2).then_some(m)
+    });
+    assert_eq!(marks.len(), 2, "one seen mark, one done mark");
     assert_eq!(marks[0].body["message_id"], 11);
     assert_eq!(marks[0].body["reaction"][0]["emoji"], "\u{1F440}");
+    assert_eq!(marks[1].body["message_id"], 11);
+    assert_eq!(
+        marks[1].body["reaction"],
+        json!([{"type": "emoji", "emoji": "\u{1F44C}"}])
+    );
     lead_idle(&hub);
     let ts = slack.say(DM, fake_slack::OWNER, "hello from slack", None);
     let posted = slack.wait(WAIT, |f| slack_posts_in(f, DM, &ts).pop());
     assert_eq!(posted.body["text"], "the answer");
-    let reactions = slack.calls("reactions.add");
-    assert_eq!(reactions.len(), 1, "one seen mark");
-    assert_eq!(reactions[0].body["timestamp"], ts.as_str());
-    assert_eq!(reactions[0].body["name"], "eyes");
+    // The seen mark, replaced by the done mark once the answer is posted: added first, then the
+    // eyes go.
+    let replaced = [
+        "reactions.add eyes",
+        "reactions.add white_check_mark",
+        "reactions.remove eyes",
+    ];
+    let marks = |f: &FakeSlack| -> Vec<String> {
+        f.seen()
+            .into_iter()
+            .filter(|s| s.method.starts_with("reactions."))
+            .inspect(|s| assert_eq!(s.body["timestamp"], ts.as_str()))
+            .map(|s| format!("{} {}", s.method, s.body["name"].as_str().unwrap()))
+            .collect()
+    };
+    slack.wait(WAIT, |f| (marks(f) == replaced).then_some(()));
     assert!(
         slack
             .acks()
@@ -180,7 +201,7 @@ fn telegram_and_slack_requests_are_answered_in_place_with_seen_marks() {
     );
     assert_eq!(
         tg.calls("setMessageReaction").len(),
-        1,
+        2,
         "no seen mark on an edit"
     );
     // Its answer replies to the edited message.
@@ -463,7 +484,11 @@ fn telegram_offset_and_replay_guard_hold_across_restarts() {
     std::thread::sleep(Duration::from_secs(3));
     assert_eq!(tg_replies_to(&tg, 21).len(), 1, "one answer only");
     assert_eq!(requests(&hub, "[telegram 7/21]").len(), 1);
-    assert_eq!(tg.calls("setMessageReaction").len(), 1);
+    assert_eq!(
+        tg.calls("setMessageReaction").len(),
+        2,
+        "one seen mark and one done mark, not again after the restart"
+    );
     assert!(hub.stop().success());
 }
 

@@ -125,6 +125,28 @@ fn reference(create: &support::discord::Seen) -> Option<String> {
         .map(str::to_string)
 }
 
+/// The bot's reaction calls on one message in order, as `PUT 👀`, `PUT ✅`, `DELETE 👀`.
+fn reactions(fake: &FakeDiscord, message: &str) -> Vec<String> {
+    let on = format!("/messages/{message}/reactions/");
+    fake.seen()
+        .into_iter()
+        .filter(|s| s.path.contains(&on))
+        .map(|s| {
+            let emoji = if s.path.ends_with("/%F0%9F%91%80/@me") {
+                "👀"
+            } else if s.path.ends_with("/%E2%9C%85/@me") {
+                "✅"
+            } else {
+                "?"
+            };
+            format!("{} {emoji}", s.method)
+        })
+        .collect()
+}
+
+/// The seen mark, then once the answer is posted the done mark added and the seen mark removed.
+const REPLACED: [&str; 3] = ["PUT 👀", "PUT ✅", "DELETE 👀"];
+
 /// Check 1: an owner message wakes the idle lead; the answer is posted as a confirmed linked reply
 /// in parts with deterministic enforced nonces, the seen mark is added and the owed reply settles.
 #[test]
@@ -170,8 +192,10 @@ fn owner_message_is_answered_in_linked_parts() {
     // answer is matched against those stored parts.
     let first = creates[0].body["content"].as_str().unwrap();
     assert!(first.encode_utf16().count() > 1958, "{}", first.len());
-    let seen = fake.calls("PUT", "/messages/800000000000000001/reactions/");
-    assert_eq!(seen.len(), 1, "one seen mark");
+    // The seen mark, replaced by the done mark once the answer is posted: ✅ first, then 👀 goes.
+    fake.wait(WAIT, |f| {
+        (reactions(f, "800000000000000001") == REPLACED).then_some(())
+    });
     let s = hub.until(WAIT, || {
         let s = status(&hub);
         // The queue item finishes when the receipt confirms the hand-off, maybe after the answer.
@@ -187,6 +211,7 @@ fn owner_message_is_answered_in_linked_parts() {
         asked[0].contains("request from the owner (authenticated)")
             && asked[0].contains("> hello lead")
     );
+    assert_eq!(reactions(&fake, "800000000000000001"), REPLACED);
     assert!(hub.stop().success());
 }
 
@@ -291,11 +316,15 @@ fn an_answer_goes_into_the_thread_started_from_the_request() {
         fake.calls("POST", &format!("/channels/{CH}/typing"))
             .is_empty()
     );
-    let seen = fake.calls("PUT", &format!("/messages/{thread}/reactions/"));
-    assert_eq!(seen.len(), 1, "one seen mark");
-    assert_eq!(
-        seen[0].path,
-        format!("/channels/{CH}/messages/{thread}/reactions/%F0%9F%91%80/@me")
+    // Both marks are on the request in the channel, though the answer is in the thread.
+    fake.wait(WAIT, |f| (reactions(f, &thread) == REPLACED).then_some(()));
+    let on = format!("/channels/{CH}/messages/{thread}/");
+    assert!(
+        fake.seen()
+            .iter()
+            .filter(|s| s.path.contains("/reactions/"))
+            .all(|s| s.path.starts_with(&on)),
+        "on the request"
     );
     assert!(hub.stop().success());
 }
@@ -916,6 +945,114 @@ fn crash_after_arrival_delivers_once() {
     std::thread::sleep(Duration::from_secs(2));
     assert_eq!(fake.creates().len(), 1, "answered once");
     assert_eq!(requests(&hub).len(), 1, "delivered once");
+    assert!(hub.stop().success());
+}
+
+/// An answer in doubt keeps the seen mark and gets no done mark; once its part is confirmed after
+/// all, the done mark replaces the seen mark, once.
+#[test]
+fn an_answer_in_doubt_gets_the_done_mark_once_it_is_posted() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000321";
+    // Every try is accepted without an acknowledgement: the part may exist.
+    fake.script_in(CH, &[500; 64]);
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_321,
+        OWNER,
+        "in doubt",
+    ));
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &format!("/channels/{CH}/messages")).len() >= 2).then_some(())
+    });
+    fake.wait(WAIT, |f| (!reactions(f, source).is_empty()).then_some(()));
+    assert_eq!(
+        answer_state(&hub, source),
+        "posting",
+        "the answer is in doubt"
+    );
+    assert_eq!(reactions(&fake, source), ["PUT 👀"], "the seen mark stays");
+    fake.unscript_in(CH);
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    fake.wait(WAIT, |f| (reactions(f, source) == REPLACED).then_some(()));
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(reactions(&fake, source), REPLACED, "replaced once");
+    assert_eq!(fake.bot_messages(CH).len(), 1, "the part exists once");
+    assert!(hub.stop().success());
+}
+
+/// The hub dies after the answer is posted and before its done mark: the restart replaces the
+/// seen mark once, posts nothing again, and a further restart changes nothing.
+#[test]
+fn a_crash_before_the_done_mark_adds_it_once_after_the_restart() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.env
+        .push(("CATALY_FAULT".into(), PathBuf::from("answer_before_done")));
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000331";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_331,
+        OWNER,
+        "mark it done",
+    ));
+    let exit = hub.wait_exit(WAIT);
+    assert!(!exit.success(), "the fault point ended the hub");
+    assert_eq!(answer_state(&hub, source), "posted");
+    assert_eq!(reactions(&fake, source), ["PUT 👀"]);
+    hub.env.clear();
+    hub.start();
+    ready(&hub);
+    fake.wait(WAIT, |f| (reactions(f, source) == REPLACED).then_some(()));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(hub.stop().success());
+    hub.start();
+    ready(&hub);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(reactions(&fake, source), REPLACED, "replaced once");
+    assert_eq!(fake.creates().len(), 1, "answered once");
+    assert!(hub.stop().success());
+}
+
+/// The hub dies between adding the done mark and removing the seen mark: the restart finishes the
+/// removal once (adding ✅ again changes nothing), and a further restart changes nothing.
+#[test]
+fn a_crash_between_the_done_mark_and_the_removal_finishes_it_after_the_restart() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.env
+        .push(("CATALY_FAULT".into(), PathBuf::from("done_before_unseen")));
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000341";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_341,
+        OWNER,
+        "replace it",
+    ));
+    let exit = hub.wait_exit(WAIT);
+    assert!(!exit.success(), "the fault point ended the hub");
+    assert_eq!(reactions(&fake, source), ["PUT 👀", "PUT ✅"]);
+    hub.env.clear();
+    hub.start();
+    ready(&hub);
+    let done = ["PUT 👀", "PUT ✅", "PUT ✅", "DELETE 👀"];
+    fake.wait(WAIT, |f| (reactions(f, source) == done).then_some(()));
+    std::thread::sleep(Duration::from_secs(2));
+    assert!(hub.stop().success());
+    hub.start();
+    ready(&hub);
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(reactions(&fake, source), done, "the seen mark removed once");
+    assert_eq!(fake.creates().len(), 1, "answered once");
     assert!(hub.stop().success());
 }
 

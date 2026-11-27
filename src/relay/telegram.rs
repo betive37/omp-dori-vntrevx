@@ -364,6 +364,25 @@ fn message_id(key: &str) -> Option<i64> {
     key.split('.').next()?.parse().ok()
 }
 
+impl TelegramRelay {
+    /// Sets the bot's one reaction on a new message to `emoji`, replacing the one before; edits
+    /// get none (MSG req. 6). Setting the same reaction again changes nothing.
+    async fn react(&self, room: &str, message: &str, emoji: &str) -> Result<(), String> {
+        if message.contains('.') {
+            return Ok(());
+        }
+        let (chat, _) = room_of(room).ok_or("bad room")?;
+        let id = message_id(message).ok_or("bad message")?;
+        let body = json!({"chat_id": chat, "message_id": id,
+            "reaction": [{"type": "emoji", "emoji": emoji}]});
+        self.api
+            .call("setMessageReaction", &body, Kind::Idempotent, Policy::CHAT)
+            .await
+            .map(drop)
+            .map_err(|e| e.to_string())
+    }
+}
+
 /// A board destination after `telegram:`: `<chat>` or `<chat>/<topic>`.
 pub(crate) fn board_target(target: &str) -> Option<(i64, Option<i64>)> {
     let (chat, topic) = match target.split_once('/') {
@@ -423,20 +442,13 @@ impl Relay for TelegramRelay {
     }
 
     async fn seen(&self, room: &str, message: &str) -> Result<(), String> {
-        // Edits get no seen mark (MSG req. 6).
-        if message.contains('.') {
-            return Ok(());
-        }
-        let (chat, _) = room_of(room).ok_or("bad room")?;
-        let id = message_id(message).ok_or("bad message")?;
-        let body = json!({"chat_id": chat, "message_id": id,
-            "reaction": [{"type": "emoji", "emoji": "\u{1F440}"}]});
-        // Setting the same reaction again changes nothing.
-        self.api
-            .call("setMessageReaction", &body, Kind::Idempotent, Policy::CHAT)
-            .await
-            .map(drop)
-            .map_err(|e| e.to_string())
+        self.react(room, message, "\u{1F440}").await
+    }
+
+    /// ✅ is not among the reactions bots may set, so the done mark is 👌 (U+1F44C), which
+    /// replaces 👀: a bot sets one reaction per message (MSG-04).
+    async fn done(&self, room: &str, message: &str) -> Result<(), String> {
+        self.react(room, message, "\u{1F44C}").await
     }
 
     fn typing(&self, _room: &str) -> impl Future<Output = Result<(), String>> + Send {

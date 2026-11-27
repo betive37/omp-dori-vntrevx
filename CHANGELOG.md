@@ -126,6 +126,14 @@
   card ("주인님이 허용했습니다"), a typed answer ("주인님이 채팅으로 답했습니다") or an answered
   question ("Answered by Master: …"), the refusals of other people's presses ("이 버튼은 주인님만
   누를 수 있어요."), and the lead's and lanes' guidance.
+- The 👀 on your message shows while the lead works on it; once the answer is posted a done mark
+  replaces it: ✅ on Discord (also when the answer went into a thread), `white_check_mark` on
+  Slack, and 👌 on Telegram, as ✅ is not a reaction Telegram lets bots set. The done mark is added
+  before the 👀 is removed, so your message never shows neither. An answer in doubt, given up or
+  not delivered keeps the 👀. The swap comes after the answer and never holds it up, once per
+  message: a restart right after the answer finishes it then, never twice, and a failed step is
+  logged once and not tried again. A later turn's text still to follow the answer (a background
+  job's result) never holds the done mark up.
 
 ## 0.2.6 (2026-11-27)
 

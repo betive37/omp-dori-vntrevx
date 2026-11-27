@@ -856,6 +856,7 @@ async fn answer(
             ["channels", _, "messages", _, "reactions", _, "@me"]
             | ["channels", _, "messages", "pins", _],
         )
+        | ("DELETE", ["channels", _, "messages", _, "reactions", _, "@me"])
         | ("POST", ["channels", _, "typing"]) => reply(204, &Value::Null),
         ("POST", ["interactions", _, _, "callback"]) => {
             reply(s.callbacks.pop_front().unwrap_or(204), &Value::Null)
