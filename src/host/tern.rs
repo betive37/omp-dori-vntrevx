@@ -1095,6 +1095,21 @@ impl Control for Session {
         if let Some(why) = why {
             return DeliverOutcome::NotReady(status, why);
         }
+        match snapshot.goal.as_ref().map(|goal| goal.status) {
+            Some(GoalStatus::Paused) => {
+                return DeliverOutcome::NotReady(status, "the goal is paused".into());
+            }
+            Some(GoalStatus::Blocked) => {
+                return DeliverOutcome::NotReady(
+                    status,
+                    "the goal is blocked by its budget".into(),
+                );
+            }
+            None
+            | Some(
+                GoalStatus::None | GoalStatus::Active | GoalStatus::Complete | GoalStatus::Dropped,
+            ) => {}
+        }
         if d.text.len() > TEXT_MAX {
             return DeliverOutcome::Refused("text over 256 KiB".into());
         }

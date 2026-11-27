@@ -224,12 +224,10 @@ impl<R: Runtime> Lanes<R> {
         Ok("continued".into())
     }
 
-    /// A lane may pause its own goal while it waits for an answer (OMP's goal tool offers that when
-    /// blocked on the user), and a paused goal takes no delivery (HOST req. 50). Every pause the
-    /// hub makes is a hold and recorded as one (LANE req. 44), so a paused goal on a lane that is
-    /// not held is the lane's own: before the owner's or the lead's message is delivered, it is
-    /// resumed (LANE req. 47). `incoming`: such a message is being delivered now; otherwise one
-    /// must wait in the inbox. `locked`: the caller holds the lane's turn.
+    /// A headless lane's unheld pause is its own; owner pauses through the hub are recorded
+    /// holds. Tern has no pause provenance, so its terminal pauses require explicit resume.
+    /// Only an owner/lead answer resumes an eligible goal, never a notice or reminder.
+    /// `locked` means the caller holds the lane's turn.
     pub(super) async fn resume_for_answer(
         &self,
         key: &str,
@@ -268,6 +266,9 @@ impl<R: Runtime> Lanes<R> {
         };
         if !matches!(rec.state, State::Running | State::Rejected | State::Claimed)
             || rec.intent.is_some()
+            || rec.pending_reopen.is_some()
+            || rec.doubt.is_some()
+            || rec.runtime != crate::config::session::RuntimeKind::Headless
             || !paused()
         {
             return;

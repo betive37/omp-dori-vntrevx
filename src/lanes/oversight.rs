@@ -561,6 +561,11 @@ impl<R: Runtime> Lanes<R> {
             self.flush_inbox(&rec.key, session, false).await;
         }
         let why = match goal() {
+            Some(GoalStatus::Paused)
+                if rec.runtime == crate::config::session::RuntimeKind::Tern =>
+            {
+                Some("the goal is paused in its terminal; pause provenance is unknown")
+            }
             Some(GoalStatus::Paused) => Some("the goal is paused"),
             Some(GoalStatus::Blocked) => Some("the goal is blocked by its budget"),
             _ => None,
@@ -583,7 +588,8 @@ impl<R: Runtime> Lanes<R> {
                 "messages undelivered",
                 &format!(
                     "{waiting} message(s) from the owner or the lead wait undelivered: {why}. \
-                     lane.pause then lane.resume resumes the goal; a budget stop needs the owner."
+                     Run cataly lane pause --params '{{\"key\":\"{key}\",\"reason\":\"resume terminal goal\"}}', then cataly lane resume --params '{{\"key\":\"{key}\"}}' to resume explicitly; a budget stop needs the owner.",
+                    key = rec.key
                 ),
                 true,
             );
