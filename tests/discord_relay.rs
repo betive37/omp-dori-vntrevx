@@ -2257,3 +2257,242 @@ fn review_a_moved_part_restores_its_reply_link_after_restart() {
     assert_eq!(messages[1]["message_reference"]["message_id"], source);
     assert!(hub.stop().success());
 }
+
+/// A hub whose fake lead answers `answer` and then, after a background job's result, ends a second
+/// turn by itself with `later` (DISC-OUT req. 21).
+fn background_hub(fake: &FakeDiscord, answer: &str, later: Option<&str>) -> TestHub {
+    let hub = relay_hub(fake, &[], "");
+    hub.fixture("omp", "answer.json", Some(&json!(answer).to_string()));
+    if let Some(later) = later {
+        hub.fixture("omp", "followup", Some(&json!(later).to_string()));
+    }
+    hub
+}
+
+/// The bot's messages in `room` by content, oldest first.
+fn contents(fake: &FakeDiscord, room: &str) -> Vec<String> {
+    fake.bot_messages(room)
+        .iter()
+        .map(|m| m["content"].as_str().unwrap_or_default().to_string())
+        .collect()
+}
+
+/// A turn a background job's result starts after the answer never replaces it: the answer is the
+/// linked reply, and that turn's text follows as its own message in the same room, a reply to
+/// nothing, with its own enforced nonce; each is posted once (DISC-OUT req. 21, 25).
+#[test]
+fn a_background_result_never_replaces_the_answer() {
+    let fake = FakeDiscord::start();
+    let mut hub = background_hub(&fake, "the real answer", Some("the backup finished"));
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000401";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_401,
+        OWNER,
+        "back up, then answer",
+    ));
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(creates[0].body["content"], "the real answer", "{creates:?}");
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    assert_eq!(creates[1].body["content"], "the backup finished");
+    assert_eq!(
+        reference(&creates[1]),
+        None,
+        "the later turn replies to nothing"
+    );
+    for c in &creates {
+        assert_eq!(c.path, format!("/channels/{CH}/messages"));
+        assert_eq!(c.body["enforce_nonce"], true);
+    }
+    assert_ne!(creates[0].body["nonce"], creates[1].body["nonce"]);
+    settled(&hub);
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        contents(&fake, CH),
+        ["the real answer", "the backup finished"],
+        "each once"
+    );
+    assert!(hub.stop().success());
+}
+
+/// A background job's result after a restart, once the answer is posted, follows it the same way:
+/// the restarted hub finds the later turn in the resumed session and posts it after the answer.
+#[test]
+fn a_background_result_after_a_restart_follows_the_answer() {
+    let fake = FakeDiscord::start();
+    let mut hub = background_hub(&fake, "the real answer", None);
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000402";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_402,
+        OWNER,
+        "back up, then answer",
+    ));
+    fake.wait_creates(1, WAIT);
+    settled(&hub);
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    assert!(hub.stop().success());
+    hub.start();
+    ready(&hub);
+    let id = hub.json(&["lead", "status", "--json"])["session"]["session_id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    hub.fixture(
+        "omp",
+        &format!("background-{id}"),
+        Some(&json!("the backup finished").to_string()),
+    );
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(
+        creates[1].body["content"], "the backup finished",
+        "{creates:?}"
+    );
+    assert_eq!(creates[1].path, format!("/channels/{CH}/messages"));
+    assert_eq!(reference(&creates[1]), None);
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        contents(&fake, CH),
+        ["the real answer", "the backup finished"],
+        "each once"
+    );
+    assert_eq!(status(&hub)["counts"]["owed_settled"], 1);
+    assert!(hub.stop().success());
+}
+
+/// An answer in the thread started from the request takes the later turn's text with it: both go
+/// into the thread as plain posts and nothing reaches the channel.
+#[test]
+fn a_background_result_follows_the_answer_into_its_thread() {
+    let fake = FakeDiscord::start();
+    let mut hub = background_hub(&fake, "the real answer", Some("the backup finished"));
+    hub.start();
+    ready(&hub);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_403, "in the thread, please");
+    let creates = fake.wait_creates(2, WAIT);
+    for c in &creates {
+        assert_eq!(
+            c.path,
+            format!("/channels/{thread}/messages"),
+            "{creates:?}"
+        );
+        assert!(c.body.get("message_reference").is_none(), "{:?}", c.body);
+    }
+    settled(&hub);
+    hub.until(WAIT, || {
+        (answer_state(&hub, &thread) == "posted").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        contents(&fake, &thread),
+        ["the real answer", "the backup finished"]
+    );
+    assert!(fake.bot_messages(CH).is_empty(), "nothing in the channel");
+    assert!(hub.stop().success());
+}
+
+/// A first part in doubt in the thread stays there through a refusal, and the later turn's text
+/// waits behind it: each exists once, in the thread, and nothing moves to the channel.
+#[test]
+fn a_background_result_waits_behind_an_uncertain_answer() {
+    let fake = FakeDiscord::start();
+    let mut hub = background_hub(&fake, "the real answer", Some("the backup finished"));
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000404";
+    // One call's four attempts end uncertain (the part may exist), then the thread refuses twice.
+    let mut thread = vec![500; 4];
+    thread.extend([403; 2]);
+    fake.script_in(source, &thread);
+    ask_with_thread(&fake, 800_000_000_000_000_404, "uncertain first part");
+    settled(&hub);
+    hub.until(WAIT, || {
+        (answer_state(&hub, source) == "posted").then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(
+        contents(&fake, source),
+        ["the real answer", "the backup finished"],
+        "each once, in order"
+    );
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing moved to the channel"
+    );
+    let creates = fake.creates();
+    let last = creates.last().unwrap();
+    assert_eq!(last.body["content"], "the backup finished");
+    assert!(last.body.get("message_reference").is_none());
+    assert!(hub.stop().success());
+}
+
+/// With `idle_sleep` on (5 min, 3 s here), a lead that owes an answer with a reminder to come stays
+/// awake, as reminders reach only a live lead: the reminder at a minute reaches the same process.
+/// The reminder carries the request's tag, so the turn it starts answers the request; once that
+/// answer settles the owed reply, the lead sleeps.
+#[test]
+fn an_owed_reply_keeps_the_lead_awake_for_its_reminders() {
+    let fake = FakeDiscord::start();
+    let mut hub = background_hub(&fake, "", None);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&config.replace("[lead]\n", "[lead]\nidle_sleep = \"5m\"\n"));
+    hub.env
+        .push(("CATALY_IDLE_SLEEP".into(), PathBuf::from("3s")));
+    hub.start();
+    ready(&hub);
+    let pid = hub.json(&["lead", "status", "--json"])["session"]["pid"].clone();
+    let source = "800000000000000405";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_405,
+        OWNER,
+        "remind me",
+    ));
+    // The first turn ends with nothing to post; the turn the reminder starts answers.
+    hub.until(WAIT, || {
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        (text.contains(&format!("[discord {CH}/{source}]"))
+            && text
+                .lines()
+                .last()
+                .is_some_and(|l| l.contains("\"assistant\"")))
+        .then_some(())
+    });
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some("\"answered after the reminder\""),
+    );
+    hub.until(Duration::from_secs(100), || {
+        let lead = hub.json(&["lead", "status", "--json"]);
+        assert_eq!(
+            lead["phase"], "live",
+            "asleep while owing an answer: {lead}"
+        );
+        assert_eq!(lead["session"]["pid"], pid, "{lead}");
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        text.contains("[reminder]").then_some(())
+    });
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(creates[0].body["content"], "answered after the reminder");
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    settled(&hub);
+    hub.until(WAIT, || {
+        let lead = hub.json(&["lead", "status", "--json"]);
+        (lead["phase"] == "asleep").then_some(())
+    });
+    assert!(hub.stop().success());
+}

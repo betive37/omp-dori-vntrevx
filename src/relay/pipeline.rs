@@ -227,6 +227,18 @@ struct LookupState {
     failed: usize,
 }
 
+/// Following the later turns of the newest answered request (DISC-OUT req. 21): the transcript is
+/// read again only when it or the request changed.
+#[derive(Debug, Default)]
+struct LaterTurns {
+    /// The request, session file, its length and whether the session was idle at the last read.
+    read: Option<(String, PathBuf, u64, bool)>,
+    /// The request whose turns ended (an input followed), so it is not read for them again.
+    ended: Option<String>,
+    /// The later turn last refused by the outgoing checks, logged once.
+    refused: Option<(String, usize)>,
+}
+
 /// The pipeline of one relay.
 pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     pub(crate) relay: Arc<R>,
@@ -245,6 +257,8 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     targets: Mutex<HashMap<String, Target>>,
     /// The answer room looked up per open request, by source.
     lookups: Mutex<HashMap<String, Lookup>>,
+    /// The newest answered request's later turns.
+    later: Mutex<LaterTurns>,
     /// A failed seen mark is logged once per run (MSG-04).
     seen_failed: AtomicBool,
     /// Live messages not handed off yet.
@@ -279,6 +293,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             stuck: Mutex::default(),
             targets: Mutex::default(),
             lookups: Mutex::default(),
+            later: Mutex::default(),
             seen_failed: AtomicBool::new(false),
             live: Mutex::default(),
             wake: Mutex::new(None),
@@ -1009,7 +1024,8 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .map(|h| (h.room, h.message))
     }
 
-    /// Reads finished answers from the lead's session file and posts them (DISC-OUT req. 21-28).
+    /// Reads finished answers from the lead's session file and posts them (DISC-OUT req. 21-28),
+    /// and after each answer the final text of every later turn OMP started by itself.
     /// `turn_over` is true when the lead's last turn ended and nothing started since, which the
     /// idle readback may not show yet.
     pub(crate) async fn answers(&self, turn_over: bool) -> Result<(), String> {
@@ -1023,7 +1039,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .retain(|m, _| open.iter().any(|h| h.message == *m));
-        if open.is_empty() {
+        let newest = self
+            .store
+            .read(|r| r.answer_newest(R::NAME, inbox::LEAD))
+            .await
+            .map_err(|e| e.to_string())?
+            .filter(|h| self.later().ended.as_deref() != Some(h.message.as_str()));
+        if open.is_empty() && newest.is_none() {
             return Ok(());
         }
         let waiting: Vec<&HandoffRow> = open
@@ -1032,21 +1054,39 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             // the session file: that entry is the confirmation itself.
             .filter(|h| h.answer == "waiting" && matches!(h.state.as_str(), "delivered" | "handed"))
             .collect();
-        if !waiting.is_empty()
-            && let Some(snap) = self.lead.snapshot()
+        if let Some(snap) = self.lead.snapshot()
             && let Some(file) = snap.session_file.clone()
         {
             let settled = turn_over || snap.status == Status::Idle;
-            let tags = waiting
-                .iter()
-                .map(|h| Self::tag(&h.room, &h.message))
-                .collect();
-            let replies =
-                transcript::read_replies(PathBuf::from(file), tags, Self::prefix(), settled)
-                    .await
-                    .map_err(|e| e.to_string())?;
-            for (h, reply) in waiting.iter().zip(replies) {
-                self.settle_reply(h, reply).await?;
+            let file = PathBuf::from(file);
+            // The newest answered request's later turns: read again only when something changed.
+            let length = std::fs::metadata(&file).map(|m| m.len()).ok();
+            let later = newest.filter(|h| {
+                let seen = &self.later().read;
+                !matches!((seen, length), (Some((m, f, l, s)), Some(length))
+                    if *m == h.message && *f == file && *l == length && *s == settled)
+            });
+            if !waiting.is_empty() || later.is_some() {
+                let tags = waiting
+                    .iter()
+                    .copied()
+                    .chain(later.as_ref())
+                    .map(|h| Self::tag(&h.room, &h.message))
+                    .collect();
+                let mut replies =
+                    transcript::read_replies(file.clone(), tags, Self::prefix(), settled)
+                        .await
+                        .map_err(|e| e.to_string())?;
+                let later_reply = later.as_ref().and_then(|_| replies.pop());
+                for (h, reply) in waiting.iter().zip(replies) {
+                    self.settle_reply(h, reply).await?;
+                }
+                if let (Some(h), Some(reply)) = (later, later_reply) {
+                    self.later_turns(&h, reply).await?;
+                    if let Some(length) = length {
+                        self.later().read = Some((h.message, file, length, settled));
+                    }
+                }
             }
         }
         // One delivery at a time, in request order (DISC-OUT req. 28).
@@ -1081,7 +1121,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             answer: answer.into(),
         };
         match reply {
-            Reply::Answer(text) => match self.relay.parts(&text) {
+            Reply::Answer { text, more, .. } => match self.relay.parts(&text) {
                 Ok(parts) => {
                     self.remember(&h.room, &format!("{}:answer", h.message), "lead", &text)
                         .await;
@@ -1099,6 +1139,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         })
                         .await
                         .map_err(|e| e.to_string())?;
+                    self.store_later(h, &more).await?;
                 }
                 Err(why) => {
                     log::warn(
@@ -1125,6 +1166,91 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn later(&self) -> MutexGuard<'_, LaterTurns> {
+        self.later.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Follows the newest answered request: its later turns not stored yet are stored, until an
+    /// input ends them or the request leaves the session file.
+    async fn later_turns(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
+        let ended = match reply {
+            Reply::Answer { more, open, .. } => {
+                self.store_later(h, &more).await?;
+                !open
+            }
+            Reply::NotFound | Reply::Pending | Reply::Abandoned => true,
+        };
+        if ended {
+            self.later().ended = Some(h.message.clone());
+        }
+        Ok(())
+    }
+
+    /// Stores the final text of each later turn of `h` (DISC-OUT req. 21) not stored yet, as its
+    /// own parts after those already stored: posted after the answer where it went, never as the
+    /// reply, settling nothing. A turn the outgoing checks refuse is skipped.
+    async fn store_later(&self, h: &HandoffRow, more: &[String]) -> Result<(), String> {
+        if more.is_empty() {
+            return Ok(());
+        }
+        let stored = {
+            let (room, source) = (h.room.clone(), h.message.clone());
+            self.store
+                .read(move |r| r.parts(R::NAME, &room, &source))
+                .await
+                .map_err(|e| e.to_string())?
+        };
+        let (Some(last), Some(done)) = (stored.last(), stored.iter().map(|p| p.turn).max()) else {
+            return Ok(());
+        };
+        let mut start = last.idx + 1;
+        let done = usize::try_from(done).unwrap_or(usize::MAX);
+        for (turn, text) in (1..).zip(more).skip(done) {
+            let split = match self.relay.parts(text) {
+                Ok(split) => split,
+                Err(why) => {
+                    let mut later = self.later();
+                    if !matches!(&later.refused, Some((m, t)) if *m == h.message && *t == turn) {
+                        log::warn(
+                            "later turn not posted",
+                            &[("message", &h.message), ("turn", &turn), ("reason", &why)],
+                        );
+                        later.refused = Some((h.message.clone(), turn));
+                    }
+                    continue;
+                }
+            };
+            self.remember(
+                &h.room,
+                &format!("{}:answer:{turn}", h.message),
+                "lead",
+                text,
+            )
+            .await;
+            let parts: Vec<(String, String)> = (start..)
+                .zip(split)
+                .map(|(idx, p)| {
+                    let idx = usize::try_from(idx).unwrap_or(usize::MAX);
+                    (self.relay.nonce(&h.room, &h.message, idx), p)
+                })
+                .collect();
+            let count = i64::try_from(parts.len()).unwrap_or(i64::MAX);
+            self.store
+                .relay(RelayWrite::Continue {
+                    relay: R::NAME.into(),
+                    room: h.room.clone(),
+                    source: h.message.clone(),
+                    turn: i64::try_from(turn).unwrap_or(i64::MAX),
+                    start,
+                    parts,
+                })
+                .await
+                .map_err(|e| e.to_string())?;
+            start = start.saturating_add(count);
         }
         Ok(())
     }
@@ -1261,7 +1387,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
 
     /// Posts one part where the answer goes: in the room bound to the request without a reply, else
     /// in the request's room with the first part (or the first part moved there, after a note
-    /// pointing back to where the answer began) as the reply.
+    /// pointing back to where the answer began) as the reply. A later turn's part is never a reply.
     async fn post_part(
         &self,
         h: &HandoffRow,
@@ -1278,7 +1404,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             }
             let (room, reply_to) = target.room.as_deref().map_or_else(
                 || {
-                    let reply = part.idx == 0 || moved;
+                    let reply = part.turn == 0 && (part.idx == 0 || moved);
                     (h.room.as_str(), reply.then_some(h.message.as_str()))
                 },
                 |room| (room, None),

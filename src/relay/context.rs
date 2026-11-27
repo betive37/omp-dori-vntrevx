@@ -13,6 +13,7 @@ use std::fmt::Write as _;
 use std::sync::{Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
+use super::text::one_line;
 use super::{Facts, Inbound, Relay};
 use crate::config::relays::ContextSettings;
 use crate::store::relay::RecallRow;
@@ -183,15 +184,6 @@ impl Context {
             let _ = write!(line, ", note {note}");
         }
     }
-}
-
-fn one_line(text: &str, max: usize) -> String {
-    text.split_whitespace()
-        .collect::<Vec<_>>()
-        .join(" ")
-        .chars()
-        .take(max)
-        .collect()
 }
 
 /// The space a message belongs to: its listed parent, else its room (DISC-IN req. 55).

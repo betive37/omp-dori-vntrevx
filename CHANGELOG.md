@@ -109,6 +109,18 @@
 - A delivery set aside now records the check that refused it (`not ready: the goal is paused`)
   instead of only the session status. While a paused or budget-blocked goal still keeps your or
   the lead's messages out, the lead gets one `messages undelivered` alert naming the reason.
+- A background job that finishes while the lead answers you no longer replaces the answer. The
+  answer is the lead's final message of the turn your message started; a turn OMP starts by itself
+  afterwards, as for the job's result, never takes its place, so the real answer is the reply again
+  instead of a one-line "the backup finished". That later turn's text is still posted, after the
+  answer and where the answer went (the channel or its thread), as its own message that replies to
+  nothing and settles nothing. It is stored before it is posted, like the answer, and a restart
+  finds it. Discord, Telegram and Slack alike. An older version posts such stored text like the
+  rest of an answer.
+- A lead with `[lead] idle_sleep` no longer sleeps through the reminders for a message of yours it
+  has not answered: while such a message still has a reminder to come (1, 4 and 16 minutes after
+  it arrived), the lead stays awake. Once the message is answered or no reminder is left, it may
+  sleep as before (from #290, @betive37).
 
 ## 0.2.6 (2026-11-27)
 

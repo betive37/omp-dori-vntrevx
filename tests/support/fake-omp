@@ -16,6 +16,8 @@
 #                               prompt_result and session_settled. omp-data/slow makes the turn take 2 s
 #                               in the background (get_state then reports streaming, and a prompt or
 #                               follow-up meanwhile waits for the turn end, as OMP's follow-up does);
+#                               omp-data/followup (a JSON string) adds a background result after the
+#                               answer and a second turn ending with that text;
 #                               with omp-data/hold (a text) a message containing that text waits for
 #                               omp-data/release before its answer;
 #                               omp-data/noentry answers the prompt and writes nothing; with omp-data/ask
@@ -159,9 +161,20 @@ turn() {
     finish "$answer" "$2"
 }
 
-# Ends a turn with the JSON string $1 as the final answer, for the prompt with ID $2.
+# Ends a turn with the JSON string $1 as the final answer, for the prompt with ID $2. With
+# omp-data/followup (a JSON string) the turn ends awaiting async work, a background result is
+# injected as OMP's async-result message, and a second turn ends with that text.
 finish() {
-    finish_quiet "$1"
+    if [ -f "$dir/followup" ]; then
+        printf '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":%s}],"stopReason":"stop"}}\n' "$1" >> "$file"
+        printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":%s}],"stopReason":"stop"}}\n' "$1"
+        echo '{"type":"agent_end","awaitingAsyncWork":true}'
+        printf '{"type":"custom_message","customType":"async-result","content":"Background job done.","display":true}\n' >> "$file"
+        echo '{"type":"agent_start"}'
+        finish_quiet "$(cat "$dir/followup")"
+    else
+        finish_quiet "$1"
+    fi
     printf '{"type":"prompt_result","id":"%s","agentInvoked":true,"status":"completed","sessionSettled":true}\n' "$2"
     echo '{"type":"session_settled"}'
 }
@@ -246,16 +259,20 @@ rpc() {
         sh "$dir/child.run" < /dev/null > "$dir/child.out" 2>&1 &
     fi
     # omp-data/background-<id>: the session runs one turn by itself, as OMP does when a background
-    # job's result arrives (no prompt, no prompt_result). The poller ends with this process: a killed
-    # process stays a zombie until the hub reaps it, and the hub reaps only after this poller lets go
-    # of stdout, so a zombie counts as gone.
+    # job's result arrives: the async-result message, then a turn ending with the file's JSON string
+    # (else "background result read"), with no prompt and no prompt_result. The poller ends with
+    # this process: a killed process stays a zombie until the hub reaps it, and the hub reaps only
+    # after this poller lets go of stdout, so a zombie counts as gone.
     if [ -n "$file" ]; then
         (
             while s=$(ps -o stat= -p $$ 2>/dev/null) && case "$s" in *Z*) false ;; *) true ;; esac; do
                 if [ -f "$dir/background-$id" ]; then
+                    said=$(cat "$dir/background-$id")
                     rm -f "$dir/background-$id"
+                    [ -n "$said" ] || said='"background result read"'
+                    printf '{"type":"custom_message","customType":"async-result","content":"Background job done.","display":true}\n' >> "$file"
                     echo '{"type":"agent_start"}'
-                    finish_quiet '"background result read"'
+                    finish_quiet "$said"
                     echo '{"type":"session_settled"}'
                 fi
                 sleep 0.2

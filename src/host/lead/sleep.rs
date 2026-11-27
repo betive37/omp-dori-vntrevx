@@ -4,7 +4,8 @@
 //!
 //! Idle means, for the whole time: no turn running and no dialog open (an approval or a question
 //! card); nothing in the lead's inbox but quiet notes (no waking message, written batch awaiting its
-//! entry or in-doubt delivery); no open owner question; and no open lane. Quiet notes wait for the
+//! entry or in-doubt delivery); no open owner question; no open lane; and no owed reply with a
+//! reminder still to come, since the reminders only reach a live lead. Quiet notes wait for the
 //! next turn anyway, so they wait through a sleep and go with the first turn after the wake. Every
 //! session event, delivery, settled in-doubt entry and start counts as activity; an idle check that
 //! finds the lead busy restarts the count.
@@ -16,6 +17,8 @@ use super::{Asleep, LEAD, Lead, Phase};
 use crate::host::{Control, Runtime, Status};
 use crate::log;
 use crate::store::host::SessionUpdate;
+use crate::store::lead::REMINDERS_MAX;
+use crate::store::relay::OWED_WINDOW_MS;
 
 /// The stop the session record keeps for a sleeping lead; its detail is how the close went.
 pub(super) const ASLEEP: &str = "asleep";
@@ -141,16 +144,20 @@ impl<R: Runtime> Lead<R> {
                     && !snapshot.input_blocked
                     && snapshot.dialogs.is_empty()
             });
+        let since = crate::sys::now_ms() - OWED_WINDOW_MS;
         let idle = session_idle
             && matches!(
                 self.env
                     .store
-                    .read(|r| Ok(r
+                    .read(move |r| Ok(r
                         .inbox_open(LEAD)?
                         .iter()
                         .all(|row| row.state == "pending" && !row.urgent && !row.owner)
                         && r.questions(true)?.is_empty()
-                        && r.lanes(true)?.is_empty()))
+                        && r.lanes(true)?.is_empty()
+                        && r.owed_open("discord", since)?
+                            .iter()
+                            .all(|o| o.reminders >= REMINDERS_MAX)))
                     .await,
                 Ok(true)
             );
