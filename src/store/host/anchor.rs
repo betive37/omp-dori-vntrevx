@@ -69,6 +69,20 @@ pub(super) fn bound(
     Ok(done)
 }
 
+/// Pins name a session ID, whose latest row per exact tuple is retained along with the current anchor.
+pub(super) fn maintain(tx: &Transaction<'_>) -> rusqlite::Result<()> {
+    tx.execute(
+        "DELETE FROM lead_bindings AS old \
+         WHERE old.handle NOT IN (SELECT handle FROM lead_anchor WHERE handle IS NOT NULL) \
+         AND EXISTS(SELECT 1 FROM lead_bindings newer \
+             WHERE newer.session_id = old.session_id AND newer.session_file = old.session_file \
+             AND newer.cwd = old.cwd AND newer.runtime = old.runtime \
+             AND (newer.bound_ms, newer.rowid) > (old.bound_ms, old.rowid))",
+        [],
+    )?;
+    Ok(())
+}
+
 impl Reads {
     /// The only resolver for current and pinned lead identity. Unbound attempts are never candidates.
     pub(crate) fn lead_target(&self, pin: Option<&str>) -> rusqlite::Result<Selection> {
@@ -121,7 +135,14 @@ impl Reads {
                 )
                 .optional()?,
         };
-        if self.0.query_row("SELECT EXISTS(SELECT 1 FROM sessions WHERE role = 'lead' AND session_id IS NULL AND state IN ('starting', 'held', 'orphan_held'))", [], |r| r.get::<_, bool>(0))? {
+        if self.0.query_row(
+            "SELECT EXISTS(SELECT 1 FROM sessions s WHERE s.role = 'lead' AND s.session_id IS NULL \
+             AND s.state IN ('starting', 'held', 'orphan_held') AND NOT EXISTS( \
+                 SELECT 1 FROM lead_anchor a JOIN sessions b ON b.handle = a.handle \
+                 WHERE (b.started_ms, b.rowid) >= (s.started_ms, s.rowid)))",
+            [],
+            |r| r.get::<_, bool>(0),
+        )? {
             hold = Some("an earlier unbound lead attempt has unknown process ownership; held until its exit is reconciled".into());
         }
         let ever_bound = self.0.query_row(
@@ -131,8 +152,8 @@ impl Reads {
         Ok(Selection {
             row,
             ever_started,
-            intent,
             ever_bound,
+            intent,
             hold,
             provenance,
         })

@@ -121,6 +121,34 @@ impl Tern {
         argv.extend(omp);
         argv
     }
+
+    async fn open_block(
+        &self,
+        tern: &Path,
+        spec: &StartSpec,
+        token: &str,
+    ) -> Result<Option<String>, StartError> {
+        // The command may have opened a block before failing to acknowledge it.
+        let failed = |detail| StartError::Startup {
+            stage: super::startup::StartupStage::Spawn,
+            outcome: super::startup::StartupOutcome::Rejected,
+            cleanup: super::startup::Cleanup::Unknown,
+            detail,
+        };
+        let argv = self.argv(tern, spec, token);
+        let done = command::run(&tern_spec(&argv, Some(&spec.cwd)))
+            .await
+            .map_err(|error| failed(format!("tern: {error}")))?;
+        if done.success() {
+            Ok(block_id(&done.stdout))
+        } else {
+            let error = String::from_utf8_lossy(&done.stderr).trim().to_string();
+            Err(failed(format!(
+                "tern did not open a block ({:?}): {error}",
+                done.exit
+            )))
+        }
+    }
 }
 
 fn tern_spec<'a>(argv: &'a [String], cwd: Option<&'a Path>) -> Spec<'a> {
@@ -206,21 +234,11 @@ impl Runtime for Tern {
                 links.remove_port(&handle);
             });
         }
-        let argv = self.argv(&tern, &spec, &token);
-        let opened = command::run(&tern_spec(&argv, Some(&spec.cwd))).await;
-        let block = match opened {
-            Ok(done) if done.success() => block_id(&done.stdout),
-            Ok(done) => {
+        let block = match self.open_block(&tern, &spec, &token).await {
+            Ok(block) => block,
+            Err(error) => {
                 self.links.remove_port(&spec.handle);
-                let err = String::from_utf8_lossy(&done.stderr).trim().to_string();
-                return Err(StartError::Refused(format!(
-                    "tern did not open a block ({:?}): {err}",
-                    done.exit
-                )));
-            }
-            Err(e) => {
-                self.links.remove_port(&spec.handle);
-                return Err(StartError::Refused(format!("tern: {e}")));
+                return Err(error);
             }
         };
         port.block.lock().await.clone_from(&block);
@@ -228,15 +246,16 @@ impl Runtime for Tern {
             Some(block) => ownership.terminal(&tern, block),
             None => Ok(()),
         };
-        let (outcome, bound) = match recorded {
-            Err(error) => (super::startup::StartupOutcome::Rejected, Err(error)),
-            Ok(()) => tokio::select! {
+        let (outcome, bound) = if let Err(error) = recorded {
+            (super::startup::StartupOutcome::Rejected, Err(error))
+        } else {
+            tokio::select! {
                 biased;
                 () = super::startup::cancelled(&mut cancel) =>
                     (super::startup::StartupOutcome::Cancelled, Err("terminal startup cancelled".into())),
                 result = tokio::time::timeout_at(deadline, async {
                     attached.await.map_err(|_| "the terminal bridge closed before binding".to_string())?;
-                    let pid = port.snapshot.borrow().pid;
+                    let pid = port.lock().pid;
                     ownership.spawned(pid).await?;
                     port.bind(&spec)
                 }) => match result {
@@ -244,7 +263,7 @@ impl Runtime for Tern {
                     Err(_) => (super::startup::StartupOutcome::Timeout,
                         Err("no terminal identity binding within the 60 s startup deadline".into())),
                 },
-            },
+            }
         };
         match bound {
             Ok(started) => Ok((Arc::new(Session { port }), started)),
@@ -669,8 +688,39 @@ impl Port {
         let port = Arc::clone(self);
         tokio::spawn(async move {
             tokio::time::sleep_until(due).await;
+            let owner = port
+                .ownership
+                .lock()
+                .unwrap_or_else(PoisonError::into_inner)
+                .clone();
+            let ended = if let Some(owner) = owner {
+                match owner.exited().await {
+                    Ok(cleanup) if cleanup.confirmed() => match owner.finished(cleanup) {
+                        Ok(()) => true,
+                        Err(error) => {
+                            log::warn("terminal exit receipt not recorded", &[("error", &error)]);
+                            false
+                        }
+                    },
+                    Ok(_) => false,
+                    Err(error) => {
+                        log::warn("terminal process exit is unknown", &[("error", &error)]);
+                        false
+                    }
+                }
+            } else {
+                false
+            };
             let mut st = port.lock();
             if st.generation != generation || st.wire.is_some() || st.stop.is_some() || st.lost {
+                return;
+            }
+            if ended {
+                drop(st);
+                port.record_stop(
+                    "exited".into(),
+                    Some("the terminal's recorded OMP process exited".into()),
+                );
                 return;
             }
             st.lost = true;

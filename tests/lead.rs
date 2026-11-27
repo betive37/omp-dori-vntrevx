@@ -1415,7 +1415,7 @@ fn first_failed_start_retries_when_no_conversation_was_bound() {
 
 #[test]
 fn a_startup_model_mismatch_keeps_the_session_fenced_until_owner_acceptance() {
-    let mut w = wrapped("", None);
+    let mut w = wrapped("", Some("1s"));
     let first = original(&mut w);
     assert!(w.hub.cli(&["lead", "stop"]).status.success());
     w.hub.fixture("omp", "model", Some("fake/other"));
@@ -1423,6 +1423,7 @@ fn a_startup_model_mismatch_keeps_the_session_fenced_until_owner_acceptance() {
     assert!(out.status.success(), "{out:?}");
     let fenced = live(&w.hub, &first["session"]["pid"]);
     assert!(fenced["session"]["input_blocked"].as_bool().unwrap());
+    stays_awake(&w.hub, &fenced["session"]["pid"], 2);
     assert_eq!(
         fenced["anchor"]["session_id"],
         first["anchor"]["session_id"]

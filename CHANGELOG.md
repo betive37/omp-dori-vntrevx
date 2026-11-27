@@ -66,10 +66,14 @@
   resume their newest proven binding, and an owner retry of a first failed start needs no
   `--fresh` when no conversation ever bound. Startup model mismatch keeps the process open and
   input fenced until `lead accept-model` durably commits the accepted identity.
+  A model fence also prevents idle sleep, so the session stays available for that decision.
 - Tern startup journals retain the block ID and process birth identity; confirmed block close
   or disappearance of that exact process proves termination. Unknown exits remain held.
   Settled startup receipts are pruned only after no anchor, recovery episode or lane references
   them; current and uncertain attempts are never discarded merely because they are old.
+  Maintenance collapses only superseded duplicate binding tuples, retaining the current anchor
+  and latest evidence for every pinnable identity. A crash before receipt pruning leaves a
+  harmless retained receipt that the next prune can remove.
 - Automatic update switch-back refuses an old reader after the new hub migrated the store beyond
   its support, leaving the new version selected with an owner-attention explanation.
 - Your answer in a lane's thread now reaches a lane that paused its own goal while waiting for

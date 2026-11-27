@@ -163,6 +163,16 @@ function ternHub(sent: any[], hub: { push?: (cmd: any) => void }, first?: Record
 	};
 }
 
+/** A fake model catalog; `fake/glm:high` and `ollama/qwen:14b` are literal IDs with a colon. */
+const CATALOG = ["fake/primary", "fake/second", "fake/glm:high", "ollama/qwen:14b"];
+function catalogResolve(spec: string) {
+	if (spec === "fake/throw") throw new Error("registry offline");
+	const hit = (s: string) => CATALOG.includes(s) && { provider: s.slice(0, s.indexOf("/")), id: s.slice(s.indexOf("/") + 1) };
+	const colon = spec.lastIndexOf(":");
+	const level = ["off", "minimal", "low", "medium", "high", "xhigh", "max"].includes(spec.slice(colon + 1));
+	return hit(spec) || (colon > 0 && level && hit(spec.slice(0, colon))) || undefined;
+}
+
 function ternCtx(pi: ReturnType<typeof fakePi>, state: { idle: boolean; aborts: number; shutdowns: number; goal: string; objective?: string }) {
 	return {
 		...ctxOf(pi),
@@ -170,8 +180,8 @@ function ternCtx(pi: ReturnType<typeof fakePi>, state: { idle: boolean; aborts: 
 		isIdle: () => state.idle,
 		abort: () => (state.aborts += 1),
 		shutdown: () => (state.shutdowns += 1),
-		// `ctx.models.resolve` accepts a thinking suffix and returns the base model.
-		models: { current: () => ({ provider: "fake", id: "primary" }), resolve: (spec: string) => (spec.startsWith("fake/") ? { provider: "fake", id: spec.slice(5).split(":")[0] } : undefined) },
+		// As stock OMP's `ctx.models.resolve`: an exact catalog ID wins, else a last-colon `:<level>` suffix is dropped.
+		models: { current: () => ({ provider: "fake", id: "primary" }), resolve: catalogResolve },
 		// As stock OMP 19.1.1: a mode change is refused while a turn runs.
 		sessionModes: {
 			getState: () => ({ goal: { status: state.goal, objective: state.objective } }),
@@ -194,6 +204,7 @@ test("a terminal session takes deliveries, steer, interrupt, model, goal and shu
 	pi.sendMessage = async (m: any, o: any) => void calls.push(["message", m, o]);
 	pi.sendUserMessage = async (t: string, o: any) => void calls.push(["user", t, o]);
 	pi.setModel = async (m: any) => void calls.push(["model", m]);
+	pi.setThinkingLevel = (l: string) => void calls.push(["thinking", l]);
 	const sent: any[] = [];
 	const hub: { push?: (cmd: any) => void } = {};
 	const state = { idle: true, aborts: 0, shutdowns: 0, goal: "active" };
@@ -230,7 +241,7 @@ test("a terminal session takes deliveries, steer, interrupt, model, goal and shu
 	expect(r[2].refused).toContain("other text");
 	expect(r[3].refused).toBe("no running turn to steer");
 	expect(r[4]).toMatchObject({ idle: true });
-	expect(r[5]).toEqual({ n: 6, model: "fake/primary" });
+	expect(r[5]).toMatchObject({ n: 6, model: "fake/primary" });
 	expect(r[6]).toMatchObject({ goal: { status: "paused" } });
 	expect(r[7]).toEqual({ n: 8, refused: "not current" });
 	expect(r[8]).toEqual({ n: 9, sent: true });
@@ -318,4 +329,86 @@ test("a mirrored form takes the first answer and withdraws the other (check 4)",
 	expect(sent.find(m => m.params?.kind === "form_closed").params).toMatchObject({ call: "f1", by: "Discord" });
 	hub.push?.({ n: 2, op: "form", call: "f1", answer: {} });
 	expect(replies(sent).find(r => r.n === 2).refused).toContain("already answered");
+});
+
+/** A Tern session over the fake catalog whose thinking level the bridge reads and sets; `push` sends one hub command. */
+async function modelSession(connect = ternHub) {
+	const pi: any = fakePi();
+	const calls: any[] = [];
+	let level = "medium";
+	pi.getThinkingLevel = () => level;
+	pi.setThinkingLevel = (l: string) => void calls.push(["thinking", (level = l)]);
+	pi.setModel = async (m: any) => void calls.push(["model", m]);
+	const sent: any[] = [];
+	const hub: { push?: (cmd: any) => void } = {};
+	bridge(pi, { env: { CATALY_LAUNCH: "t" }, connect: connect(sent, hub), uid: () => 1 });
+	await pi.emit("session_start", {}, ternCtx(pi, { idle: true, aborts: 0, shutdowns: 0, goal: "inactive" }));
+	const ask = async (cmd: any) => {
+		hub.push?.({ n: 1, session: "s1", ...cmd });
+		await settle();
+		const out = replies(sent).pop();
+		sent.length = 0;
+		return out;
+	};
+	return { ask, calls, hello: sent[0]?.params };
+}
+
+const resolution = (selector: string, provider: string, id: string, requested: string | null, observed = "medium") =>
+	({ n: 1, model_resolution: { version: 1, selector, provider, id, thinking: { requested, observed } } });
+
+test("the hello announces the model resolution version", async () => {
+	expect((await modelSession()).hello).toMatchObject({ model_resolution_version: 1 });
+});
+
+test("model.resolve: a literal catalog ID with a colon wins and requests no effort", async () => {
+	const { ask } = await modelSession();
+	expect(await ask({ op: "model.resolve", selector: "fake/glm:high" })).toEqual(resolution("fake/glm:high", "fake", "glm:high", null));
+});
+
+test("model.resolve: `x:high` is OMP's base model with high requested; an explicit level wins as stock `--thinking`", async () => {
+	const { ask } = await modelSession();
+	expect(await ask({ op: "model.resolve", selector: "fake/second:high" })).toEqual(resolution("fake/second:high", "fake", "second", "high"));
+	expect(await ask({ op: "model.resolve", selector: "fake/second:high", thinking: "low" })).toEqual(resolution("fake/second:high", "fake", "second", "low"));
+});
+
+test("model.resolve: `ollama/qwen:14b` stays literal, `:14b` is no thinking level", async () => {
+	const { ask } = await modelSession();
+	expect(await ask({ op: "model.resolve", selector: "ollama/qwen:14b" })).toEqual(resolution("ollama/qwen:14b", "ollama", "qwen:14b", null));
+});
+
+test("model.resolve answers unverified, never a model, when OMP cannot resolve the selector", async () => {
+	const { ask } = await modelSession();
+	expect(await ask({ op: "model.resolve", selector: "fake/nothing:high" })).toEqual({ n: 1, model_unverified: "OMP does not know the model fake/nothing:high" });
+	expect(await ask({ op: "model.resolve", selector: "fake/throw" })).toEqual({ n: 1, model_unverified: "OMP could not resolve the model fake/throw: registry offline" });
+	expect((await ask({ op: "model.resolve", selector: "fake/second", thinking: "auto" })).model_unverified).toContain("auto");
+});
+
+test("the model command sets OMP's resolved model and the effort separately, never splitting at the first colon", async () => {
+	const { ask, calls } = await modelSession();
+	expect(await ask({ op: "model", model: "ollama/qwen:14b:xhigh" })).toMatchObject({ model_resolution: { id: "qwen:14b", thinking: { requested: "xhigh", observed: "xhigh" } } });
+	expect(calls).toEqual([["model", { provider: "ollama", id: "qwen:14b" }], ["thinking", "xhigh"]]);
+	calls.length = 0;
+	expect(await ask({ op: "model", model: "fake/glm:high" })).toMatchObject({ model_resolution: { id: "glm:high", thinking: { requested: null } } });
+	expect(calls).toEqual([["model", { provider: "fake", id: "glm:high" }]]);
+	calls.length = 0;
+	expect(await ask({ op: "model", model: "fake/nothing" })).toEqual({ n: 1, refused: "OMP does not know the model fake/nothing", model_unverified: "OMP does not know the model fake/nothing" });
+	expect(calls).toEqual([]);
+});
+
+test("a session without Tern answers model.resolve and still takes no other command", async () => {
+	const leadHub = (sent: any[], hub: { push?: (cmd: any) => void }): Deps["connect"] => async (_path, onLine): Promise<Wire> => {
+		hub.push = cmd => onLine(JSON.stringify({ v: 1, id: 0, item: { cmd } }));
+		return {
+			write(line: string) {
+				const msg = JSON.parse(line);
+				sent.push(msg);
+				if (msg.method === "bridge.hello") queueMicrotask(() => onLine(JSON.stringify({ v: 1, id: msg.id, ok: { role: "lead", key: "k4", tools: [] } })));
+			},
+			close() {},
+		};
+	};
+	const { ask, calls } = await modelSession(leadHub);
+	expect(await ask({ op: "model.resolve", selector: "fake/second:max" })).toEqual(resolution("fake/second:max", "fake", "second", "max"));
+	expect(await ask({ op: "model", model: "fake/second" })).toBeUndefined();
+	expect(calls).toEqual([]);
 });

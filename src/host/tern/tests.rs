@@ -403,3 +403,76 @@ async fn a_user_switch_moves_the_current_session_and_deliveries_follow_it() {
         DeliverOutcome::NotReady(..)
     ));
 }
+
+#[tokio::test]
+async fn a_detached_terminal_process_exit_emits_a_confirmed_stop() {
+    use crate::host::lead::ownership::Ownership;
+    use crate::host::startup::Cleanup;
+    let dir = crate::sys::fs::tests::scratch("tern-exited");
+    let argv = ["sh".into(), "-c".into(), "read line".into()];
+    let child = command::attach(&argv, Some(&dir), &[], None, 4096).unwrap();
+    let owner = Arc::new(Ownership::prepare(&dir, "t1").unwrap());
+    owner.spawned(child.pid()).await.unwrap();
+    let (port, attached) = port();
+    *port.ownership.lock().unwrap() = Some(owner);
+    let (tx, _rx) = mpsc::channel(8);
+    port.attach(&hello("s1", u64::from(child.pid().unwrap())), "owned", tx)
+        .unwrap();
+    attached.await.unwrap();
+    port.bind(&spec("t1", None)).unwrap();
+    let mut states = port.snapshot.subscribe();
+    let (exit, _) = child
+        .close(Duration::from_secs(1), Duration::from_secs(1))
+        .await;
+    assert_ne!(exit, command::Exit::Unknown);
+    port.detach("owned");
+    let stopped = timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(stop) = states.borrow_and_update().stop.clone() {
+                break stop;
+            }
+            states.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("a proven process exit must end the session, not leave it lost");
+    assert_eq!(stopped.cleanup, Cleanup::LocalReaped);
+    assert_eq!(stopped.how, "exited");
+}
+
+#[tokio::test]
+async fn a_failed_terminal_open_does_not_claim_no_writer_was_spawned() {
+    use std::os::unix::fs::PermissionsExt as _;
+    let dir = crate::sys::fs::tests::scratch("tern-open-failed");
+    let program = dir.join("tern");
+    std::fs::write(&program, "#!/bin/sh\nexit 7\n").unwrap();
+    std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let tern = Tern {
+        program: Some(program),
+        block_session: None,
+        omp: "omp".into(),
+        state: dir.to_path_buf(),
+        socket: dir.join("hub.sock"),
+        spill: dir.join("spill"),
+        extra_flags: Vec::new(),
+        agent_start: Latency::default(),
+        links: Arc::default(),
+    };
+    let (_keep, cancel) = watch::channel(false);
+    let Err(error) = tern
+        .start_supervised(spec("failed-open", None), cancel)
+        .await
+    else {
+        panic!("the terminal open failed");
+    };
+    assert!(
+        matches!(
+            error,
+            StartError::Startup {
+                cleanup: super::super::startup::Cleanup::Unknown,
+                ..
+            }
+        ),
+        "{error:?}"
+    );
+}

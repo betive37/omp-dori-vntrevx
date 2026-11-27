@@ -12,6 +12,7 @@ import type {
 } from "@oh-my-pi/pi-coding-agent";
 
 const PROTOCOL = 1;
+const MODEL_RESOLUTION = 1; // the `model.resolve` answer's version, announced in the hello (additive to PROTOCOL 1)
 const VERSION = "0.0.0-source"; // `cataly extension` writes the release file with it filled in (IR req. 5-6)
 const MARKER = "cataly";
 const DELIVERY = "cataly-delivery";
@@ -118,6 +119,35 @@ function modelOf(ctx: Ctx): string {
 	return m ? `${m.provider}/${m.id}` : "";
 }
 
+/** The concrete efforts of OMP's selector suffix grammar, `provider/id:<level>` (OMP v19.2.1 public docs/models.md:811;
+ * src/config/model-selector.ts:36-54, `splitThinkingSuffix` takes the suffix after the last colon only). */
+const LEVELS = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+
+/** OMP's model type, named through its public `ctx.models` API: it lives in `@oh-my-pi/pi-ai`, not a dependency here. */
+type Model = NonNullable<ReturnType<Ctx["models"]["resolve"]>>;
+
+/** The model OMP itself resolves `selector` to, and the effort it requests, or why it is unverified. The model comes
+ * only from `ctx.models.resolve`, which "resolve[s] thinking/routing suffixes to the base model (pass effort
+ * separately)" (OMP v19.2.1 src/extensibility/extensions/types.ts:606-612; public docs/extensions.md:548). An explicit
+ * `thinking` wins over the suffix, as stock `--thinking` does (src/main.ts:1630-1631, 1803-1804). Otherwise the
+ * suffix is the effort only when OMP's model ID is the selector's ID without it; a literal ID that ends in a colon
+ * part (`glm:high`, `qwen:14b`) requests nothing. */
+function resolveSelector(ctx: Ctx, selector: string, thinking: unknown): { model: Model; requested: string | null } | string {
+	let model: Model | undefined;
+	try {
+		model = ctx.models.resolve(selector);
+	} catch (e) {
+		return `OMP could not resolve the model ${selector}: ${(e as Error)?.message ?? e}`;
+	}
+	if (!model) return `OMP does not know the model ${selector}`;
+	if (thinking != null) return LEVELS.includes(String(thinking)) ? { model, requested: String(thinking) } : `${thinking} is not a thinking level`;
+	const id = selector.startsWith(`${model.provider}/`) ? selector.slice(model.provider.length + 1) : selector;
+	const colon = id.lastIndexOf(":");
+	const level = id.slice(colon + 1);
+	const suffix = model.id !== id && colon > 0 && LEVELS.includes(level) && model.id === id.slice(0, colon);
+	return { model, requested: suffix ? level : null };
+}
+
 /** Agent registry IDs of this realm's accepted sessions and subagents, with the session the hub knows. */
 const owners = new Map<string, string>();
 
@@ -193,7 +223,8 @@ export class Bridge {
 		const ctx = this.ctx;
 		const [cwd, agent, mode] = [ctx?.cwd ?? "", ctx?.agent?.kind ?? "main", ctx?.mode ?? ""].map(String);
 		const ids = { version: VERSION, token: this.token, key: this.key, session: this.session, file: this.file(), parent: this.parent };
-		return { ext: PROTOCOL, ...ids, pid: process.pid, cwd, agent, mode, marker: marked(ctx), ...this.facts(ctx) };
+		const caps = { model_resolution_version: MODEL_RESOLUTION };
+		return { ext: PROTOCOL, ...ids, ...caps, pid: process.pid, cwd, agent, mode, marker: marked(ctx), ...this.facts(ctx) };
 	}
 
 	async connect(): Promise<void> {
@@ -272,7 +303,8 @@ export class Bridge {
 			resolve?.(cmd.answer);
 			return this.send("bridge.reply", { n: cmd.n, ...(resolve ? {} : { refused: "the form was already answered" }) });
 		}
-		if (cmd) return void (this.chain = this.chain.then(() => (this.tern ? this.command(cmd) : undefined)));
+		// Every accepted session answers the read-only `model.resolve`; only a Tern session takes the other commands.
+		if (cmd) return void (this.chain = this.chain.then(() => (this.tern || cmd.op === "model.resolve" ? this.command(cmd) : undefined)));
 		if (item && typeof item.status === "string") this.status(item.status);
 	}
 
@@ -424,12 +456,18 @@ export class Bridge {
 		if (c.op === "deliver") return this.deliver(c, idle);
 		if (c.op === "interrupt") return idle ? { idle: true } : (ctx.abort(), {});
 		if (c.op === "shutdown") return !idle && !c.force ? { refused: "busy: a turn is running" } : (ctx.shutdown(), {});
+		if (c.op === "model.resolve") {
+			const selector = String(c.selector ?? "");
+			const found = resolveSelector(ctx, selector, c.thinking);
+			return typeof found === "string" ? { model_unverified: found } : this.resolution(selector, found);
+		}
 		if (c.op === "model") {
 			if (!idle) return { refused: "a turn is running" };
-			const model = ctx.models.resolve(String(c.model));
-			if (!model) return { refused: `OMP does not know the model ${c.model}` };
-			if ((await this.pi.setModel(model)) === false) return { refused: "OMP did not set the model" };
-			return { model: modelOf(ctx) };
+			const found = resolveSelector(ctx, String(c.model), c.thinking);
+			if (typeof found === "string") return { refused: found, model_unverified: found };
+			if ((await this.pi.setModel(found.model)) === false) return { refused: "OMP did not set the model" };
+			if (found.requested) this.pi.setThinkingLevel(found.requested as Parameters<Pi["setThinkingLevel"]>[0]);
+			return { model: modelOf(ctx), ...this.resolution(String(c.model), found) };
 		}
 		if (c.op === "goal") {
 			if (!ctx?.sessionModes) return { refused: "goal control needs OMP's TUI session modes" };
@@ -437,6 +475,12 @@ export class Bridge {
 			return done?.ok === false ? { refused: `${done.code}: ${done.message}` } : this.facts(ctx);
 		}
 		return { refused: `unknown command ${c.op}` };
+	}
+
+	/** The `model_resolution` answer, version `MODEL_RESOLUTION`, with the thinking level OMP reports now. */
+	resolution(selector: string, found: { model: Model; requested: string | null }): Json {
+		const thinking = { requested: found.requested, observed: safe(() => this.pi.getThinkingLevel?.()) ?? null };
+		return { model_resolution: { version: MODEL_RESOLUTION, selector, provider: found.model.provider, id: found.model.id, thinking } };
 	}
 
 	/** Deliver (EXT req. 25, 29): a custom message carrying the delivery ID (wake), or a steer of

@@ -105,22 +105,9 @@ impl Runtime for Headless {
         let token = super::random_hex(16);
         self.links.issue(&token, &spec.handle, spec.role);
         if let Some(worker) = spec.worker.clone() {
-            let owner = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
-                .map_err(StartError::Refused)?;
-            owner
-                .identify(spec.expected_id.as_deref(), Some(&worker))
-                .map_err(StartError::Refused)?;
-            let result = self
+            return self
                 .start_remote(spec, &worker, &token, deadline, cancel)
                 .await;
-            if let Err(error) = &result {
-                let cleanup = match error {
-                    StartError::Startup { cleanup, .. } => *cleanup,
-                    StartError::Refused(_) => Cleanup::NotSpawned,
-                };
-                owner.finished(cleanup).map_err(StartError::Refused)?;
-            }
-            return result;
         }
         let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
         let argv = Launch {
@@ -223,6 +210,32 @@ impl Headless {
     /// cancellation govern it end to end; a failure after the spawn waits for the worker's exit
     /// acknowledgement, which alone proves the attempt ended.
     async fn start_remote(
+        &self,
+        spec: StartSpec,
+        worker: &str,
+        token: &str,
+        deadline: tokio::time::Instant,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
+        let owner = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
+            .map_err(StartError::Refused)?;
+        owner
+            .identify(spec.expected_id.as_deref(), Some(worker))
+            .map_err(StartError::Refused)?;
+        let result = self
+            .bind_remote(spec, worker, token, deadline, cancel)
+            .await;
+        if let Err(error) = &result {
+            let cleanup = match error {
+                StartError::Startup { cleanup, .. } => *cleanup,
+                StartError::Refused(_) => Cleanup::NotSpawned,
+            };
+            owner.finished(cleanup).map_err(StartError::Refused)?;
+        }
+        result
+    }
+
+    async fn bind_remote(
         &self,
         spec: StartSpec,
         worker: &str,

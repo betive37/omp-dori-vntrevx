@@ -576,8 +576,9 @@ fn resolve(
 }
 
 /// Retention (DESIGN 7.2): finished inbox rows, deliveries and receipts after 7 days; once-only
-/// identities after 30 days; stopped attempts after 30 days, never proven lead bindings.
+/// identities after 30 days; stopped attempts after 30 days, preserving current and pinnable bindings.
 pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
+    anchor::maintain(tx)?;
     let finished = now - FINISHED_KEEP_MS;
     tx.execute(
         "DELETE FROM inbox WHERE state IN ('delivered', 'failed') AND updated_ms < ?1",
