@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- **The lead tool declares the lane parameters.** The `cataly_lead` JSON schema listed only the
+  request, question, job and onboarding parameters, so a model could not send `lane.open`'s
+  `checks` as a list (the open was refused with "the done checks must be a list of signals") nor
+  `key`, `brief`, `worktree`, `after` and the other lane parameters. Every key the lane operations
+  read is now declared with its JSON type; a test fails when the dispatcher reads a key the schema
+  lacks.
+
 ## 0.2.5 (2026-11-27)
 
 - **Remote workers, phase 1 (enrolment and connection).** `cataly worker add user@host[:port]`
