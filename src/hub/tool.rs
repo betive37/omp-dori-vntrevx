@@ -23,7 +23,7 @@ pub(crate) const LEAD_TOOL: &str = "cataly_lead";
 pub(crate) fn definition() -> Value {
     let text = |d: &str| json!({ "type": "string", "description": d });
     let int = |d: &str| json!({ "type": "integer", "description": d });
-    json!({
+    let mut def = json!({
         "name": LEAD_TOOL,
         "label": "Cataly",
         "description": "Cataly's records and watches. op is one of: requests (all?), request.add (title, source, thread?), \
@@ -88,6 +88,78 @@ pub(crate) fn definition() -> Value {
             },
             "required": ["op"]
         }
+    });
+    if let (Some(props), Value::Object(lane)) = (
+        def["parameters"]["properties"].as_object_mut(),
+        lane_properties(),
+    ) {
+        props.extend(lane);
+    }
+    def
+}
+
+/// The parameters of the `lane.*` operations, in their JSON types (a checks list stays a list).
+fn lane_properties() -> Value {
+    let text = |d: &str| json!({ "type": "string", "description": d });
+    let int = |d: &str| json!({ "type": "integer", "description": d });
+    let signal = json!({
+        "type": "object",
+        "properties": {
+            "kind": { "type": "string", "enum": ["pr_merged", "issue_closed", "command", "file", "web", "pr_policy"] },
+            "repo": text("owner/name"),
+            "number": { "type": "integer" },
+            "argv": { "type": "array", "items": { "type": "string" } },
+            "pattern": text("regular expression"),
+            "path": { "type": "string" },
+            "sha256": { "type": "string" },
+            "field": text("JSON field of the file"),
+            "value": { "description": "expected value of field" },
+            "url": { "type": "string" },
+            "status": { "type": "integer" }
+        },
+        "required": ["kind"]
+    });
+    json!({
+                "key": text("lane key"),
+                "brief": text("lane brief"),
+                "brief_file": text("path of a file holding the lane brief"),
+                "checks": { "type": "array", "description": "done signals", "items": signal },
+                "thread_from": text("lane.open: message to start the lane's new thread from"),
+                "kickoff": text("lane.open: one line posted into the new thread (with thread_from)"),
+                "cwd": text("working directory"),
+                "model": text("model"),
+                "origin": text("where the lane came from"),
+                "look_only": { "type": "boolean", "description": "the lane only reads" },
+                "ceilings": { "type": "object", "description": "lane.open: spend and time ceilings" },
+                "preview": { "type": "boolean", "description": "lane.open: show, do not start" },
+                "request_id": text("lane.open: the request-log item it serves"),
+                "worktree": {
+                    "type": "object",
+                    "properties": { "path": { "type": "string" }, "branch": { "type": "string" }, "base": { "type": "string" } },
+                    "required": ["path", "branch", "base"]
+                },
+                "worker": text("a configured worker"),
+                "priority": int("1 to 9"),
+                "after": { "type": "array", "items": { "type": "string" }, "description": "predecessor lane keys" },
+                "expires_hours": { "type": "number", "description": "a queued launch expires after this" },
+                "condition": text("when a parked lane may resume"),
+                "reasons": { "type": "array", "items": { "type": "string" } },
+                "note": text("close, reopen or release note"),
+                "lesson": text("lesson learned"),
+                "revision": text("the lane revision the call is for"),
+                "steer": { "type": "boolean", "description": "lane.send: interrupt the current turn" },
+                "count": int("how many"),
+                "dialog": text("the lane dialog ID"),
+                "rule": int("the rule number"),
+                "evidence": text("evidence for a claim or rule"),
+                "repo": text("owner/name"),
+                "label": text("issue label"),
+                "pr": text("owner/name#N"),
+                "dry_run": { "type": "boolean" },
+                "path": text("file path"),
+                "visibility": text("private|public"),
+                "scope": text("global|repo"),
+                "destination": text("where the finding goes")
     })
 }
 
@@ -554,4 +626,112 @@ pub(crate) async fn recap(hub: &Hub) -> String {
         out.truncate(end);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::definition;
+
+    /// The sources whose code reads the lead tool's input, for every op the tool dispatches.
+    const SOURCES: [&str; 9] = [
+        include_str!("tool.rs"),
+        include_str!("onboarding.rs"),
+        include_str!("streams.rs"),
+        include_str!("../lanes/mod.rs"),
+        include_str!("../lanes/plan.rs"),
+        include_str!("../lanes/queue.rs"),
+        include_str!("../lanes/review.rs"),
+        include_str!("../lanes/publish.rs"),
+        include_str!("../lanes/board.rs"),
+    ];
+
+    /// Every quoted key after one of `prefixes` in `code` with its whitespace removed.
+    fn keys_after(code: &str, prefixes: &[&str], out: &mut Vec<String>) {
+        let flat: String = code.chars().filter(|c| !c.is_whitespace()).collect();
+        let flat = flat.split("#[cfg(test)]").next().unwrap_or_default();
+        for prefix in prefixes {
+            for (at, _) in flat.match_indices(prefix) {
+                let rest = &flat[at + prefix.len()..];
+                let key: String = rest
+                    .chars()
+                    .take_while(|c| c.is_ascii_lowercase() || *c == '_')
+                    .collect();
+                if !key.is_empty() && rest[key.len()..].starts_with('"') {
+                    out.push(key);
+                }
+            }
+        }
+    }
+
+    /// The fields of the lane open input, which is read as a whole.
+    fn open_fields(out: &mut Vec<String>) {
+        let code = include_str!("../lanes/record.rs");
+        let start = code
+            .find("pub(crate) struct OpenInput {")
+            .expect("OpenInput");
+        let body = &code[start..];
+        let body = &body[..body.find("\n}").expect("end of OpenInput")];
+        for line in body.lines().skip(1) {
+            if let Some(field) = line.trim().strip_prefix("pub(crate) ")
+                && let Some((name, _)) = field.split_once(':')
+            {
+                out.push(name.to_string());
+            }
+        }
+    }
+
+    #[test]
+    fn schema_declares_every_input_key() {
+        let mut keys = Vec::new();
+        for code in SOURCES {
+            keys_after(
+                code,
+                &["(input,\"", "input.get(\"", "m.remove(\""],
+                &mut keys,
+            );
+        }
+        open_fields(&mut keys);
+        assert!(
+            keys.iter().any(|k| k == "checks"),
+            "the scan found the lane keys"
+        );
+        let def = definition();
+        let props = def["parameters"]["properties"].as_object().unwrap();
+        let mut missing: Vec<_> = keys.iter().filter(|k| !props.contains_key(*k)).collect();
+        missing.sort();
+        missing.dedup();
+        assert!(
+            missing.is_empty(),
+            "keys read but not in the schema: {missing:?}"
+        );
+    }
+
+    #[test]
+    fn structured_lane_inputs_have_their_types() {
+        let def = definition();
+        let p = &def["parameters"]["properties"];
+        for (key, kind) in [
+            ("checks", "array"),
+            ("after", "array"),
+            ("argv", "array"),
+            ("options", "array"),
+            ("calls", "array"),
+            ("reasons", "array"),
+            ("worktree", "object"),
+            ("ceilings", "object"),
+            ("priority", "integer"),
+            ("rule", "integer"),
+            ("count", "integer"),
+            ("expires_hours", "number"),
+            ("preview", "boolean"),
+            ("look_only", "boolean"),
+            ("steer", "boolean"),
+            ("dry_run", "boolean"),
+        ] {
+            assert_eq!(p[key]["type"], kind, "{key}");
+        }
+        assert_eq!(p["checks"]["items"]["type"], "object");
+        assert!(p["checks"]["items"]["properties"]["kind"]["enum"].is_array());
+        assert_eq!(p["worktree"]["properties"]["branch"]["type"], "string");
+    }
 }

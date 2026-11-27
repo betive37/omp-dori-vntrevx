@@ -966,6 +966,62 @@ fn lead_tool(bridge: &mut Bridge, session: &Value, call: &str, input: Value) -> 
     )
 }
 
+/// Whether `value` has the JSON Schema `kind`.
+fn has_type(value: &Value, kind: &str) -> bool {
+    match kind {
+        "string" => value.is_string(),
+        "integer" => value.is_i64() || value.is_u64(),
+        "number" => value.is_number(),
+        "boolean" => value.is_boolean(),
+        "array" => value.is_array(),
+        "object" => value.is_object(),
+        _ => false,
+    }
+}
+
+/// The lead opens a lane through its own tool as a model would: every key it sends is declared by
+/// the schema the bridge registered, with the declared type, and `checks` goes as a list.
+#[test]
+fn lead_tool_opens_a_lane_with_a_checks_list() {
+    let (mut hub, work) = lane_hub("");
+    let text = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{text}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    start(&mut hub);
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    let (_, err) = lead_tool(&mut b, &s, "t1", json!({ "op": "onboarding.start" }));
+    assert!(!err);
+    let no = json!({ "op": "onboarding.consent", "answer": "no", "message": "owner-msg-1" });
+    let (_, err) = lead_tool(&mut b, &s, "t2", no);
+    assert!(!err);
+    let input = json!({
+        "op": "lane.open",
+        "key": "tool-open",
+        "title": "Work through the tool",
+        "brief": "Do the work.",
+        "checks": [{ "kind": "command", "argv": ["true"] }],
+        "priority": 3,
+    });
+    let props = &meta["hello"]["tools"][0]["parameters"]["properties"];
+    for (key, value) in input.as_object().unwrap() {
+        let kind = props[key]["type"].as_str();
+        assert!(
+            kind.is_some_and(|k| has_type(value, k)),
+            "{key} is not declared as {value} in the tool schema: {}",
+            props[key]
+        );
+    }
+    let (why, err) = lead_tool(&mut b, &s, "t3", input);
+    assert!(!err, "{why}");
+    let rec = record(&hub, "tool-open");
+    assert_eq!(rec["key"], "tool-open", "{why}");
+    drop(b);
+    hub.stop();
+}
+
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
 /// recorded before it), a "no" is stored and not asked again (also after a restart), and messenger
 /// writes from the lead (tool posts and `cataly` commands in its shell) are refused while it runs.
