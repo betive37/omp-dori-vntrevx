@@ -44,6 +44,18 @@
 - After an update, sessions still recovering are reported as recovering, not as a final state,
   by the hub's message and by `cataly update`; a second `update.sessions` message gives the final
   result once they settle.
+- **Going back a version can no longer strand the hub.** `cataly version --json` reports
+  `store_reader`, the newest store schema the binary reads. `cataly rollback`, an update or install
+  that switches versions, and `install.sh` over an existing install (through the installed binary's
+  new `cataly install --preflight <binary>`) read the store's `meta.min_reader` read-only and refuse
+  a version that cannot open it, before the hub is stopped or any file switched (exit status 6). A
+  version whose report lacks the field (every release up to 0.2.6) is refused once the store's floor
+  is above schema 9. The message, in `[hub] language`, says the store was upgraded for conversation
+  safety and which version cannot read it, and offers staying on the current version or restoring
+  the store copy the hub made before that upgrade (named when one exists; updates keep none of their
+  own). An `install.sh` or binary already published cannot be taught this check: going back with one
+  of them leaves the older hub refusing to open the store, with nothing lost; installing the current
+  version again brings it back.
 
 ## 0.2.6 (Unreleased)
 

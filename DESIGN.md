@@ -433,8 +433,8 @@ relay destinations, or kept locally. Messenger posts never mention anyone and pa
   a daily maintenance job; page cache capped at 2 MiB.
 - **Migrations.** Ordered SQL files embedded in the binary; `PRAGMA user_version` is the schema version. Before
   a migration the hub writes `VACUUM INTO <state>/backup/cataly-v<N>.db`. Each migration declares whether it is
-  additive; the store records the lowest binary version that can still open it. A rollback binary older than
-  that refuses to start and names the backup to restore. No down-migrations.
+  additive; the store records the lowest schema a binary must know to open it (`meta.min_reader`). A binary
+  older than that refuses to start and names the backup to restore. No down-migrations.
 
 ### 7.3 Schema outline
 
@@ -775,6 +775,19 @@ rest on the registry's own integrity check, not on the release signature (11.4).
   answer with the new version, else switch back.
 - Rollback keeps exactly one previous version; its two files are re-hashed against its record before switching.
 - Store compatibility across versions follows 7.2 (migrations, minimum reader version, backup).
+- **Store gate before a switch.** `cataly version --json` reports `store_reader`, the newest schema the binary
+  reads; reports up to 0.2.6 lack it (unknown). Before anything is stopped or switched, `cataly rollback`, an
+  update or install that switches versions, and `install.sh` over an existing install (through the installed
+  binary's `cataly install --preflight <candidate>`) read the store's `meta.min_reader` read-only. A candidate
+  that reads below it, or an unknown one while the floor is above 9 (the schema of main before 0.2.7), is
+  refused with exit status 6: the store was upgraded for conversation safety, so stay on the current version
+  or restore the copy the hub made before that migration (`<state>/backup/cataly-v<N>.db`, named when one the
+  candidate reads exists; conversation since then is not in it). Updates themselves keep no store copy; the
+  only copies are those the hub writes before migrating. An npm or Bun update never goes back a version.
+- **Limits of the gate.** An `install.sh` or a binary already published (0.2.6 and earlier) cannot be taught
+  this check. When a downgrade goes through one of them, the older hub refuses to open the store and does not
+  start: it fails closed, and the store and the conversation in it are kept, not lost. Recovery is to install
+  the current version again, which opens the store as it was.
 
 ### 11.4 Release verification
 

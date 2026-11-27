@@ -29,6 +29,10 @@ const STOP_WAIT: Duration = Duration::from_mins(1);
 const START_WAIT: Duration = Duration::from_secs(30);
 /// `omp --version`: 5 s (IR req. 25).
 const OMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// The store floor assumed readable by a binary whose report carries no store reader capability
+/// (every release up to 0.2.6): the schema of main before 0.2.7. No earlier release raised a
+/// store's floor above 1, and 0.2.7's lead anchor raises it above this.
+const CAPABILITY_LESS_READER: i64 = 9;
 
 /// The four outcomes (IR req. 34).
 enum Outcome {
@@ -251,6 +255,9 @@ fn path_note(l: &Layout) {
 /// `cataly install --from <folder>`: a first install, a reinstall (no change) or an update from a
 /// local folder of release assets (IR req. 19).
 async fn install(p: &Parsed, paths: &Paths) -> Outcome {
+    if let Some(candidate) = p.value("--preflight") {
+        return preflight(Path::new(candidate), paths).await;
+    }
     let Some(from) = p.value("--from").map(PathBuf::from) else {
         return Outcome::Held("--from <folder of release assets> is required".into());
     };
@@ -292,7 +299,7 @@ async fn from_folder(
         Err(e) => return Outcome::Held(format!("{e}; nothing changed")),
     };
     let Some(current) = l.current_version() else {
-        return first_install(l, staged).await;
+        return first_install(l, paths, staged).await;
     };
     let (new, old) = (
         Version::parse(&staged.record.version),
@@ -318,8 +325,15 @@ async fn from_folder(
     }
 }
 
-async fn first_install(l: &Layout, staged: Staged) -> Outcome {
-    let report = release::candidate_report(&staged.binary()).await;
+/// A first install here. State a removed install left behind is kept, so its store is checked too.
+async fn first_install(l: &Layout, paths: &Paths, staged: Staged) -> Outcome {
+    let report = release::candidate_report(&staged.binary()).await.ok();
+    if let Some(r) = &report
+        && let Err(why) = store_preflight(paths, r, release::VERSION)
+    {
+        staged.discard();
+        return Outcome::Held(why);
+    }
     let minimum = report.map_or_default(|r| r.omp_minimum);
     let _ = omp_gate(&minimum, true).await;
     let version = staged.record.version.clone();
@@ -359,6 +373,10 @@ async fn switch_to(
     if let Err(o) = omp_gate(&report.omp_minimum, false).await {
         staged.discard();
         return o;
+    }
+    if let Err(why) = store_preflight(paths, &report, current) {
+        staged.discard();
+        return Outcome::Held(why);
     }
     let answering = hub_version(paths).is_some();
     let running = answering && restart;
@@ -551,6 +569,128 @@ fn busy_held(language: Language, busy: &str) -> String {
             "the update is waiting for a busy session ({busy}); busy sessions are never stopped. \
              Run it again once that work is done. Nothing changed."
         ),
+    }
+}
+
+/// Whether a binary reporting `reader` (none: a report from before the capability) opens a store
+/// whose reader floor is `floor`.
+fn reads(reader: Option<i64>, floor: i64) -> bool {
+    floor <= reader.unwrap_or(CAPABILITY_LESS_READER)
+}
+
+/// Refuses a switch from `current` to `candidate` when the candidate's hub could not open the store
+/// and would refuse to start. Reads the store's reader floor without writing; runs before anything
+/// is stopped or switched. A store that cannot be read refuses too.
+fn store_preflight(
+    paths: &Paths,
+    candidate: &release::Report,
+    current: &str,
+) -> Result<(), String> {
+    let floor = match layout_ops::store_floor(&paths.db_file()) {
+        Ok(None) => return Ok(()),
+        Ok(Some(floor)) => floor,
+        Err(e) => return Err(format!("{e}; nothing was stopped or switched")),
+    };
+    if reads(candidate.store_reader, floor) {
+        return Ok(());
+    }
+    let copy = layout_ops::store_copies(&paths.backup_dir)
+        .into_iter()
+        .find(|(_, path)| {
+            layout_ops::store_floor(path)
+                .is_ok_and(|f| f.is_some_and(|f| reads(candidate.store_reader, f)))
+        })
+        .map(|(_, path)| path);
+    Err(store_refusal(
+        owner_language(paths),
+        &Refusal {
+            candidate: &candidate.version,
+            reader: candidate.store_reader,
+            floor,
+            current,
+            store: &paths.db_file(),
+            copy: copy.as_deref(),
+        },
+    ))
+}
+
+/// What a store refusal names.
+struct Refusal<'a> {
+    candidate: &'a str,
+    reader: Option<i64>,
+    floor: i64,
+    current: &'a str,
+    store: &'a Path,
+    copy: Option<&'a Path>,
+}
+
+/// Why the switch is refused and the way out, in the owner's language.
+fn store_refusal(language: Language, r: &Refusal<'_>) -> String {
+    let (candidate, floor, current, store) = (r.candidate, r.floor, r.current, r.store.display());
+    match language {
+        Language::Korean => {
+            let why = r.reader.map_or_else(
+                || format!("{candidate} 버전은 어떤 저장소를 읽을 수 있는지 알려주지 않습니다"),
+                |reader| {
+                    format!("{candidate} 버전은 스키마 {reader}까지 읽고, 이 저장소는 {floor} 이상을 요구합니다")
+                },
+            );
+            let way = r.copy.map_or_else(
+                || {
+                    format!(
+                        "{current} 버전을 그대로 쓰세요. 업그레이드 전 저장소 사본이 없어 되돌릴 저장소가 없습니다."
+                    )
+                },
+                |copy| {
+                    format!(
+                        "{current} 버전을 그대로 쓰거나, 허브를 멈추고 업그레이드 전에 허브가 만든 저장소 사본 {}을(를) \
+                         {store} 자리에 복원한 뒤 다시 시도하세요. 사본 이후의 대화는 사본에 없습니다.",
+                        copy.display()
+                    )
+                },
+            );
+            format!(
+                "대화 보존을 위해 저장소를 업그레이드했습니다. {candidate} 버전은 이 저장소를 읽을 수 없습니다 ({why}). \
+                 아무것도 멈추거나 바꾸지 않았습니다. {way}"
+            )
+        }
+        Language::English => {
+            let why = r.reader.map_or_else(
+                || format!("{candidate} does not say which store it reads"),
+                |reader| format!("{candidate} reads schema {reader}; this store needs {floor}"),
+            );
+            let way = r.copy.map_or_else(
+                || {
+                    format!(
+                        "Stay on {current}; there is no store copy from before the upgrade to restore."
+                    )
+                },
+                |copy| {
+                    format!(
+                        "Stay on {current}, or stop the hub, restore the store copy the hub made before the \
+                         upgrade, {}, in place of {store}, and try again; conversation since that copy is not in it.",
+                        copy.display()
+                    )
+                },
+            );
+            format!(
+                "the store was upgraded for conversation safety; version {candidate} cannot read it ({why}). \
+                 Nothing was stopped or switched. {way}"
+            )
+        }
+    }
+}
+
+/// `cataly install --preflight <binary>`: whether that binary can read the store; changes nothing.
+/// `install.sh` runs it through the installed version before it replaces anything.
+async fn preflight(candidate: &Path, paths: &Paths) -> Outcome {
+    let report = match release::candidate_report(candidate).await {
+        Ok(r) => r,
+        Err(e) => return Outcome::Held(format!("{e}; nothing changed")),
+    };
+    match store_preflight(paths, &report, release::VERSION) {
+        Ok(()) => Outcome::Done(format!("cataly {} can read the store", report.version)),
+        Err(why) => Outcome::Held(why),
     }
 }
 
@@ -911,13 +1051,15 @@ async fn rollback(p: &Parsed, paths: &Paths) -> Outcome {
         return Outcome::Held(format!("{e}; nothing changed"));
     }
     let binary = l.version_dir(&previous.version).join(layout_ops::BINARY);
-    match release::candidate_report(&binary).await {
-        Ok(r) => {
-            if let Err(o) = omp_gate(&r.omp_minimum, false).await {
-                return o;
-            }
-        }
+    let report = match release::candidate_report(&binary).await {
+        Ok(r) => r,
         Err(e) => return Outcome::Held(e),
+    };
+    if let Err(o) = omp_gate(&report.omp_minimum, false).await {
+        return o;
+    }
+    if let Err(why) = store_preflight(paths, &report, &current) {
+        return Outcome::Held(why);
     }
     let answering = hub_version(paths).is_some();
     let running = answering && !p.flag("--no-restart");
@@ -1314,5 +1456,136 @@ mod tests {
             "the hub did not stop: control socket: the hub closed the connection; nothing changed"
         );
         assert!(hub.join().unwrap().contains(method::HUB_STOP));
+    }
+
+    /// A candidate's report: version 0.2.5, reading up to `reader` (none: a report from before the
+    /// capability).
+    fn candidate(reader: Option<i64>) -> release::Report {
+        release::Report {
+            version: "0.2.5".into(),
+            store_reader: reader,
+            ..release::report()
+        }
+    }
+
+    /// A store migrated as the hub migrates it, then its reader floor set to `floor` as a later
+    /// non-additive schema would set it.
+    fn store_at(paths: &Paths, floor: i64) {
+        let (store, writer) =
+            crate::store::Store::open(&paths.db_file(), &paths.backup_dir).unwrap();
+        drop(store);
+        writer.join().unwrap().unwrap();
+        raise_floor(&paths.db_file(), floor);
+    }
+
+    fn raise_floor(db: &Path, floor: i64) {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'min_reader'",
+                [floor.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_candidate_that_reads_the_store_passes() {
+        let dir = scratch("preflight");
+        let paths = paths_in(&dir);
+        // No store yet: nothing to protect, and none is made.
+        store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
+        assert!(!paths.db_file().exists());
+        store_at(&paths, 1);
+        let before = std::fs::read(paths.db_file()).unwrap();
+        store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
+        store_preflight(&paths, &candidate(Some(9)), "0.2.7").unwrap();
+        assert_eq!(
+            std::fs::read(paths.db_file()).unwrap(),
+            before,
+            "the check changes nothing"
+        );
+        raise_floor(&paths.db_file(), 11);
+        store_preflight(&paths, &candidate(Some(11)), "0.2.7").unwrap();
+    }
+
+    #[test]
+    fn a_candidate_too_old_for_the_store_floor_is_refused() {
+        let dir = scratch("preflight");
+        let paths = paths_in(&dir);
+        store_at(&paths, 99);
+        let held = store_preflight(&paths, &candidate(Some(9)), "0.2.7").unwrap_err();
+        assert!(
+            held.contains("version 0.2.5 cannot read it")
+                || held.contains("0.2.5 버전은 이 저장소를 읽을 수 없습니다"),
+            "{held}"
+        );
+        let english = store_refusal(
+            Language::English,
+            &Refusal {
+                candidate: "0.2.5",
+                reader: Some(9),
+                floor: 99,
+                current: "0.2.7",
+                store: &paths.db_file(),
+                copy: None,
+            },
+        );
+        assert_eq!(
+            english,
+            "the store was upgraded for conversation safety; version 0.2.5 cannot read it (0.2.5 \
+             reads schema 9; this store needs 99). Nothing was stopped or switched. Stay on 0.2.7; \
+             there is no store copy from before the upgrade to restore."
+        );
+    }
+
+    #[test]
+    fn an_unknown_capability_is_refused_above_the_capability_less_schema() {
+        let dir = scratch("preflight");
+        let paths = paths_in(&dir);
+        store_at(&paths, CAPABILITY_LESS_READER);
+        store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
+        // The copy the hub made before a migration, readable by a capability-less release.
+        crate::sys::fs::ensure_private_dir(&paths.backup_dir).unwrap();
+        let copy = paths.backup_dir.join("cataly-v10.db");
+        rusqlite::Connection::open(paths.db_file())
+            .unwrap()
+            .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+            .unwrap();
+        raise_floor(&paths.db_file(), CAPABILITY_LESS_READER + 2);
+        let held = store_preflight(&paths, &candidate(None), "0.2.7").unwrap_err();
+        assert!(held.contains(&copy.display().to_string()), "{held}");
+        let refusal = |language| {
+            store_refusal(
+                language,
+                &Refusal {
+                    candidate: "0.2.5",
+                    reader: None,
+                    floor: 11,
+                    current: "0.2.7",
+                    store: &paths.db_file(),
+                    copy: Some(&copy),
+                },
+            )
+        };
+        let korean = refusal(Language::Korean);
+        assert!(
+            korean.starts_with(
+                "대화 보존을 위해 저장소를 업그레이드했습니다. 0.2.5 버전은 이 저장소를 읽을 수 \
+                 없습니다 (0.2.5 버전은 어떤 저장소를 읽을 수 있는지 알려주지 않습니다). 아무것도 \
+                 멈추거나 바꾸지 않았습니다. 0.2.7 버전을 그대로 쓰거나,"
+            ),
+            "{korean}"
+        );
+        let english = refusal(Language::English);
+        assert!(
+            english.contains("0.2.5 does not say which store it reads")
+                && english.contains(&format!("{}, in place of", copy.display())),
+            "{english}"
+        );
+        // A copy the candidate cannot read either is never offered.
+        raise_floor(&copy, 50);
+        raise_floor(&paths.db_file(), 40);
+        let held = store_preflight(&paths, &candidate(None), "0.2.7").unwrap_err();
+        assert!(!held.contains("cataly-v10.db"), "{held}");
     }
 }

@@ -119,8 +119,8 @@ pub(crate) const COMMANDS: [Spec; 59] = [
         path: &["install"],
         args: &[],
         flags: &[],
-        values: &["--from", "--prefix"],
-        summary: "install from a folder of release assets (--from); install.sh runs this",
+        values: &["--from", "--prefix", "--preflight"],
+        summary: "install from a folder of release assets (--from); install.sh runs this; --preflight <binary> only checks that binary can read the store (install.sh runs it through the installed version first)",
     },
     Spec {
         path: &["update"],
