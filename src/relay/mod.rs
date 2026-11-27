@@ -117,8 +117,8 @@ pub(crate) trait Relay: Send + Sync + 'static {
     /// Adds the seen mark to an admitted message (MSG-04).
     fn seen(&self, room: &str, message: &str) -> impl Future<Output = Result<(), String>> + Send;
 
-    /// Adds the done mark to a request whose answer was posted (MSG-04): next to the seen mark,
-    /// or in its place where the platform keeps one reaction per bot (Telegram).
+    /// Replaces the seen mark with the done mark once the request's answer was posted (MSG-04):
+    /// the done mark first, then the seen mark removed, so the request never shows neither.
     fn done(&self, room: &str, message: &str) -> impl Future<Output = Result<(), String>> + Send;
 
     /// Shows that an answer is being written; relays without such a signal say so.

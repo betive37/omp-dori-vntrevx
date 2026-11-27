@@ -149,14 +149,22 @@ fn telegram_and_slack_requests_are_answered_in_place_with_seen_marks() {
     let ts = slack.say(DM, fake_slack::OWNER, "hello from slack", None);
     let posted = slack.wait(WAIT, |f| slack_posts_in(f, DM, &ts).pop());
     assert_eq!(posted.body["text"], "the answer");
-    let reactions = slack.wait(WAIT, |f| {
-        let r = f.calls("reactions.add");
-        (r.len() >= 2).then_some(r)
-    });
-    assert_eq!(reactions.len(), 2, "one seen mark, one done mark");
-    assert!(reactions.iter().all(|r| r.body["timestamp"] == ts.as_str()));
-    assert_eq!(reactions[0].body["name"], "eyes");
-    assert_eq!(reactions[1].body["name"], "white_check_mark");
+    // The seen mark, replaced by the done mark once the answer is posted: added first, then the
+    // eyes go.
+    let replaced = [
+        "reactions.add eyes",
+        "reactions.add white_check_mark",
+        "reactions.remove eyes",
+    ];
+    let marks = |f: &FakeSlack| -> Vec<String> {
+        f.seen()
+            .into_iter()
+            .filter(|s| s.method.starts_with("reactions."))
+            .inspect(|s| assert_eq!(s.body["timestamp"], ts.as_str()))
+            .map(|s| format!("{} {}", s.method, s.body["name"].as_str().unwrap()))
+            .collect()
+    };
+    slack.wait(WAIT, |f| (marks(f) == replaced).then_some(()));
     assert!(
         slack
             .acks()

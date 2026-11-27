@@ -800,6 +800,29 @@ impl Rest {
         .map(drop)
     }
 
+    /// Removes the bot's reaction with `emoji` from a message (DISC-OUT req. 30); a 404 (the
+    /// reaction or the message is gone) counts as removed.
+    pub(crate) async fn unreact(
+        &self,
+        channel: Snowflake,
+        message: Snowflake,
+        emoji: &str,
+    ) -> Result<(), RestError> {
+        match self
+            .call(
+                "DELETE channels/messages/reactions",
+                Method::DELETE,
+                &format!("/channels/{channel}/messages/{message}/reactions/{emoji}/@me"),
+                None,
+                Kind::Idempotent,
+            )
+            .await
+        {
+            Err(e) if e.status == Some(404) => Ok(()),
+            other => other.map(drop),
+        }
+    }
+
     /// The typing indicator (about 10 s on Discord's side).
     pub(crate) async fn typing(&self, channel: Snowflake) -> Result<(), RestError> {
         self.call(

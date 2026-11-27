@@ -165,13 +165,16 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 
 30. When the daemon admits an owner message as a request, it adds the eyes reaction (U+1F440) to that
     exact message and records the mark. Failure to react is logged and never causes the message to
-    be admitted again. Once the request's answer is posted (every part of it confirmed, wherever it
-    went, a thread included), the daemon adds the check mark (U+2705) to that same message next to
-    the eyes, after the answer and never holding it or the next answer up. An answer in doubt,
-    abandoned or dropped, a refused or failed post and a hold notice add none; an answer posted
-    later adds it then. The check mark is recorded once added or tried, so it is added once: a
-    failure is logged once per run and never retried, and after a restart a check mark not
-    recorded for an answer posted within the last 30 minutes is added then.
+    be admitted again. The eyes show while the request is worked on. Once its answer is posted
+    (every part of it confirmed, wherever it went, a thread included), the check mark (U+2705)
+    replaces them on that same message: the daemon adds the check mark, then removes its eyes
+    reaction, so the message never shows neither; a 404 on the removal counts as removed. This
+    comes after the answer and never holds it or the next answer up. An answer in doubt, abandoned
+    or dropped, a refused or failed post and a hold notice keep the eyes and add no check mark; an
+    answer posted later replaces them then. The replacement is recorded once done or tried, so it
+    happens once: a failed step is logged once per run and never retried (a failed check mark
+    leaves the eyes), and after a restart a replacement not recorded for an answer posted within
+    the last 30 minutes is made then, both steps (adding the check mark again changes nothing).
 31. Sessions may add or remove the bot's own reaction with any emoji on a message in an allowed
     channel; emoji are URL-encoded in the reaction route. Adding a reaction to an owner request
     counts as its read mark.

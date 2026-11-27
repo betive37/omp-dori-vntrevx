@@ -2,12 +2,13 @@
 
 ## 0.2.7 (Unreleased)
 
-- Your message gets a done mark once its answer is posted, next to the 👀: ✅ on Discord (also
-  when the answer went into a thread), `white_check_mark` on Slack, and 👌 on Telegram, where it
-  replaces the 👀 because a bot keeps one reaction and ✅ is not one Telegram lets bots set. An
-  answer in doubt, given up or not delivered gets none. The mark is added after the answer and
-  never holds it up, once per message: a restart right after the answer adds it then, never
-  twice, and a failed mark is logged once and not tried again.
+- The 👀 on your message shows while the lead works on it; once the answer is posted a done mark
+  replaces it: ✅ on Discord (also when the answer went into a thread), `white_check_mark` on
+  Slack, and 👌 on Telegram, as ✅ is not a reaction Telegram lets bots set. The done mark is added
+  before the 👀 is removed, so your message never shows neither. An answer in doubt, given up or
+  not delivered keeps the 👀. The swap comes after the answer and never holds it up, once per
+  message: a restart right after the answer finishes it then, never twice, and a failed step is
+  logged once and not tried again.
 
 ## 0.2.6 (2026-11-27)
 

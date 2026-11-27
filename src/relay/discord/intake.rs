@@ -145,11 +145,20 @@ impl Relay for DiscordRelay {
             .map_err(|e| e.to_string())
     }
 
+    /// ✅ first, then the 👀 goes, so the request never shows neither.
     async fn done(&self, room: &str, message: &str) -> Result<(), String> {
+        let (channel, message) = (id(room)?, id(message)?);
         self.rest
-            .react(id(room)?, id(message)?, DONE)
+            .react(channel, message, DONE)
             .await
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+        // Debug builds only: the crash test of a stop between the two steps.
+        #[cfg(debug_assertions)]
+        crate::sys::fault::point("done_before_unseen");
+        self.rest
+            .unreact(channel, message, SEEN)
+            .await
+            .map_err(|e| format!("the seen mark was not removed: {e}"))
     }
 
     async fn typing(&self, room: &str) -> Result<(), String> {

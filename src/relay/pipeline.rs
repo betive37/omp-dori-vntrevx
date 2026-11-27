@@ -676,9 +676,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         self.marking.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Adds the done mark in the background once the answer to a request was posted, and records
-    /// it (MSG-04, DISC-OUT req. 30): after the answer, never holding it up, and once per request,
-    /// also across a restart. A failure is logged once per run and recorded all the same, so it is
+    /// Replaces the seen mark with the done mark in the background once the answer to a request
+    /// was posted, and records it (MSG-04, DISC-OUT req. 30): after the answer, never holding it
+    /// up, and once per request, also across a restart, which repeats both steps when a stop came
+    /// before the record. A failure is logged once per run and recorded all the same, so it is
     /// never tried again.
     fn mark_done(self: &Arc<Self>, room: &str, message: &str) {
         let key = (room.to_string(), message.to_string());

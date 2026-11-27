@@ -209,7 +209,7 @@ operator who configures the daemon (in practice the same person).
     are per conversation; other conversations continue.
 44. After a successful hand-off to step (a) or (b), the daemon adds a 👀 reaction to the owner's
     message. A failed reaction is logged and never causes a second hand-off. The lead's own read
-    mark, and the ✅ added next to the 👀 once the answer is posted, are part of the outbound spec
+    mark, and the ✅ that replaces the 👀 once the answer is posted, are part of the outbound spec
     (DISC-OUT req. 30).
 45. Delivered text over 64 KiB is written to a private file and the session receives a short line
     giving its size and path instead.
