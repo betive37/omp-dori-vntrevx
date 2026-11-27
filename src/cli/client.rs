@@ -20,6 +20,8 @@ pub(crate) enum ClientError {
     /// Nothing answers on the socket.
     NoHub,
     Io(std::io::Error),
+    /// The hub ended the connection without answering the request it was sent.
+    Closed,
     Protocol(String),
     Remote(ErrorBody),
     /// The socket's directory is not the owner's private one; nothing was sent.
@@ -31,6 +33,7 @@ impl fmt::Display for ClientError {
         match self {
             Self::NoHub => f.write_str("the hub is not running"),
             Self::Io(e) => write!(f, "control socket: {e}"),
+            Self::Closed => f.write_str("control socket: the hub closed the connection"),
             Self::Protocol(e) => write!(f, "control socket: {e}"),
             Self::Remote(body) => f.write_str(&body.message),
             Self::Unsafe(e) => write!(f, "control socket not used: {e}"),
@@ -74,7 +77,7 @@ impl Client {
         })?;
         stream
             .set_write_timeout(Some(CONNECT_TIMEOUT))
-            .map_err(ClientError::Io)?;
+            .map_err(closed_or_io)?;
         let writer = stream.try_clone().map_err(ClientError::Io)?;
         Ok(Self {
             reader: BufReader::new(stream),
@@ -99,7 +102,7 @@ impl Client {
         line.push('\n');
         self.writer
             .write_all(line.as_bytes())
-            .map_err(ClientError::Io)?;
+            .map_err(closed_or_io)?;
         Ok(id)
     }
 
@@ -109,7 +112,7 @@ impl Client {
         self.reader
             .get_ref()
             .set_read_timeout(timeout)
-            .map_err(ClientError::Io)?;
+            .map_err(closed_or_io)?;
         let mut line = Vec::new();
         let limit = u64::try_from(MAX_LINE).unwrap_or(u64::MAX) + 1;
         let read = (&mut self.reader)
@@ -119,7 +122,7 @@ impl Client {
                 ErrorKind::WouldBlock | ErrorKind::TimedOut => {
                     ClientError::Protocol("no answer from the hub in time".into())
                 }
-                _ => ClientError::Io(e),
+                _ => closed_or_io(e),
             })?;
         if read == 0 {
             return Ok(None);
@@ -145,9 +148,7 @@ impl Client {
     ) -> Result<Value, ClientError> {
         let id = self.send(method, params)?;
         loop {
-            let response = self
-                .receive(Some(timeout))?
-                .ok_or_else(|| ClientError::Protocol("the hub closed the connection".into()))?;
+            let response = self.receive(Some(timeout))?.ok_or(ClientError::Closed)?;
             if response.id != id && response.id != 0 {
                 continue;
             }
@@ -175,6 +176,29 @@ impl Client {
             }
         }
         Ok(())
+    }
+}
+
+/// A socket error that means the hub ended the connection is [`ClientError::Closed`], the same on
+/// every platform: Linux reports it as EPIPE or ECONNRESET, while macOS can also report a write,
+/// a shutdown or a socket option on a connection its peer closed as EINVAL or ENOTCONN. Every other
+/// error, and any error std made itself rather than the socket, stays [`ClientError::Io`].
+fn closed_or_io(e: std::io::Error) -> ClientError {
+    use rustix::io::Errno;
+    let closed = Errno::from_io_error(&e).is_some_and(|errno| {
+        [
+            Errno::PIPE,
+            Errno::CONNRESET,
+            Errno::CONNABORTED,
+            Errno::NOTCONN,
+            Errno::INVAL,
+        ]
+        .contains(&errno)
+    });
+    if closed {
+        ClientError::Closed
+    } else {
+        ClientError::Io(e)
     }
 }
 
@@ -209,5 +233,34 @@ mod tests {
             Client::connect(&open.join("hub.sock")),
             Err(ClientError::Unsafe(_))
         ));
+    }
+
+    /// Each errno a platform gives for a connection its peer closed reads as closed without an
+    /// answer, so `cataly update` waits for the hub's end on macOS as on Linux.
+    #[test]
+    fn a_peer_close_reads_the_same_on_every_platform() {
+        use rustix::io::Errno;
+        for errno in [
+            Errno::PIPE,
+            Errno::CONNRESET,
+            Errno::CONNABORTED,
+            Errno::NOTCONN,
+            Errno::INVAL,
+        ] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            let got = closed_or_io(e);
+            assert!(matches!(got, ClientError::Closed), "{errno:?}: {got}");
+            assert_eq!(
+                got.to_string(),
+                "control socket: the hub closed the connection"
+            );
+        }
+        for errno in [Errno::ACCESS, Errno::NOBUFS, Errno::BADF] {
+            let e = std::io::Error::from_raw_os_error(errno.raw_os_error());
+            assert!(matches!(closed_or_io(e), ClientError::Io(_)), "{errno:?}");
+        }
+        // std's own refusal, not the socket's, is never taken for a close.
+        let own = std::io::Error::new(ErrorKind::InvalidInput, "zero duration");
+        assert!(matches!(closed_or_io(own), ClientError::Io(_)));
     }
 }
