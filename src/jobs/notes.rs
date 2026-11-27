@@ -183,14 +183,22 @@ impl Notes {
         jiff::Zoned::now().date()
     }
 
-    /// COORD req. 47: off until created; creating twice is refused.
-    pub(crate) fn create(&self) -> Result<String, String> {
+    /// COORD req. 47: off until created; creating twice is refused. `by_message` is the owner's
+    /// message a lead create names; it becomes the first change-log line.
+    pub(crate) fn create(&self, by_message: Option<&str>) -> Result<String, String> {
         if std::fs::symlink_metadata(&self.file).is_ok() {
             return Err("the owner notes already exist".into());
         }
         let mut text = String::from("# Owner notes\n");
         for s in SECTIONS {
             let _ = write!(text, "\n{s}\n");
+        }
+        if let Some(message) = by_message {
+            let _ = write!(
+                text,
+                "\n- ({}) Created by the lead on the owner's request (message {message}).\n",
+                Self::today()
+            );
         }
         fs::create_atomic(&self.file, text.as_bytes()).map_err(|e| err(&e))?;
         Ok(format!("owner notes created at {}", self.file.display()))
@@ -279,7 +287,9 @@ impl Notes {
     pub(crate) fn save(&self, text: &str) -> Result<String, String> {
         if !self.exists() {
             return Err(
-                "the owner has not created the owner notes (cataly lane profile-create)".into(),
+                "the owner notes do not exist yet: profile.create on the owner's request, or the \
+                 owner runs cataly lane profile-create"
+                    .into(),
             );
         }
         let today = Self::today();
@@ -461,8 +471,8 @@ mod tests {
         let dir = scratch("notes");
         let n = Notes::new(&dir);
         assert!(n.save("x").is_err(), "off until created");
-        n.create().unwrap();
-        assert!(n.create().is_err());
+        n.create(None).unwrap();
+        assert!(n.create(None).is_err());
         let first = notes(&["ship on Fridays"], &Notes::today().to_string());
         n.save(&first).unwrap();
         // Today's snapshot holds the decision once the morning's snapshot is retaken.
