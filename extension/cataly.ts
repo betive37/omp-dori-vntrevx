@@ -117,10 +117,7 @@ const owners = new Map<string, string>();
 
 /** The bridge state of one OMP process. */
 export class Bridge {
-	wired = false; role = "none"; key: string | undefined;
-	// The bridge tools' activation. OMP's goal and plan modes read the enabled tools before an await and set them after,
-	// so a hub command run while the activation is still pending would drop the bridge tools.
-	toolsActive: Promise<unknown> = Promise.resolve();
+	wired = false; role = "none"; key: string | undefined; toolsActive: Promise<unknown> = Promise.resolve();
 	guidance = ""; session = ""; ctx!: Ctx;
 	// The connection, its numbering, its offline buffer and its reconnect state (EXT req. 13-15).
 	wire: Wire | undefined;
@@ -334,7 +331,8 @@ export class Bridge {
 		if (heartbeat) this.send("bridge.ping", {});
 	}
 
-	/** After the first acceptance: handlers, tools and the heartbeat (EXT req. 4, 15, 17). */
+	/** After the first acceptance: handlers, tools and the heartbeat (EXT req. 4, 15, 17). Hub commands wait for the tools'
+	 * activation: OMP's goal mode reads the enabled tools, awaits, then sets them, so it would drop a pending bridge tool. */
 	wire_up(answer: Json): void {
 		this.wired = true;
 		const pi = this.pi;
@@ -417,8 +415,7 @@ export class Bridge {
 	async command(c: Json): Promise<void> {
 		const current = c.session === this.session && !this.changing;
 		this.applying += Number(current);
-		if (current) await this.toolsActive;
-		const out = current ? await this.run(c, this.ctx).catch(e => ({ refused: String(e?.message ?? e) })) : { refused: "not current" };
+		const out = current ? await this.toolsActive.then(() => this.run(c, this.ctx)).catch(e => ({ refused: String(e?.message ?? e) })) : { refused: "not current" };
 		this.applying -= Number(current);
 		this.send("bridge.reply", { n: c.n, ...out });
 	}
