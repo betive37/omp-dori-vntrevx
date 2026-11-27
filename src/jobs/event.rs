@@ -328,7 +328,7 @@ const KINDS: [KindRow; 72] = [
     (
         EventKind::PressureAlert,
         "pressure.alert",
-        &["reasons"],
+        &["reasons", "cause"],
         "host under pressure: {reasons}",
     ),
     (

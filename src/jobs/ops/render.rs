@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use crate::config::Language;
 use crate::jobs::event::field;
+use crate::jobs::owner::pressure::Causes;
 
 pub(crate) const BANNER: &str = "panel-banner.jpg";
 pub(crate) const THUMB: &str = "panel-thumb.jpg";
@@ -58,8 +59,11 @@ pub(crate) enum HostState {
     /// Below the ready line: heavy compute is welcome.
     Ready,
     Busy,
-    /// Over the alert line or failing a check.
-    Alert,
+    /// Failing these checks: over the alert line, short of memory or of disk.
+    Alert(Causes),
+    /// Still in alert, but the checks that raised it pass again: the pressure job's next tick
+    /// clears it.
+    Recovering,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -327,27 +331,90 @@ fn plain(text: &str) -> String {
     out
 }
 
+/// Why the panel is not green, most important first.
+enum Reason<'a> {
+    Disk,
+    Memory,
+    Load,
+    Held,
+    /// Jobs failing twice or more in a row.
+    Failing(Vec<&'a str>),
+    /// Jobs held until the owner acknowledges them.
+    Ack(Vec<&'a str>),
+    Recovering,
+    Limit(&'a Limit),
+    /// Jobs with one failure.
+    Erring(Vec<&'a str>),
+    LeadError,
+    /// The lead restarting on its kept conversation.
+    LeadRecovering,
+    Busy,
+}
+
+/// The reasons named after the summary; the rest are counted.
+const REASONS_SHOWN: usize = 4;
+
 impl Panel {
-    /// Red only when the owner must act: the host overloaded, a job failing or waiting for an ack,
+    /// Red only when the owner must act: the host in alert, a job failing or waiting for an ack,
     /// or the lead held.
     pub(crate) fn level(&self) -> Level {
-        let failing = self.issues.iter().any(|i| i.failures >= 2 || i.needs_ack);
-        if self.host.state == HostState::Alert || failing || self.people.lead == LeadState::Held {
-            return Level::Act;
+        self.reasons().first().map_or(Level::Fine, |(l, _)| *l)
+    }
+
+    /// Every reason the panel is not green, the most serious first.
+    fn reasons(&self) -> Vec<(Level, Reason<'_>)> {
+        let mut out = Vec::new();
+        if let HostState::Alert(c) = self.host.state {
+            for (on, r) in [
+                (c.disk, Reason::Disk),
+                (c.memory, Reason::Memory),
+                (c.load, Reason::Load),
+            ] {
+                if on {
+                    out.push((Level::Act, r));
+                }
+            }
         }
-        let high = self.limits.iter().flatten().any(|l| {
-            self.used_by_a_session(&l.provider) && l.percent.is_some_and(|p| p >= HIGH_LIMIT)
-        });
-        if self.host.state == HostState::Busy
-            || high
-            || !self.issues.is_empty()
-            || self.people.lead == LeadState::Error
-            || self.people.lead == LeadState::Recovering
-        {
-            Level::Watch
-        } else {
-            Level::Fine
+        if self.people.lead == LeadState::Held {
+            out.push((Level::Act, Reason::Held));
         }
+        let jobs = |keep: fn(&Issue) -> bool| -> Vec<&str> {
+            self.issues
+                .iter()
+                .filter(|i| keep(i))
+                .map(|i| i.job.as_str())
+                .collect()
+        };
+        let failing = jobs(|i| !i.needs_ack && i.failures >= 2);
+        if !failing.is_empty() {
+            out.push((Level::Act, Reason::Failing(failing)));
+        }
+        let ack = jobs(|i| i.needs_ack);
+        if !ack.is_empty() {
+            out.push((Level::Act, Reason::Ack(ack)));
+        }
+        if self.host.state == HostState::Recovering {
+            out.push((Level::Watch, Reason::Recovering));
+        }
+        for l in self.limits.iter().flatten() {
+            if self.used_by_a_session(&l.provider) && l.percent.is_some_and(|p| p >= HIGH_LIMIT) {
+                out.push((Level::Watch, Reason::Limit(l)));
+            }
+        }
+        let erring = jobs(|i| !i.needs_ack && i.failures < 2);
+        if !erring.is_empty() {
+            out.push((Level::Watch, Reason::Erring(erring)));
+        }
+        if self.people.lead == LeadState::Error {
+            out.push((Level::Watch, Reason::LeadError));
+        }
+        if self.people.lead == LeadState::Recovering {
+            out.push((Level::Watch, Reason::LeadRecovering));
+        }
+        if self.host.state == HostState::Busy {
+            out.push((Level::Watch, Reason::Busy));
+        }
+        out
     }
 
     /// Whether a live session uses `provider`. A model without a provider may use any of them.
@@ -357,14 +424,95 @@ impl Panel {
             _ => true,
         })
     }
+
+    /// The reasons after the summary, in a few words each: `디스크 여유 3 GB · 작업 실패 (github)`.
+    fn reason_words(&self, lang: Language) -> String {
+        let h = &self.host;
+        let names = |jobs: &[&str]| jobs.iter().map(|j| plain(j)).collect::<Vec<_>>().join(", ");
+        let reasons = self.reasons();
+        let mut words: Vec<String> = reasons
+            .iter()
+            .take(REASONS_SHOWN)
+            .map(|(_, r)| match r {
+                Reason::Disk => {
+                    let d = h
+                        .disk_free_gb
+                        .map_or_else(|| "?".to_string(), |d| format!("{d:.0} GB"));
+                    format!("{} {d}", t(lang, "디스크 여유", "disk free"))
+                }
+                Reason::Memory => {
+                    let m = h
+                        .memory_free
+                        .map_or_else(|| "?".to_string(), |m| percent(m, 5.0));
+                    format!("{} {m}", t(lang, "메모리 여유", "memory free"))
+                }
+                Reason::Load => {
+                    let l = h.load.map_or_else(|| "?".to_string(), |l| percent(l, 5.0));
+                    format!("{} {l}", t(lang, "서버 부하", "host load"))
+                }
+                Reason::Held => t(lang, "리드 보류", "lead held").into(),
+                Reason::Failing(jobs) => {
+                    format!("{} ({})", t(lang, "작업 실패", "job failing"), names(jobs))
+                }
+                Reason::Ack(jobs) => format!(
+                    "{} ({})",
+                    t(lang, "작업 확인 필요", "job needs your ack"),
+                    names(jobs)
+                ),
+                Reason::Recovering => t(lang, "서버 회복 중", "host recovering").into(),
+                Reason::Limit(l) => {
+                    let p = l
+                        .percent
+                        .map_or_else(|| "?".to_string(), |p| percent(p, 1.0));
+                    format!("{} {} {p}", plain(&l.provider), t(lang, "한도", "limit"))
+                }
+                Reason::Erring(jobs) => {
+                    format!("{} ({})", t(lang, "작업 오류", "job error"), names(jobs))
+                }
+                Reason::LeadError => t(lang, "리드 오류", "lead error").into(),
+                Reason::LeadRecovering => t(lang, "리드 복구 중", "lead recovering").into(),
+                Reason::Busy => t(lang, "서버 바쁨", "host busy").into(),
+            })
+            .collect();
+        if reasons.len() > REASONS_SHOWN {
+            let more = reasons.len() - REASONS_SHOWN;
+            words.push(match lang {
+                Language::Korean => format!("외 {more}개"),
+                Language::English => format!("{more} more"),
+            });
+        }
+        cut(&words.join(" · "), REASONS_MAX)
+    }
+}
+
+/// The reasons after the summary stay within about two lines.
+const REASONS_MAX: usize = 160;
+
+/// The host's alert causes as short labels, the most serious first: `디스크 부족 · 과부하`.
+pub(crate) fn cause_labels(c: Causes, lang: Language) -> String {
+    [
+        (c.disk, t(lang, "디스크 부족", "low disk")),
+        (c.memory, t(lang, "메모리 부족", "low memory")),
+        (c.load, t(lang, "과부하", "overloaded")),
+    ]
+    .iter()
+    .filter(|(on, _)| *on)
+    .map(|(_, w)| *w)
+    .collect::<Vec<_>>()
+    .join(" · ")
 }
 
 fn host_value(h: &Host, lang: Language) -> String {
     let mut out = String::new();
+    let alert;
     let state = match h.state {
         HostState::Ready => t(lang, "여유", "ready"),
         HostState::Busy => t(lang, "바쁨", "busy"),
-        HostState::Alert => t(lang, "과부하", "overloaded"),
+        HostState::Recovering => t(lang, "회복 중", "recovering"),
+        HostState::Alert(c) => {
+            alert = cause_labels(c, lang);
+            alert.as_str()
+        }
     };
     match h.load {
         Some(l) => {
@@ -540,6 +688,10 @@ pub(crate) fn panel(p: &Panel, lang: Language, version: &str) -> Value {
         Level::Act => (RED, t(lang, "🔴 확인이 필요해요", "🔴 Needs you")),
     };
     let mut description = summary.to_string();
+    let reasons = p.reason_words(lang);
+    if !reasons.is_empty() {
+        let _ = write!(description, ": {reasons}");
+    }
     if let Some(until) = p.muted_until_ms {
         let _ = write!(
             description,
@@ -874,13 +1026,44 @@ pub(crate) fn line(r: &Recent, lang: Language) -> String {
     let ko = lang == Language::Korean;
     let pick = |k: String, e: String| if ko { k } else { e };
     match r.kind.as_str() {
-        "pressure.alert" => t(
-            lang,
-            "🔥 서버 부하가 5분 넘게 높아요",
-            "🔥 Host under pressure for 5+ minutes",
-        )
-        .into(),
-        "pressure.clear" => t(lang, "✅ 서버 부하 정상", "✅ Host pressure cleared").into(),
+        "pressure.alert" => {
+            let c = Causes::parse(&field(r.fields.as_deref(), "cause").unwrap_or_default());
+            match (c.disk, c.memory, c.load) {
+                (true, false, false) => t(
+                    lang,
+                    "💾 디스크 여유가 5분 넘게 부족해요",
+                    "💾 Disk space low for 5+ minutes",
+                )
+                .into(),
+                (false, true, false) => t(
+                    lang,
+                    "🧠 메모리 여유가 5분 넘게 부족해요",
+                    "🧠 Memory low for 5+ minutes",
+                )
+                .into(),
+                (false, false, true) => t(
+                    lang,
+                    "🔥 서버 부하가 5분 넘게 높아요",
+                    "🔥 Host load high for 5+ minutes",
+                )
+                .into(),
+                // An alert stored before its cause was recorded.
+                (false, false, false) => t(
+                    lang,
+                    "⚠️ 서버 점검이 5분 넘게 실패해요",
+                    "⚠️ Host checks failing for 5+ minutes",
+                )
+                .into(),
+                _ => pick(
+                    format!(
+                        "🔥 서버 문제가 5분 넘게 계속돼요: {}",
+                        cause_labels(c, lang)
+                    ),
+                    format!("🔥 Host trouble for 5+ minutes: {}", cause_labels(c, lang)),
+                ),
+            }
+        }
+        "pressure.clear" => t(lang, "✅ 서버 정상으로 돌아옴", "✅ Host back to normal").into(),
         "quota.level" => {
             let (p, pc) = (get(r, "provider"), get(r, "percent"));
             pick(
@@ -1405,5 +1588,209 @@ pub(crate) mod tests {
         let before = a["embeds"][0]["description"].clone();
         stamp(&mut a, 1_795_660_240_551);
         assert_eq!(a["embeds"][0]["description"], before);
+    }
+
+    /// Every red or yellow reason is named after the summary, most serious first, in both languages;
+    /// the host label names its cause.
+    #[test]
+    #[allow(clippy::too_many_lines)]
+    fn the_summary_names_every_reason() {
+        let calm = || {
+            let mut p = spent_elsewhere();
+            p.limits = Some(Vec::new());
+            p
+        };
+        let cause = |disk, memory, load| Causes { disk, memory, load };
+        let issue = |job: &str, failures, needs_ack| Issue {
+            job: job.into(),
+            failures,
+            needs_ack,
+        };
+        let head = |p: &Panel, lang| {
+            description(p, lang)
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string()
+        };
+        let host = |p: &Panel, lang| {
+            panel(p, lang, "x")["embeds"][0]["fields"][0]["value"]
+                .as_str()
+                .unwrap()
+                .to_string()
+        };
+        let p = calm();
+        assert_eq!(head(&p, Language::Korean), "🟢 모두 정상");
+        assert_eq!(head(&p, Language::English), "🟢 All fine");
+        // The live panel of the report: 20 % load, 3 GB of disk free.
+        let mut disk = calm();
+        disk.host.load = Some(20.0);
+        disk.host.memory_free = Some(75.0);
+        disk.host.disk_free_gb = Some(3.2);
+        disk.host.state = HostState::Alert(cause(true, false, false));
+        assert_eq!(disk.level(), Level::Act);
+        assert_eq!(
+            head(&disk, Language::Korean),
+            "🔴 확인이 필요해요: 디스크 여유 3 GB"
+        );
+        assert_eq!(
+            head(&disk, Language::English),
+            "🔴 Needs you: disk free 3 GB"
+        );
+        let ko = host(&disk, Language::Korean);
+        assert!(
+            ko.contains("20% · 디스크 부족") && !ko.contains("과부하"),
+            "{ko}"
+        );
+        assert!(host(&disk, Language::English).contains("20% · low disk"));
+        let mut memory = calm();
+        memory.host.memory_free = Some(8.0);
+        memory.host.state = HostState::Alert(cause(false, true, false));
+        assert_eq!(
+            head(&memory, Language::Korean),
+            "🔴 확인이 필요해요: 메모리 여유 10%"
+        );
+        assert_eq!(
+            head(&memory, Language::English),
+            "🔴 Needs you: memory free 10%"
+        );
+        assert!(host(&memory, Language::Korean).contains("· 메모리 부족"));
+        assert!(host(&memory, Language::English).contains("· low memory"));
+        let mut load = calm();
+        load.host.load = Some(172.0);
+        load.host.state = HostState::Alert(cause(false, false, true));
+        assert_eq!(
+            head(&load, Language::Korean),
+            "🔴 확인이 필요해요: 서버 부하 170%"
+        );
+        assert_eq!(
+            head(&load, Language::English),
+            "🔴 Needs you: host load 170%"
+        );
+        assert!(host(&load, Language::Korean).contains("· 과부하"));
+        assert!(host(&load, Language::English).contains("· overloaded"));
+        // Several at once: all named, the most serious first; red before yellow.
+        let mut many = disk.clone();
+        many.host.load = Some(172.0);
+        many.host.state = HostState::Alert(cause(true, false, true));
+        many.issues = vec![issue("github", 3, false), issue("mail", 1, false)];
+        many.people.lead = LeadState::Held;
+        assert_eq!(
+            head(&many, Language::Korean),
+            "🔴 확인이 필요해요: 디스크 여유 3 GB · 서버 부하 170% · 리드 보류 · 작업 실패 (github) · 외 1개"
+        );
+        assert_eq!(
+            head(&many, Language::English),
+            "🔴 Needs you: disk free 3 GB · host load 170% · lead held · job failing (github) · 1 more"
+        );
+        assert!(host(&many, Language::Korean).contains("디스크 부족 · 과부하"));
+        let mut jobs = calm();
+        jobs.issues = vec![issue("github", 2, false), issue("backup", 0, true)];
+        assert_eq!(
+            head(&jobs, Language::Korean),
+            "🔴 확인이 필요해요: 작업 실패 (github) · 작업 확인 필요 (backup)"
+        );
+        assert_eq!(
+            head(&jobs, Language::English),
+            "🔴 Needs you: job failing (github) · job needs your ack (backup)"
+        );
+        let mut on_hold = calm();
+        on_hold.people.lead = LeadState::Held;
+        assert_eq!(
+            head(&on_hold, Language::Korean),
+            "🔴 확인이 필요해요: 리드 보류"
+        );
+        assert_eq!(head(&on_hold, Language::English), "🔴 Needs you: lead held");
+        // Yellow.
+        let mut limit = spent_elsewhere();
+        for l in limit.limits.iter_mut().flatten() {
+            if l.provider == "anthropic" {
+                l.percent = Some(100.0);
+            }
+        }
+        assert_eq!(
+            head(&limit, Language::Korean),
+            "🟡 살펴볼 것이 있어요: anthropic 한도 100%"
+        );
+        assert_eq!(
+            head(&limit, Language::English),
+            "🟡 Worth a look: anthropic limit 100%"
+        );
+        let mut watch = calm();
+        watch.host.state = HostState::Busy;
+        watch.issues = vec![issue("mail", 1, false)];
+        watch.people.lead = LeadState::Error;
+        assert_eq!(
+            head(&watch, Language::Korean),
+            "🟡 살펴볼 것이 있어요: 작업 오류 (mail) · 리드 오류 · 서버 바쁨"
+        );
+        assert_eq!(
+            head(&watch, Language::English),
+            "🟡 Worth a look: job error (mail) · lead error · host busy"
+        );
+        let mut recovering = calm();
+        recovering.host.state = HostState::Recovering;
+        assert_eq!(
+            head(&recovering, Language::Korean),
+            "🟡 살펴볼 것이 있어요: 서버 회복 중"
+        );
+        assert_eq!(
+            head(&recovering, Language::English),
+            "🟡 Worth a look: host recovering"
+        );
+        assert!(host(&recovering, Language::Korean).contains("· 회복 중"));
+        assert!(host(&recovering, Language::English).contains("· recovering"));
+        let mut lead = calm();
+        lead.people.lead = LeadState::Recovering;
+        assert_eq!(
+            head(&lead, Language::Korean),
+            "🟡 살펴볼 것이 있어요: 리드 복구 중"
+        );
+        assert_eq!(
+            head(&lead, Language::English),
+            "🟡 Worth a look: lead recovering"
+        );
+    }
+
+    /// The recent line of a host alert names its cause.
+    #[test]
+    fn a_host_alert_line_names_its_cause() {
+        let alert = |cause: Option<&str>| Recent {
+            at_ms: 0,
+            kind: "pressure.alert".into(),
+            job: "host".into(),
+            fields: cause.map(|c| format!(r#"{{"reasons":"x","cause":"{c}"}}"#)),
+            text: "host under pressure: x".into(),
+        };
+        for (cause, ko, en) in [
+            (
+                Some("disk"),
+                "💾 디스크 여유가 5분 넘게 부족해요",
+                "💾 Disk space low for 5+ minutes",
+            ),
+            (
+                Some("memory"),
+                "🧠 메모리 여유가 5분 넘게 부족해요",
+                "🧠 Memory low for 5+ minutes",
+            ),
+            (
+                Some("load"),
+                "🔥 서버 부하가 5분 넘게 높아요",
+                "🔥 Host load high for 5+ minutes",
+            ),
+            (
+                Some("disk,load"),
+                "🔥 서버 문제가 5분 넘게 계속돼요: 디스크 부족 · 과부하",
+                "🔥 Host trouble for 5+ minutes: low disk · overloaded",
+            ),
+            (
+                None,
+                "⚠️ 서버 점검이 5분 넘게 실패해요",
+                "⚠️ Host checks failing for 5+ minutes",
+            ),
+        ] {
+            assert_eq!(line(&alert(cause), Language::Korean), ko);
+            assert_eq!(line(&alert(cause), Language::English), en);
+        }
     }
 }
