@@ -180,7 +180,17 @@ impl<R: Runtime> Lanes<R> {
         *launch.revision = self
             .save(launch.record, Some(*launch.revision), None)
             .await
-            .map_err(StartError::Refused)?;
+            .map_err(|detail| {
+                launch.record.startup_cleanup = Cleanup::NotSpawned;
+                StartError::Refused(detail)
+            })?;
+        // Ownership/lease reads and durable handle writes consume the same episode budget.
+        if let (Some(recovery), Some(id)) = (recovery, &launch.spec.expected_id)
+            && let Err(detail) = recovery.begin(id, false).await
+        {
+            launch.record.startup_cleanup = Cleanup::NotSpawned;
+            return Err(rejected(detail, Cleanup::NotSpawned));
+        }
         Ok(())
     }
 
