@@ -12,6 +12,8 @@
 
 mod support;
 
+use std::io::{BufRead, BufReader, Write};
+use std::os::unix::net::UnixStream;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -913,5 +915,360 @@ fn owed_messages_bring_a_reminder_after_a_minute() {
     });
     let text = std::fs::read_to_string(session_file(&hub)).unwrap();
     assert!(text.contains(&format!("[discord {CH}/800000000000000095]")));
+    assert!(hub.stop().success());
+}
+
+/// The lead's side of the bridge, as its OMP extension speaks it, for calls of its tool.
+struct ToolBridge {
+    reader: BufReader<UnixStream>,
+    writer: UnixStream,
+    session: Value,
+    next: u64,
+}
+
+impl ToolBridge {
+    /// Connects as the live lead with its launch token.
+    fn connect(hub: &TestHub) -> Self {
+        let session = hub.until(WAIT, || {
+            let v = hub.json(&["lead", "status", "--json"]);
+            (v["phase"] == "live").then(|| v["session"]["session_id"].clone())
+        });
+        let launch = std::fs::read_to_string(hub.root.join("bin/omp-data/launch")).unwrap();
+        let token = launch
+            .lines()
+            .rfind(|l| l.split(' ').nth(1) == session.as_str())
+            .and_then(|l| l.split(' ').next())
+            .unwrap()
+            .to_string();
+        let writer = UnixStream::connect(hub.socket()).unwrap();
+        writer
+            .set_read_timeout(Some(Duration::from_secs(180)))
+            .unwrap();
+        let reader = BufReader::new(writer.try_clone().unwrap());
+        let mut bridge = Self {
+            reader,
+            writer,
+            session: session.clone(),
+            next: 1,
+        };
+        bridge.call(
+            "bridge.hello",
+            &json!({ "ext": 1, "token": token, "session": session, "agent": "main" }),
+        );
+        bridge
+    }
+
+    fn call(&mut self, method: &str, params: &Value) -> Value {
+        let id = self.next;
+        self.next += 1;
+        let line = json!({ "v": 1, "id": id, "method": method, "params": params });
+        self.writer
+            .write_all(format!("{line}\n").as_bytes())
+            .unwrap();
+        loop {
+            let mut reply = String::new();
+            self.reader.read_line(&mut reply).unwrap();
+            let v: Value = serde_json::from_str(&reply).unwrap();
+            if v["id"] == id {
+                return v["ok"].clone();
+            }
+        }
+    }
+
+    /// One `cataly_lead` call: its text and whether it is an error.
+    fn tool(&mut self, input: &Value) -> (String, bool) {
+        let call = format!("call-{}", self.next);
+        let params =
+            json!({ "call": call, "tool": "cataly_lead", "session": self.session, "input": input });
+        let v = self.call("bridge.tool", &params);
+        (
+            v["text"].as_str().unwrap_or_default().to_string(),
+            v["error"] == true,
+        )
+    }
+}
+
+/// Records a question with `question.ask` in `CH`; its ID and the ID of its message.
+fn record_question(lead: &mut ToolBridge, input: &Value) -> (String, String) {
+    let mut input = input.clone();
+    input["op"] = json!("question.ask");
+    input["source"] = json!(format!("discord:{CH}/800000000000000001"));
+    input["room"] = json!(CH);
+    let (said, error) = lead.tool(&input);
+    assert!(!error && said.contains("posted in"), "{said}");
+    let id = said.split_whitespace().nth(1).unwrap().to_string();
+    let message = said.split_whitespace().last().unwrap().to_string();
+    (id, message)
+}
+
+/// A recorded question's state and outcome in the ledger.
+fn ledger(hub: &TestHub, id: &str) -> (String, Option<String>) {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT state, outcome FROM questions WHERE id = ?1",
+        [id],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// The bot's message `id` in `CH` once it has no buttons any more.
+fn closed(fake: &FakeDiscord, id: &str) -> Value {
+    fake.wait(WAIT, |f| {
+        f.bot_messages(CH)
+            .into_iter()
+            .find(|m| m["id"] == id && m["components"].as_array().is_none_or(Vec::is_empty))
+    })
+}
+
+/// The `n`-th interaction callback, once it was answered.
+fn callback(fake: &FakeDiscord, n: usize) -> support::discord::Seen {
+    callbacks(fake, n + 1).swap_remove(n)
+}
+
+/// An owner reply to message `to` in `CH`.
+fn reply_to(id: u64, to: &str, text: &str) -> Value {
+    let mut m = FakeDiscord::message(CH, id, OWNER, text);
+    m["message_reference"] = json!({ "message_id": to, "channel_id": CH });
+    m
+}
+
+/// A question the lead records with `question.ask` gets one button per option, the recommended
+/// one styled primary. Someone else's press is refused and records nothing; the owner's press
+/// records the option like a reply naming it, tells the lead which question it answered and
+/// closes the buttons; a later press is refused and a later reply is not recorded again.
+#[test]
+fn a_question_button_answers_the_recorded_question_once() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Ship it?", "options": ["yes", "no", "later"], "recommended": 2 }),
+    );
+    let posted = fake
+        .bot_messages(CH)
+        .into_iter()
+        .find(|m| m["id"] == message.as_str())
+        .unwrap();
+    let content = posted["content"].as_str().unwrap();
+    assert!(content.contains(&format!("**Question {id}**")), "{content}");
+    assert!(content.contains("Reply to this message with a number or your answer."));
+    let row = &posted["components"][0]["components"];
+    assert_eq!(row.as_array().unwrap().len(), 3, "{posted}");
+    assert_eq!(row[0]["label"], "1. yes");
+    assert_eq!(row[1]["custom_id"], format!("cy:{id}:1"));
+    assert_eq!(row[1]["style"], 1, "recommended is primary");
+    assert_eq!(row[0]["style"], 2);
+
+    fake.press(OTHER, CH, &message, &format!("cy:{id}:0"));
+    let refusal = callback(&fake, 0);
+    assert_eq!(refusal.body["type"], 4);
+    assert_eq!(refusal.body["data"]["flags"], 64);
+    assert_eq!(ledger(&hub, &id), ("open".into(), None));
+
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:1"));
+    assert_eq!(callback(&fake, 1).body["type"], 6, "deferred update");
+    let (state, outcome) = hub.until(WAIT, || {
+        let l = ledger(&hub, &id);
+        (l.0 != "open").then_some(l)
+    });
+    assert_eq!(state, "answered");
+    let outcome = outcome.unwrap();
+    assert!(outcome.ends_with(": option 2 (no)"), "{outcome}");
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("Answered by the owner: 2. no"),
+        "{edited}"
+    );
+    let told = hub.until(WAIT, || {
+        hub.events()
+            .into_iter()
+            .find(|e| e["kind"] == "question.answered")
+    });
+    assert_eq!(told["urgent"], true, "{told}");
+    let said = format!("question {id} (Ship it?): option 2 (no)");
+    assert!(told["text"].as_str().unwrap().contains(&said), "{told}");
+    hub.until(WAIT, || {
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        (text.contains("[event question.answered]") && text.contains(&said)).then_some(())
+    });
+
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
+    let late = callback(&fake, 2);
+    assert_eq!(late.body["type"], 4, "a press after the answer is refused");
+    assert_eq!(late.body["data"]["flags"], 64);
+    fake.say(reply_to(800_000_000_000_000_401, &message, "1"));
+    hub.until(WAIT, || {
+        requests(&hub)
+            .into_iter()
+            .find(|r| r.contains("800000000000000401"))
+    });
+    assert!(
+        !requests(&hub)
+            .iter()
+            .any(|r| r.contains("answers question")),
+        "the reply is an ordinary message"
+    );
+    assert_eq!(ledger(&hub, &id), ("answered".into(), Some(outcome)));
+    assert_eq!(
+        hub.events()
+            .iter()
+            .filter(|e| e["kind"] == "question.answered")
+            .count(),
+        1
+    );
+    assert!(hub.stop().success());
+}
+
+/// A recommended option is never chosen by itself, whatever the quiet time of OMP's questions. A
+/// reply naming an option answers the question and closes its buttons; a press after that is
+/// refused and records nothing.
+#[test]
+fn a_reply_closes_the_question_buttons_and_nothing_is_chosen_by_itself() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "form_default_after = \"1s\"\n");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Which?", "options": ["a", "b"], "recommended": 1 }),
+    );
+    std::thread::sleep(Duration::from_secs(3));
+    assert_eq!(ledger(&hub, &id), ("open".into(), None));
+    let posted = fake
+        .bot_messages(CH)
+        .into_iter()
+        .find(|m| m["id"] == message.as_str())
+        .unwrap();
+    assert_eq!(posted["components"][0]["components"][0]["style"], 1);
+    assert!(fake.calls("POST", "/callback").is_empty());
+    assert!(
+        hub.events()
+            .iter()
+            .all(|e| e["kind"] != "question.answered")
+    );
+
+    fake.say(reply_to(800_000_000_000_000_411, &message, "2"));
+    let request = hub.until(WAIT, || {
+        requests(&hub)
+            .into_iter()
+            .find(|r| r.contains("800000000000000411"))
+    });
+    assert!(
+        request.contains(&format!(
+            "this message answers question {id} (Which?): option 2 (b)"
+        )),
+        "{request}"
+    );
+    let (state, outcome) = ledger(&hub, &id);
+    assert_eq!(state, "answered");
+    assert!(
+        outcome
+            .as_deref()
+            .unwrap()
+            .ends_with("800000000000000411: option 2 (b)")
+    );
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .contains("Answered by the owner: 2. b"),
+        "{edited}"
+    );
+    fake.press(OWNER, CH, &message, &format!("cy:{id}:0"));
+    assert_eq!(callback(&fake, 0).body["type"], 4);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(ledger(&hub, &id), (state, outcome));
+    assert!(
+        hub.events()
+            .iter()
+            .all(|e| e["kind"] != "question.answered")
+    );
+    assert!(hub.stop().success());
+}
+
+/// Settling a question with the lead's tool (an answer recorded by hand, a withdrawal) closes its
+/// buttons too, and a press after that is refused.
+#[test]
+fn settling_a_question_by_tool_closes_its_buttons() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (first, first_message) =
+        record_question(&mut lead, &json!({ "text": "One?", "options": ["a", "b"] }));
+    let (second, second_message) =
+        record_question(&mut lead, &json!({ "text": "Two?", "options": ["c", "d"] }));
+    let (said, error) =
+        lead.tool(&json!({ "op": "question.withdraw", "id": first, "reason": "moot" }));
+    assert!(!error, "{said}");
+    let edited = closed(&fake, &first_message);
+    assert!(
+        edited["content"].as_str().unwrap().contains("Withdrawn"),
+        "{edited}"
+    );
+    let (said, error) = lead.tool(&json!({
+        "op": "question.answer", "id": second, "text": "d", "message": "800000000000000421"
+    }));
+    assert!(!error, "{said}");
+    let edited = closed(&fake, &second_message);
+    assert!(
+        edited["content"].as_str().unwrap().contains("Answered"),
+        "{edited}"
+    );
+    fake.press(OWNER, CH, &first_message, &format!("cy:{first}:0"));
+    assert_eq!(callback(&fake, 0).body["type"], 4);
+    assert_eq!(ledger(&hub, &first).0, "withdrawn");
+    assert!(hub.stop().success());
+}
+
+/// Without buttons over the Gateway (the application has an interactions endpoint URL) a question
+/// is posted as text only, as before; a reply still answers it.
+#[test]
+fn without_gateway_buttons_a_question_is_text_only() {
+    let fake = FakeDiscord::start();
+    fake.set_interactions_url("https://example.org/interactions");
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let mut lead = ToolBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Which?", "options": ["a", "b"] }),
+    );
+    let posted = fake
+        .bot_messages(CH)
+        .into_iter()
+        .find(|m| m["id"] == message.as_str())
+        .unwrap();
+    assert!(
+        posted["components"].as_array().is_none_or(Vec::is_empty),
+        "{posted}"
+    );
+    assert!(
+        posted["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Reply to this message with a number or your answer.")
+    );
+    fake.say(reply_to(800_000_000_000_000_431, &message, "1"));
+    let (state, _) = hub.until(WAIT, || {
+        let l = ledger(&hub, &id);
+        (l.0 != "open").then_some(l)
+    });
+    assert_eq!(state, "answered");
     assert!(hub.stop().success());
 }

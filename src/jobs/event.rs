@@ -103,6 +103,8 @@ pub(crate) enum EventKind {
     PlannerRun,
     /// An item question for the owner, through the lead (COORD req. 32).
     ItemQuestion,
+    /// The owner answered a question the lead recorded by pressing one of its buttons (EVR req. 37).
+    QuestionAnswered,
     /// The daily owner-notes refresh request (COORD req. 49).
     NotesRefresh,
     /// A newer stable release is out (IR req. 37).
@@ -121,7 +123,7 @@ type KindRow = (
     &'static str,
 );
 
-const KINDS: [KindRow; 66] = [
+const KINDS: [KindRow; 67] = [
     (
         EventKind::HubStarted,
         "hub.started",
@@ -504,6 +506,12 @@ const KINDS: [KindRow; 66] = [
         "item.question",
         &["item", "question"],
         "item {item}: {question}",
+    ),
+    (
+        EventKind::QuestionAnswered,
+        "question.answered",
+        &["question", "text", "outcome"],
+        "the owner's button answers question {question} ({text}): {outcome}",
     ),
     (
         EventKind::NotesRefresh,
