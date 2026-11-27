@@ -1,7 +1,12 @@
 # Changelog
 
-## Unreleased
+## 0.2.5 (Unreleased)
 
+- A Telegram, Slack or Discord message read live is no longer handed to the lead by a round that
+  finds it queued before its arrival finished. Such a hand-off lost the message's wake from
+  `cataly stats` (`*_wake_latency`) and left its read time in the hub's memory for good. The
+  round now waits for the arrival, and no read time outlives its message, also when the message
+  leaves the queue without a hand-off (a reset, a channel leaving scope).
 - When a Discord thread was started from your message (by you, by the lead through the bot, or by
   a lane), the lead's answer to it goes into that thread instead of a reply in the channel: every
   part of a long answer, with the same once-only posting, and the owed reply counts as answered.
