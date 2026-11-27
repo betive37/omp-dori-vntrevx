@@ -7,10 +7,6 @@ mod children;
 )]
 #[path = "support/hosted_controls.rs"]
 mod hosted_controls;
-#[expect(
-    dead_code,
-    reason = "shared fixtures also serve the core policy contract binary"
-)]
 #[path = "support/hosted_harness.rs"]
 mod hosted_harness;
 #[expect(
