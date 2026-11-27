@@ -924,7 +924,7 @@ impl<R: Runtime> Lanes<R> {
         let notes = crate::jobs::notes::Notes::new(&self.env.state_dir);
         let today = crate::jobs::notes::Notes::today();
         match op {
-            "profile-create" => notes.create().map(Value::String),
+            "profile-create" => notes.create(None).map(Value::String),
             "profile-show" => notes.show().map(Value::String),
             "profile-check" => {
                 let problems = notes.check_file(today)?;

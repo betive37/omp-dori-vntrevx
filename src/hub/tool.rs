@@ -232,9 +232,9 @@ fn notes(hub: &Hub, op: &str, input: &Value) -> Result<String, String> {
         "profile.read" => notes.show(),
         // Only on the owner's direct request, named by its message (COORD req. 47).
         "profile.create" => {
-            need(input, "message", 400, true)
+            let message = need(input, "message", 400, true)
                 .map_err(|_| "message: the owner's message asking for the owner notes")?;
-            notes.create()
+            notes.create(Some(message))
         }
         "profile.save" => notes.save(need(input, "text", PROFILE_MAX, false)?),
         "profile.snapshot" => notes.snapshot(today),

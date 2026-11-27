@@ -992,6 +992,10 @@ fn lead_creates_owner_notes_on_the_owners_request() {
     assert!(err && why.contains("already exist"), "{why}");
     let (shown, err) = lead_tool(&mut b, &s, "p5", json!({ "op": "profile.read" }));
     assert!(!err, "{shown}");
+    assert!(
+        shown.contains("on the owner's request (message discord:1/2)"),
+        "the create keeps the owner's message: {shown}"
+    );
     let mut notes = shown.trim_end().to_string();
     notes = notes.replacen(
         "## Standing decisions",
