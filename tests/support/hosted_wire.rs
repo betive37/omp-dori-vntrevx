@@ -33,7 +33,7 @@ fn tools(value: &Value, namespace: &str, out: &mut Surface) {
                 .flatten()
             {
                 text(description, &mut |text| {
-                    references(text, &mut out.references)
+                    references(text, &mut out.references);
                 });
             }
         }
@@ -123,7 +123,7 @@ impl Surface {
             text(value, &mut |text| {
                 commands(text, &mut out.commands);
                 references(text, &mut out.references);
-            })
+            });
         };
         for key in ["system", "instructions"] {
             if let Some(value) = body.get(key) {

@@ -1,5 +1,7 @@
 //! Live negative controls for the hosted stock-tool contract.
-use super::hosted_controls::{CHILD_POLICY_CONTROL, Control, UNKNOWN, UNKNOWN_EXTENSION, eval_call};
+use super::hosted_controls::{
+    CHILD_POLICY_CONTROL, Control, UNKNOWN, UNKNOWN_EXTENSION, eval_call,
+};
 use super::hosted_harness::{Hosted, enabled};
 use super::hosted_surface::{Purpose, Surface, Violation, execution_violations};
 use super::policy::Role;

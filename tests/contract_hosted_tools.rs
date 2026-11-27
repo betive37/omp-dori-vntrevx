@@ -56,13 +56,8 @@ fn request(host: &Hosted, from: usize, target: Witness<'_>) -> Surface {
     })
 }
 
-fn profile(commands: bool) {
-    let settings = if commands {
-        ""
-    } else {
-        "tools:\n  commands: false\n"
-    };
-    let mut host = Hosted::new("headless", settings);
+fn headless_profile(commands: bool) {
+    let mut host = Hosted::new("headless", "");
     // Both lower-precedence layers deliberately disagree with the hosted hard policy.
     let attempt = format!(
         "eval:\n  py: true\n  js: true\ntools:\n  commands: {commands}\n  approval:\n    eval: allow\n"
@@ -163,6 +158,14 @@ fn profile(commands: bool) {
         ],
     );
     assert!(host.hub.stop().success());
+}
+
+fn tern_profile(commands: bool) {
+    let settings = if commands {
+        ""
+    } else {
+        "tools:\n  commands: false\n"
+    };
     let mut tern = Hosted::new("tern", settings);
     tern.start();
     let from = tern.lead("Tern lead capability witness");
@@ -174,14 +177,16 @@ fn profile(commands: bool) {
 #[test]
 fn stock_default_profile_witnesses_every_hosted_role() {
     if enabled() {
-        profile(true);
+        headless_profile(true);
+        tern_profile(true);
     }
 }
 
 #[test]
 fn stock_direct_profile_witnesses_every_hosted_role() {
     if enabled() {
-        profile(false);
+        headless_profile(false);
+        tern_profile(false);
     }
 }
 
