@@ -61,9 +61,9 @@ pub(crate) enum Resume {
     Here,
     /// The room bound to the request, where the first part is.
     Bound(String),
-    /// The request's room, because the bound room holding the first part is gone: the next part
-    /// posted there is the reply to the request.
-    Moved,
+    /// The request's room, because the bound room holding the first part (named here) is gone:
+    /// the next part posted there is the reply to the request.
+    Moved(String),
 }
 
 /// What a relay knows about one room, for the channel facts line (DISC-IN req. 53).
@@ -100,14 +100,20 @@ pub(crate) trait Relay: Send + Sync + 'static {
     fn normalise(&self, row: &crate::store::relay::QueueRow) -> Result<Inbound, String>;
 
     /// Another room bound to `source` that takes the whole answer to it instead of a reply in `room`
-    /// (Discord: the thread started from that message); asked once per new answer. `None` keeps
-    /// the reply in `room`, and so does a failed lookup, which the relay logs.
+    /// (Discord: the thread started from that message). `None` keeps the reply in `room`; `Err`
+    /// when the lookup failed for now, which the pipeline asks again a bounded number of times.
     fn answer_room(
         &self,
         _room: &str,
         _source: &str,
-    ) -> impl Future<Output = Option<String>> + Send {
-        async { None }
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send {
+        async { Ok(None) }
+    }
+
+    /// The part `text` that continues in the request's room an answer begun in the bound room
+    /// `from`, with a pointer back there; [`Relay::parts`] leaves room for it.
+    fn continued(&self, text: &str, _from: &str) -> String {
+        text.to_string()
     }
 
     /// Where the rest of an answer goes after a restart in the middle of it, its first part

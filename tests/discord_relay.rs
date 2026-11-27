@@ -275,8 +275,8 @@ fn an_answer_goes_into_the_thread_started_from_the_request() {
     assert!(hub.stop().success());
 }
 
-/// When the thread lookup fails, the answer is the linked reply in the channel, as without a
-/// thread; the bounded lookup does not hold the answer back for long.
+/// When the thread lookup keeps failing, the answer is the linked reply in the channel, as without
+/// a thread; the bounded lookups (three, 5 s each) do not hold the answer back for long.
 #[test]
 fn a_failed_thread_lookup_replies_in_the_channel() {
     let fake = FakeDiscord::start();
@@ -286,7 +286,7 @@ fn a_failed_thread_lookup_replies_in_the_channel() {
     let source = "800000000000000111";
     fake.fail_reads(&format!("/channels/{CH}/messages/{source}"), 500);
     let thread = ask_with_thread(&fake, 800_000_000_000_000_111, "lookup fails");
-    let creates = fake.wait_creates(1, WAIT);
+    let creates = fake.wait_creates(1, Duration::from_secs(60));
     assert_eq!(creates[0].path, format!("/channels/{CH}/messages"));
     assert_eq!(reference(&creates[0]).as_deref(), Some(source));
     assert!(
@@ -297,6 +297,36 @@ fn a_failed_thread_lookup_replies_in_the_channel() {
     assert!(
         fake.calls("POST", &format!("/channels/{thread}/messages"))
             .is_empty()
+    );
+    assert!(hub.stop().success());
+}
+
+/// A thread lookup that fails for now is not kept for the request: the first part waits and a
+/// later round looks again, so one slow read does not send the whole answer to the channel.
+#[test]
+fn a_thread_lookup_that_failed_once_is_tried_again() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let source = "800000000000000112";
+    let read = format!("/channels/{CH}/messages/{source}");
+    // One lookup's reads all fail: three tries (1 s, then 2 s apart) within its 5 s.
+    fake.fail_reads_times(&read, 500, 3);
+    let thread = ask_with_thread(&fake, 800_000_000_000_000_112, "lookup fails once");
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(
+        creates[0].path,
+        format!("/channels/{thread}/messages"),
+        "{creates:?}"
+    );
+    assert!(creates[0].body.get("message_reference").is_none());
+    settled(&hub);
+    assert!(fake.calls("GET", &read).len() > 3, "looked up again");
+    assert!(
+        fake.calls("POST", &format!("/channels/{CH}/messages"))
+            .is_empty(),
+        "nothing in the channel"
     );
     assert!(hub.stop().success());
 }
@@ -358,15 +388,17 @@ fn an_uncertain_post_in_the_thread_keeps_the_answer_there() {
 
 /// A thread that closes in the middle of an answer (locked or no access: 403; deleted: unknown
 /// channel) takes nothing more: the rest goes to the channel, its first part as the reply to the
-/// request, and later answers are not held up.
+/// request with a line pointing back to the thread (a full part still fits with it), and later
+/// answers are not held up.
 #[test]
 fn a_thread_closed_mid_answer_moves_the_rest_to_the_channel() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
+    // Three parts: the moved second one is a full one.
     hub.fixture(
         "omp",
         "answer.json",
-        Some(&json!("word ".repeat(600)).to_string()),
+        Some(&json!("word ".repeat(1000)).to_string()),
     );
     hub.start();
     ready(&hub);
@@ -384,21 +416,36 @@ fn a_thread_closed_mid_answer_moves_the_rest_to_the_channel() {
             let s = status(&hub);
             (s["counts"]["owed_settled"] == n + 1 && s["counts"]["queued"] == 0).then_some(())
         });
-        fake.wait(WAIT, |f| {
+        let moved = fake.wait(WAIT, |f| {
             let moved: Vec<Value> = f
                 .bot_messages(CH)
                 .into_iter()
                 .filter(|m| m["message_reference"]["message_id"] == source.as_str())
                 .collect();
-            (moved.len() == 1).then_some(())
+            (moved.len() == 1).then_some(moved)
         });
+        let text = moved[0]["content"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!("-# continued from <#{source}>\n")),
+            "{text}"
+        );
+        assert!(text.encode_utf16().count() > 1900, "a full part");
         assert_eq!(
             fake.bot_messages(&source).len(),
             1,
             "only the first part in the thread"
         );
     }
-    assert_eq!(fake.bot_messages(CH).len(), 2, "one moved part per answer");
+    // Two moved parts per answer.
+    let posted = fake.wait(WAIT, |f| {
+        let posted = f.bot_messages(CH);
+        (posted.len() == 4).then_some(posted)
+    });
+    let pointers = posted
+        .iter()
+        .filter(|m| m["content"].as_str().unwrap().contains("continued from"))
+        .count();
+    assert_eq!(pointers, 2, "one pointer per answer");
     assert!(hub.stop().success());
 }
 
@@ -641,6 +688,11 @@ fn a_thread_gone_before_a_restart_moves_the_rest_as_a_reply() {
             moved[0]["message_reference"]["message_id"],
             source.as_str(),
             "{refusal}: the moved part is the reply to the request"
+        );
+        let text = moved[0]["content"].as_str().unwrap();
+        assert!(
+            text.starts_with(&format!("-# continued from <#{source}>\n")),
+            "{refusal}: it points back to the thread: {text}"
         );
         assert_eq!(
             in_thread(),

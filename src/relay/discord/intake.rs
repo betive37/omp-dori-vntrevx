@@ -40,6 +40,11 @@ const THREADS_MAX: usize = 128;
 /// Cached thread lookups (DISC-IN req. 10).
 const LOOKUPS_MAX: usize = 256;
 const LOOKUP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Opens the line that points a part moved to the channel back to the thread the answer began in
+/// (DISC-OUT req. 25); the thread's ID and `>` and a line break follow.
+const CONTINUED: &str = "-# continued from <#";
+/// What the pointer takes: the opening, a snowflake (at most 20 digits), `>` and a line break.
+const POINTER_ROOM: usize = CONTINUED.len() + 20 + 2;
 /// The handling round runs at least this often while work is open.
 const TICK: Duration = Duration::from_secs(3);
 const IDLE_TICK: Duration = Duration::from_secs(30);
@@ -89,8 +94,13 @@ impl Relay for DiscordRelay {
         let answer = answer.trim();
         text::check(answer, &self.checks)
             .map_err(|e| format!("refused by the outgoing text checks: {e}"))?;
-        text::split(&text::render_tables(answer), DISCORD_LIMIT)
-            .ok_or_else(|| "empty answer".into())
+        let rendered = text::render_tables(answer);
+        let parts = text::split(&rendered, DISCORD_LIMIT).ok_or("empty answer")?;
+        if parts.len() == 1 {
+            return Ok(parts);
+        }
+        // A later part may move to the channel with a pointer back to the thread.
+        text::split(&rendered, DISCORD_LIMIT - POINTER_ROOM).ok_or_else(|| "empty answer".into())
     }
 
     fn nonce(&self, room: &str, source: &str, index: usize) -> String {
@@ -104,22 +114,24 @@ impl Relay for DiscordRelay {
     }
 
     /// The thread started from the request, looked up within 5 s (DISC-OUT req. 25).
-    async fn answer_room(&self, room: &str, source: &str) -> Option<String> {
+    async fn answer_room(&self, room: &str, source: &str) -> Result<Option<String>, String> {
         if !self.follow_threads {
-            return None;
+            return Ok(None);
         }
-        let (channel, message) = (id(room).ok()?, id(source).ok()?);
-        let lookup = self.rest.started_thread(channel, message);
-        let why = match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
-            Ok(Ok(thread)) => return thread.map(|t| t.to_string()),
-            Ok(Err(why)) => why,
-            Err(_) => "no answer within 5 s".into(),
+        let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
+            return Ok(None);
         };
-        log::warn(
-            "thread lookup failed; the answer is a reply in the channel",
-            &[("message", &source), ("reason", &why)],
-        );
-        None
+        let lookup = self.rest.started_thread(channel, message);
+        match tokio::time::timeout(LOOKUP_TIMEOUT, lookup).await {
+            Ok(Ok(thread)) => Ok(thread.map(|t| t.to_string())),
+            Ok(Err(why)) => Err(why),
+            Err(_) => Err("no answer within 5 s".into()),
+        }
+    }
+
+    /// The pointer back to the thread where the answer began (DISC-OUT req. 25).
+    fn continued(&self, text: &str, from: &str) -> String {
+        format!("{CONTINUED}{from}>\n{text}")
     }
 
     /// Where the first part of a half-posted answer is (DISC-OUT req. 25). Only reading the part
@@ -130,6 +142,10 @@ impl Relay for DiscordRelay {
     /// rest waits.
     async fn resume_room(&self, room: &str, source: &str, posted: &str) -> Result<Resume, String> {
         let (Ok(channel), Ok(message)) = (id(room), id(source)) else {
+            log::debug(
+                "not a Discord room or message; the rest follows the request's room",
+                &[("room", &room), ("message", &source)],
+            );
             return Ok(Resume::Here);
         };
         let posted = id(posted)?;
@@ -140,7 +156,7 @@ impl Relay for DiscordRelay {
         match self.read_part(message, posted).await {
             Ok(()) => Ok(Resume::Bound(source.to_string())),
             Err(e) if in_channel.unknown_message() && (e.closed() || e.unknown_message()) => {
-                Ok(Resume::Moved)
+                Ok(Resume::Moved(source.to_string()))
             }
             Err(e) => Err(format!(
                 "the first part is not readable in the channel ({}) or in the thread ({})",
@@ -786,7 +802,7 @@ impl<T: Runtime> Intake<T> {
     /// Where typing shows for the request `message` in `room`: where its answer would go now
     /// (DISC-OUT req. 25). Only a followed thread with the request's ID (a thread started from a
     /// message takes its ID) needs the answer's own lookup, shared with posting and run off the
-    /// handling round; `None` while it runs.
+    /// handling round; `None` while it runs or after it failed (a later round looks again).
     fn typing_target(&self, room: String, message: String) -> Option<String> {
         let followed = Snowflake::parse(&message).is_some_and(|m| {
             self.scope()
@@ -802,7 +818,8 @@ impl<T: Runtime> Intake<T> {
         }
         let pipeline = Arc::clone(&self.pipeline);
         tokio::spawn(async move {
-            pipeline.answer_room(&room, &message).await;
+            // A failure is logged and counted by the pipeline.
+            let _ = pipeline.answer_room(&room, &message).await;
         });
         None
     }
