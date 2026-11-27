@@ -26,8 +26,10 @@ VALUES (1,
     (SELECT b.handle FROM lead_bindings b JOIN sessions s USING(handle)
      ORDER BY s.started_ms DESC, s.rowid DESC LIMIT 1),
     EXISTS(SELECT 1 FROM sessions WHERE role = 'lead'),
-    CASE WHEN (SELECT mode = 'fresh' AND session_id IS NULL FROM sessions WHERE role = 'lead'
-               ORDER BY started_ms DESC, rowid DESC LIMIT 1)
+    CASE WHEN EXISTS(SELECT 1 FROM sessions f WHERE f.role = 'lead' AND f.mode = 'fresh'
+               AND f.session_id IS NULL AND NOT EXISTS(
+                   SELECT 1 FROM lead_bindings b JOIN sessions p USING(handle)
+                   WHERE (p.started_ms, p.rowid) > (f.started_ms, f.rowid)))
          THEN 'fresh_failed' ELSE 'resume' END,
     CASE WHEN EXISTS(SELECT 1 FROM sessions WHERE role = 'lead')
               AND NOT EXISTS(SELECT 1 FROM lead_bindings)
@@ -36,6 +38,8 @@ VALUES (1,
 UPDATE lead_anchor SET hold = 'ambiguous lead binding history'
 WHERE EXISTS(SELECT session_id FROM lead_bindings GROUP BY session_id
              HAVING COUNT(DISTINCT session_file || char(0) || cwd || char(0) || runtime) > 1);
+UPDATE lead_anchor SET hold = 'ambiguous current lead history; select an exact previously bound session_id'
+WHERE (SELECT COUNT(DISTINCT session_id) FROM lead_bindings) > 1 AND hold IS NULL;
 -- Episode accounting survives attempt retention and hub restarts. A completed episode is replaced
 -- only by an explicit owner retry or a new failure after a successful binding.
 CREATE TABLE startup_episodes (

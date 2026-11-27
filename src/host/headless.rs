@@ -5,6 +5,13 @@
 //!
 //! The state mutex is only ever held for synchronous updates, never across an await.
 
+#[path = "lead/local_cleanup.rs"]
+mod local_cleanup;
+
+#[cfg(test)]
+#[path = "lead/startup_tests.rs"]
+mod startup_tests;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -19,7 +26,7 @@ use super::dialogs::{
     self, AnswerFrame, Dialog, Entry, Facts, ReadState, Status, UiFrame, read_state, same_model,
     spend_offer,
 };
-use super::startup::{Cleanup, StartupOutcome, StartupStage, STARTUP_BUDGET};
+use super::startup::{Cleanup, STARTUP_BUDGET, StartupOutcome, StartupStage};
 use super::{
     Control, DeliverOutcome, Delivery, EventPage, Role, Runtime, SessionEvent, Snapshot,
     StartError, StartSpec, Started, StopRecord, Timing,
@@ -89,7 +96,19 @@ impl Runtime for Headless {
         self.start_supervised(spec, cancel).await
     }
 
-    async fn start_supervised(&self, spec: StartSpec, mut cancel: watch::Receiver<bool>) -> Result<(Arc<Session>, Started), StartError> {
+    async fn start_supervised(
+        &self,
+        spec: StartSpec,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
+        if *cancel.borrow() {
+            return Err(StartError::Startup {
+                stage: StartupStage::Spawn,
+                outcome: StartupOutcome::Cancelled,
+                cleanup: Cleanup::NotSpawned,
+                detail: "startup cancelled before spawn".into(),
+            });
+        }
         let deadline = tokio::time::Instant::now() + STARTUP_BUDGET;
         let token = super::random_hex(16);
         self.links.issue(&token, &spec.handle, spec.role);
@@ -114,44 +133,57 @@ impl Runtime for Headless {
         crate::sys::fs::ensure_private_dir(&self.logs)
             .map_err(|e| StartError::Refused(e.to_string()))?;
         let stderr = self.logs.join(format!("session-{}.err", spec.handle));
-        let ownership = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle).map_err(StartError::Refused)?;
+        let ownership = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
+            .map_err(StartError::Refused)?;
         let mut child = command::attach(&argv, Some(&spec.cwd), &env, Some(&stderr), STDERR_CAP)
             .map_err(|e| StartError::Refused(e.to_string()))?;
         if let Err(detail) = ownership.spawned(child.pid()).await {
-            let (exit, _) = child.close(CLOSE_WAIT, KILL_GRACE).await;
-            return Err(StartError::Startup { stage: StartupStage::Spawn, outcome: StartupOutcome::Rejected,
-                cleanup: if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped }, detail });
+            return Err(local_cleanup::finish(
+                child,
+                &ownership,
+                local_cleanup::Failure {
+                    stage: StartupStage::Spawn,
+                    outcome: StartupOutcome::Rejected,
+                    detail,
+                },
+            )
+            .await);
         }
         // Its shell and tools act in this session's role on the control socket (DESIGN 8).
         if let Some(pid) = child.pid() {
             self.links.adopt(pid, &spec.handle, spec.role);
         }
         let (Some(stdin), Some(stdout)) = (child.take_stdin(), child.take_stdout()) else {
-            child.close(CLOSE_WAIT, KILL_GRACE).await;
-            return Err(StartError::Failed("OMP's pipes are not available".into()));
+            return Err(local_cleanup::finish(
+                child,
+                &ownership,
+                local_cleanup::Failure {
+                    stage: StartupStage::Spawn,
+                    outcome: StartupOutcome::Rejected,
+                    detail: "OMP's pipes are not available".into(),
+                },
+            )
+            .await);
         };
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let rpc = match Rpc::connect_supervised(stdout, stdin, deadline.saturating_duration_since(tokio::time::Instant::now()), Some(tx), cancel.clone()).await {
+        let rpc = match Rpc::connect_supervised(
+            stdout,
+            stdin,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            Some(tx),
+            cancel.clone(),
+        )
+        .await
+        {
             Ok(rpc) => rpc,
             Err(e) => {
-                let (exit, step) = child.close(CLOSE_WAIT, KILL_GRACE).await;
-                let timed_out = matches!(e, RpcError::Timeout(_));
-                let detail = if timed_out {
-                    format!("no rpc-ui ready frame within {} s", READY_WITHIN.as_secs())
-                } else {
-                    format!("rpc-ui handshake failed: {e}")
-                };
-                let detail = format!("{detail} (OMP cleanup: {step:?}, {exit:?})");
-                let cleanup = if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped };
-                if let Err(error) = ownership.finished(cleanup) {
-                    return Err(StartError::Startup { stage: StartupStage::Ready, outcome: StartupOutcome::Rejected, cleanup: Cleanup::Unknown, detail: error });
-                }
-                return Err(StartError::Startup {
-                    stage: if e == RpcError::Timeout("ready frame") { StartupStage::Ready } else { StartupStage::Protocol },
-                    outcome: if *cancel.borrow_and_update() { StartupOutcome::Cancelled } else if timed_out { StartupOutcome::Timeout } else { StartupOutcome::Rejected },
-                    cleanup,
-                    detail,
-                });
+                let cancelled = *cancel.borrow_and_update();
+                return Err(local_cleanup::finish(
+                    child,
+                    &ownership,
+                    local_cleanup::Failure::rpc(e, cancelled),
+                )
+                .await);
             }
         };
         let settings = Settings {
@@ -402,6 +434,12 @@ fn names_model(selector: &str, model: &str) -> bool {
             .is_some_and(|base| same_model(base, model))
 }
 
+enum BindFailure {
+    Rpc(RpcError),
+    Invalid(String),
+    Cancelled,
+}
+
 impl Session {
     /// Runs the start handshake over a connected rpc stream (HOST req. 23-28) and starts the event
     /// task. On failure the child is closed.
@@ -445,59 +483,100 @@ impl Session {
         });
         tokio::spawn(event_loop(Arc::clone(&inner), events));
         let session = Arc::new(Self { inner });
-        let deadline = session.inner.settings.deadline.unwrap_or_else(|| tokio::time::Instant::now() + STARTUP_BUDGET);
+        let deadline = session
+            .inner
+            .settings
+            .deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + STARTUP_BUDGET);
         let (_keep, never_cancel) = watch::channel(false);
-        let mut cancel = session.inner.settings.cancel.clone().unwrap_or(never_cancel);
+        let mut cancel = session
+            .inner
+            .settings
+            .cancel
+            .clone()
+            .unwrap_or(never_cancel);
         let bound = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err(BindFailure::Cancelled),
             result = tokio::time::timeout_at(deadline, session.handshake(&spec, deadline)) => result
-                .unwrap_or_else(|_| Err("startup exceeded the shared 60 s deadline".into())),
-            () = super::startup::cancelled(&mut cancel) => Err("startup cancelled; owned process closed".into()),
+                .unwrap_or(Err(BindFailure::Rpc(RpcError::Timeout("startup deadline")))),
         };
         match bound {
             Ok(started) => Ok((session, started)),
-            Err(reason) => {
+            Err(failure) => {
+                let (outcome, reason) = match failure {
+                    BindFailure::Rpc(error) => (
+                        if matches!(error, RpcError::Timeout(_)) {
+                            StartupOutcome::Timeout
+                        } else {
+                            StartupOutcome::Rejected
+                        },
+                        error.to_string(),
+                    ),
+                    BindFailure::Invalid(reason) => (StartupOutcome::Rejected, reason),
+                    BindFailure::Cancelled => (
+                        StartupOutcome::Cancelled,
+                        "startup cancelled; owned process closed".into(),
+                    ),
+                };
                 session.inner.fault(&reason);
-                let outcome = if *cancel.borrow() { StartupOutcome::Cancelled } else if tokio::time::Instant::now() >= deadline { StartupOutcome::Timeout } else { StartupOutcome::Rejected };
                 let stopped = session.inner.end("failed", Some(reason.clone())).await;
-                Err(StartError::Startup { stage: StartupStage::Binding, outcome, cleanup: stopped.cleanup, detail: reason })
+                Err(StartError::Startup {
+                    stage: StartupStage::Binding,
+                    outcome,
+                    cleanup: stopped.cleanup,
+                    detail: reason,
+                })
             }
         }
     }
 
-    async fn handshake(&self, spec: &StartSpec, deadline: tokio::time::Instant) -> Result<Started, String> {
+    async fn handshake(
+        &self,
+        spec: &StartSpec,
+        deadline: tokio::time::Instant,
+    ) -> Result<Started, BindFailure> {
         let inner = &self.inner;
-        let call = |kind, fields: &[(&str, Value)]| inner.rpc.call(
-            rpc::command(kind, fields),
-            deadline.saturating_duration_since(tokio::time::Instant::now()),
-        );
+        let call = |kind, fields: &[(&str, Value)]| {
+            inner.rpc.call(
+                rpc::command(kind, fields),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+        };
         let _ = call("set_ask_dialog", &[("enabled", json!(true))]).await;
         let state = async || {
-            let reply = call("get_state", &[]).await.map_err(|e| e.to_string())?;
+            let reply = call("get_state", &[]).await.map_err(BindFailure::Rpc)?;
             if !reply.success {
-                return Err(format!("OMP refused get_state: {}", reply.error.unwrap_or_default()));
+                return Err(BindFailure::Invalid(format!(
+                    "OMP refused get_state: {}",
+                    reply.error.unwrap_or_default()
+                )));
             }
-            read_state(reply.data.as_ref()).ok_or_else(|| "get_state answered without a session identity".to_string())
+            read_state(reply.data.as_ref()).ok_or_else(|| {
+                BindFailure::Invalid("get_state answered without a session identity".into())
+            })
         };
         let first = state().await?;
         let second = state().await?;
         if (first.session_id.as_str(), first.session_file.as_str())
             != (second.session_id.as_str(), second.session_file.as_str())
         {
-            return Err("two get_state answers named different sessions".into());
+            return Err(BindFailure::Invalid(
+                "two get_state answers named different sessions".into(),
+            ));
         }
         if first.model != second.model || first.thinking != second.thinking {
-            return Err("two get_state answers named different model/thinking settings".into());
+            return Err(BindFailure::Invalid(
+                "two get_state answers named different model/thinking settings".into(),
+            ));
         }
         if !Path::new(&first.session_file).is_absolute() {
-            return Err("OMP reported a transcript path that is not absolute".into());
+            return Err(BindFailure::Invalid(
+                "OMP reported a transcript path that is not absolute".into(),
+            ));
         }
         // A worker's session file is recorded with its worker; the worker resolved its paths.
-        let reported_file = match &inner.worker {
-            Some(_) => inner.recorded(&first.session_file),
-            None => std::fs::canonicalize(&first.session_file)
-                .map_err(|e| format!("reported transcript cannot be canonicalized: {e}"))?
-                .display().to_string(),
-        };
+        let reported_file = inner.recorded(&first.session_file);
         if let (Some(expected), Target::Resume(file)) = (&spec.expected_id, &spec.target) {
             let same = if inner.worker.is_some() {
                 Path::new(&reported_file) == file.as_path()
@@ -506,12 +585,12 @@ impl Session {
                 reported.is_some() && reported == std::fs::canonicalize(file).ok()
             };
             if &first.session_id != expected || !same {
-                return Err(format!(
+                return Err(BindFailure::Invalid(format!(
                     "OMP resumed a different session: expected {expected} at {}, got {} at {}",
                     file.display(),
                     first.session_id,
                     reported_file
-                ));
+                )));
             }
         }
         let held = match &first.model {
@@ -922,7 +1001,11 @@ impl Inner {
         let (how, detail, cleanup) = match proc {
             Some(Proc::Child(child)) => {
                 let (exit, step) = child.close(CLOSE_WAIT, KILL_GRACE).await;
-                let cleanup = if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped };
+                let cleanup = if exit == Exit::Unknown {
+                    Cleanup::Unknown
+                } else {
+                    Cleanup::LocalReaped
+                };
                 let (how, detail) = match (step, exit) {
                     (Step::Input, Exit::Code(0)) => (how.to_string(), detail),
                     (Step::Input, exit) => ("exited".into(), Some(format!("{exit:?}"))),
@@ -961,8 +1044,12 @@ impl Inner {
             return record;
         }
         if let Some(ownership) = &self.settings.ownership
-            && let Err(error) = ownership.finished(cleanup) {
-            log::warn("startup ownership receipt not persisted", &[("error", &error)]);
+            && let Err(error) = ownership.finished(cleanup)
+        {
+            log::warn(
+                "startup ownership receipt not persisted",
+                &[("error", &error)],
+            );
         }
         let record = StopRecord {
             cleanup,
@@ -1268,9 +1355,19 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<Value>) {
     let (detail, cleanup) = match proc {
         Some(Proc::Child(child)) => {
             let (exit, _) = child.close(Duration::from_secs(1), KILL_GRACE).await;
-            (format!("{exit:?}"), if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped })
+            (
+                format!("{exit:?}"),
+                if exit == Exit::Unknown {
+                    Cleanup::Unknown
+                } else {
+                    Cleanup::LocalReaped
+                },
+            )
         }
-        Some(Proc::Remote(remote)) => (format!("output closed on {}", remote.worker), Cleanup::Unknown),
+        Some(Proc::Remote(remote)) => (
+            format!("output closed on {}", remote.worker),
+            Cleanup::Unknown,
+        ),
         #[cfg(test)]
         Some(Proc::Fake) => ("output closed".into(), Cleanup::LocalReaped),
         None => ("output closed".into(), Cleanup::Unknown),

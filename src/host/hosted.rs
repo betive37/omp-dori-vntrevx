@@ -47,6 +47,23 @@ impl Runtime for Hosted {
                 .map(|(s, started)| (Arc::new(Hosting::Tern(s)), started)),
         }
     }
+
+    async fn start_supervised(
+        &self,
+        spec: StartSpec,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Hosting>, Started), StartError> {
+        match self {
+            Self::Headless(runtime) => runtime
+                .start_supervised(spec, cancel)
+                .await
+                .map(|(session, started)| (Arc::new(Hosting::Headless(session)), started)),
+            Self::Tern(runtime) => runtime
+                .start_supervised(spec, cancel)
+                .await
+                .map(|(session, started)| (Arc::new(Hosting::Tern(session)), started)),
+        }
+    }
 }
 
 /// Calls the same method on whichever session this is.
