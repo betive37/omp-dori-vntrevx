@@ -825,11 +825,15 @@ fn capability_less() -> PathBuf {
             text.replacen(field, none, 1).into_bytes()
         },
     );
+    // Its own target folder: the shared one's `target/debug/cataly` is whichever crate copy put it
+    // there last, and a variant's binary (also 0.2.6, with the capability) was seen standing in
+    // for this one after a build that found nothing to rebuild.
+    let target = out_dir.join("target-capability-less");
     let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
     let built = std::process::Command::new(cargo)
         .args(["build", "--offline", "--bin", "cataly"])
         .current_dir(out_dir.join("src-capability-less"))
-        .env("CARGO_TARGET_DIR", out_dir.join("target"))
+        .env("CARGO_TARGET_DIR", &target)
         .env("CARGO_PROFILE_DEV_DEBUG", "false")
         .env_remove("CATALY_RELEASE_KEY")
         .env_remove("CATALY_COMMIT")
@@ -838,7 +842,7 @@ fn capability_less() -> PathBuf {
     assert!(built.success(), "the capability-less build failed");
     let out = out_dir.join("cataly-capability-less");
     let part = out_dir.join("cataly-capability-less.part");
-    std::fs::copy(out_dir.join("target/debug/cataly"), &part).unwrap();
+    std::fs::copy(target.join("debug/cataly"), &part).unwrap();
     std::fs::rename(&part, &out).unwrap();
     out
 }
