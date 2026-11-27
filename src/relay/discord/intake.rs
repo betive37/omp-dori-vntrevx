@@ -358,6 +358,14 @@ impl<T: Runtime> Intake<T> {
     fn active_tap(&self) -> Option<&Tap> {
         self.tap.0.as_deref().filter(|_| self.tap.1)
     }
+
+    /// Presses recorded but not told before the last stop, looked for once per process: a later
+    /// intake start could tell a press whose event is still on its way.
+    async fn recover_presses(&self) {
+        if !self.shared.presses_recovered.swap(true, Ordering::SeqCst) {
+            self.tell_untold_presses().await;
+        }
+    }
 }
 
 fn str_field<'a>(v: &'a Value, key: &str) -> Option<&'a str> {
@@ -457,6 +465,7 @@ impl<T: Runtime> Intake<T> {
             intake.unlist(*channel, e);
         }
         intake.close_left_open().await;
+        intake.recover_presses().await;
         intake.baseline_listed().await?;
         // A queue left from before is drained after a full catch-up read (DISC-IN req. 28).
         let queued = env

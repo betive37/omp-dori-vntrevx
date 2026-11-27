@@ -240,6 +240,7 @@ impl<T: crate::host::Runtime> super::intake::Intake<T> {
         row: &crate::store::relay::QueueRow,
         mut inbound: crate::relay::Inbound,
     ) -> crate::relay::Inbound {
+        use super::questions::ledger;
         use crate::store::lead::{LeadDone, LeadWrite};
         let Some(target) = inbound.reply_to.clone() else {
             return inbound;
@@ -254,10 +255,13 @@ impl<T: crate::host::Runtime> super::intake::Intake<T> {
         };
         let text = inbound.text.trim();
         let outcome = match text.parse::<usize>() {
-            Ok(n) if (1..=q.options.len()).contains(&n) => Some(format!(
-                "option {n} ({})",
-                q.options.get(n - 1).map_or("", String::as_str)
-            )),
+            Ok(n) if (1..=q.options.len()).contains(&n) => {
+                let picked = ledger::picked(&q, n);
+                Some((
+                    format!("Answered by the owner: {}", ledger::shown(&q, n)),
+                    picked,
+                ))
+            }
             Ok(n) => {
                 inbound.data.push(format!(
                     "this reply names option {n} of question {}, which has {} options; nothing was recorded",
@@ -266,18 +270,22 @@ impl<T: crate::host::Runtime> super::intake::Intake<T> {
                 ));
                 None
             }
-            Err(_) => Some(format!(
-                "free answer: {}",
-                text.chars().take(1000).collect::<String>()
+            Err(_) => Some((
+                "Answered by the owner's reply.".to_string(),
+                format!(
+                    "free answer: {}",
+                    text.chars().take(1000).collect::<String>()
+                ),
             )),
         };
-        if let Some(outcome) = outcome {
+        if let Some((status, outcome)) = outcome {
             let write = LeadWrite::QuestionSettle {
                 id: q.id.clone(),
                 state: "answered".into(),
                 outcome: format!("owner message {}: {outcome}", row.message),
             };
             if matches!(self.store.lead(write).await, Ok(LeadDone::Done)) {
+                ledger::close(Arc::clone(&self.rest), &q, &status);
                 inbound.data.push(format!(
                     "this message answers question {} ({}): {outcome}",
                     q.id, q.text

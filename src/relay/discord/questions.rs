@@ -28,6 +28,7 @@ use crate::relay::text::DISCORD_LIMIT;
 use crate::store::relay::{QueueRow, RelayWrite};
 
 mod approval;
+pub(crate) mod ledger;
 mod panel;
 mod typed;
 /// The longest excerpt of a waiting dialog in its local notice.
@@ -1095,12 +1096,15 @@ impl<T: Runtime> Intake<T> {
 
     /// A button press (DISC-OUT req. 69, 82): the owner's press on an open card answers it; anyone
     /// else's gets an ephemeral refusal; presses while one is being taken are ignored. Presses on
-    /// the ops panel go to the panel.
+    /// the ops panel go to the panel, presses on a question the lead recorded to [`ledger`].
     pub(super) async fn press(self: Arc<Self>, press: Press) {
         if press.custom_id.starts_with("ops:") {
             return self.ops_press(&press).await;
         }
         let Some(card) = self.cards.by_message(press.message) else {
+            if self.ledger_press(&press).await {
+                return;
+            }
             return self.refuse(&press, "This question is closed.").await;
         };
         if !press.by_owner(self.application, self.owner) || press.channel != card.channel {

@@ -85,6 +85,8 @@ struct State {
     /// the bot is in, and the bot's avatar and banner hashes with the data each was set from.
     token: Option<String>,
     app_flags: u64,
+    /// The application's interactions endpoint URL; set, buttons do not come over the Gateway.
+    interactions_url: Option<String>,
     guilds: Vec<Value>,
     profile: HashMap<String, (String, String)>,
     /// Channel -> the Discord error code its reads get (50001 or 50013).
@@ -398,6 +400,11 @@ impl FakeDiscord {
         self.state.lock().unwrap().app_flags = flags;
     }
 
+    /// Gives the application an interactions endpoint URL, so presses would not reach the Gateway.
+    pub fn set_interactions_url(&self, url: &str) {
+        self.state.lock().unwrap().interactions_url = Some(url.into());
+    }
+
     pub fn app_flags(&self) -> u64 {
         self.state.lock().unwrap().app_flags
     }
@@ -580,7 +587,7 @@ async fn gateway(stream: tokio::net::TcpStream, state: Arc<Mutex<State>>, port: 
 
 /// The application object, owned by [`APP_OWNER`].
 fn application(s: &State) -> Value {
-    json!({ "id": APP, "flags": s.app_flags, "interactions_endpoint_url": null,
+    json!({ "id": APP, "flags": s.app_flags, "interactions_endpoint_url": s.interactions_url,
         "icon": s.profile.get("icon").map(|(h, _)| h.clone()),
         "owner": { "id": APP_OWNER, "username": "fake-owner" }, "team": null })
 }
