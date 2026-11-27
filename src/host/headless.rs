@@ -19,6 +19,7 @@ use super::dialogs::{
     self, AnswerFrame, Dialog, Entry, Facts, ReadState, Status, UiFrame, read_state, same_model,
     spend_offer,
 };
+use super::startup::{Cleanup, StartupOutcome, StartupStage, STARTUP_BUDGET};
 use super::{
     Control, DeliverOutcome, Delivery, EventPage, Role, Runtime, SessionEvent, Snapshot,
     StartError, StartSpec, Started, StopRecord, Timing,
@@ -30,10 +31,8 @@ use crate::sys::command::{self, Attached, Exit, KILL_GRACE, Step};
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
 
-/// Ready frame (HOST req. 23).
-const READY_WITHIN: Duration = Duration::from_secs(15);
-/// Whole start, ready to bound identity (HOST req. 28).
-const START_BUDGET: Duration = Duration::from_secs(30);
+/// Transport and binding share the deadline measured before spawning.
+const READY_WITHIN: Duration = STARTUP_BUDGET;
 /// After end of input before TERM (DESIGN 4.2, decision 8).
 const CLOSE_WAIT: Duration = Duration::from_secs(15);
 /// A forced close waits this long for the interrupted turn to stop (HOST req. 66).
@@ -86,6 +85,12 @@ impl Runtime for Headless {
     }
 
     async fn start(&self, spec: StartSpec) -> Result<(Arc<Session>, Started), StartError> {
+        let (_keep, cancel) = watch::channel(false);
+        self.start_supervised(spec, cancel).await
+    }
+
+    async fn start_supervised(&self, spec: StartSpec, mut cancel: watch::Receiver<bool>) -> Result<(Arc<Session>, Started), StartError> {
+        let deadline = tokio::time::Instant::now() + STARTUP_BUDGET;
         let token = super::random_hex(16);
         self.links.issue(&token, &spec.handle, spec.role);
         if let Some(worker) = spec.worker.clone() {
@@ -109,8 +114,14 @@ impl Runtime for Headless {
         crate::sys::fs::ensure_private_dir(&self.logs)
             .map_err(|e| StartError::Refused(e.to_string()))?;
         let stderr = self.logs.join(format!("session-{}.err", spec.handle));
+        let ownership = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle).map_err(StartError::Refused)?;
         let mut child = command::attach(&argv, Some(&spec.cwd), &env, Some(&stderr), STDERR_CAP)
             .map_err(|e| StartError::Refused(e.to_string()))?;
+        if let Err(detail) = ownership.spawned(child.pid()).await {
+            let (exit, _) = child.close(CLOSE_WAIT, KILL_GRACE).await;
+            return Err(StartError::Startup { stage: StartupStage::Spawn, outcome: StartupOutcome::Rejected,
+                cleanup: if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped }, detail });
+        }
         // Its shell and tools act in this session's role on the control socket (DESIGN 8).
         if let Some(pid) = child.pid() {
             self.links.adopt(pid, &spec.handle, spec.role);
@@ -120,16 +131,35 @@ impl Runtime for Headless {
             return Err(StartError::Failed("OMP's pipes are not available".into()));
         };
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let rpc = match Rpc::connect(stdout, stdin, READY_WITHIN, Some(tx)).await {
+        let rpc = match Rpc::connect_supervised(stdout, stdin, deadline.saturating_duration_since(tokio::time::Instant::now()), Some(tx), cancel.clone()).await {
             Ok(rpc) => rpc,
             Err(e) => {
-                child.close(CLOSE_WAIT, KILL_GRACE).await;
-                return Err(StartError::Failed(format!("no rpc-ui ready frame: {e}")));
+                let (exit, step) = child.close(CLOSE_WAIT, KILL_GRACE).await;
+                let timed_out = matches!(e, RpcError::Timeout(_));
+                let detail = if timed_out {
+                    format!("no rpc-ui ready frame within {} s", READY_WITHIN.as_secs())
+                } else {
+                    format!("rpc-ui handshake failed: {e}")
+                };
+                let detail = format!("{detail} (OMP cleanup: {step:?}, {exit:?})");
+                let cleanup = if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped };
+                if let Err(error) = ownership.finished(cleanup) {
+                    return Err(StartError::Startup { stage: StartupStage::Ready, outcome: StartupOutcome::Rejected, cleanup: Cleanup::Unknown, detail: error });
+                }
+                return Err(StartError::Startup {
+                    stage: if e == RpcError::Timeout("ready frame") { StartupStage::Ready } else { StartupStage::Protocol },
+                    outcome: if *cancel.borrow_and_update() { StartupOutcome::Cancelled } else if timed_out { StartupOutcome::Timeout } else { StartupOutcome::Rejected },
+                    cleanup,
+                    detail,
+                });
             }
         };
         let settings = Settings {
             spend_phrases: self.spend_phrases.clone(),
             agent_start: self.agent_start.clone(),
+            deadline: Some(deadline),
+            cancel: Some(cancel),
+            ownership: Some(ownership),
         };
         Session::bind(rpc, rx, Proc::Child(Box::new(child)), spec, settings).await
     }
@@ -215,6 +245,9 @@ impl Headless {
         let settings = Settings {
             spend_phrases: self.spend_phrases.clone(),
             agent_start: self.agent_start.clone(),
+            deadline: None,
+            cancel: None,
+            ownership: None,
         };
         let remote = Remote {
             worker: worker.to_string(),
@@ -226,10 +259,13 @@ impl Headless {
 }
 
 /// Per-session settings that are not part of the start spec.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Settings {
     pub(crate) spend_phrases: Vec<String>,
     pub(crate) agent_start: Latency,
+    deadline: Option<tokio::time::Instant>,
+    cancel: Option<watch::Receiver<bool>>,
+    ownership: Option<super::lead::ownership::Ownership>,
 }
 
 #[derive(Default)]
@@ -409,39 +445,59 @@ impl Session {
         });
         tokio::spawn(event_loop(Arc::clone(&inner), events));
         let session = Arc::new(Self { inner });
-        let elapsed = Duration::from_millis(u64::try_from(now_ms() - now).unwrap_or(0));
-        let budget = START_BUDGET.saturating_sub(READY_WITHIN.min(elapsed));
-        let bound = timeout(budget, session.handshake(&spec))
-            .await
-            .unwrap_or_else(|_| Err("the start took longer than 30 s".into()));
+        let deadline = session.inner.settings.deadline.unwrap_or_else(|| tokio::time::Instant::now() + STARTUP_BUDGET);
+        let (_keep, never_cancel) = watch::channel(false);
+        let mut cancel = session.inner.settings.cancel.clone().unwrap_or(never_cancel);
+        let bound = tokio::select! {
+            result = tokio::time::timeout_at(deadline, session.handshake(&spec, deadline)) => result
+                .unwrap_or_else(|_| Err("startup exceeded the shared 60 s deadline".into())),
+            () = super::startup::cancelled(&mut cancel) => Err("startup cancelled; owned process closed".into()),
+        };
         match bound {
             Ok(started) => Ok((session, started)),
             Err(reason) => {
                 session.inner.fault(&reason);
-                session.inner.end("failed", Some(reason.clone())).await;
-                Err(StartError::Failed(reason))
+                let outcome = if *cancel.borrow() { StartupOutcome::Cancelled } else if tokio::time::Instant::now() >= deadline { StartupOutcome::Timeout } else { StartupOutcome::Rejected };
+                let stopped = session.inner.end("failed", Some(reason.clone())).await;
+                Err(StartError::Startup { stage: StartupStage::Binding, outcome, cleanup: stopped.cleanup, detail: reason })
             }
         }
     }
 
-    async fn handshake(&self, spec: &StartSpec) -> Result<Started, String> {
+    async fn handshake(&self, spec: &StartSpec, deadline: tokio::time::Instant) -> Result<Started, String> {
         let inner = &self.inner;
-        // Structured ask dialogs; an OMP without them keeps using select and editor (HOST req. 16).
-        let _ = inner
-            .call("set_ask_dialog", &[("enabled", json!(true))])
-            .await;
-        let first = inner.get_state().await?;
-        let second = inner.get_state().await?;
+        let call = |kind, fields: &[(&str, Value)]| inner.rpc.call(
+            rpc::command(kind, fields),
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+        );
+        let _ = call("set_ask_dialog", &[("enabled", json!(true))]).await;
+        let state = async || {
+            let reply = call("get_state", &[]).await.map_err(|e| e.to_string())?;
+            if !reply.success {
+                return Err(format!("OMP refused get_state: {}", reply.error.unwrap_or_default()));
+            }
+            read_state(reply.data.as_ref()).ok_or_else(|| "get_state answered without a session identity".to_string())
+        };
+        let first = state().await?;
+        let second = state().await?;
         if (first.session_id.as_str(), first.session_file.as_str())
             != (second.session_id.as_str(), second.session_file.as_str())
         {
             return Err("two get_state answers named different sessions".into());
         }
+        if first.model != second.model || first.thinking != second.thinking {
+            return Err("two get_state answers named different model/thinking settings".into());
+        }
         if !Path::new(&first.session_file).is_absolute() {
             return Err("OMP reported a transcript path that is not absolute".into());
         }
         // A worker's session file is recorded with its worker; the worker resolved its paths.
-        let reported_file = inner.recorded(&first.session_file);
+        let reported_file = match &inner.worker {
+            Some(_) => inner.recorded(&first.session_file),
+            None => std::fs::canonicalize(&first.session_file)
+                .map_err(|e| format!("reported transcript cannot be canonicalized: {e}"))?
+                .display().to_string(),
+        };
         if let (Some(expected), Target::Resume(file)) = (&spec.expected_id, &spec.target) {
             let same = if inner.worker.is_some() {
                 Path::new(&reported_file) == file.as_path()
@@ -863,15 +919,17 @@ impl Inner {
         self.lock().stopping = true;
         self.rpc.end_input().await;
         let proc = self.proc.lock().await.take();
-        let (how, detail) = match proc {
+        let (how, detail, cleanup) = match proc {
             Some(Proc::Child(child)) => {
                 let (exit, step) = child.close(CLOSE_WAIT, KILL_GRACE).await;
-                match (step, exit) {
+                let cleanup = if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped };
+                let (how, detail) = match (step, exit) {
                     (Step::Input, Exit::Code(0)) => (how.to_string(), detail),
                     (Step::Input, exit) => ("exited".into(), Some(format!("{exit:?}"))),
                     (Step::Term, exit) => ("term".into(), Some(format!("needed TERM ({exit:?})"))),
                     (Step::Kill, exit) => ("kill".into(), Some(format!("needed KILL ({exit:?})"))),
-                }
+                };
+                (how, detail, cleanup)
             }
             Some(Proc::Remote(remote)) => {
                 // The worker closes its OMP by the same rule once its input ended; the output
@@ -880,28 +938,34 @@ impl Inner {
                 let wait = CLOSE_WAIT + KILL_GRACE + Duration::from_secs(5);
                 let ended = timeout(wait, closed.wait_for(|c| *c)).await.is_ok();
                 if ended {
-                    (how.to_string(), detail)
+                    (how.to_string(), detail, Cleanup::Unknown)
                 } else {
                     let _ = remote.hold.link().signal(remote.channel, "KILL").await;
                     (
                         "kill".into(),
                         Some(format!("needed KILL on {}", remote.worker)),
+                        Cleanup::Unknown,
                     )
                 }
             }
             #[cfg(test)]
-            Some(Proc::Fake) => (how.to_string(), detail),
-            None => (how.to_string(), detail),
+            Some(Proc::Fake) => (how.to_string(), detail, Cleanup::LocalReaped),
+            None => (how.to_string(), detail, Cleanup::Unknown),
         };
-        self.record_stop(how, detail)
+        self.record_stop(how, detail, cleanup)
     }
 
-    fn record_stop(&self, how: String, detail: Option<String>) -> StopRecord {
+    fn record_stop(&self, how: String, detail: Option<String>, cleanup: Cleanup) -> StopRecord {
         let mut st = self.lock();
         if let Some(record) = st.stop.clone() {
             return record;
         }
+        if let Some(ownership) = &self.settings.ownership
+            && let Err(error) = ownership.finished(cleanup) {
+            log::warn("startup ownership receipt not persisted", &[("error", &error)]);
+        }
         let record = StopRecord {
+            cleanup,
             how,
             detail,
             session_id: st.bound.as_ref().map(|(id, _)| id.clone()),
@@ -1201,21 +1265,21 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<Value>) {
         return;
     }
     let proc = inner.proc.lock().await.take();
-    let detail = match proc {
+    let (detail, cleanup) = match proc {
         Some(Proc::Child(child)) => {
             let (exit, _) = child.close(Duration::from_secs(1), KILL_GRACE).await;
-            format!("{exit:?}")
+            (format!("{exit:?}"), if exit == Exit::Unknown { Cleanup::Unknown } else { Cleanup::LocalReaped })
         }
-        Some(Proc::Remote(remote)) => format!("output closed on {}", remote.worker),
+        Some(Proc::Remote(remote)) => (format!("output closed on {}", remote.worker), Cleanup::Unknown),
         #[cfg(test)]
-        Some(Proc::Fake) => "output closed".into(),
-        None => "output closed".into(),
+        Some(Proc::Fake) => ("output closed".into(), Cleanup::LocalReaped),
+        None => ("output closed".into(), Cleanup::Unknown),
     };
     log::warn(
         "session child exited",
         &[("handle", &inner.handle), ("detail", &detail)],
     );
-    inner.record_stop("exited".into(), Some(detail));
+    inner.record_stop("exited".into(), Some(detail), cleanup);
 }
 
 impl Control for Session {

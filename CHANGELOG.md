@@ -10,6 +10,20 @@
   published files and unknown checks all keep the worktree; removal failures retain the record
   and appear in its receipt. Remote EOF is not a worker reap acknowledgement. Ignored cache
   disposal is a separate explicit owner action, not part of close or recovery.
+- Retain the lead's proven conversation independently of failed launch attempts and history
+  retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
+  hold rather than silently starting fresh. After a failed explicit fresh start, use
+  `lead start --fresh` to retry fresh or `lead start` to resume the retained old conversation.
+- Bound headless startup from spawn through exact binding by one 60-second deadline, with a
+  15-second notice, verified process cleanup, and a durable 300-second recovery episode.
+  Retain pre-binding ownership evidence across hub crashes; input stays fenced until the
+  validated identity is committed.
+
+## 0.2.6 (Unreleased)
+
+- Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the
+  lead's existing backoff after verifying the child exited and the session lease is free. Failed
+  resume attempts keep their diagnostics without superseding the last bound session.
 
 ## 0.2.5 (2026-11-27)
 

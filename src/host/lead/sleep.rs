@@ -70,13 +70,23 @@ impl<R: Runtime> Lead<R> {
         if self.env.config.borrow().lead.is_none() || self.phase().0 != Phase::NotStarted {
             return;
         }
-        let last = match self.env.store.read(|r| r.latest_session("lead")).await {
-            Ok(last) => last,
-            Err(e) => {
-                log::warn("lead sleep not read", &[("error", &e)]);
+        let pin = self.env.config.borrow().lead.as_ref().and_then(|settings| settings.session_id.clone());
+        let selected = match self.resolve(pin).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.set_phase(Phase::Held, Some(error));
                 return;
             }
         };
+        if let Some(reason) = selected.hold {
+            self.set_phase(Phase::Held, Some(reason));
+            return;
+        }
+        if selected.intent != "resume" {
+            self.set_phase(Phase::Held, Some("fresh start did not bind; choose `lead start --fresh` or `lead start` to resume old".into()));
+            return;
+        }
+        let last = selected.row;
         let Some(row) =
             last.filter(|r| r.state == "stopped" && r.stop_how.as_deref() == Some(ASLEEP))
         else {
@@ -195,9 +205,8 @@ impl<R: Runtime> Lead<R> {
     }
 
     /// `lead stop` while the lead sleeps: it stays stopped, and its record shows the clean stop a
-    /// live `lead stop` leaves. `false` when the lead is not asleep.
+    /// live `lead stop` leaves. The caller holds the start lock. `false` when the lead is not asleep.
     pub(super) async fn stop_asleep(&self) -> bool {
-        let _one = self.starting.lock().await;
         let Some(asleep) = self.asleep() else {
             return false;
         };
