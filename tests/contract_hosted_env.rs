@@ -496,11 +496,21 @@ fn stock_bindings(host: &Hosted) -> BTreeSet<(String, String)> {
     found
 }
 
+/// The binding sweep runs eight stock processes at a time for minutes; a hub test beside it on a
+/// small CI runner starves (a Tern lane whose goal never activates within its wait). The live
+/// tests of this binary therefore run one at a time.
+fn live() -> std::sync::MutexGuard<'static, ()> {
+    static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    LIVE.lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner)
+}
+
 #[test]
 fn headless_lead_and_lane_keep_pins_against_listed_and_dotenv_variables() {
     if !enabled() {
         return;
     }
+    let _live = live();
     let mut host = hosted("headless", true);
     // The owner lists the bound variables as "credentials" and the hub has them: passed on, unless
     // the launch pins them last.
@@ -541,6 +551,7 @@ fn tern_lead_and_lane_keep_pins_against_inherited_and_dotenv_variables() {
     if !enabled() {
         return;
     }
+    let _live = live();
     let mut host = hosted("tern", false);
     hostile_terminal(&host, false);
     host.start();
@@ -555,6 +566,7 @@ fn tern_without_the_pins_fails_the_contract() {
     if !enabled() {
         return;
     }
+    let _live = live();
     let mut host = hosted("tern", false);
     hostile_terminal(&host, true);
     host.start();
