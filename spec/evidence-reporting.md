@@ -175,6 +175,9 @@ lane lifecycle area consumes the completion checker, the step records and the pu
 34. The lead records a question it puts to the owner: text (one line, 1 to 1000), a source reference (where the need
     came from, 1 to 400), optional lane, thread, 1 to 9 options (each one line, 1 to 200), a recommended option
     number, a request-log item, and the posted message reference. The daemon assigns an 8-hex-digit ID.
+    It posts the question in the Discord channel the lead names, else in the Discord thread the
+    question belongs to (`discord:<id>`), else in the home channel. A named channel that is not a
+    Discord channel ID, or one the post fails in, is refused: nothing is recorded.
 35. Who settles: owner-only (the default) or lead-may-choose. Lead-may-choose needs at least 2 options and a thread;
     when a lane with a thread is given, it must be that thread. Cost, access, outside commitments, irreversible work
     and changes of scope stay owner-only; the lead's instructions say so, the daemon cannot judge content.
@@ -183,6 +186,8 @@ lane lifecycle area consumes the completion checker, the step records and the pu
     root), the daemon records it as the answer before handing the message to the lead, and the hand-off says which
     question it answered. A bare number within the options names that option; a number outside them is not recorded
     and the lead is told; other text is a free answer. Replies to unbound messages are ordinary messages.
+    A reply to the lead's open question, or the reply recorded as its answer, goes to the lead even in a thread an
+    open lane owns; a later reply to a settled question is an ordinary message.
 38. The lead may also record an owner answer by hand, citing the owner's message reference.
 39. The lead may choose for a lead-may-choose question only: an option number in range, a reason (1 to 1000), and the
     reference of the message in the question's own thread that announced the choice. A different thread is refused.

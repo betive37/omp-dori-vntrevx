@@ -1032,6 +1032,121 @@ fn lead_creates_owner_notes_on_the_owners_request() {
     assert!(!err, "{why}");
 }
 
+/// `question.ask` posts in the room it names, else in its `discord:<id>` thread, else in the home
+/// channel; a room it cannot read is refused, posted nowhere and not recorded. The owner's reply
+/// to a lead question in a lane's thread goes to the lead, not the lane (EVR req. 34, 37).
+#[test]
+fn question_ask_posts_in_its_thread() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    fake.thread(THREAD, CH);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}{}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        fake.config(&token, OWNER, &[CH]),
+        work.display()
+    ));
+    start(&mut hub);
+    hub.until(WAIT, || {
+        (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
+    });
+    open(
+        &hub,
+        "q-1",
+        &json!({ "thread": format!("discord:{THREAD}"), "cwd": work }),
+    );
+    let rec = record(&hub, "q-1");
+    let lane_file = || std::fs::read_to_string(rec["session_file"].as_str().unwrap()).unwrap();
+    let (mut b, meta) = lead_bridge(&hub);
+    let s = meta["session"].clone();
+    let lead = hub.json(&["lead", "status", "--json"]);
+    let lead_file = PathBuf::from(lead["session"]["session_file"].as_str().unwrap());
+    let ask = |thread: Option<String>, room: Option<&str>| {
+        let mut v = json!({ "op": "question.ask", "text": "Which?", "source": "discord:1:2",
+            "options": ["a", "b"] });
+        if let Some(t) = thread {
+            v["thread"] = json!(t);
+        }
+        if let Some(r) = room {
+            v["room"] = json!(r);
+        }
+        v
+    };
+    let in_thread = || Some(format!("discord:{THREAD}"));
+    let posts = |room: &str| fake.bot_messages(room).len();
+    // The thread, when no room is given.
+    let (said, err) = lead_tool(&mut b, &s, "q1", ask(in_thread(), None));
+    assert!(
+        !err && said.contains(&format!("posted in {THREAD}")),
+        "{said}"
+    );
+    assert_eq!((posts(THREAD), posts(CH)), (1, 0));
+    let asked = fake.bot_messages(THREAD)[0]["id"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    // A room wins over the thread; an empty room counts as none.
+    let (said, err) = lead_tool(&mut b, &s, "q2", ask(in_thread(), Some(CH)));
+    assert!(!err && said.contains(&format!("posted in {CH}")), "{said}");
+    let (said, err) = lead_tool(&mut b, &s, "q3", ask(in_thread(), Some(" ")));
+    assert!(
+        !err && said.contains(&format!("posted in {THREAD}")),
+        "{said}"
+    );
+    // Another messenger's thread, or none: the home channel, as before.
+    let (said, err) = lead_tool(&mut b, &s, "q4", ask(Some("telegram:5".into()), None));
+    assert!(!err && said.contains(&format!("posted in {CH}")), "{said}");
+    let (said, err) = lead_tool(&mut b, &s, "q5", ask(None, None));
+    assert!(!err && said.contains(&format!("posted in {CH}")), "{said}");
+    assert_eq!((posts(THREAD), posts(CH)), (2, 3));
+    // An unreadable room is refused: posted nowhere and not recorded.
+    let (before, _) = lead_tool(&mut b, &s, "q6", json!({ "op": "questions" }));
+    let bad = ask(in_thread(), Some(&format!("discord:{CH}")));
+    let (why, err) = lead_tool(&mut b, &s, "q7", bad);
+    assert!(err && why.contains("room"), "{why}");
+    assert_eq!((posts(THREAD), posts(CH)), (2, 3));
+    let (after, _) = lead_tool(&mut b, &s, "q8", json!({ "op": "questions" }));
+    assert_eq!(before, after, "nothing recorded");
+    // A named room that cannot take the post is refused the same way.
+    let denied = "123456789012345678";
+    fake.script_in(denied, &[403]);
+    let (why, err) = lead_tool(&mut b, &s, "q9", ask(in_thread(), Some(denied)));
+    assert!(err && why.contains("could not post"), "{why}");
+    let (after, _) = lead_tool(&mut b, &s, "q10", json!({ "op": "questions" }));
+    assert_eq!(before, after, "nothing recorded");
+    // The owner answers the lead's question in the lane's thread: the lead gets it, the lane not.
+    let mut reply = FakeDiscord::message(THREAD, 700_000_000_000_000_001, OWNER, "1");
+    reply["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
+    fake.say(reply);
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&lead_file)
+            .unwrap()
+            .contains("answers question")
+            .then_some(())
+    });
+    assert!(
+        !lane_file().contains("answers question"),
+        "the lane does not get it"
+    );
+    // A later reply to the settled question is the lane's again.
+    let mut later = FakeDiscord::message(THREAD, 700_000_000_000_000_002, OWNER, "late follow-up");
+    later["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
+    fake.say(later);
+    hub.until(WAIT, || {
+        lane_file().contains("late follow-up").then_some(())
+    });
+    // A reply to any other message in the lane's thread is still the lane's.
+    let mut other = FakeDiscord::message(THREAD, 700_000_000_000_000_004, OWNER, "lane reply");
+    other["message_reference"] =
+        json!({ "message_id": "700000000000000001", "channel_id": THREAD });
+    fake.say(other);
+    hub.until(WAIT, || lane_file().contains("lane reply").then_some(()));
+    drop(b);
+    hub.stop();
+}
+
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
 /// recorded before it), a "no" is stored and not asked again (also after a restart), and messenger
 /// writes from the lead (tool posts and `cataly` commands in its shell) are refused while it runs.

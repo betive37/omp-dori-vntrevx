@@ -277,10 +277,16 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     }
     body.push_str("\nReply to this message with a number or your answer.");
     let config = hub.config();
-    let room = p::ROOM
-        .text(input)
-        .and_then(crate::relay::discord::Snowflake::parse)
-        .or_else(|| config.discord.home());
+    let snowflake = crate::relay::discord::Snowflake::parse;
+    let named = p::ROOM.text(input).map(str::trim).filter(|r| !r.is_empty());
+    let room = match named {
+        Some(r) => Some(snowflake(r).ok_or("room: a Discord channel ID is required")?),
+        None => thread
+            .as_deref()
+            .and_then(|t| t.strip_prefix("discord:"))
+            .and_then(snowflake)
+            .or_else(|| config.discord.home()),
+    };
     let posted = match (room, hub.discord_rest()) {
         (Some(room), Some(rest)) => {
             let nonce = crate::relay::discord::nonce(&format!("ledger:{id}"), 0);
@@ -295,6 +301,11 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         }
         _ => None,
     };
+    // A room the lead named but that could not take the post is refused like an unreadable one:
+    // nothing is recorded (EVR req. 34).
+    if let (Some(r), None) = (named, &posted) {
+        return Err(format!("room: could not post in {r}; nothing recorded"));
+    }
     let row = QuestionRow {
         id: id.clone(),
         text: text.into(),

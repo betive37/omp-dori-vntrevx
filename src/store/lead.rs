@@ -383,6 +383,28 @@ impl Reads {
         self.0.query_row(&sql, [id], question_of).optional()
     }
 
+    /// Whether `reply`, a reply to `message`, is the lead's (EVR req. 37): the question posted as
+    /// `message` is still open, or `reply` is the owner message recorded as its answer, so a
+    /// hand-off made again after the answer was recorded still goes to the lead while a later
+    /// reply to a settled question does not.
+    pub(crate) fn question_reply(
+        &self,
+        room: &str,
+        message: &str,
+        reply: &str,
+    ) -> rusqlite::Result<bool> {
+        let answer = format!("owner message {reply}: ");
+        self.0
+            .query_row(
+                "SELECT 1 FROM questions WHERE room = ?1 AND message = ?2 AND (state = 'open' \
+                 OR (state = 'answered' AND substr(outcome, 1, length(?3)) = ?3))",
+                [room, message, answer.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
+    }
+
     /// The open question bound to a posted message (EVR req. 37).
     pub(crate) fn question_at(
         &self,
@@ -510,12 +532,26 @@ mod tests {
                 .unwrap(),
             LeadDone::Refused(_)
         ));
+        let reply = |answer: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .read(move |r| r.question_reply("1", "9", answer))
+                    .await
+                    .unwrap()
+            }
+        };
+        // Open: any reply to it is the lead's.
+        assert!(reply("51").await && reply("52").await);
         let settle = LeadWrite::QuestionSettle {
             id: "0000abcd".into(),
             state: "answered".into(),
-            outcome: "option 2".into(),
+            outcome: "owner message 51: option 2".into(),
         };
         assert_eq!(store.lead(settle.clone()).await.unwrap(), LeadDone::Done);
+        // Settled: only the reply recorded as its answer, not a later one or a longer ID.
+        assert!(reply("51").await);
+        assert!(!reply("52").await && !reply("5").await);
         assert!(matches!(
             store.lead(settle).await.unwrap(),
             LeadDone::Refused(_)

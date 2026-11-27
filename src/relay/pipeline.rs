@@ -692,8 +692,30 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 .collect()
         };
         // A thread one open lane names goes to that lane; two claimants hold the room (DISC-IN
-        // req. 41-42). Lanes never answer the owner, so no reply is owed for it (OPC-57).
-        let route = self.lanes.route(R::NAME, &row.room).await;
+        // req. 41-42). Lanes never answer the owner, so no reply is owed for it (OPC-57). A reply
+        // to the lead's own question goes to the lead even there (EVR req. 37).
+        let to_lead = match inbound.reply_to.clone() {
+            Some(target) => {
+                let (room, reply) = (row.room.clone(), row.message.clone());
+                let read = self
+                    .store
+                    .read(move |r| r.question_reply(&room, &target, &reply))
+                    .await;
+                match read {
+                    Ok(bound) => bound,
+                    Err(e) => {
+                        let why = format!("the question ledger could not be read: {e}");
+                        return self.hold(&row.room, &row.message, "failed", &why).await;
+                    }
+                }
+            }
+            None => false,
+        };
+        let route = if to_lead {
+            None
+        } else {
+            self.lanes.route(R::NAME, &row.room).await
+        };
         if let Some(Err(why)) = &route {
             return self.hold(&row.room, &row.message, "failed", why).await;
         }

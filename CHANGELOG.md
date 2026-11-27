@@ -11,6 +11,11 @@
   is created. Creating them twice is still refused (#295, @tknmaxxer).
   Before, `profile.save` refused until the owner ran `cataly lane profile-create` in a terminal,
   even after asking the lead to make them.
+- The lead's `question.ask` posts in the Discord thread it names (`thread: "discord:<id>"`) when
+  no `room` is given, instead of the home channel. A `room` that is not a Discord channel ID is
+  refused instead of silently posting in the home channel, and so is a `room` the post fails in
+  (nothing is recorded). The owner's reply to the lead's open question goes to the lead even in a
+  thread an open lane owns.
 
 ## 0.2.5 (2026-11-27)
 

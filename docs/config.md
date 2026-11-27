@@ -266,7 +266,7 @@ when both `owner` and `channels` are set; setting one without the other is an er
 | `owner` | string | none | Discord user ID | Your account. | `--owner` (default: the application's owner) |
 | `channels` | list of strings | `[]` | Discord IDs, at most 256, duplicates dropped | Watched channels, threads, DMs and forums. Can also be set from the [ops panel](#ops)'s 📡 button; a change applies on the running connection. | `#cataly`, found or created |
 | `follow_threads` | boolean | `true` | | Also take threads under watched channels. | |
-| `home` | string | the one watched channel, if there is exactly one | one of `channels` | Where the lead's questions go. | `#cataly` when there are several |
+| `home` | string | the one watched channel, if there is exactly one | one of `channels` | Where the lead's questions go when they name no room or thread. | `#cataly` when there are several |
 | `remote_approvals` | boolean | `false` | | Let you approve OMP permission requests by button, on a card in `[hub] language` with the command in a code block. Cataly's own tools and a fixed list of read-only commands (`ls`, `cat`, `grep`, `git status`, `git log`, `git diff` and the like) never ask; anything else still does. | `--approvals on\|off` (setup's default: on) |
 | `form_default_after` | duration | `"3m"` | 1s–1h | A question with one recommended choice takes it after this long. | |
 | `profile` | boolean | `true` | | `cataly setup` puts Cataly's avatar and banner on the bot where the bot has none (or still has Cataly's older ones); an image you set yourself is kept. Off: setup leaves the profile alone. | `--profile` re-applies them |
