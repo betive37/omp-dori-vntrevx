@@ -91,7 +91,7 @@ impl Runtime for Headless {
     async fn start_supervised(
         &self,
         spec: StartSpec,
-        mut cancel: watch::Receiver<bool>,
+        cancel: watch::Receiver<bool>,
     ) -> Result<(Arc<Session>, Started), StartError> {
         if *cancel.borrow() {
             return Err(StartError::Startup {
@@ -109,6 +109,37 @@ impl Runtime for Headless {
                 .start_remote(spec, &worker, &token, deadline, cancel)
                 .await;
         }
+        self.start_local(spec, &token, deadline, cancel).await
+    }
+}
+
+impl Headless {
+    /// What every session of this runtime is bound with: its own deadline, cancellation and
+    /// local ownership, and the hub's spend phrases and latency ring.
+    fn settings(
+        &self,
+        deadline: tokio::time::Instant,
+        cancel: watch::Receiver<bool>,
+        ownership: Option<super::lead::ownership::Ownership>,
+    ) -> Settings {
+        Settings {
+            spend_phrases: self.spend_phrases.clone(),
+            agent_start: self.agent_start.clone(),
+            deadline: Some(deadline),
+            cancel: Some(cancel),
+            ownership,
+        }
+    }
+
+    /// The start on this machine: OMP as the hub's own child, with its stderr logged and its PID
+    /// adopted by the session's role. Spawn, the rpc stream and binding spend the one deadline.
+    async fn start_local(
+        &self,
+        spec: StartSpec,
+        token: &str,
+        deadline: tokio::time::Instant,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
         let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
         let argv = Launch {
             exe: &self.exe,
@@ -122,7 +153,7 @@ impl Runtime for Headless {
             tools: spec.tools.as_deref(),
         }
         .argv();
-        let env = session_env(&self.credentials, &self.socket, &token);
+        let env = session_env(&self.credentials, &self.socket, token);
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         crate::sys::fs::ensure_private_dir(&self.logs)
             .map_err(|e| StartError::Refused(e.to_string()))?;
@@ -191,18 +222,10 @@ impl Runtime for Headless {
                 .await);
             }
         };
-        let settings = Settings {
-            spend_phrases: self.spend_phrases.clone(),
-            agent_start: self.agent_start.clone(),
-            deadline: Some(deadline),
-            cancel: Some(cancel),
-            ownership: Some(ownership),
-        };
+        let settings = self.settings(deadline, cancel, Some(ownership));
         Session::bind(rpc, rx, Proc::Child(Box::new(child)), spec, settings).await
     }
-}
 
-impl Headless {
     /// The same start on a worker (design 2.1): its own OMP, spawned over the worker stream for the
     /// spec's handle as its attempt token, with the overlay and instructions copied to its root, its
     /// session under `<root>/sessions`, no hub credentials, and its bridge on the worker's socket.
@@ -314,13 +337,7 @@ impl Headless {
                     .await);
             }
         };
-        let settings = Settings {
-            spend_phrases: self.spend_phrases.clone(),
-            agent_start: self.agent_start.clone(),
-            deadline: Some(deadline),
-            cancel: Some(cancel),
-            ownership: None,
-        };
+        let settings = self.settings(deadline, cancel, None);
         Session::bind(rpc, rx, Proc::Remote(Box::new(remote)), spec, settings).await
     }
 

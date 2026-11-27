@@ -49,6 +49,10 @@ fn bridge_block(hub: &TestHub, file: &Path, number: usize) -> std::thread::JoinH
                         .unwrap();
                     let entry = json!({"type":"custom_message","customType":"cataly-delivery","content":cmd["text"],"display":true,"details":{"delivery":cmd["id"]}});
                     writeln!(transcript, "{entry}").unwrap();
+                    if file.with_extension("owner-pause").exists() {
+                        std::fs::remove_file(file.with_extension("owner-pause")).unwrap();
+                        status = "paused";
+                    }
                 }
                 "shutdown" => {
                     let killed = Command::new("kill")
@@ -66,6 +70,10 @@ fn bridge_block(hub: &TestHub, file: &Path, number: usize) -> std::thread::JoinH
                 "goal":{"status":status,"objective":"Work."}
             }});
             writeln!(wire, "{reply}").unwrap();
+            if op == "deliver" && status == "paused" {
+                sequence += 1;
+                writeln!(wire, "{}", json!({"v":1,"id":sequence,"method":"bridge.event","params":{"session":SESSION,"kind":"goal_updated","status":"paused","objective":"Work."}})).unwrap();
+            }
             if op == "shutdown" {
                 sequence += 1;
                 writeln!(wire, "{}", json!({"v":1,"id":sequence,"method":"bridge.event","params":{"session":SESSION,"kind":"session_shutdown"}})).unwrap();
@@ -75,9 +83,8 @@ fn bridge_block(hub: &TestHub, file: &Path, number: usize) -> std::thread::JoinH
     })
 }
 
-#[test]
-fn tern_lane_reconciles_its_exit_journal_after_block_shutdown() {
-    let (mut hub, work) = lane_hub("");
+fn open_terminal_lane(owner_paused: bool) -> (TestHub, PathBuf, std::thread::JoinHandle<()>) {
+    let (mut hub, work) = lane_hub("[lanes.oversight]\nsweep = \"1s\"\n");
     let tern = hub.install_fake("tern");
     hub.fixture("omp", "tui", Some(""));
     hub.fixture(
@@ -109,6 +116,9 @@ fn tern_lane_reconciles_its_exit_journal_after_block_shutdown() {
         .unwrap();
     let file = directory.join(format!("2026-11-25T10-00-00-000Z_{SESSION}.jsonl"));
     std::fs::write(&file, format!("{}\n", json!({"type":"session","version":3,"id":SESSION,"cwd":std::fs::canonicalize(work).unwrap()}))).unwrap();
+    if owner_paused {
+        std::fs::write(file.with_extension("owner-pause"), "").unwrap();
+    }
     let params = json!({"key":"tern-lane","title":"Tern lane","brief":"Work.","checks":[{"kind":"command","argv":["true"]}]}).to_string();
     let mut opening = hub
         .command(&["lane", "open", "--json", "--params", &params])
@@ -120,6 +130,13 @@ fn tern_lane_reconciles_its_exit_journal_after_block_shutdown() {
     let before = record(&hub, "tern-lane");
     assert_eq!(before["live"], true);
     assert_eq!(before["state"], "running");
+    (hub, file, first)
+}
+
+#[test]
+fn tern_lane_reconciles_its_exit_journal_after_block_shutdown() {
+    let (mut hub, file, first) = open_terminal_lane(false);
+    let before = record(&hub, "tern-lane");
     hub.stop();
     first.join().unwrap();
     // Simulate a crash after the runtime journal was saved but before the lane snapshot caught up.
@@ -138,4 +155,49 @@ fn tern_lane_reconciles_its_exit_journal_after_block_shutdown() {
     assert_eq!(after["run_id"], before["run_id"]);
     hub.stop();
     second.join().unwrap();
+}
+
+#[test]
+fn terminal_owner_pause_needs_an_explicit_resume_before_delivering_an_answer() {
+    let (mut hub, file, bridge) = open_terminal_lane(true);
+    hub.until(WAIT, || {
+        let status = hub.json(&["lane", "status", "tern-lane", "--json"]);
+        status
+            .as_str()
+            .unwrap()
+            .contains("goal paused")
+            .then_some(())
+    });
+    lane(
+        &hub,
+        "send",
+        &json!({"key":"tern-lane","text":"TERMINAL-ANSWER"}),
+    )
+    .unwrap();
+    assert!(
+        !std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("TERMINAL-ANSWER")
+    );
+    let alert = hub.until(WAIT, || {
+        events_of(&hub, "lane.alert")
+            .into_iter()
+            .find(|event| event.to_string().contains("messages undelivered"))
+    });
+    assert!(alert.to_string().contains("terminal"), "{alert}");
+    lane(
+        &hub,
+        "pause",
+        &json!({"key":"tern-lane","reason":"confirm terminal pause"}),
+    )
+    .unwrap();
+    lane(&hub, "resume", &json!({"key":"tern-lane"})).unwrap();
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&file)
+            .unwrap()
+            .contains("TERMINAL-ANSWER")
+            .then_some(())
+    });
+    hub.stop();
+    bridge.join().unwrap();
 }
