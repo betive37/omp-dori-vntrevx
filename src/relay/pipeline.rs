@@ -209,8 +209,11 @@ struct Target {
     /// part single, instead of falling back to the request's room.
     held: bool,
     /// The rest moved to the request's room from this room after a part was out there: the next
-    /// part posted in the request's room is the reply to the request and points back here.
+    /// part posted in the request's room is the reply to the request, after a note pointing back
+    /// here ([`Relay::moved_note`]).
     moved_from: Option<String>,
+    /// The note for `moved_from` was tried (once per delivery, whatever came of it).
+    noted: bool,
 }
 
 /// The answer room of one request, shared by typing and posting: a found room (or none) is kept,
@@ -1127,12 +1130,12 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 Resume::Here => Target {
                     room: None,
                     held: true,
-                    moved_from: None,
+                    ..Target::default()
                 },
                 Resume::Bound(room) => Target {
                     room: Some(room),
                     held: true,
-                    moved_from: None,
+                    ..Target::default()
                 },
                 Resume::Moved(from) => {
                     log::warn(
@@ -1143,14 +1146,14 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         room: None,
                         held: true,
                         moved_from: Some(from),
+                        noted: false,
                     }
                 }
             },
             // A failed lookup holds the first part until a later round looks again.
             None => Target {
                 room: self.answer_room(&h.room, &h.message).await?,
-                held: false,
-                moved_from: None,
+                ..Target::default()
             },
         };
         if let Some(room) = &target.room {
@@ -1242,24 +1245,25 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
     }
 
     /// Posts one part where the answer goes: in the room bound to the request without a reply, else
-    /// in the request's room with the first part (or the first part moved there, pointing back to
-    /// where the answer began) as the reply.
+    /// in the request's room with the first part (or the first part moved there, after a note
+    /// pointing back to where the answer began) as the reply.
     async fn post_part(&self, h: &HandoffRow, part: &PartRow, target: &mut Target) -> PartOutcome {
         loop {
-            let moved = target
-                .moved_from
-                .as_deref()
-                .filter(|_| target.room.is_none());
+            let moved = target.room.is_none() && target.moved_from.is_some();
+            if moved && !target.noted {
+                self.post_moved_note(h, &h.message, target).await;
+            }
             let (room, reply_to) = target.room.as_deref().map_or_else(
                 || {
-                    let reply = part.idx == 0 || moved.is_some();
+                    let reply = part.idx == 0 || moved;
                     (h.room.as_str(), reply.then_some(h.message.as_str()))
                 },
                 |room| (room, None),
             );
-            let text = moved.map(|from| self.relay.continued(&part.text, from));
-            let text = text.as_deref().unwrap_or(&part.text);
-            let outcome = self.relay.post(room, reply_to, text, &part.nonce).await;
+            let outcome = self
+                .relay
+                .post(room, reply_to, &part.text, &part.nonce)
+                .await;
             let bound = target.room.is_some();
             match outcome {
                 // The room bound to the request takes no posts at all (gone, locked, no access):
@@ -1278,6 +1282,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         room: None,
                         held: true,
                         moved_from: from,
+                        noted: false,
                     };
                     self.set_target(&h.message, target);
                 }
@@ -1308,6 +1313,32 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 }
                 other => return other,
             }
+        }
+    }
+
+    /// Posts the note pointing back to the room the rest of the answer to `h` moved from
+    /// ([`Relay::moved_note`]): its own message with its own nonce, tried once per delivery and
+    /// never in the place of a part, so no part's text changes and a failed note holds nothing up.
+    async fn post_moved_note(&self, h: &HandoffRow, source: &str, target: &mut Target) {
+        target.noted = true;
+        self.set_target(source, target);
+        let Some(note) = target
+            .moved_from
+            .as_deref()
+            .and_then(|from| self.relay.moved_note(from))
+        else {
+            return;
+        };
+        let nonce = self.relay.nonce(&h.room, &format!("{source}~moved"), 0);
+        let outcome = self.relay.post(&h.room, None, &note, &nonce).await;
+        if !matches!(outcome, PartOutcome::Posted { .. }) {
+            log::warn(
+                "note on the moved answer not posted; the rest goes on",
+                &[
+                    ("message", &h.message),
+                    ("outcome", &format!("{outcome:?}")),
+                ],
+            );
         }
     }
 

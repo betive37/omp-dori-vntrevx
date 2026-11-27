@@ -15,7 +15,7 @@
   a lookup that failed three times (logged; one failure only delays the answer a few seconds) or
   `[discord] follow_threads = false`, the answer is the reply in the channel as before; a thread
   locked or deleted in the middle of an answer gets nothing more, and the rest goes to the
-  channel as a reply that opens with a line pointing back to the thread.
+  channel as a reply, after a short note pointing back to the thread.
 
 ## 0.2.4 (2026-11-27)
 
