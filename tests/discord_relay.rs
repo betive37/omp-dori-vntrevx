@@ -2224,7 +2224,10 @@ fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
     let told = all.iter().find(|e| e["subject"] == id.as_str()).unwrap();
     let older = all.iter().find(|e| e["subject"] == "older").unwrap();
     assert!(
-        older["text"].as_str().unwrap().contains(": an older wording — Which?"),
+        older["text"]
+            .as_str()
+            .unwrap()
+            .contains(": an older wording — Which?"),
         "{older}"
     );
     let said = format!("question {id}: option 2 (b) — Which?");

@@ -338,7 +338,10 @@ mod tests {
         };
         // The recorded words: restart recovery and the ledger's readers depend on them.
         let outcome = press_outcome("700000000000000001", &q, 2);
-        assert_eq!(outcome, "owner press 700000000000000001: option 2 (b: or c)");
+        assert_eq!(
+            outcome,
+            "owner press 700000000000000001: option 2 (b: or c)"
+        );
         assert_eq!(pressed_option(&q, &outcome), Some(2));
         assert_eq!(pressed_option(&q, &press_outcome("7", &q, 1)), Some(1));
         assert_eq!(pressed_option(&q, "owner press 7: option 3 (c)"), None);
