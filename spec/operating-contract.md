@@ -189,8 +189,11 @@ Verdict count: KEEP 67, SIMPLIFY 21, DROP 5.
     exists, it is reused; the extension refuses to replace it.
 27. An objective needs an observable stop condition. Questions, status replies and waiting do not create objectives.
 28. A paused objective resumes only on an owner resume event. Reminders, watch wakes, queued messages, recovery after
-    a crash and reading saved notes never resume it. A lane that paused its own goal to wait for an answer is not
-    paused in this sense: the owner's or the lead's answer resumes it (lane-lifecycle 47).
+    a crash and reading saved notes never clear a hold. A headless lane that paused its own goal to wait for an
+    answer may resume for the owner's or lead's answer only under lane-lifecycle 47. Tern pause provenance is
+    unknown, so its goal stays paused with an alert explaining explicit terminal resume or `lane.pause` then
+    `lane.resume`. Owner-paused or held lanes without a pending reopen intent stay down after a hub restart;
+    an explicit reopen continues only its recorded episode, run, note and step.
 29. When the owner asks to wait, stop or hold, the lead calls the daemon's pause in the same turn. With no session
     named, it pauses every working session on that topic and names them in the reply. The daemon confirms the goal is
     paused through OMP before reporting success; otherwise it reports the pause as unconfirmed and the lead retries

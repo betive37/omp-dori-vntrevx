@@ -15,6 +15,14 @@
   reports its final result to the owner and lane thread, and is cancelled by close, park or hub stop.
 - `cataly lane status <key>` shows the named lane. Lane alerts and recovery recaps reach the
   owner's home room directly, even while no lead is available.
+- Legacy lanes without startup journals may resume only with their saved identity, no recorded
+  attempt ownership and a fresh free-lease check. Recorded unknown ownership still holds.
+- Explicit reopen records its recovery episode, run, note and completed step durably. A hub stop
+  cancels the live attempt; restart continues that same intent without repeating its run or note.
+  Owner-paused or held lanes without a reopen intent stay down. Failed reopen preflight changes
+  nothing, and holding an already-held lane preserves the first reason.
+- In-doubt input prevents destructive worktree removal, not a safe park or close. The message
+  ledger and kept worktree remain available for inspection; uncertain input is never replayed.
 - Retain the lead's proven conversation independently of failed launch attempts and history
   retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
   hold rather than silently starting fresh. After a failed explicit fresh start, use
@@ -76,11 +84,11 @@
   harmless retained receipt that the next prune can remove.
 - Automatic update switch-back refuses an old reader after the new hub migrated the store beyond
   its support, leaving the new version selected with an owner-attention explanation.
-- Your answer in a lane's thread now reaches a lane that paused its own goal while waiting for
-  you. A paused goal takes no messages, so such a lane never got the answer: every delivery was
-  set aside as `not ready: Idle`, and only `lane.pause` then `lane.resume` freed it. Now a message
-  from you or the lead resumes the goal of a lane that paused it itself, then is delivered. A lane
-  the lead or you held (`lane.pause`) stays held, and hub reminders resume nothing.
+- Your answer in a headless lane's thread now reaches a lane that paused its own goal while
+  waiting for you. An owner or lead message resumes that goal before delivery only when the
+  lane is not owner-held, reopening or in doubt. Reminders and budget blocks never resume it.
+  Tern cannot prove who paused its goal, so it stays paused and reports how to continue explicitly
+  in the terminal or with `lane.pause` followed by `lane.resume`; no automatic answer-resume.
 - A delivery set aside now records the check that refused it (`not ready: the goal is paused`)
   instead of only the session status. While a paused or budget-blocked goal still keeps your or
   the lead's messages out, the lead gets one `messages undelivered` alert naming the reason.
