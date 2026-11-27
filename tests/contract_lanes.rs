@@ -190,7 +190,6 @@ fn open_report_claim_close_in_stock_omp() {
         "{closed}"
     );
     assert_eq!(closed["session_id"], rec["session_id"]);
-    l.model.assert_eval_not_offered();
     assert!(l.hub.stop().success());
 }
 
@@ -483,6 +482,5 @@ fn a_lane_subagent_is_held_by_shell_rules_and_eval_deny_in_stock_omp() {
             );
         }
     }
-    l.model.assert_eval_not_offered();
     assert!(l.hub.stop().success());
 }

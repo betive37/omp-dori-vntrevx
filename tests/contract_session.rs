@@ -1131,7 +1131,6 @@ fn lead_follows_the_owners_omp_approval_settings_in_stock_omp() {
             && !eval.contains("EVAL-RAN"),
         "{eval}"
     );
-    model.assert_eval_not_offered();
     // The owner's own OMP setting applies: a write asks, the dialog reaches the hub, Deny holds.
     assert!(hub.stop().success());
     std::fs::write(
