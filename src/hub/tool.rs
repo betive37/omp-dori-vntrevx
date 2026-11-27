@@ -287,7 +287,8 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     body.push_str("\nReply to this message with a number or your answer.");
     let config = hub.config();
     let snowflake = crate::relay::discord::Snowflake::parse;
-    let room = match s(input, "room").map(str::trim).filter(|r| !r.is_empty()) {
+    let named = s(input, "room").map(str::trim).filter(|r| !r.is_empty());
+    let room = match named {
         Some(r) => Some(snowflake(r).ok_or("room: a Discord channel ID is required")?),
         None => thread
             .as_deref()
@@ -309,6 +310,13 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         }
         _ => None,
     };
+    // A room the lead named but that could not take the post is refused like an unreadable one:
+    // nothing is recorded (EVR req. 34).
+    if let (Some(r), None) = (named, &posted) {
+        return Err(format!(
+            "room: the question could not be posted in {r}; nothing was recorded"
+        ));
+    }
     let row = QuestionRow {
         id: id.clone(),
         text: text.into(),

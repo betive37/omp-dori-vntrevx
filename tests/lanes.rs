@@ -1043,6 +1043,13 @@ fn question_ask_posts_in_its_thread() {
     assert_eq!((posts(THREAD), posts(CH)), (2, 3));
     let (after, _) = lead_tool(&mut b, &s, "q8", json!({ "op": "questions" }));
     assert_eq!(before, after, "nothing recorded");
+    // A named room that cannot take the post is refused the same way.
+    let denied = "123456789012345678";
+    fake.script_in(denied, &[403]);
+    let (why, err) = lead_tool(&mut b, &s, "q9", ask(in_thread(), Some(denied)));
+    assert!(err && why.contains("could not be posted"), "{why}");
+    let (after, _) = lead_tool(&mut b, &s, "q10", json!({ "op": "questions" }));
+    assert_eq!(before, after, "nothing recorded");
     // The owner answers the lead's question in the lane's thread: the lead gets it, the lane not.
     let mut reply = FakeDiscord::message(THREAD, 700_000_000_000_000_001, OWNER, "1");
     reply["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
@@ -1057,8 +1064,13 @@ fn question_ask_posts_in_its_thread() {
         !lane_file().contains("answers question"),
         "the lane does not get it"
     );
+    // A later reply to the settled question is the lane's again.
+    let mut later = FakeDiscord::message(THREAD, 700_000_000_000_000_002, OWNER, "late follow-up");
+    later["message_reference"] = json!({ "message_id": asked, "channel_id": THREAD });
+    fake.say(later);
+    hub.until(WAIT, || lane_file().contains("late follow-up").then_some(()));
     // A reply to any other message in the lane's thread is still the lane's.
-    let mut other = FakeDiscord::message(THREAD, 700_000_000_000_000_002, OWNER, "lane reply");
+    let mut other = FakeDiscord::message(THREAD, 700_000_000_000_000_004, OWNER, "lane reply");
     other["message_reference"] =
         json!({ "message_id": "700000000000000001", "channel_id": THREAD });
     fake.say(other);

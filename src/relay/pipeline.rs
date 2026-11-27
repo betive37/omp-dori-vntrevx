@@ -612,10 +612,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         // to the lead's own question goes to the lead even there (EVR req. 37).
         let to_lead = match inbound.reply_to.clone() {
             Some(target) => {
-                let room = row.room.clone();
+                let (room, reply) = (row.room.clone(), row.message.clone());
                 let read = self
                     .store
-                    .read(move |r| r.question_posted(&room, &target))
+                    .read(move |r| r.question_reply(&room, &target, &reply))
                     .await;
                 match read {
                     Ok(bound) => bound,
