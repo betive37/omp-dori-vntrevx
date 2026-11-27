@@ -17,8 +17,6 @@ use crate::log;
 use crate::store::lanes::{LaneDone, LaneWrite, Revision};
 use crate::sys::now_ms;
 
-/// A close waits this long for the process to exit before it is terminated (LANE req. 58).
-const EXIT_WAIT: Duration = Duration::from_secs(30);
 /// A hub-start restart waits this long for the lease to be free (decision 9).
 const LEASE_WAIT: Duration = Duration::from_secs(30);
 /// A tern hold waits this long in all for the running turn to end and the goal pause to land.
@@ -273,6 +271,7 @@ impl<R: Runtime> Lanes<R> {
             checks: Vec::new(),
             step: "intent".into(),
             receipt: vec![format!("reason: {reason}"), "worktrees kept".into()],
+            quiescence: super::supervisor::Quiescence::Unknown,
             lesson: None,
         });
         if rec.state != State::Held {
@@ -289,10 +288,13 @@ impl<R: Runtime> Lanes<R> {
     /// written and unconfirmed, and every pending wake (the lead's and the owner's messages). A
     /// pending quiet note (the claim notice) is no accepted message: it waits for the next turn, which
     /// a lane told to stay idle never starts, so counting it would postpone every settle for ever.
-    async fn undelivered(&self, key: &str) -> usize {
+    pub(super) async fn undelivered(&self, key: &str) -> usize {
         self.mailbox(key).list().await.map_or(usize::MAX, |rows| {
             rows.iter()
-                .filter(|(l, _)| l.state == "sent" || (l.state == "pending" && l.wakes))
+                .filter(|(l, _)| {
+                    matches!(l.state.as_str(), "sent" | "in_doubt")
+                        || (l.state == "pending" && l.wakes)
+                })
                 .count()
         })
     }
@@ -520,6 +522,7 @@ impl<R: Runtime> Lanes<R> {
             step: "intent".into(),
             receipt: lines,
             lesson,
+            quiescence: super::supervisor::Quiescence::Unknown,
         });
         rec.prev = Some(rec.state);
         rec.state = State::Closing;
@@ -545,12 +548,11 @@ impl<R: Runtime> Lanes<R> {
                 {
                     let _ = goal_to(&**s, "pause", &STOPPED).await;
                 }
-                match tokio::time::timeout(EXIT_WAIT, s.close(false)).await {
-                    Ok(Ok(_)) => {}
-                    _ => {
-                        let _ = s.close(true).await;
-                    }
-                }
+                let stopped = super::supervisor::stop(&**s, &rec).await;
+                intent.quiescence = stopped.cleanup;
+                intent
+                    .receipt
+                    .push(format!("writer cleanup: {}", stopped.detail));
                 if s.alive() {
                     return Err("the lane's process is still running; the close is held".into());
                 }
@@ -580,19 +582,12 @@ impl<R: Runtime> Lanes<R> {
         }
         if intent.step == "hook" {
             if intent.outcome == "completed" {
-                for w in rec.worktrees.clone() {
-                    // A worktree that holds a published file stays (EVR-19).
-                    if self.holds_published(&w).await {
-                        intent
-                            .receipt
-                            .push(format!("worktree {w} kept: it holds a published file"));
-                        continue;
-                    }
+                for w in &rec.worktrees {
                     intent
                         .receipt
-                        .push(match git::remove_worktree(&rec.place(), &w).await {
+                        .push(match self.remove_worktree(&rec, w).await {
                             Ok(()) => format!("worktree {w} removed"),
-                            Err(e) => e,
+                            Err(e) => format!("worktree {w} kept: {e}"),
                         });
                 }
             }
@@ -704,6 +699,24 @@ impl<R: Runtime> Lanes<R> {
             )
             .await?;
         self.tern_spend(&config, &rec).await?;
+        // Fence input while binding, but retain the old run until the exact resume succeeds.
+        rec.prev = Some(State::Running);
+        rec.state = State::Held;
+        let outcome = self
+            .start(
+                rec,
+                rev,
+                exe,
+                &config,
+                super::startup::Ownership::ResumeExisting((id.clone(), PathBuf::from(&file))),
+            )
+            .await;
+        let (mut rec, rev) = self.load(key).await?;
+        if outcome != "started" || rec.session_id.as_deref() != Some(id.as_str()) {
+            return Err(format!(
+                "reopen did not confirm the session ({outcome}); the lane stays held for inspection"
+            ));
+        }
         let now = now_ms();
         new_run(&mut rec, now);
         let write = LaneWrite::Save {
@@ -729,21 +742,6 @@ impl<R: Runtime> Lanes<R> {
             LaneDone::Refused(why) => return Err(why),
             other => return Err(format!("unexpected store answer {other:?}")),
         };
-        let outcome = self
-            .start(
-                rec,
-                rev,
-                exe,
-                &config,
-                Some((id.clone(), PathBuf::from(&file))),
-            )
-            .await;
-        let (rec, rev) = self.load(key).await?;
-        if outcome != "started" || rec.session_id.as_deref() != Some(id.as_str()) {
-            return Err(format!(
-                "reopen did not confirm the session ({outcome}); the lane stays held for inspection"
-            ));
-        }
         self.resume_locked(rec.clone(), rev).await?;
         if let Some(note) = note {
             let session = self.session(key).ok_or("the lane's session ended")?;
@@ -950,20 +948,18 @@ impl<R: Runtime> Lanes<R> {
         }
         let (Some(id), Some(file)) = (rec.session_id.clone(), rec.session_file.clone()) else {
             if rec.state == State::Starting {
-                let _ = self
-                    .start_failed(rec, rev, None, "the hub stopped during the start")
-                    .await;
-                return "start failed during the hub stop; record removed".into();
+                let _ = self.unconfirmed(&mut rec, rev,
+                    "the hub stopped during startup; writer ownership is unknown; work retained").await;
+                return "start interrupted; held for inspection; work retained".into();
             }
             return "no session to restart".into();
         };
         if rec.state == State::Starting {
             let _ = self
-                .unconfirmed(rec, rev, "the hub stopped during the start")
+                .unconfirmed(&mut rec, rev, "the hub stopped during the start")
                 .await;
             return "start unconfirmed; held for inspection".into();
         }
-        let was_active = matches!(rec.state, State::Running | State::Rejected | State::Claimed);
         if let Err(line) = self.lease_wait(&mut rec, rev, &id).await {
             return line;
         }
@@ -987,7 +983,7 @@ impl<R: Runtime> Lanes<R> {
                 return format!("lost: {e}");
             }
         };
-        rec.lost = None;
+        let was_active = super::cleanup::prepare_restart(&mut rec);
         let rev = match self.save(&rec, Some(rev), None).await {
             Ok(r) => r,
             Err(e) => return format!("not restarted: {e}"),
@@ -998,9 +994,12 @@ impl<R: Runtime> Lanes<R> {
                 rev,
                 exe,
                 &config,
-                Some((id.clone(), PathBuf::from(&file))),
+                super::startup::Ownership::ResumeExisting((id.clone(), PathBuf::from(&file))),
             )
             .await;
+        if outcome != "started" {
+            return format!("not restarted: {outcome}");
+        }
         let Some(session) = self.session(key) else {
             return format!("not restarted: {outcome}");
         };

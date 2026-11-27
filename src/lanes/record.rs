@@ -69,6 +69,9 @@ pub(crate) struct Intent {
     pub(crate) step: String,
     pub(crate) receipt: Vec<String>,
     pub(crate) lesson: Option<String>,
+    /// Durable exit evidence; legacy close intents have no authority to discard work.
+    #[serde(default)]
+    pub(super) quiescence: super::supervisor::Quiescence,
 }
 
 /// A one-attempt grant for one rule of one command (LANE req. 75).

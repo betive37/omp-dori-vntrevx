@@ -72,16 +72,6 @@ pub(crate) async fn add_worktree(
     }
 }
 
-/// Non-forced removal; the failure is named in the receipt (LANE req. 61).
-pub(crate) async fn remove_worktree(place: &Place, path: &str) -> Result<(), String> {
-    let (ok, _) = git(place, Path::new(path), &["worktree", "remove", path], LOCAL).await?;
-    if ok {
-        Ok(())
-    } else {
-        Err(format!("git worktree remove {path} refused; kept"))
-    }
-}
-
 /// Unsent work in one checkout: tracked changes or commits on no remote. Untracked files do not
 /// count; git state that cannot be read counts (LANE req. 60). `None` when it is not a checkout.
 pub(crate) async fn unsent(place: &Place, dir: &Path) -> Option<String> {

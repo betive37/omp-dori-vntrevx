@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- Failed lane resumes (hub restart, worker reconnect and explicit reopen) keep the exact session,
+  run, mailbox and worktree ownership, held with diagnostics rather than rolling back prior work.
+  Fresh launch rollback is limited to the attempt's own proven unused allocation.
+- Worktree removal now requires a durable close/rollback intent, confirmed writer exit and a fresh
+  preservation check. Tracked, untracked and ignored files, unpushed commits, uncertain input,
+  published files and unknown checks all keep the worktree; removal failures retain the record
+  and appear in its receipt. Remote EOF is not a worker reap acknowledgement. Ignored cache
+  disposal is a separate explicit owner action, not part of close or recovery.
+
 ## 0.2.5 (2026-11-27)
 
 - The lead can open lanes again: `cataly_lead` now declares every parameter its operations read,

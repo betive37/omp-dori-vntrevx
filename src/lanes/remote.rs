@@ -367,6 +367,7 @@ impl<R: Runtime> Lanes<R> {
                 || rec.state == State::Starting
                 || rec.session_id.is_none()
                 || self.session(&rec.key).is_some()
+                || rec.start_note.as_deref() == Some("start failed; work retained")
                 || self.worker_up(&worker).await.is_err()
             {
                 continue;
