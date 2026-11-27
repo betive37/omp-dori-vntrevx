@@ -2,6 +2,97 @@
 
 ## 0.2.7 (Unreleased)
 
+### Upgrade notes
+
+- **Worker update required:** protocol 2 refuses protocol-1 workers. Run `cataly update` on each
+  worker PC; until then its lanes are held, with their conversation and work retained.
+- Conversation-safe stores require schema reader 11. Older hubs must not open them and bypass
+  the resume anchor; retain the new version, or explicitly restore the pre-upgrade store backup
+  before a compatible downgrade. The store moves to schema 12: `0011_lead_anchor` (raises the
+  reader floor to 11) and `0012_outbox_turns` (additive: a later turn's parts, the floor stays 11).
+- **Going back a version can no longer strand the hub.** `cataly version --json` reports
+  `store_reader`, the newest store schema the binary reads. `cataly rollback`, an update or install
+  that switches versions, and `install.sh` over an existing install (through the installed binary's
+  new `cataly install --preflight <binary>`) read the store's `meta.min_reader` read-only and refuse
+  a version that cannot open it, before the hub is stopped or any file switched (exit status 6). A
+  version without the field uses an exact released-version table: 0.2.0–0.2.5 read schema 9;
+  0.2.6 reads schema 10. Unlisted versions fail closed. The message, in `[hub] language`, says the store was upgraded for conversation
+  safety and which version cannot read it, and offers staying on the current version or restoring
+  the store copy the hub made before that upgrade (named when one exists; updates keep none of their
+  own). An `install.sh` or binary already published cannot be taught this check: going back with one
+  of them leaves the older hub refusing to open the store, with nothing lost; installing the current
+  version again brings it back.
+  An unreadable candidate report also refuses an install over retained state; an empty home
+  remains installable without a store-reader capability.
+  Preflight uses a query-only reader with a 250 ms busy limit; an unreadable floor refuses
+  rather than waiting on or changing a running hub's store.
+- Automatic update switch-back refuses an old reader after the new hub migrated the store beyond
+  its support, leaving the new version selected with an owner-attention explanation.
+- After an update, sessions still recovering are reported as recovering, not as a final state,
+  by the hub's message and by `cataly update`; a second `update.sessions` message gives the final
+  result once they settle.
+
+### Lead resume and startup
+
+- Retain the lead's proven conversation independently of failed launch attempts and history
+  retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
+  hold rather than silently starting fresh. After a failed explicit fresh start, use
+  `lead start --fresh` to retry fresh or `lead start` to resume the retained old conversation.
+- Bound headless startup from spawn through exact binding by one 60-second deadline, with a
+  15-second notice, verified process cleanup, and a durable 300-second recovery episode.
+  Retain pre-binding ownership evidence across hub crashes; input stays fenced until the
+  validated identity is committed.
+  Duplicate same-target starts leave the owned attempt running; a refused busy stop leaves
+  recovery intact. Worker termination receipts must match the exact persisted attempt token.
+- Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the
+  lead's existing backoff after verifying the child exited and the session lease is free. Failed
+  resume attempts keep their diagnostics without superseding the last bound session
+  ([PR #299](https://github.com/vntrevx/Cataly/pull/299), @Momentum96).
+- Explicit fresh intent clears a migrated anchor hold. Ordinary A-to-B conversation histories
+  resume their newest proven binding, and an owner retry of a first failed start needs no
+  `--fresh` when no conversation ever bound. Startup model mismatch keeps the process open and
+  input fenced until `lead accept-model` durably commits the accepted identity.
+  A model fence also prevents idle sleep, so the session stays available for that decision.
+- The owner hears directly, in `[hub] language`, when the lead is still starting at 15 s (once
+  per recovery) and once per hold, with the reason, what is kept, `cataly lead start` after the
+  fix, and that an update does not lift the hold. A hold found again after a hub restart or an
+  update is not announced again. `cataly lead status` and `cataly health` show the target, the
+  startup phase and elapsed time, attempts and next retry, the last cleanup and lease evidence,
+  the inbox counts, and the same hold text; the ops panel shows a recovering lead.
+- **A lead woken from sleep or restarted after a crash no longer gets a second start recap.**
+  The recap goes in front of a new conversation and of the lead's first connection after a hub
+  start; the extension's hello on a resumed or woken session is a connection, not a new
+  conversation, so it adds none.
+- Tern startup journals retain the block ID and process birth identity; confirmed block close
+  or disappearance of that exact process proves termination. Unknown exits remain held.
+  Settled startup receipts are pruned only after no anchor, recovery episode or lane references
+  them; current and uncertain attempts are never discarded merely because they are old.
+  Maintenance collapses only superseded duplicate binding tuples, retaining the current anchor
+  and latest evidence for every pinnable identity. A crash before receipt pruning leaves a
+  harmless retained receipt that the next prune can remove.
+- A written message is resent after a restart only when the whole transcript proves it absent.
+  The marker search now covers the entire file instead of its newest 8 MiB, and a partial,
+  unparsable, oversized or unreadable transcript (or a search out of time) leaves the message in
+  doubt for the owner instead of writing it again. A resend still happens at most once, under
+  the original delivery ID, into the same session; worker deliveries are never resent
+  automatically. Protocol 2 workers answer the hub's search with `absent` or `unknown`.
+
+### Model selectors
+
+- **No more false "model mismatch" for thinking suffixes.** A configured model such as
+  `anthropic/claude-opus-5-5:high` is checked against what OMP itself resolves it to: the base
+  model at that thinking level. The hub asks the session's bridge with a read-only query within
+  the startup deadline; an ID with a colon part of its own (`ollama/qwen:14b`) stays whole, and a
+  level OMP clamped is still a mismatch. The lead, lanes, the lane model barrier, `lead model` and
+  terminal sessions all use the resolution; a terminal `lead model` no longer splits the selector
+  at its first colon. A bridge older than the hub cannot answer: the session stays open and fenced
+  as "model unverified" at once. A session whose extension never connects is not a failed start
+  either: at the end of the startup deadline it binds, fenced the same way. The owner hears once
+  (not on every restart) to run `cataly update` or restart the session, or to keep the model with
+  `cataly lead accept-model`.
+
+### Lanes
+
 - Failed lane resumes (hub restart, worker reconnect and explicit reopen) keep the exact session,
   run, mailbox and worktree ownership, held with diagnostics rather than rolling back prior work.
   Fresh launch rollback is limited to the attempt's own proven unused allocation.
@@ -23,92 +114,23 @@
   nothing, and holding an already-held lane preserves the first reason.
 - In-doubt input prevents destructive worktree removal, not a safe park or close. The message
   ledger and kept worktree remain available for inspection; uncertain input is never replayed.
-- Retain the lead's proven conversation independently of failed launch attempts and history
-  retention. Pins select their exact earlier binding; missing, unsafe or unverified transcripts
-  hold rather than silently starting fresh. After a failed explicit fresh start, use
-  `lead start --fresh` to retry fresh or `lead start` to resume the retained old conversation.
-- Bound headless startup from spawn through exact binding by one 60-second deadline, with a
-  15-second notice, verified process cleanup, and a durable 300-second recovery episode.
-  Retain pre-binding ownership evidence across hub crashes; input stays fenced until the
-  validated identity is committed.
-  Duplicate same-target starts leave the owned attempt running; a refused busy stop leaves
-  recovery intact. Worker termination receipts must match the exact persisted attempt token.
-- Conversation-safe stores require schema reader 11. Older hubs must not open them and bypass
-  the resume anchor; retain the new version, or explicitly restore the pre-upgrade store backup
-  before a compatible downgrade.
-- A written message is resent after a restart only when the whole transcript proves it absent.
-  The marker search now covers the entire file instead of its newest 8 MiB, and a partial,
-  unparsable, oversized or unreadable transcript (or a search out of time) leaves the message in
-  doubt for the owner instead of writing it again. A resend still happens at most once, under
-  the original delivery ID, into the same session; worker deliveries are never resent
-  automatically. Protocol 2 workers answer the hub's search with `absent` or `unknown`.
-- **Worker update required:** protocol 2 refuses protocol-1 workers. Run `cataly update` on each
-  worker PC; until then its lanes are held, with their conversation and work retained.
-- The owner hears directly, in `[hub] language`, when the lead is still starting at 15 s (once
-  per recovery) and once per hold, with the reason, what is kept, `cataly lead start` after the
-  fix, and that an update does not lift the hold. A hold found again after a hub restart or an
-  update is not announced again. `cataly lead status` and `cataly health` show the target, the
-  startup phase and elapsed time, attempts and next retry, the last cleanup and lease evidence,
-  the inbox counts, and the same hold text; the ops panel shows a recovering lead.
-- After an update, sessions still recovering are reported as recovering, not as a final state,
-  by the hub's message and by `cataly update`; a second `update.sessions` message gives the final
-  result once they settle.
-- **Going back a version can no longer strand the hub.** `cataly version --json` reports
-  `store_reader`, the newest store schema the binary reads. `cataly rollback`, an update or install
-  that switches versions, and `install.sh` over an existing install (through the installed binary's
-  new `cataly install --preflight <binary>`) read the store's `meta.min_reader` read-only and refuse
-  a version that cannot open it, before the hub is stopped or any file switched (exit status 6). A
-  version without the field uses an exact released-version table: 0.2.0–0.2.5 read schema 9;
-  0.2.6 reads schema 10. Unlisted versions fail closed. The message, in `[hub] language`, says the store was upgraded for conversation
-  safety and which version cannot read it, and offers staying on the current version or restoring
-  the store copy the hub made before that upgrade (named when one exists; updates keep none of their
-  own). An `install.sh` or binary already published cannot be taught this check: going back with one
-  of them leaves the older hub refusing to open the store, with nothing lost; installing the current
-  version again brings it back.
-  An unreadable candidate report also refuses an install over retained state; an empty home
-  remains installable without a store-reader capability.
-  Preflight uses a query-only reader with a 250 ms busy limit; an unreadable floor refuses
-  rather than waiting on or changing a running hub's store.
-- Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the
-  lead's existing backoff after verifying the child exited and the session lease is free. Failed
-  resume attempts keep their diagnostics without superseding the last bound session.
-- Explicit fresh intent clears a migrated anchor hold. Ordinary A-to-B conversation histories
-  resume their newest proven binding, and an owner retry of a first failed start needs no
-  `--fresh` when no conversation ever bound. Startup model mismatch keeps the process open and
-  input fenced until `lead accept-model` durably commits the accepted identity.
-  A model fence also prevents idle sleep, so the session stays available for that decision.
-- **No more false "model mismatch" for thinking suffixes.** A configured model such as
-  `anthropic/claude-opus-5-5:high` is checked against what OMP itself resolves it to: the base
-  model at that thinking level. The hub asks the session's bridge with a read-only query within
-  the startup deadline; an ID with a colon part of its own (`ollama/qwen:14b`) stays whole, and a
-  level OMP clamped is still a mismatch. The lead, lanes, the lane model barrier, `lead model` and
-  terminal sessions all use the resolution; a terminal `lead model` no longer splits the selector
-  at its first colon. A bridge older than the hub cannot answer: the session stays open and fenced
-  as "model unverified" at once. A session whose extension never connects is not a failed start
-  either: at the end of the startup deadline it binds, fenced the same way. The owner hears once
-  (not on every restart) to run `cataly update` or restart the session, or to keep the model with
-  `cataly lead accept-model`.
-- **A lead woken from sleep or restarted after a crash no longer gets a second start recap.**
-  The recap goes in front of a new conversation and of the lead's first connection after a hub
-  start; the extension's hello on a resumed or woken session is a connection, not a new
-  conversation, so it adds none.
-- Tern startup journals retain the block ID and process birth identity; confirmed block close
-  or disappearance of that exact process proves termination. Unknown exits remain held.
-  Settled startup receipts are pruned only after no anchor, recovery episode or lane references
-  them; current and uncertain attempts are never discarded merely because they are old.
-  Maintenance collapses only superseded duplicate binding tuples, retaining the current anchor
-  and latest evidence for every pinnable identity. A crash before receipt pruning leaves a
-  harmless retained receipt that the next prune can remove.
-- Automatic update switch-back refuses an old reader after the new hub migrated the store beyond
-  its support, leaving the new version selected with an owner-attention explanation.
 - Your answer in a headless lane's thread now reaches a lane that paused its own goal while
   waiting for you. An owner or lead message resumes that goal before delivery only when the
   lane is not owner-held, reopening or in doubt. Reminders and budget blocks never resume it.
   Tern cannot prove who paused its goal, so it stays paused and reports how to continue explicitly
-  in the terminal or with `lane.pause` followed by `lane.resume`; no automatic answer-resume.
+  in the terminal or with `lane.pause` followed by `lane.resume`; no automatic answer-resume
+  ([PR #311](https://github.com/vntrevx/Cataly/pull/311), @tknmaxxer).
 - A delivery set aside now records the check that refused it (`not ready: the goal is paused`)
   instead of only the session status. While a paused or budget-blocked goal still keeps your or
   the lead's messages out, the lead gets one `messages undelivered` alert naming the reason.
+- A terminal (Tern) lane keeps its `cataly_lane` tool when the hub sets its goal right after the
+  lane connects. Stock OMP's goal mode reads the enabled tools before it switches and sets them
+  after, so a goal entered while the extension was still activating its tool dropped it, and the
+  lane could not report. The extension now finishes activating its tools before it runs any hub
+  command.
+
+### Answers and messages
+
 - A background job that finishes while the lead answers you no longer replaces the answer. The
   answer is the lead's final message of the turn your message started; a turn OMP starts by itself
   afterwards, as for the job's result, never takes its place, so the real answer is the reply again
@@ -116,16 +138,11 @@
   answer and where the answer went (the channel or its thread), as its own message that replies to
   nothing and settles nothing. It is stored before it is posted, like the answer, and a restart
   finds it. Discord, Telegram and Slack alike. An older version posts such stored text like the
-  rest of an answer.
+  rest of an answer ([PR #313](https://github.com/vntrevx/Cataly/pull/313)).
 - A lead with `[lead] idle_sleep` no longer sleeps through the reminders for a message of yours it
   has not answered: while such a message still has a reminder to come (1, 4 and 16 minutes after
   it arrived), the lead stays awake. Once the message is answered or no reminder is left, it may
   sleep as before (from #290, @betive37).
-- Cataly addresses the owner as "주인님" in Korean and "Master" in English instead of "보스",
-  "주인" and "boss"/"the owner": the update notice and message, the closing line of an approval
-  card ("주인님이 허용했습니다"), a typed answer ("주인님이 채팅으로 답했습니다") or an answered
-  question ("Answered by Master: …"), the refusals of other people's presses ("이 버튼은 주인님만
-  누를 수 있어요."), and the lead's and lanes' guidance.
 - The 👀 on your message shows while the lead works on it; once the answer is posted a done mark
   replaces it: ✅ on Discord (also when the answer went into a thread), `white_check_mark` on
   Slack, and 👌 on Telegram, as ✅ is not a reaction Telegram lets bots set. The done mark is added
@@ -134,17 +151,14 @@
   message: a restart right after the answer finishes it then, never twice, and a failed step is
   logged once and not tried again. A later turn's text still to follow the answer (a background
   job's result) never holds the done mark up.
-- The ops panel names why it is not green after its summary, the most serious first
-  (`🔴 확인이 필요해요: 디스크 여유 3 GB`, `🟡 Worth a look: anthropic limit 100%`). The host
-  line names the alert's cause ("과부하"/"overloaded" for load only, "메모리 부족"/"low memory",
-  "디스크 부족"/"low disk"), and so do the alert post and its recent line: a low disk at 20 % load
-  showed as "과부하" and "서버 부하가 5분 넘게 높아요". `pressure.alert` carries a `cause` field.
-  A cause that has passed shows as recovering until the pressure job's next tick clears the
-  alert, and the load margin now applies only once the load itself was over the line. A lead
-  restarting on its kept conversation is named too ("리드 복구 중"/"lead recovering").
-- The ops panel's pictures are sharper: the banner is 1024×341 and the thumbnail (also on job
-  notifications) 512×512, cut from the same originals with the same framing, instead of 768×256
-  and 160×160 at heavy compression.
+- Cataly addresses the owner as "주인님" in Korean and "Master" in English instead of "보스",
+  "주인" and "boss"/"the owner": the update notice and message, the closing line of an approval
+  card ("주인님이 허용했습니다"), a typed answer ("주인님이 채팅으로 답했습니다") or an answered
+  question ("Answered by Master: …"), the refusals of other people's presses ("이 버튼은 주인님만
+  누를 수 있어요."), and the lead's and lanes' guidance.
+
+### Hosted-tool policy
+
 - One hosted-tool policy hides and denies `eval` and its unavailable helper instructions, keeps
   debug/LSP offered, and reports trusted owner-installed MCP/extension tools at startup. Stock-OMP
   contracts gate PRs and releases against both the minimum and latest versions; the documented shell
@@ -157,11 +171,20 @@
 - The OMP probe keeps reading OMP's output until OMP exits. With an MCP server configured, stock
   OMP 19.1.1 could still write after the probe's last request and then exit with an error on the
   closed pipe, so the probe failed and the lead never started.
-- A terminal (Tern) lane keeps its `cataly_lane` tool when the hub sets its goal right after the
-  lane connects. Stock OMP's goal mode reads the enabled tools before it switches and sets them
-  after, so a goal entered while the extension was still activating its tool dropped it, and the
-  lane could not report. The extension now finishes activating its tools before it runs any hub
-  command.
+
+### Ops panel
+
+- The ops panel names why it is not green after its summary, the most serious first
+  (`🔴 확인이 필요해요: 디스크 여유 3 GB`, `🟡 Worth a look: anthropic limit 100%`). The host
+  line names the alert's cause ("과부하"/"overloaded" for load only, "메모리 부족"/"low memory",
+  "디스크 부족"/"low disk"), and so do the alert post and its recent line: a low disk at 20 % load
+  showed as "과부하" and "서버 부하가 5분 넘게 높아요". `pressure.alert` carries a `cause` field.
+  A cause that has passed shows as recovering until the pressure job's next tick clears the
+  alert, and the load margin now applies only once the load itself was over the line. A lead
+  restarting on its kept conversation is named too ("리드 복구 중"/"lead recovering").
+- The ops panel's pictures are sharper: the banner is 1024×341 and the thumbnail (also on job
+  notifications) 512×512, cut from the same originals with the same framing, instead of 768×256
+  and 160×160 at heavy compression.
 
 ## 0.2.6 (2026-11-27)
 
