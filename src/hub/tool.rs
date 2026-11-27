@@ -25,7 +25,16 @@ pub(crate) fn definition() -> Value {
     json!({
         "name": LEAD_TOOL,
         "label": "Cataly",
-        "description": "Cataly's records and watches. op is one of: requests (all?), request.add (title, source, thread?), \
+        // `answer` waits for the messenger to post (at most `relay::intake::ANSWER_WAIT`); the
+        // bridge waits this long for the hub's answer.
+        "timeout_ms": 150_000,
+        "description": "Cataly's records and watches. op is one of: answer (message: the owner message as \
+    discord:<room>/<message> from its [discord <room>/<message>] tag, text, room?: another room such as a thread you \
+    opened): posts your answer to that owner message like an automatic answer (split, into the thread started from \
+    it if any) and settles it; later calls for the same message post follow-ups. A repeat with the same text posts \
+    only what is missing, where it went (naming another room is refused): after \"still being posted by itself\" it \
+    is not needed; after \"may already be posted\" check the room first. With [lead] answers = \"tool\" it is \
+    the only way an answer reaches the owner: your final message is not posted. requests (all?), request.add (title, source, thread?), \
     request.next (id, text), request.note (id, text), request.close (id, text); questions, question.ask (text, source, \
     options, recommended?, settle owner|lead, thread?, request?, room?), question.answer (id, text, message), \
     question.choose (id, option, reason, message), question.withdraw (id, reason); jobs, job.start (name, argv, \
@@ -185,28 +194,77 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
                 lines.join("\n")
             ))
         }
-        "digest" => {
-            let since = match p::SINCE.text(input) {
-                Some(t) => t
-                    .parse::<jiff::Timestamp>()
-                    .map_err(|e| format!("since: {e}"))?
-                    .as_millisecond(),
-                None => now_ms() - 24 * 3_600_000,
-            };
-            Ok(crate::relay::discord::away::build(
-                hub.store.clone(),
-                hub.discord_rest(),
-                &hub.config(),
-                since,
-            )
-            .await
-            .0)
-        }
+        "digest" => digest(hub, input).await,
         "recap" => Ok(recap(hub).await),
+        "answer" => answer(hub, input).await,
         profile if profile.starts_with("profile.") => notes(hub, profile, input),
         "" => Err("op is required".into()),
         other => Err(format!("unknown op {other}; see the tool description")),
     }
+}
+
+/// The digest of what happened since `since` (default the last 24 hours).
+async fn digest(hub: &Hub, input: &Value) -> Result<String, String> {
+    let since = match p::SINCE.text(input) {
+        Some(t) => t
+            .parse::<jiff::Timestamp>()
+            .map_err(|e| format!("since: {e}"))?
+            .as_millisecond(),
+        None => now_ms() - 24 * 3_600_000,
+    };
+    Ok(crate::relay::discord::away::build(
+        hub.store.clone(),
+        hub.discord_rest(),
+        &hub.config(),
+        since,
+    )
+    .await
+    .0)
+}
+
+/// The longest answer accepted, in characters.
+const ANSWER_MAX: usize = 100_000;
+
+/// An owner message as the lead sees it: `discord:<room>/<message>`, or the request tag
+/// `[discord <room>/<message>]`; the relay, the room and the message.
+fn message_ref(text: &str) -> Option<(&str, &str, &str)> {
+    let text = text.trim();
+    let text = text
+        .strip_prefix('[')
+        .and_then(|t| t.strip_suffix(']'))
+        .unwrap_or(text);
+    let (relay, rest) = text.split_once([':', ' '])?;
+    let (room, message) = rest.trim().rsplit_once('/')?;
+    (!room.is_empty() && !message.is_empty() && !message.contains(char::is_whitespace))
+        .then_some((relay, room, message))
+}
+
+/// Posts the lead's answer to one owner message through its relay (DISC-OUT req. 21).
+async fn answer(hub: &Hub, input: &Value) -> Result<String, String> {
+    let reference = p::MESSAGE.need(input, 400, true)?;
+    let text = p::TEXT.need(input, ANSWER_MAX, false)?;
+    let (relay, room, message) = message_ref(reference).ok_or(
+        "message: the owner message as discord:<room>/<message> (the [discord <room>/<message>] tag of the request)",
+    )?;
+    let shared = match relay {
+        "discord" => &hub.discord,
+        "telegram" => &hub.telegram,
+        "slack" => &hub.slack,
+        other => return Err(format!("message: unknown messenger {other}")),
+    };
+    let to = p::ROOM.text(input);
+    // Onboarding is read-only, but the lead's replies to the owner still go out (its guidance): an
+    // answer in place, as the reply to the owner's message, carries its questions; nothing goes
+    // elsewhere.
+    let in_place = super::onboarding::running(hub).await;
+    if to.is_some() && in_place {
+        return Err(
+            "answer with room is refused while onboarding runs: onboarding is read-only; answer \
+             in place, as the reply to the owner's message"
+                .into(),
+        );
+    }
+    shared.answer(room, message, text, to, in_place).await
 }
 
 /// The lead's owner-notes operations (COORD-34 to COORD-37, OPC-79).
@@ -497,4 +555,25 @@ pub(crate) async fn recap(hub: &Hub) -> String {
         out.truncate(end);
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn answers_name_their_owner_message_as_the_lead_sees_it() {
+        assert_eq!(message_ref("discord:10/20"), Some(("discord", "10", "20")));
+        assert_eq!(
+            message_ref(" [discord 10/20] "),
+            Some(("discord", "10", "20"))
+        );
+        assert_eq!(
+            message_ref("telegram:-100:5/77"),
+            Some(("telegram", "-100:5", "77"))
+        );
+        assert_eq!(message_ref("discord:10"), None);
+        assert_eq!(message_ref("discord:/20"), None);
+        assert_eq!(message_ref("20"), None);
+    }
 }

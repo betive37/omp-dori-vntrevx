@@ -371,9 +371,9 @@ params! {
     /// The thread or room.
     THREAD: "thread", Type::Text, "the thread or room it belongs to", [Lead], false;
     /// The channel to ask in.
-    ROOM: "room", Type::Text, "the Discord channel to post a question in (default the home channel)", [Lead], false;
+    ROOM: "room", Type::Text, "question.ask: the Discord channel to post in (default the home channel); answer: another room to post in", [Lead], false;
     /// A message ID.
-    MESSAGE: "message", Type::Text, "the owner's or the announcing message ID", [Lead], false;
+    MESSAGE: "message", Type::Text, "the owner's or the announcing message ID; answer: the owner message as discord:<room>/<message>", [Lead], false;
     /// Why.
     REASON: "reason", Type::Text, "why", [Lead], false;
     /// Why, as a list.

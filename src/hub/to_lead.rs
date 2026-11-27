@@ -218,11 +218,14 @@ pub(crate) async fn remind(hub: Arc<Hub>, mut stop: watch::Receiver<bool>) -> Re
                 continue;
             }
             let line = super::bridge::owed_line(&o.room, &o.message, o.admitted_ms, &o.text);
+            let how = if hub.config().tool_answers() {
+                "Answer it with cataly_lead op answer (message: its tag above), or say in one line what happens next the same way."
+            } else {
+                "Answer it, or say in one line what happens next."
+            };
             let message = Message {
                 sender: HUB_SENDER.into(),
-                text: format!(
-                    "[reminder] This owner message has no answer yet:\n{line}\nAnswer it, or say in one line what happens next."
-                ),
+                text: format!("[reminder] This owner message has no answer yet:\n{line}\n{how}"),
                 urgent: true,
                 owner: false,
                 identity: Some(format!("owed:{}:{}:{}", o.room, o.message, o.reminders + 1)),

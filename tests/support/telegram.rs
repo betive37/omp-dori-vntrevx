@@ -1,6 +1,7 @@
 //! A fake Telegram Bot API on loopback only: identity, webhook info, long-poll updates with offsets,
-//! scripted poll statuses (409, 429, 401), a hang switch, message send and edit with message IDs,
-//! reactions, bot name and chat lookups. Every request is recorded with its time.
+//! scripted poll statuses (409, 429, 401), a hang switch, message send (with scripted statuses) and
+//! edit with message IDs, reactions, bot name and chat lookups. Every request is recorded with its
+//! time.
 
 use std::collections::VecDeque;
 use std::sync::{Arc, Mutex};
@@ -32,6 +33,8 @@ struct State {
     next_message: i64,
     /// Statuses and bodies for the next polls.
     scripted: VecDeque<(u16, Value)>,
+    /// Statuses for the next sends; the message is created all the same (an uncertain outcome).
+    send_scripted: VecDeque<u16>,
     hang: bool,
     not_bot: bool,
     webhook: String,
@@ -109,6 +112,11 @@ impl FakeTelegram {
             .unwrap()
             .scripted
             .push_back((status, body));
+    }
+
+    /// The next send creates its message but answers `status`, as a reply lost on the way.
+    pub fn script_send(&self, status: u16) {
+        self.state.lock().unwrap().send_scripted.push_back(status);
     }
 
     pub fn set_hang(&self, on: bool) {
@@ -233,12 +241,17 @@ async fn answer(
         "setMyName" | "setMessageReaction" | "editMessageText" => ok(json!(true)),
         "getChat" => ok(json!({"id": body["chat_id"], "type": "private"})),
         "sendMessage" => {
-            let id = {
+            let (id, scripted) = {
                 let mut s = state.lock().unwrap();
                 s.next_message += 1;
-                s.next_message
+                (s.next_message, s.send_scripted.pop_front())
             };
-            ok(json!({"message_id": id, "chat": {"id": body["chat_id"]}, "text": body["text"]}))
+            match scripted {
+                Some(status) => reply(status, &json!({"ok": false, "description": "scripted"})),
+                None => ok(
+                    json!({"message_id": id, "chat": {"id": body["chat_id"]}, "text": body["text"]}),
+                ),
+            }
         }
         "getUpdates" => poll(&state, &body).await,
         _ => reply(404, &json!({"ok": false, "description": "Not Found"})),

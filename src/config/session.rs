@@ -127,6 +127,30 @@ pub(crate) struct LeadSettings {
     /// How long the lead must be fully idle before the hub stops its OMP and keeps its session;
     /// `None` (`0s`) never.
     pub(crate) idle_sleep: Option<Duration>,
+    /// How the lead answers owner messages (DISC-OUT req. 21).
+    pub(crate) answers: Answers,
+}
+
+/// `[lead] answers`: who posts the lead's answer to an owner message.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum Answers {
+    /// The hub posts the final message of the turn the request started.
+    #[default]
+    Final,
+    /// Only what the lead posts with its tool's `answer` operation; final messages are not posted.
+    Tool,
+}
+
+/// `[lead] answers`: `final` (the default) or `tool`.
+fn answers(errors: &mut Vec<ConfigError>, l: &mut Section<'_>) -> Answers {
+    match l.string(errors, "answers") {
+        None | Some("final") => Answers::Final,
+        Some("tool") => Answers::Tool,
+        Some(_) => {
+            errors.push(l.error("answers", "expected final or tool"));
+            Answers::Final
+        }
+    }
 }
 
 /// `[fallback]`: carried into the overlay only when set (DESIGN 9.2).
@@ -281,6 +305,7 @@ pub(super) fn parse(
             .map(str::to_string);
         let autostart = l.bool(errors, "autostart").unwrap_or(true);
         let idle_sleep = idle_sleep(errors, &mut l);
+        let answers = answers(errors, &mut l);
         l.finish(errors);
         if let Some(model) = model.filter(|m| model_selector(m)) {
             *lead = Some(LeadSettings {
@@ -291,6 +316,7 @@ pub(super) fn parse(
                 instructions,
                 autostart,
                 idle_sleep,
+                answers,
             });
         }
     }
@@ -359,7 +385,11 @@ mod tests {
         assert_eq!(config.sessions.cap, 4);
         assert_eq!(config.sessions.spend_phrases, ["top up"]);
         assert_eq!(config.lead.as_ref().unwrap().model, "p/m");
+        assert_eq!(config.lead.as_ref().unwrap().answers, Answers::Final);
         assert_eq!(config.fallback.chains["default"], ["p/n"]);
+        let tool = crate::config::parse("[lead]\nmodel = \"p/m\"\nanswers = \"tool\"\n").unwrap();
+        assert_eq!(tool.lead.unwrap().answers, Answers::Tool);
+        assert!(crate::config::parse("[lead]\nmodel = \"p/m\"\nanswers = \"auto\"\n").is_err());
         let errors = crate::config::parse(
             "[sessions]\ncap = 99\ncredentials = [\"CATALY_X\"]\n[lead]\nmodel = \"bad\"\n\
              [fallback]\non = \"never\"\n[fallback.chains]\ndefault = [\"x\"]\n",

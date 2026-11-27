@@ -235,6 +235,13 @@ impl Config {
             .collect()
     }
 
+    /// The lead answers with its tool only (`[lead] answers = "tool"`).
+    pub(crate) fn tool_answers(&self) -> bool {
+        self.lead
+            .as_ref()
+            .is_some_and(|l| l.answers == session::Answers::Tool)
+    }
+
     /// A destination by name; [`HOME_DESTINATION`] is the owner's home room when a relay has one.
     pub(crate) fn destination(&self, name: &str) -> Option<Destination> {
         if name != HOME_DESTINATION {
