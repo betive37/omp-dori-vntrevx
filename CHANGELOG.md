@@ -11,6 +11,9 @@
   variables from project, agent and home `.env` files, so a `.env` line could turn the eval
   kernels back on. The variables come from a table derived from OMP's settings schema, and a stock
   contract fails when OMP adds or renames a binding for a pinned setting.
+- The OMP probe keeps reading OMP's output until OMP exits. With an MCP server configured, stock
+  OMP 19.1.1 could still write after the probe's last request and then exit with an error on the
+  closed pipe, so the probe failed and the lead never started.
 
 ## 0.2.6 (2026-11-27)
 

@@ -92,9 +92,18 @@ export default function(pi: ExtensionAPI) {
     let mut input = writer.join().unwrap();
     input.write_all(b"/contract-plan\r").unwrap();
     input.flush().unwrap();
+    // Stock 19.1.1 can leave the first command in the editor after its Enter (seen with the
+    // slash-command completion open); press Enter again while no transition is recorded. On an
+    // empty editor Enter does nothing.
+    let mut pressed = std::time::Instant::now();
     let transition: Value = plan.hub.until(WAIT, || {
-        let text = std::fs::read_to_string(plan.hub.root.join("work/plan-transition.json")).ok()?;
-        serde_json::from_str(&text).ok()
+        let text = std::fs::read_to_string(plan.hub.root.join("work/plan-transition.json")).ok();
+        if text.is_none() && pressed.elapsed() > std::time::Duration::from_secs(3) {
+            input.write_all(b"\r").unwrap();
+            input.flush().unwrap();
+            pressed = std::time::Instant::now();
+        }
+        serde_json::from_str(&text?).ok()
     });
     assert_eq!(transition["result"]["ok"], true, "{transition}");
     assert_eq!(

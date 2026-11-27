@@ -259,21 +259,28 @@ async fn exchange(
         child.close(CLOSE_WAIT, KILL_GRACE).await;
         return Err("OMP's pipes are not available".into());
     };
+    // The connection outlives end of input: OMP may still write (an MCP server finishing discovery,
+    // say) while it shuts down, and stock 19.1.1 exits 1 on a closed stdout. Its reader keeps
+    // draining until the child is closed.
+    let mut rpc = None;
     let result = timeout(EXCHANGE_TIMEOUT, async {
-        let rpc = Rpc::connect(stdout, stdin, READY_TIMEOUT, None)
-            .await
-            .map_err(|e| e.to_string())?;
-        let outcome = steps(&rpc, report).await;
-        rpc.end_input().await;
+        let connected = rpc.insert(
+            Rpc::connect(stdout, stdin, READY_TIMEOUT, None)
+                .await
+                .map_err(|e| e.to_string())?,
+        );
+        let outcome = steps(connected, report).await;
+        connected.end_input().await;
         crate::log::debug(
             "omp probe exchange done",
-            &[("events_dropped", &rpc.dropped_events())],
+            &[("events_dropped", &connected.dropped_events())],
         );
         outcome
     })
     .await
     .unwrap_or_else(|_| Err("the rpc exchange took longer than 20 s".into()));
     let (exit, step) = child.close(CLOSE_WAIT, KILL_GRACE).await;
+    drop(rpc);
     result.and_then(|()| ended_well(exit, step))
 }
 
