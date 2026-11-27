@@ -1,5 +1,16 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- A background job that finishes while the lead answers you no longer replaces the answer. The
+  answer is the lead's final message of the turn your message started; a turn OMP starts by itself
+  afterwards, as for the job's result, never takes its place, so the real answer is the reply again
+  instead of a one-line "the backup finished". That later turn's text is still posted, after the
+  answer and where the answer went (the channel or its thread), as its own message that replies to
+  nothing and settles nothing. It is stored before it is posted, like the answer, and a restart
+  finds it. Discord, Telegram and Slack alike. An older version posts such stored text like the
+  rest of an answer.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a

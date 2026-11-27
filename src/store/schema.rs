@@ -14,7 +14,7 @@ struct Migration {
     additive: bool,
 }
 
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 11] = [
     Migration {
         sql: include_str!("migrations/0001_init.sql"),
         additive: false,
@@ -55,6 +55,11 @@ const MIGRATIONS: [Migration; 10] = [
         sql: include_str!("migrations/0010_outbox_destinations.sql"),
         // Old readers do not honor destination pins or in-flight uncertainty.
         additive: false,
+    },
+    Migration {
+        sql: include_str!("migrations/0011_outbox_turns.sql"),
+        // An old reader posts a later turn's parts like answer parts after the answer.
+        additive: true,
     },
 ];
 

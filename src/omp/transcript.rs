@@ -519,8 +519,14 @@ pub(crate) enum Reply {
     NotFound,
     /// The turn has not ended yet.
     Pending,
-    /// The final assistant text of the turn the request started.
-    Answer(String),
+    /// `text` is the final assistant text of the turn the request started; `more` the final text
+    /// of each later turn OMP started by itself (a background job's result) before another input,
+    /// in order. `open` while no input followed, so more such turns may come.
+    Answer {
+        text: String,
+        more: Vec<String>,
+        open: bool,
+    },
     /// Another input entered the transcript before an answer: the answer would belong to mixed work.
     Abandoned,
 }
@@ -642,7 +648,11 @@ fn message_entries(path: &Path) -> Result<Option<Vec<Said>>> {
 
 /// The answer to each request tag. `prefix` starts every request tag, so a later request in the same
 /// user entry (one batch) takes the answer; `settled` means the session is idle, so a final message
-/// at the end of the file is the answer rather than a step of a turn still running.
+/// at the end of the file has ended its turn rather than being a step of one still running.
+///
+/// A turn ends with its final message, so the first final message after the request ends the turn
+/// the request started. Every later final message before the next input ends a turn OMP started by
+/// itself (a background job's result): it never replaces the answer.
 pub(crate) fn replies(
     path: &Path,
     tags: &[String],
@@ -670,19 +680,33 @@ pub(crate) fn replies(
             if later_request {
                 return Reply::Abandoned;
             }
-            let mut answer: Option<&str> = None;
-            for e in entries.iter().skip(at + 1) {
-                if e.user {
-                    return answer.map_or(Reply::Abandoned, |a| Reply::Answer(a.to_string()));
-                }
-                answer = (e.stop.as_deref() == Some("stop")
-                    && !e.tool_call
-                    && !e.text.trim().is_empty())
-                .then_some(e.text.as_str());
+            let span = entries.get(at + 1..).unwrap_or_default();
+            let end = span.iter().position(|e| e.user);
+            let turns = span.get(..end.unwrap_or(span.len())).unwrap_or_default();
+            // A final message counts once anything follows it or the session is idle.
+            let mut finals: Vec<String> = turns
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| {
+                    e.stop.as_deref() == Some("stop")
+                        && !e.tool_call
+                        && !e.text.trim().is_empty()
+                        && (settled || end.is_some() || i + 1 < turns.len())
+                })
+                .map(|(_, e)| e.text.clone())
+                .collect();
+            if finals.is_empty() {
+                return if end.is_some() {
+                    Reply::Abandoned
+                } else {
+                    Reply::Pending
+                };
             }
-            match answer {
-                Some(a) if settled => Reply::Answer(a.to_string()),
-                _ => Reply::Pending,
+            let text = finals.remove(0);
+            Reply::Answer {
+                text,
+                more: finals,
+                open: end.is_none(),
             }
         })
         .collect())
@@ -1002,8 +1026,13 @@ mod tests {
         let tags: Vec<String> = ["[d a]", "[d b]", "[d c]", "[d e]", "[d z]"]
             .map(String::from)
             .to_vec();
+        let answer = |text: &str, open: bool| Reply::Answer {
+            text: text.into(),
+            more: Vec::new(),
+            open,
+        };
         let got = replies(&path, &tags, "[d ", false).unwrap();
-        assert_eq!(got[0], Reply::Answer("first answer".into()));
+        assert_eq!(got[0], answer("first answer", false));
         assert_eq!(got[1], Reply::Abandoned, "steered before an answer");
         assert_eq!(
             got[2],
@@ -1013,7 +1042,61 @@ mod tests {
         assert_eq!(got[3], Reply::Pending, "the session still works");
         assert_eq!(got[4], Reply::NotFound);
         let got = replies(&path, &tags, "[d ", true).unwrap();
-        assert_eq!(got[3], Reply::Answer("done".into()));
+        assert_eq!(got[3], answer("done", true));
+    }
+
+    #[test]
+    fn a_turn_omp_starts_itself_never_replaces_the_answer() {
+        let dir = crate::sys::fs::tests::scratch("continuations");
+        let path = dir.join("s.jsonl");
+        let said = |t: &str, stop: &str, tool: bool| {
+            let tool = if tool {
+                r#",{"type":"toolCall","id":"c","name":"bash","arguments":{}}"#
+            } else {
+                ""
+            };
+            format!(
+                r#"{{"type":"message","message":{{"role":"assistant","content":[{{"type":"text","text":"{t}"}}{tool}],"stopReason":"{stop}"}}}}"#
+            )
+        };
+        let result = r#"{"type":"custom_message","customType":"async-result","content":"done","display":true}"#;
+        let mut lines = vec![
+            r#"{"type":"session","id":"x"}"#.to_string(),
+            r#"{"type":"message","message":{"role":"user","content":"[d a] back up"}}"#.to_string(),
+            said("started the backup", "stop", false),
+            result.to_string(),
+            said("checking", "toolUse", true),
+            said("the backup finished", "stop", false),
+            result.to_string(),
+            said("cleaned up", "stop", false),
+        ];
+        let read = |lines: &[String], settled| {
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            replies(&path, &["[d a]".to_string()], "[d ", settled)
+                .unwrap()
+                .remove(0)
+        };
+        let reply = |more: &[&str], open| Reply::Answer {
+            text: "started the backup".into(),
+            more: more.iter().map(|m| (*m).to_string()).collect(),
+            open,
+        };
+        assert_eq!(
+            read(&lines, false),
+            reply(&["the backup finished"], true),
+            "the last turn may still run"
+        );
+        assert_eq!(
+            read(&lines, true),
+            reply(&["the backup finished", "cleaned up"], true)
+        );
+        lines.push(r#"{"type":"message","message":{"role":"user","content":"[d b] next"}}"#.into());
+        lines.push(said("next answer", "stop", false));
+        assert_eq!(
+            read(&lines, false),
+            reply(&["the backup finished", "cleaned up"], false),
+            "the next input closes the request's turns"
+        );
     }
 
     #[test]

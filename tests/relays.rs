@@ -201,6 +201,43 @@ fn telegram_and_slack_requests_are_answered_in_place_with_seen_marks() {
     assert!(hub.stop().success());
 }
 
+/// Telegram takes a background job's later turn through the same pipeline: the answer replies to
+/// the request, and the later turn's text follows in the same chat as a plain message (DISC-OUT
+/// req. 21).
+#[test]
+fn a_background_result_follows_the_telegram_answer() {
+    let tg = FakeTelegram::start();
+    let mut hub = relay_hub(Some(&tg), None, "");
+    hub.fixture("omp", "followup", Some("\"the backup finished\""));
+    hub.start();
+    ready(&hub, &["telegram"]);
+    lead_idle(&hub);
+    tg.push(
+        "message",
+        FakeTelegram::message(12, FakeTelegram::dm(), 7, "back up, then answer"),
+    );
+    let sent = tg.wait(WAIT, |f| {
+        let sent = f.calls("sendMessage");
+        (sent.len() >= 2).then_some(sent)
+    });
+    assert_eq!(sent[0].body["text"], "the answer", "{sent:?}");
+    assert_eq!(sent[0].body["reply_parameters"]["message_id"], 12);
+    assert_eq!(sent[1].body["text"], "the backup finished");
+    assert_eq!(sent[1].body["chat_id"], 7);
+    assert!(
+        sent[1].body.get("reply_parameters").is_none(),
+        "{:?}",
+        sent[1].body
+    );
+    hub.until(WAIT, || {
+        let s = status(&hub, "telegram");
+        (s["counts"]["owed_settled"] == 1 && s["counts"]["answers_waiting"] == 0).then_some(())
+    });
+    std::thread::sleep(Duration::from_secs(2));
+    assert_eq!(tg.calls("sendMessage").len(), 2, "each once");
+    assert!(hub.stop().success());
+}
+
 /// Check 3: untagged replies in a thread the account posted in are admitted; an unlisted member is
 /// dropped; every envelope is acknowledged within 3 s; an upload URL off files.slack.com is refused
 /// before any byte is sent.
