@@ -142,6 +142,9 @@
   A cause that has passed shows as recovering until the pressure job's next tick clears the
   alert, and the load margin now applies only once the load itself was over the line. A lead
   restarting on its kept conversation is named too ("리드 복구 중"/"lead recovering").
+- The ops panel's pictures are sharper: the banner is 1024×341 and the thumbnail (also on job
+  notifications) 512×512, cut from the same originals with the same framing, instead of 768×256
+  and 160×160 at heavy compression.
 
 ## 0.2.6 (2026-11-27)
 
