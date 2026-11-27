@@ -181,7 +181,7 @@ impl Runtime for Headless {
                 return Err(local_cleanup::finish(
                     child,
                     &ownership,
-                    local_cleanup::Failure::rpc(e, cancelled),
+                    local_cleanup::Failure::rpc(&e, cancelled),
                 )
                 .await);
             }

@@ -12,9 +12,9 @@ pub(super) struct Failure {
 }
 
 impl Failure {
-    pub(super) fn rpc(error: super::RpcError, cancelled: bool) -> Self {
+    pub(super) fn rpc(error: &super::RpcError, cancelled: bool) -> Self {
         Self {
-            stage: if error == super::RpcError::Timeout("ready frame") {
+            stage: if *error == super::RpcError::Timeout("ready frame") {
                 StartupStage::Ready
             } else {
                 StartupStage::Protocol
