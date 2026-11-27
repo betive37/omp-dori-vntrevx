@@ -358,9 +358,7 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     // A room the lead named but that could not take the post is refused like an unreadable one:
     // nothing is recorded (EVR req. 34).
     if let (Some(r), None) = (named, &posted) {
-        return Err(format!(
-            "room: the question could not be posted in {r}; nothing was recorded"
-        ));
+        return Err(format!("room: could not post in {r}; nothing recorded"));
     }
     let row = QuestionRow {
         id: id.clone(),
