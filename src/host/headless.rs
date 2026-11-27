@@ -105,9 +105,22 @@ impl Runtime for Headless {
         let token = super::random_hex(16);
         self.links.issue(&token, &spec.handle, spec.role);
         if let Some(worker) = spec.worker.clone() {
-            return self
+            let owner = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
+                .map_err(StartError::Refused)?;
+            owner
+                .identify(spec.expected_id.as_deref(), Some(&worker))
+                .map_err(StartError::Refused)?;
+            let result = self
                 .start_remote(spec, &worker, &token, deadline, cancel)
                 .await;
+            if let Err(error) = &result {
+                let cleanup = match error {
+                    StartError::Startup { cleanup, .. } => *cleanup,
+                    StartError::Refused(_) => Cleanup::NotSpawned,
+                };
+                owner.finished(cleanup).map_err(StartError::Refused)?;
+            }
+            return result;
         }
         let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
         let argv = Launch {
@@ -129,8 +142,19 @@ impl Runtime for Headless {
         let stderr = self.logs.join(format!("session-{}.err", spec.handle));
         let ownership = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
             .map_err(StartError::Refused)?;
-        let mut child = command::attach(&argv, Some(&spec.cwd), &env, Some(&stderr), STDERR_CAP)
-            .map_err(|e| StartError::Refused(e.to_string()))?;
+        ownership
+            .identify(spec.expected_id.as_deref(), None)
+            .map_err(StartError::Refused)?;
+        let mut child =
+            match command::attach(&argv, Some(&spec.cwd), &env, Some(&stderr), STDERR_CAP) {
+                Ok(child) => child,
+                Err(error) => {
+                    ownership
+                        .finished(Cleanup::NotSpawned)
+                        .map_err(StartError::Refused)?;
+                    return Err(StartError::Refused(error.to_string()));
+                }
+            };
         if let Err(detail) = ownership.spawned(child.pid()).await {
             return Err(local_cleanup::finish(
                 child,

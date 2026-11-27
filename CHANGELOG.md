@@ -33,8 +33,9 @@
   unparsable, oversized or unreadable transcript (or a search out of time) leaves the message in
   doubt for the owner instead of writing it again. A resend still happens at most once, under
   the original delivery ID, into the same session; worker deliveries are never resent
-  automatically. Workers answer the hub's search with `absent` or `unknown`; an older worker's
-  "not found" now counts as unknown.
+  automatically. Protocol 2 workers answer the hub's search with `absent` or `unknown`.
+- **Worker update required:** protocol 2 refuses protocol-1 workers. Run `cataly update` on each
+  worker PC; until then its lanes are held, with their conversation and work retained.
 - The owner hears directly, in `[hub] language`, when the lead is still starting at 15 s (once
   per recovery) and once per hold, with the reason, what is kept, `cataly lead start` after the
   fix, and that an update does not lift the hold. A hold found again after a hub restart or an
@@ -49,8 +50,8 @@
   that switches versions, and `install.sh` over an existing install (through the installed binary's
   new `cataly install --preflight <binary>`) read the store's `meta.min_reader` read-only and refuse
   a version that cannot open it, before the hub is stopped or any file switched (exit status 6). A
-  version whose report lacks the field (every release up to 0.2.6) is refused once the store's floor
-  is above schema 9. The message, in `[hub] language`, says the store was upgraded for conversation
+  version without the field uses an exact released-version table: 0.2.0–0.2.5 read schema 9;
+  0.2.6 reads schema 10. Unlisted versions fail closed. The message, in `[hub] language`, says the store was upgraded for conversation
   safety and which version cannot read it, and offers staying on the current version or restoring
   the store copy the hub made before that upgrade (named when one exists; updates keep none of their
   own). An `install.sh` or binary already published cannot be taught this check: going back with one
@@ -61,6 +62,16 @@
 - Recover the lead on its existing session after a transient rpc-ui ready timeout. Retries use the
   lead's existing backoff after verifying the child exited and the session lease is free. Failed
   resume attempts keep their diagnostics without superseding the last bound session.
+- Explicit fresh intent clears a migrated anchor hold. Ordinary A-to-B conversation histories
+  resume their newest proven binding, and an owner retry of a first failed start needs no
+  `--fresh` when no conversation ever bound. Startup model mismatch keeps the process open and
+  input fenced until `lead accept-model` durably commits the accepted identity.
+- Tern startup journals retain the block ID and process birth identity; confirmed block close
+  or disappearance of that exact process proves termination. Unknown exits remain held.
+  Settled startup receipts are pruned only after no anchor, recovery episode or lane references
+  them; current and uncertain attempts are never discarded merely because they are old.
+- Automatic update switch-back refuses an old reader after the new hub migrated the store beyond
+  its support, leaving the new version selected with an owner-attention explanation.
 
 ## 0.2.6 (2026-11-27)
 

@@ -831,15 +831,11 @@ pub(crate) async fn search(path: PathBuf, marker: String) -> Result<Found> {
                 .unwrap_or("the worker could not read the whole file")
                 .to_string()
         };
-        // A worker before 0.2.7 searched only the newest 8 MiB: its "no" proves nothing.
         return match answer.get("found").and_then(Value::as_str) {
             Some("yes") => Ok(Found::Yes),
             Some("absent") => Ok(Found::Absent),
             Some("missing") => Ok(Found::Missing),
             Some("unknown") => Ok(Found::Unknown(reason())),
-            Some("no" | "out_of_time") => Ok(Found::Unknown(
-                "the worker's older search does not cover the whole file".into(),
-            )),
             _ => Err(TranscriptError::Io(
                 "the worker's search answer is unknown".into(),
             )),

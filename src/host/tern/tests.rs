@@ -94,6 +94,60 @@ async fn missing_tern_is_refused_with_an_install_hint() {
     assert!(reason.contains("install Tern"), "{reason}");
 }
 
+#[tokio::test]
+async fn cancelled_terminal_start_requires_a_confirmed_block_close() {
+    use crate::host::startup::Cleanup;
+    use std::os::unix::fs::PermissionsExt as _;
+
+    for (exit, expected) in [(0, Cleanup::LocalReaped), (1, Cleanup::Unknown)] {
+        let dir = crate::sys::fs::tests::scratch("tern-cleanup");
+        let program = dir.join("tern");
+        let opened = dir.join("opened");
+        std::fs::write(&program, format!(
+            "#!/bin/sh\ncase \"$1\" in\nnew) touch '{}'; printf '{{\"id\":\"owned-block\"}}\\n';;\nclose) exit {exit};;\nesac\n",
+            opened.display(),
+        )).unwrap();
+        std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
+        let tern = Tern {
+            program: Some(program),
+            block_session: None,
+            omp: "omp".into(),
+            state: dir.to_path_buf(),
+            socket: dir.join("hub.sock"),
+            spill: dir.join("spill"),
+            extra_flags: Vec::new(),
+            agent_start: Latency::default(),
+            links: Arc::default(),
+        };
+        let (cancel, receive) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            tern.start_supervised(spec("cancelled", None), receive)
+                .await
+        });
+        timeout(Duration::from_secs(10), async {
+            while !opened.exists() {
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .unwrap();
+        cancel.send_replace(true);
+        let Err(error) = task.await.unwrap() else {
+            panic!("cancelled startup bound")
+        };
+        assert!(
+            matches!(error, StartError::Startup { cleanup, .. } if cleanup == expected),
+            "{error:?}"
+        );
+        assert_eq!(
+            super::super::lead::ownership::reconcile(&dir, "cancelled")
+                .await
+                .unwrap(),
+            expected
+        );
+    }
+}
+
 #[test]
 fn the_block_runs_omp_with_the_token_and_without_rpc_flags() {
     let tern = Tern {

@@ -777,14 +777,18 @@ rest on the registry's own integrity check, not on the release signature (11.4).
 - Rollback keeps exactly one previous version; its two files are re-hashed against its record before switching.
 - Store compatibility across versions follows 7.2 (migrations, minimum reader version, backup).
 - **Store gate before a switch.** `cataly version --json` reports `store_reader`, the newest schema the binary
-  reads; reports up to 0.2.6 lack it (unknown). Before anything is stopped or switched, `cataly rollback`, an
+  reads. Reports without it use an exact released-version table: 0.2.0–0.2.5 read schema 9 and 0.2.6
+  reads schema 10; unlisted versions are unknown. Before anything is stopped or switched, `cataly rollback`, an
   update or install that switches versions, and `install.sh` over an existing install (through the installed
   binary's `cataly install --preflight <candidate>`) read the store's `meta.min_reader` read-only. A candidate
-  that reads below it, or an unknown one while the floor is above 9 (the schema of main before 0.2.7), is
+  that reads below it, or whose reader capability is unknown, is
   refused with exit status 6: the store was upgraded for conversation safety, so stay on the current version
   or restore the copy the hub made before that migration (`<state>/backup/cataly-v<N>.db`, named when one the
   candidate reads exists; conversation since then is not in it). Updates themselves keep no store copy; the
   only copies are those the hub writes before migrating. An npm or Bun update never goes back a version.
+  Automatic switch-back also checks the current store floor against the old binary's schema support;
+  if the new hub already migrated beyond that support, the new version remains selected and needs
+  owner attention instead of switching to a hub that cannot open the store.
 - **Limits of the gate.** An `install.sh` or a binary already published (0.2.6 and earlier) cannot be taught
   this check. When a downgrade goes through one of them, the older hub refuses to open the store and does not
   start: it fails closed, and the store and the conversation in it are kept, not lost. Recovery is to install

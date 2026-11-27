@@ -38,8 +38,8 @@ VALUES (1,
 UPDATE lead_anchor SET hold = 'ambiguous lead binding history'
 WHERE EXISTS(SELECT session_id FROM lead_bindings GROUP BY session_id
              HAVING COUNT(DISTINCT session_file || char(0) || cwd || char(0) || runtime) > 1);
-UPDATE lead_anchor SET hold = 'ambiguous current lead history; select an exact previously bound session_id'
-WHERE (SELECT COUNT(DISTINCT session_id) FROM lead_bindings) > 1 AND hold IS NULL;
+-- The total (started_ms, rowid) ordering above selects the newest proven binding, including an
+-- explicit fresh switch. Different conversation IDs alone are not ambiguous.
 -- Episode accounting survives attempt retention and hub restarts. A completed episode is replaced
 -- only by an explicit owner retry or a new failure after a successful binding.
 CREATE TABLE startup_episodes (

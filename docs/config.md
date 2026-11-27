@@ -653,8 +653,8 @@ or your DM. With neither, they stay in the event log; for Slack, name a destinat
 keeps the lead's resume anchor there), and a binary older than that upgrade cannot open it.
 `cataly rollback`, an update or install that switches versions, and `install.sh` over an existing
 install check this first, before the hub is stopped or any file switched: a version that cannot
-read the store, or one too old to say what it reads while the store needs more than those
-releases knew, is refused (exit status 6). The message says which version cannot read the store
+read the store is refused (exit status 6). Releases without a reader report use their exact known
+schemas: 0.2.0–0.2.5 read 9 and 0.2.6 reads 10; an unknown release fails closed. The message says which version cannot read the store
 and the way out: stay on the current version, or restore the store copy the hub made in
 `<state>/backup/` before that upgrade (its path is named when one exists; conversation since then
 is not in it). Updates keep no store copy of their own; when the hub made none, the message says
