@@ -15,8 +15,8 @@ pub(crate) const DISPATCHES: [&str; 3] =
 #[cfg_attr(not(feature = "voice"), allow(dead_code))]
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Seen<'a> {
-    /// READY or RESUMED: the bot's user ID.
-    Up(u64),
+    /// READY or RESUMED: the bot's user ID and whether voice states were resumed.
+    Up { bot: u64, resumed: bool },
     /// One of [`DISPATCHES`].
     Dispatch(&'a str, &'a Value),
     /// The connection went down.

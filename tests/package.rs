@@ -63,6 +63,76 @@ fn launch(runtime: &str, launcher: &Path, args: &[&str]) -> Output {
         .unwrap()
 }
 
+/// A preload that holds the launcher for a second right after it starts the binary.
+const SLOW_SPAWN: &str = "const cp = require(\"node:child_process\");\n\
+    const spawn = cp.spawn;\n\
+    cp.spawn = (...args) => {\n\
+    \tconst child = spawn(...args);\n\
+    \tcp.spawnSync(\"sleep\", [\"1\"]);\n\
+    \treturn child;\n\
+    };\n";
+
+/// Starts the launcher with the binary's `wait` (with `preload` loaded first), sends the launcher
+/// a TERM once the binary is ready, and checks that the binary got it and its status is the
+/// launcher's. A TERM that ends the launcher instead fails within 20 s, the binary killed.
+fn term_reaches_the_binary(runtime: &str, launcher: &Path, preload: Option<&Path>) {
+    let mut command = Command::new(runtime);
+    if let Some(preload) = preload {
+        command
+            .arg(if runtime == "bun" {
+                "--preload"
+            } else {
+                "--require"
+            })
+            .arg(preload);
+    }
+    let mut child = command
+        .arg(launcher)
+        .arg("wait")
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .unwrap();
+    // Lines are read off this thread, so a binary left running cannot block the test.
+    let stdout = child.stdout.take().unwrap();
+    let (tx, lines) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        for line in BufReader::new(stdout).lines().map_while(Result::ok) {
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let next = || lines.recv_timeout(Duration::from_secs(20)).ok();
+    let deadline = Instant::now() + Duration::from_secs(20);
+    while next().as_deref() != Some("ready") {
+        assert!(
+            Instant::now() < deadline,
+            "{runtime}: the binary never got ready"
+        );
+    }
+    Command::new("kill")
+        .args(["-TERM", &child.id().to_string()])
+        .status()
+        .unwrap();
+    let status = child.wait().unwrap();
+    let said = next();
+    if said.as_deref() != Some("got-term") {
+        // The binary still runs: end it, so it does not outlive the test.
+        let package = launcher.parent().unwrap().parent().unwrap();
+        let _ = Command::new("pkill")
+            .args(["-KILL", "-f", &package.display().to_string()])
+            .status();
+    }
+    assert_eq!(
+        said.as_deref(),
+        Some("got-term"),
+        "{runtime} {preload:?}: {status}"
+    );
+    assert_eq!(status.code(), Some(3), "{runtime} {preload:?}");
+}
+
 #[test]
 fn the_launcher_runs_the_platform_binary_under_node_and_bun() {
     let root = PathBuf::from(format!("/tmp/cy-launch-{}", std::process::id()));
@@ -94,26 +164,12 @@ fn the_launcher_runs_the_platform_binary_under_node_and_bun() {
         );
 
         // A TERM sent to the launcher reaches the binary, which decides how it ends.
-        let mut child = Command::new(runtime)
-            .arg(&launcher)
-            .arg("wait")
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::null())
-            .spawn()
-            .unwrap();
-        let mut lines = BufReader::new(child.stdout.take().unwrap()).lines();
-        let deadline = Instant::now() + Duration::from_secs(20);
-        while lines.next().unwrap().unwrap() != "ready" {
-            assert!(Instant::now() < deadline);
-        }
-        Command::new("kill")
-            .args(["-TERM", &child.id().to_string()])
-            .status()
-            .unwrap();
-        let status = child.wait().unwrap();
-        assert_eq!(lines.next().unwrap().unwrap(), "got-term", "{runtime}");
-        assert_eq!(status.code(), Some(3), "{runtime}");
+        term_reaches_the_binary(runtime, &launcher, None);
+        // Also one sent while the launcher has not gone on after starting the binary (a busy
+        // machine): the preload holds it there for a second, and the binary is ready meanwhile.
+        let slow = root.join("slow-spawn.js");
+        std::fs::write(&slow, SLOW_SPAWN).unwrap();
+        term_reaches_the_binary(runtime, &launcher, Some(&slow));
 
         let out = launch(runtime, &missing, &["version"]);
         assert_eq!(out.status.code(), Some(1), "{runtime}");

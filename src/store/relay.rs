@@ -58,8 +58,9 @@ pub(crate) struct PartRow {
     pub(crate) idx: i64,
     pub(crate) text: String,
     pub(crate) nonce: String,
-    pub(crate) remote: Option<String>,
+    pub(crate) destination: Option<String>,
     pub(crate) state: String,
+    pub(crate) uncertain: bool,
 }
 
 /// One owed reply.
@@ -178,6 +179,15 @@ pub(crate) enum RelayWrite {
         room: String,
         source: String,
         parts: Vec<(String, String)>,
+    },
+    /// Pins a pending part's destination and whether an attempt may already have taken effect.
+    PartState {
+        relay: String,
+        room: String,
+        source: String,
+        idx: i64,
+        destination: String,
+        uncertain: bool,
     },
     /// One part confirmed with its remote ID; `linked` for a confirmed linked first part.
     PartDone {
@@ -466,9 +476,10 @@ pub(super) fn write(
         | RelayWrite::Doubt { .. }
         | RelayWrite::Hold { .. }
         | RelayWrite::Flag { .. } => write_queue(tx, change, now),
-        RelayWrite::ReadMark { .. } | RelayWrite::Outbox { .. } | RelayWrite::PartDone { .. } => {
-            write_replies(tx, change, now)
-        }
+        RelayWrite::ReadMark { .. }
+        | RelayWrite::Outbox { .. }
+        | RelayWrite::PartState { .. }
+        | RelayWrite::PartDone { .. } => write_replies(tx, change, now),
         RelayWrite::Answer { .. } | RelayWrite::Question { .. } => write_marks(tx, change, now),
         RelayWrite::State { .. } | RelayWrite::Recall { .. } => write_state(tx, change, now),
     }
@@ -701,6 +712,21 @@ fn write_replies(
             )?;
             Ok(RelayDone::Done)
         }
+        RelayWrite::PartState {
+            relay,
+            room,
+            source,
+            idx,
+            destination,
+            uncertain,
+        } => {
+            tx.execute(
+                "UPDATE outbox_parts SET destination = ?5, uncertain = ?6, updated_ms = ?7 \
+                 WHERE relay = ?1 AND room = ?2 AND source = ?3 AND idx = ?4 AND state = 'pending'",
+                params![relay, room, source, idx, destination, uncertain, now],
+            )?;
+            Ok(RelayDone::Done)
+        }
         RelayWrite::PartDone {
             relay,
             room,
@@ -710,7 +736,7 @@ fn write_replies(
             linked,
         } => {
             tx.execute(
-                "UPDATE outbox_parts SET state = 'confirmed', remote = ?5, linked = ?6, updated_ms = ?7 \
+                "UPDATE outbox_parts SET state = 'confirmed', remote = ?5, linked = ?6, updated_ms = ?7, uncertain = 0 \
                  WHERE relay = ?1 AND room = ?2 AND source = ?3 AND idx = ?4",
                 params![relay, room, source, idx, remote, linked, now],
             )?;
@@ -926,7 +952,7 @@ impl Reads {
         source: &str,
     ) -> rusqlite::Result<Vec<PartRow>> {
         let mut stmt = self.0.prepare(
-            "SELECT idx, text, nonce, remote, state FROM outbox_parts WHERE relay = ?1 AND room = ?2 \
+            "SELECT idx, text, nonce, destination, state, uncertain FROM outbox_parts WHERE relay = ?1 AND room = ?2 \
              AND source = ?3 ORDER BY idx",
         )?;
         stmt.query_map(params![relay, room, source], |r| {
@@ -934,8 +960,9 @@ impl Reads {
                 idx: r.get(0)?,
                 text: r.get(1)?,
                 nonce: r.get(2)?,
-                remote: r.get(3)?,
+                destination: r.get(3)?,
                 state: r.get(4)?,
+                uncertain: r.get(5)?,
             })
         })?
         .collect()

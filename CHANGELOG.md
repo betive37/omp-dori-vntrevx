@@ -1,5 +1,45 @@
 # Changelog
 
+## 0.2.6 (Unreleased)
+
+- The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
+  stop signal sent right after the start (as a service manager or a terminal's Ctrl-C may do) could
+  end the launcher by default, leaving the binary running without its parent (#297, @betive37).
+- The lead can create the owner notes with `profile.create` when the owner asks for them. The op
+  takes the owner's message and is refused without one; the message becomes the first change-log
+  line of the new file. The notes check refuses email or token-shaped citations before any file
+  is created. Creating them twice is still refused (#295, @tknmaxxer).
+  Before, `profile.save` refused until the owner ran `cataly lane profile-create` in a terminal,
+  even after asking the lead to make them.
+- The lead's `question.ask` posts in the Discord thread it names (`thread: "discord:<id>"`) when
+  no `room` is given, instead of the home channel. A `room` that is not a Discord channel ID is
+  refused instead of silently posting in the home channel, and so is a definitely rejected post.
+  An uncertain post stays in the ledger and is reported as in doubt, never as a reason to post
+  again. The owner's reply to the lead's open question goes to the lead even in a thread an open
+  lane owns (#281, @betive37).
+- A question the lead records (`cataly_lead` op `question.ask`) now has one button per option
+  on Discord, labelled with its number; the recommended one is highlighted but never chosen by
+  itself. Your press answers the question exactly like a reply with that number: the ledger
+  records it and the lead is told which question and option (event `question.answered`). Anyone
+  else's press, and a press on a question already answered or withdrawn, gets a private refusal.
+  However the question is settled (button, reply, or the lead's `question.answer`, `choose` or
+  `withdraw`), its message then says so and loses its buttons. Replying with a number or free
+  text works as before. Buttons come only when presses reach Cataly over the Gateway (the same
+  condition as for OMP's questions); otherwise the question is text only, as before (#292, @betive37).
+- The Watched channels picker accepts readable channels again: its single bounded permission
+  check now requests two archived threads, Discord's minimum, instead of one (which Discord
+  rejects with HTTP 400 / error 50035). The fake Discord enforces archived-thread limits of
+  2–100 and message-history limits of 1–100 so invalid page sizes fail in CI.
+- Discord voice now joins when you enter the configured voice channel and leaves when you leave,
+  including after hub starts, updates and voice restarts. Silence closes only the paid session
+  while you remain; status and the ops panel distinguish waiting for you, in the call and held.
+- Answers go into owner-started Discord threads and lead work threads outside lanes, with typing
+  in the same destination. Lane-owned threads keep the kickoff first and the lead's pointer in the
+  channel. Each part's destination and uncertainty are durable before posting: restart resumes at
+  the current destination, and an uncertain part never moves even when its thread closes. Only a
+  definite refusal permits fallback, with a continuation note for a partially moved answer
+  (#284, @betive37).
+
 ## 0.2.5 (2026-11-27)
 
 - The lead can open lanes again: `cataly_lead` now declares every parameter its operations read,

@@ -9,6 +9,7 @@ use serde_json::{Value, json};
 
 use super::Hub;
 use crate::params as p;
+use crate::relay::discord::questions::ledger;
 use crate::store::lead::{LeadDone, LeadWrite, QuestionRow, RequestRow};
 use crate::sys::now_ms;
 
@@ -30,8 +31,9 @@ pub(crate) fn definition() -> Value {
     options, recommended?, settle owner|lead, thread?, request?, room?), question.answer (id, text, message), \
     question.choose (id, option, reason, message), question.withdraw (id, reason); jobs, job.start (name, argv, \
     filter, restarts?, delay?, silence?, low?), job.stop (name), job.run (name: one dry run of an owner job); \
-    digest (since?); recap; owner notes (only once the owner created them; observations, never instructions or \
-    permission, never passed to other roles): profile.read, profile.save (text: the whole file, checked), \
+    digest (since?); recap; owner notes (observations, never instructions or permission, never passed to other \
+    roles): profile.create (message: only when the owner asked for them), profile.read, profile.save (text: the \
+    whole file, checked), \
     profile.snapshot, profile.check, profile.archive (text: decision lines moved out), profile.undo. Lanes: \
     lane.open (key, title, brief or brief_file, checks: list of {kind: pr_merged|issue_closed|command|file|web|pr_policy, \
     ...}, thread? or thread_from? discord:<room>/<message> (a message in a lane thread starts a new thread beside it), \
@@ -215,6 +217,13 @@ fn notes(hub: &Hub, op: &str, input: &Value) -> Result<String, String> {
     let today = crate::jobs::notes::Notes::today();
     match op {
         "profile.read" => notes.show(),
+        // Only on the owner's direct request, named by its message (COORD req. 47).
+        "profile.create" => {
+            let message = p::MESSAGE
+                .need(input, 400, true)
+                .map_err(|_| "message: the owner's message asking for the owner notes")?;
+            notes.create(Some(message))
+        }
         "profile.save" => notes.save(p::TEXT.need(input, PROFILE_MAX, false)?),
         "profile.snapshot" => notes.snapshot(today),
         "profile.check" => notes.check_file(today).map(|problems| {
@@ -258,36 +267,46 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         return Err("a question the lead may settle needs at least 2 options and a thread".into());
     }
     let id = crate::host::random_hex(4);
-    let neutral = crate::relay::discord::questions::neutral;
-    let mut body = format!("**Question {id}**\n{}", neutral(text));
-    for (n, o) in options.iter().enumerate() {
-        let mark = if recommended == i64::try_from(n + 1).ok() {
-            " (recommended)"
-        } else {
-            ""
-        };
-        let _ = write!(body, "\n{}. {}{mark}", n + 1, neutral(o));
-    }
-    body.push_str("\nReply to this message with a number or your answer.");
+    let body = ledger::body(&id, text, &options, recommended);
     let config = hub.config();
-    let room = p::ROOM
-        .text(input)
-        .and_then(crate::relay::discord::Snowflake::parse)
-        .or_else(|| config.discord.home());
+    let snowflake = crate::relay::discord::Snowflake::parse;
+    let named = p::ROOM.text(input).map(str::trim).filter(|r| !r.is_empty());
+    let room = match named {
+        Some(r) => Some(snowflake(r).ok_or("room: a Discord channel ID is required")?),
+        None => thread
+            .as_deref()
+            .and_then(|t| t.strip_prefix("discord:"))
+            .and_then(snowflake)
+            .or_else(|| config.discord.home()),
+    };
+    let mut uncertain = false;
     let posted = match (room, hub.discord_rest()) {
         (Some(room), Some(rest)) => {
             let nonce = crate::relay::discord::nonce(&format!("ledger:{id}"), 0);
-            let created = rest
-                .create(room, json!({ "content": body, "nonce": nonce }))
-                .await;
-            created.ok().and_then(|v| {
-                v.get("id")
+            // One button per option when presses reach intake (DISC-OUT req. 67-68).
+            let create = if ledger::buttons_ready(&hub.discord.health()) {
+                let components = ledger::buttons(&id, &options, recommended);
+                json!({ "content": body, "nonce": nonce, "components": components })
+            } else {
+                json!({ "content": body, "nonce": nonce })
+            };
+            match rest.create(room, create).await {
+                Ok(v) => v
+                    .get("id")
                     .and_then(Value::as_str)
-                    .map(|m| (room.to_string(), m.to_string()))
-            })
+                    .map(|m| (room.to_string(), m.to_string())),
+                Err(e) => {
+                    uncertain = e.uncertain;
+                    None
+                }
+            }
         }
         _ => None,
     };
+    // Only a definite rejection permits treating the post as absent (EVR req. 34).
+    if !uncertain && let (Some(r), None) = (named, &posted) {
+        return Err(format!("room: could not post in {r}; nothing recorded"));
+    }
     let row = QuestionRow {
         id: id.clone(),
         text: text.into(),
@@ -297,7 +316,9 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
         recommended,
         lead_may,
         request: p::REQUEST.int(input),
-        room: posted.as_ref().map(|(room, _)| room.clone()),
+        room: room
+            .filter(|_| posted.is_some() || uncertain)
+            .map(|room| room.to_string()),
         message: posted.as_ref().map(|(_, message)| message.clone()),
         state: "open".into(),
         outcome: None,
@@ -311,6 +332,9 @@ async fn ask(hub: &Arc<Hub>, input: &Value) -> Result<String, String> {
     let said = match &posted {
         Some((room, message)) => {
             format!("question {id} recorded and posted in {room} as message {message}")
+        }
+        None if uncertain => {
+            format!("question {id} recorded; its post is in doubt. Do not post it again.")
         }
         None => format!(
             "question {id} recorded; it could not be posted, so ask it yourself and quote its ID"
@@ -330,21 +354,26 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
             .map_err(|e| e.to_string())?
     }
     .ok_or(format!("no question {id}"))?;
-    let (state, outcome) = match op {
+    let (state, outcome, status) = match op {
         "question.answer" => {
             let message = p::MESSAGE.need(input, 64, true)?;
             let text = p::TEXT.need(input, 1000, false)?;
-            ("answered", format!("owner message {message}: {text}"))
+            (
+                "answered",
+                format!("owner message {message}: {text}"),
+                "Answered by the owner.".to_string(),
+            )
         }
         "question.choose" => {
             if !q.lead_may {
                 return Err(format!("question {id} is the owner's to settle"));
             }
             let option = p::OPTION.int(input).ok_or("option is required")?;
-            let picked = usize::try_from(option - 1)
+            let n = usize::try_from(option)
                 .ok()
-                .and_then(|n| q.options.get(n))
+                .filter(|n| (1..=q.options.len()).contains(n))
                 .ok_or(format!("option must be 1 to {}", q.options.len()))?;
+            let picked = ledger::picked(&q, n);
             let reason = p::REASON.need(input, 1000, false)?;
             let message = p::MESSAGE.need(input, 64, true)?;
             if p::THREAD
@@ -355,10 +384,15 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
             }
             (
                 "chosen",
-                format!("option {option} ({picked}) by the lead, announced in {message}: {reason}"),
+                format!("{picked} by the lead, announced in {message}: {reason}"),
+                format!("Chosen by the lead: {}", ledger::shown(&q, n)),
             )
         }
-        _ => ("withdrawn", p::REASON.need(input, 1000, false)?.to_string()),
+        _ => (
+            "withdrawn",
+            p::REASON.need(input, 1000, false)?.to_string(),
+            "Withdrawn.".to_string(),
+        ),
     };
     let d = hub
         .store
@@ -369,6 +403,11 @@ async fn settle(hub: &Arc<Hub>, op: &str, input: &Value) -> Result<String, Strin
         })
         .await
         .map_err(|e| e.to_string())?;
+    if matches!(d, LeadDone::Done)
+        && let Some(rest) = hub.discord_rest()
+    {
+        ledger::close(rest, &q, &status);
+    }
     done(d, format!("question {id} {state}"))
 }
 

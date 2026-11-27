@@ -315,6 +315,9 @@ fn note(tx: &Transaction<'_>, id: i64, text: &str, now: i64) -> rusqlite::Result
 
 const REQUEST_COLUMNS: &str =
     "id, title, source, thread, next, notes, result, created_ms, closed_ms";
+/// Questions read per page when untold presses are looked for.
+pub(crate) const UNTOLD_PAGE: usize = 50;
+
 const QUESTION_COLUMNS: &str = "id, text, source, thread, options, recommended, lead_may, request, \
      room, message, state, outcome, created_ms";
 
@@ -381,6 +384,48 @@ impl Reads {
     pub(crate) fn question(&self, id: &str) -> rusqlite::Result<Option<QuestionRow>> {
         let sql = format!("SELECT {QUESTION_COLUMNS} FROM questions WHERE id = ?1");
         self.0.query_row(&sql, [id], question_of).optional()
+    }
+
+    /// Whether `reply`, a reply to `message`, is the lead's (EVR req. 37): the question posted as
+    /// `message` is still open, or `reply` is the owner message recorded as its answer, so a
+    /// hand-off made again after the answer was recorded still goes to the lead while a later
+    /// reply to a settled question does not.
+    pub(crate) fn question_reply(
+        &self,
+        room: &str,
+        message: &str,
+        reply: &str,
+    ) -> rusqlite::Result<bool> {
+        let answer = format!("owner message {reply}: ");
+        self.0
+            .query_row(
+                "SELECT 1 FROM questions WHERE room = ?1 AND message = ?2 AND (state = 'open' \
+                 OR (state = 'answered' AND substr(outcome, 1, length(?3)) = ?3))",
+                [room, message, answer.as_str()],
+                |_| Ok(()),
+            )
+            .optional()
+            .map(|r| r.is_some())
+    }
+
+    /// Questions the owner answered with a button (an outcome starting with `press`) since
+    /// `since_ms` whose `question.answered` event is missing: the hub stopped between recording the
+    /// answer and telling the lead. One page of at most [`UNTOLD_PAGE`] in ID order, after the ID `after`.
+    pub(crate) fn pressed_untold(
+        &self,
+        since_ms: i64,
+        press: &str,
+        after: &str,
+    ) -> rusqlite::Result<Vec<QuestionRow>> {
+        let sql = format!(
+            "SELECT {QUESTION_COLUMNS} FROM questions AS q WHERE state = 'answered' \
+             AND substr(outcome, 1, length(?2)) = ?2 AND settled_ms >= ?1 AND id > ?3 AND NOT EXISTS \
+             (SELECT 1 FROM events AS e WHERE e.kind = 'question.answered' AND e.subject = q.id) \
+             ORDER BY id LIMIT {UNTOLD_PAGE}"
+        );
+        let mut stmt = self.0.prepare(&sql)?;
+        stmt.query_map(params![since_ms, press, after], question_of)?
+            .collect()
     }
 
     /// The open question bound to a posted message (EVR req. 37).
@@ -510,16 +555,37 @@ mod tests {
                 .unwrap(),
             LeadDone::Refused(_)
         ));
+        let reply = |answer: &'static str| {
+            let store = store.clone();
+            async move {
+                store
+                    .read(move |r| r.question_reply("1", "9", answer))
+                    .await
+                    .unwrap()
+            }
+        };
+        // Open: any reply to it is the lead's.
+        assert!(reply("51").await && reply("52").await);
         let settle = LeadWrite::QuestionSettle {
             id: "0000abcd".into(),
             state: "answered".into(),
-            outcome: "option 2".into(),
+            outcome: "owner message 51: option 2".into(),
         };
-        assert_eq!(store.lead(settle.clone()).await.unwrap(), LeadDone::Done);
-        assert!(matches!(
-            store.lead(settle).await.unwrap(),
-            LeadDone::Refused(_)
-        ));
+        let competing = LeadWrite::QuestionSettle {
+            id: "0000abcd".into(),
+            state: "chosen".into(),
+            outcome: "option 1 by the lead".into(),
+        };
+        let (first, second) = tokio::join!(
+            biased;
+            store.lead(settle),
+            store.lead(competing)
+        );
+        assert_eq!(first.unwrap(), LeadDone::Done);
+        assert!(matches!(second.unwrap(), LeadDone::Refused(_)));
+        // Settled: only the reply recorded as its answer, not a later one or a longer ID.
+        assert!(reply("51").await);
+        assert!(!reply("52").await && !reply("5").await);
         let open = store.read(|r| r.requests(true)).await.unwrap();
         assert_eq!(open.len(), 1);
         assert_eq!(open[0].next.as_deref(), Some("run tests"));

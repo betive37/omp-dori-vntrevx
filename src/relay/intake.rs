@@ -60,6 +60,9 @@ pub(crate) struct Shared {
     pub(crate) catch_up_latency: Latency,
     /// Receive time minus the platform's message time (TELE-07).
     pub(crate) receive_lag: Latency,
+    /// Presses recorded but not told before the last stop were looked for: once per process,
+    /// since a later intake start could tell a press whose event is still on its way.
+    pub(crate) presses_recovered: AtomicBool,
 }
 
 impl Shared {

@@ -17,7 +17,7 @@ use serde_json::{Value, json};
 use super::form::{Field, FieldKind, Form};
 use super::intake::{Intake, NAME};
 use super::types::Press;
-use super::{Snowflake, nonce};
+use super::{Rest, Snowflake, nonce};
 use crate::config::Language;
 use crate::host::dialogs::DialogKind;
 use crate::host::dialogs::Question;
@@ -28,6 +28,7 @@ use crate::relay::text::DISCORD_LIMIT;
 use crate::store::relay::{QueueRow, RelayWrite};
 
 mod approval;
+pub(crate) mod ledger;
 mod panel;
 mod typed;
 /// The longest excerpt of a waiting dialog in its local notice.
@@ -613,14 +614,19 @@ fn duration_words(d: Duration) -> String {
     }
 }
 
+/// Best-effort closing transport shared by dialogs and recorded questions.
+async fn edit_closed(rest: &Rest, at: (Snowflake, Snowflake), content: &str) {
+    let body = json!({ "content": content, "components": [] });
+    match tokio::time::timeout(EDIT_BUDGET, rest.edit(at.0, at.1, body)).await {
+        Ok(Ok(())) => {}
+        Ok(Err(e)) => log::info("question not updated", &[("error", &e)]),
+        Err(_) => log::info("question not updated within 3 s", &[]),
+    }
+}
+
 impl<T: Runtime> Intake<T> {
     async fn edit_closing(&self, channel: Snowflake, message: Snowflake, content: &str) {
-        let body = json!({ "content": content, "components": [] });
-        match tokio::time::timeout(EDIT_BUDGET, self.rest.edit(channel, message, body)).await {
-            Ok(Ok(())) => {}
-            Ok(Err(e)) => log::info("question not updated", &[("error", &e)]),
-            Err(_) => log::info("question not updated within 3 s", &[]),
-        }
+        edit_closed(&self.rest, (channel, message), content).await;
         self.mark_question(channel, message, false).await;
     }
 
@@ -1095,12 +1101,15 @@ impl<T: Runtime> Intake<T> {
 
     /// A button press (DISC-OUT req. 69, 82): the owner's press on an open card answers it; anyone
     /// else's gets an ephemeral refusal; presses while one is being taken are ignored. Presses on
-    /// the ops panel go to the panel.
+    /// the ops panel go to the panel, presses on a question the lead recorded to [`ledger`].
     pub(super) async fn press(self: Arc<Self>, press: Press) {
         if press.custom_id.starts_with("ops:") {
             return self.ops_press(&press).await;
         }
         let Some(card) = self.cards.by_message(press.message) else {
+            if self.ledger_press(&press).await {
+                return;
+            }
             return self.refuse(&press, "This question is closed.").await;
         };
         if !press.by_owner(self.application, self.owner) || press.channel != card.channel {
@@ -1321,15 +1330,17 @@ impl<T: Runtime> Intake<T> {
     /// Replies to the owner's message about a typed answer (not taken, or one part taken).
     async fn correct(&self, card: &Card, row: &QueueRow, text: &str) {
         let seed = format!("correction:{}:{}", self.bot, row.message);
-        if let crate::relay::PartOutcome::Rejected(e) | crate::relay::PartOutcome::Uncertain(e) =
-            self.rest
-                .reply_part(
-                    card.channel,
-                    Snowflake::parse(&row.message),
-                    text,
-                    &nonce(&seed, 0),
-                )
-                .await
+        if let crate::relay::PartOutcome::Rejected(e)
+        | crate::relay::PartOutcome::Closed(e)
+        | crate::relay::PartOutcome::Uncertain(e) = self
+            .rest
+            .reply_part(
+                card.channel,
+                Snowflake::parse(&row.message),
+                text,
+                &nonce(&seed, 0),
+            )
+            .await
         {
             log::info("correction not posted", &[("error", &e)]);
         }
