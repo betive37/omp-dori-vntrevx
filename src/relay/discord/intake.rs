@@ -451,6 +451,7 @@ impl<T: Runtime> Intake<T> {
             intake.unlist(*channel, e);
         }
         intake.close_left_open().await;
+        intake.tell_untold_presses().await;
         intake.baseline_listed().await?;
         // A queue left from before is drained after a full catch-up read (DISC-IN req. 28).
         let queued = env

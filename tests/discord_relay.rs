@@ -2175,3 +2175,60 @@ fn a_press_on_a_long_question_keeps_the_choice_in_view() {
     );
     assert!(hub.stop().success());
 }
+
+/// A press recorded just before the hub stopped, its event not yet written: the next start tells
+/// the lead and closes the question's buttons, once.
+#[test]
+fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.start();
+    ready(&hub);
+    let (mut lead, _) = LeadBridge::connect(&hub);
+    let (id, message) = record_question(
+        &mut lead,
+        &json!({ "text": "Which?", "options": ["a", "b"] }),
+    );
+    drop(lead);
+    assert!(hub.stop().success());
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    let settled = db
+        .execute(
+            "UPDATE questions SET state = 'answered', outcome = 'owner press 7: option 2 (b)', \
+             settled_ms = CAST(strftime('%s', 'now') AS INTEGER) * 1000 WHERE id = ?1",
+            [&id],
+        )
+        .unwrap();
+    assert_eq!(settled, 1);
+    drop(db);
+    hub.start();
+    ready(&hub);
+    let told = hub.until(WAIT, || {
+        hub.events()
+            .into_iter()
+            .find(|e| e["kind"] == "question.answered")
+    });
+    let said = format!("question {id}: option 2 (b) — Which?");
+    assert!(told["text"].as_str().unwrap().contains(&said), "{told}");
+    let edited = closed(&fake, &message);
+    assert!(
+        edited["content"]
+            .as_str()
+            .unwrap()
+            .ends_with("Answered by the owner: 2. b"),
+        "{edited}"
+    );
+    assert!(hub.stop().success());
+    hub.start();
+    ready(&hub);
+    std::thread::sleep(Duration::from_secs(1));
+    assert_eq!(
+        hub.events()
+            .iter()
+            .filter(|e| e["kind"] == "question.answered")
+            .count(),
+        1,
+        "told once"
+    );
+    assert!(hub.stop().success());
+}
