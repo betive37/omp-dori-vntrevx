@@ -2418,3 +2418,61 @@ fn a_background_result_waits_behind_an_uncertain_answer() {
     assert!(last.body.get("message_reference").is_none());
     assert!(hub.stop().success());
 }
+
+/// With `idle_sleep` on (5 min, 3 s here), a lead that owes an answer with a reminder to come stays
+/// awake, as reminders reach only a live lead: the reminder at a minute reaches the same process.
+/// The reminder carries the request's tag, so the turn it starts answers the request; once that
+/// answer settles the owed reply, the lead sleeps.
+#[test]
+fn an_owed_reply_keeps_the_lead_awake_for_its_reminders() {
+    let fake = FakeDiscord::start();
+    let mut hub = background_hub(&fake, "", None);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&config.replace("[lead]\n", "[lead]\nidle_sleep = \"5m\"\n"));
+    hub.env
+        .push(("CATALY_IDLE_SLEEP".into(), PathBuf::from("3s")));
+    hub.start();
+    ready(&hub);
+    let pid = hub.json(&["lead", "status", "--json"])["session"]["pid"].clone();
+    let source = "800000000000000405";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_405,
+        OWNER,
+        "remind me",
+    ));
+    // The first turn ends with nothing to post; the turn the reminder starts answers.
+    hub.until(WAIT, || {
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        (text.contains(&format!("[discord {CH}/{source}]"))
+            && text
+                .lines()
+                .last()
+                .is_some_and(|l| l.contains("\"assistant\"")))
+        .then_some(())
+    });
+    hub.fixture(
+        "omp",
+        "answer.json",
+        Some("\"answered after the reminder\""),
+    );
+    hub.until(Duration::from_secs(100), || {
+        let lead = hub.json(&["lead", "status", "--json"]);
+        assert_eq!(
+            lead["phase"], "live",
+            "asleep while owing an answer: {lead}"
+        );
+        assert_eq!(lead["session"]["pid"], pid, "{lead}");
+        let text = std::fs::read_to_string(session_file(&hub)).unwrap_or_default();
+        text.contains("[reminder]").then_some(())
+    });
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(creates[0].body["content"], "answered after the reminder");
+    assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+    settled(&hub);
+    hub.until(WAIT, || {
+        let lead = hub.json(&["lead", "status", "--json"]);
+        (lead["phase"] == "asleep").then_some(())
+    });
+    assert!(hub.stop().success());
+}
