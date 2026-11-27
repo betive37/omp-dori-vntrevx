@@ -118,6 +118,9 @@ const owners = new Map<string, string>();
 /** The bridge state of one OMP process. */
 export class Bridge {
 	wired = false; role = "none"; key: string | undefined;
+	// The bridge tools' activation. OMP's goal and plan modes read the enabled tools before an await and set them after,
+	// so a hub command run while the activation is still pending would drop the bridge tools.
+	toolsActive: Promise<unknown> = Promise.resolve();
 	guidance = ""; session = ""; ctx!: Ctx;
 	// The connection, its numbering, its offline buffer and its reconnect state (EXT req. 13-15).
 	wire: Wire | undefined;
@@ -349,7 +352,7 @@ export class Bridge {
 			const execute: ToolDefinition["execute"] = (callId, params, _s, _u, ctx) => this.tool(name, ms, callId, params as Json, ctx);
 			pi.registerTool({ name, label, description, parameters, approval, loadMode: "essential", execute });
 		}
-		safe(() => pi.setActiveTools?.([...(pi.getActiveTools?.() ?? []).filter((n: string) => !names.includes(n)), ...names]));
+		this.toolsActive = Promise.resolve(safe(() => pi.setActiveTools?.([...(pi.getActiveTools?.() ?? []).filter((n: string) => !names.includes(n)), ...names]))).catch(() => undefined);
 		this.timer(() => this.capabilities(true), HEARTBEAT_MS, true);
 		pi.on("before_agent_start", async (e, ctx) => (await this.barrier(ctx), this.guide(e, ctx)));
 		// Lane and terminal hooks, added only once the hub said they apply (EXT req. 1, 32, 34, 38, 42).
@@ -414,6 +417,7 @@ export class Bridge {
 	async command(c: Json): Promise<void> {
 		const current = c.session === this.session && !this.changing;
 		this.applying += Number(current);
+		if (current) await this.toolsActive;
 		const out = current ? await this.run(c, this.ctx).catch(e => ({ refused: String(e?.message ?? e) })) : { refused: "not current" };
 		this.applying -= Number(current);
 		this.send("bridge.reply", { n: c.n, ...out });

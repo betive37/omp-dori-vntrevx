@@ -14,6 +14,11 @@
 - The OMP probe keeps reading OMP's output until OMP exits. With an MCP server configured, stock
   OMP 19.1.1 could still write after the probe's last request and then exit with an error on the
   closed pipe, so the probe failed and the lead never started.
+- A terminal (Tern) lane keeps its `cataly_lane` tool when the hub sets its goal right after the
+  lane connects. Stock OMP's goal mode reads the enabled tools before it switches and sets them
+  after, so a goal entered while the extension was still activating its tool dropped it, and the
+  lane could not report. The extension now finishes activating its tools before it runs any hub
+  command.
 
 ## 0.2.6 (2026-11-27)
 
