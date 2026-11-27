@@ -97,6 +97,8 @@ pub enum GatewayEvent {
     Ready {
         /// The bot's user ID.
         bot: u64,
+        /// A resumed feed (or a current cached snapshot), not a fresh identify.
+        resumed: bool,
     },
     /// The guild snapshot: the configured channel's type, and who sits in which voice channel.
     Guild {

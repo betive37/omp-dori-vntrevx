@@ -30,6 +30,9 @@
   check now requests two archived threads, Discord's minimum, instead of one (which Discord
   rejects with HTTP 400 / error 50035). The fake Discord enforces archived-thread limits of
   2–100 and message-history limits of 1–100 so invalid page sizes fail in CI.
+- Discord voice now joins when you enter the configured voice channel and leaves when you leave,
+  including after hub starts, updates and voice restarts. Silence closes only the paid session
+  while you remain; status and the ops panel distinguish waiting for you, in the call and held.
 
 ## 0.2.5 (2026-11-27)
 

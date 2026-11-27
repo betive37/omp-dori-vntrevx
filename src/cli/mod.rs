@@ -544,7 +544,12 @@ fn voice(hub: &mut Client, p: &Parsed, verb: &str, as_json: bool) -> Result<(), 
     };
     match verb {
         "status" => {
-            out::line(&format!("voice    {}", field("state")));
+            let activity = if v.get("activity").is_some_and(Value::is_string) {
+                "activity"
+            } else {
+                "state"
+            };
+            out::line(&format!("voice    {}", field(activity)));
             if v.get("reason").is_some_and(|r| !r.is_null()) {
                 out::line(&format!("reason   {}", field("reason")));
             }

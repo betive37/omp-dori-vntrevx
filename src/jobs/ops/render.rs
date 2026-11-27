@@ -214,6 +214,7 @@ pub(crate) struct Panel {
     /// `None` when no usage data was read.
     pub(crate) limits: Option<Vec<Limit>>,
     pub(crate) people: People,
+    pub(crate) voice: Option<super::voice::Voice>,
     pub(crate) jobs: usize,
     pub(crate) issues: Vec<Issue>,
     pub(crate) recent: Vec<Recent>,
@@ -552,7 +553,7 @@ pub(crate) fn panel(p: &Panel, lang: Language, version: &str) -> Value {
         t(lang, "마지막 갱신", "Updated")
     );
     let field = |name: &str, value: String, inline: bool| json!({ "name": cut(name, FIELD_NAME_MAX), "value": cut(&value, FIELD_VALUE_MAX), "inline": inline });
-    let fields = vec![
+    let mut fields = vec![
         field(
             t(lang, "🖥️ 서버", "🖥️ Host"),
             host_value(&p.host, lang),
@@ -579,6 +580,13 @@ pub(crate) fn panel(p: &Panel, lang: Language, version: &str) -> Value {
             false,
         ),
     ];
+    if let Some(voice) = &p.voice {
+        fields.push(field(
+            t(lang, "음성", "Voice"),
+            plain(&voice.text(lang)),
+            false,
+        ));
+    }
     let embed = json!({
         "title": t(lang, "Cataly 상황판", "Cataly status"),
         "description": cut(&description, DESCRIPTION_MAX),
@@ -1038,6 +1046,7 @@ pub(crate) mod tests {
                 ],
                 workers: Vec::new(),
             },
+            voice: None,
             jobs: 5,
             issues: Vec::new(),
             recent: vec![Recent {
