@@ -134,6 +134,74 @@ pub(super) async fn tick(t: &mut Tick<'_>, p: &Pressure) -> Result<(), String> {
 /// Load margin, in percentage points, the load must cross back over before a state changes again,
 /// so a load near a threshold cannot flip it every tick.
 pub(crate) const HYSTERESIS: f64 = 10.0;
+
+/// The failing checks that hold the host in alert, kept in the job's memory (`host`/`cause`) and
+/// on the alert's `cause` field as `disk,memory,load`. The job's own sample counts no sessions, so
+/// the session cap never puts the host in alert.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) struct Causes {
+    /// Free disk below `min_free_disk_gb`, or unknown.
+    pub(crate) disk: bool,
+    /// Free memory or container headroom below `min_free_memory`, or unknown.
+    pub(crate) memory: bool,
+    /// Load over `alert_load` (less the margin once over), or unknown.
+    pub(crate) load: bool,
+}
+
+impl Causes {
+    /// The checks `s` fails; `load` is whether the load counts as over.
+    pub(crate) fn of(s: &Sample, p: &Pressure, load: bool) -> Self {
+        let min = f64::from(p.min_free_memory);
+        let headroom = match s.headroom {
+            #[cfg(target_os = "linux")]
+            Headroom::Percent(h) => h < min,
+            Headroom::NoLimit => false,
+            Headroom::Unknown => true,
+        };
+        #[allow(clippy::cast_precision_loss)]
+        let disk_min = p.min_free_disk_gb as f64;
+        Self {
+            disk: s.disk_free_gb.is_none_or(|d| d < disk_min),
+            memory: headroom || s.memory_free_percent.is_none_or(|m| m < min),
+            load,
+        }
+    }
+
+    pub(crate) const fn any(self) -> bool {
+        self.disk || self.memory || self.load
+    }
+
+    pub(crate) const fn and(self, other: Self) -> Self {
+        Self {
+            disk: self.disk && other.disk,
+            memory: self.memory && other.memory,
+            load: self.load && other.load,
+        }
+    }
+
+    pub(crate) fn name(self) -> String {
+        [
+            (self.disk, "disk"),
+            (self.memory, "memory"),
+            (self.load, "load"),
+        ]
+        .iter()
+        .filter(|(on, _)| *on)
+        .map(|(_, n)| *n)
+        .collect::<Vec<_>>()
+        .join(",")
+    }
+
+    pub(crate) fn parse(text: &str) -> Self {
+        let has = |n: &str| text.split(',').any(|c| c.trim() == n);
+        Self {
+            disk: has("disk"),
+            memory: has("memory"),
+            load: has("load"),
+        }
+    }
+}
+
 /// How long the host stays failing a check before the alert is raised.
 pub(crate) const ALERT_AFTER_MS: i64 = 5 * 60_000;
 
@@ -143,31 +211,35 @@ fn evaluate(t: &mut Tick<'_>, p: &Pressure, s: &Sample) {
         .memory
         .get("host", "over_since")
         .and_then(|v| v.parse::<i64>().ok());
+    let was = t.memory.get("host", "cause").map_or_default(Causes::parse);
     let mut reasons = admission(s, p);
     // Once over the alert line, the load must fall a margin below it to count as under.
-    let line = f64::from(p.alert_load)
-        - if over_since.is_some() {
-            HYSTERESIS
-        } else {
-            0.0
-        };
-    match s.load_percent {
+    let line = f64::from(p.alert_load) - if was.load { HYSTERESIS } else { 0.0 };
+    let load = match s.load_percent {
         Some(l) if l > line => {
             reasons.insert(0, format!("load {l:.0}% above {}%", p.alert_load));
+            true
         }
-        Some(_) => {}
-        None => reasons.insert(0, "load unknown".into()),
-    }
-    let since = if reasons.is_empty() {
-        t.memory.clear("host", "over_since");
-        None
-    } else {
+        Some(_) => false,
+        None => {
+            reasons.insert(0, "load unknown".into());
+            true
+        }
+    };
+    let causes = Causes::of(s, p, load);
+    let since = if causes.any() {
         let since = over_since.unwrap_or(t.now);
         t.memory
             .transition("host", "over_since", &since.to_string());
+        t.memory.transition("host", "cause", &causes.name());
         Some(since)
+    } else {
+        t.memory.clear("host", "over_since");
+        t.memory.clear("host", "cause");
+        None
     };
-    // The alert is raised after five minutes over and lasts until the host is under again.
+    // The alert is raised after five minutes over and lasts until the host is under again: the
+    // first tick with every check passing clears it.
     let alert = since.is_some_and(|s| was_alert || t.now - s >= ALERT_AFTER_MS);
     t.memory
         .transition("host", "alert", if alert { "1" } else { "0" });
@@ -175,7 +247,8 @@ fn evaluate(t: &mut Tick<'_>, p: &Pressure, s: &Sample) {
         if alert {
             t.emit(
                 Emit::new(EventKind::PressureAlert, Severity::Warning, true, "host")
-                    .with("reasons", reasons.join("; ")),
+                    .with("reasons", reasons.join("; "))
+                    .with("cause", causes.name()),
             );
         } else {
             t.emit(Emit::new(
@@ -340,5 +413,91 @@ mod tests {
         assert_eq!(at(&mut t, 52, 79.0), [EventKind::PressureReady]);
         let live = sample(Path::new("/")).await;
         assert!(live.load_percent.is_some() && live.disk_free_gb.is_some());
+    }
+
+    /// Disk, memory and load each raise the alert with their own cause, and the panel is green again
+    /// at the job's first tick after the check passes; a load inside the margin keeps it named.
+    #[tokio::test]
+    async fn each_cause_is_named_and_clears_at_the_next_tick() {
+        use crate::config::Language;
+        use crate::jobs::ops::{host_state, render};
+        let (ctx, _stop, _dir) = ctx_with("[jobs.host]\nkind = \"pressure\"\n", "pressure-cause");
+        let job = ctx.config().jobs.get("host").cloned().unwrap();
+        let low_disk = Sample {
+            disk_free_gb: Some(3.0),
+            ..good()
+        };
+        let low_memory = Sample {
+            memory_free_percent: Some(5.0),
+            ..good()
+        };
+        let hot = Sample {
+            load_percent: Some(200.0),
+            ..good()
+        };
+        let warm = Sample {
+            load_percent: Some(145.0),
+            ..good()
+        };
+        let panel = |t: &Tick<'_>, s: &Sample| {
+            let mut p = render::tests::sample();
+            p.limits = Some(Vec::new());
+            p.host.load = s.load_percent;
+            p.host.memory_free = s.memory_free_percent;
+            p.host.disk_free_gb = s.disk_free_gb;
+            p.host.state = host_state(
+                t.memory.get("host", "alert") == Some("1"),
+                t.memory.get("host", "ready") == Some("1"),
+                t.memory.get("host", "cause"),
+                s,
+                &limits(),
+            );
+            render::panel(&p, Language::Korean, "x")["embeds"][0]["description"]
+                .as_str()
+                .unwrap()
+                .lines()
+                .next()
+                .unwrap()
+                .to_string()
+        };
+        for (bad, cause, words) in [
+            (&low_disk, "disk", "디스크 여유 3 GB"),
+            (&low_memory, "memory", "메모리 여유 5%"),
+            (&hot, "load", "서버 부하 200%"),
+        ] {
+            let mut t = Tick {
+                ctx: &ctx,
+                job: &job,
+                dry: false,
+                first: false,
+                memory: Memory::new("host", false, Vec::new()),
+                emits: Vec::new(),
+                now: 0,
+                soft_failure: None,
+            };
+            for minute in 0..=5 {
+                t.now = minute * 60_000;
+                evaluate(&mut t, &limits(), bad);
+            }
+            assert_eq!(t.memory.get("host", "alert"), Some("1"), "{cause}");
+            assert_eq!(t.memory.get("host", "cause"), Some(cause));
+            let raised = &t.emits[0];
+            assert_eq!(raised.kind, EventKind::PressureAlert);
+            assert!(raised.values.contains(&("cause", cause.to_string())));
+            assert_eq!(panel(&t, bad), format!("🔴 확인이 필요해요: {words}"));
+            if cause == "load" {
+                // Inside the margin the load still holds the alert, and the panel says so.
+                t.now = 6 * 60_000;
+                evaluate(&mut t, &limits(), &warm);
+                assert_eq!(t.memory.get("host", "alert"), Some("1"));
+                assert_eq!(panel(&t, &warm), "🔴 확인이 필요해요: 서버 부하 145%");
+            }
+            t.now = 7 * 60_000;
+            evaluate(&mut t, &limits(), &good());
+            assert_eq!(t.memory.get("host", "alert"), Some("0"), "{cause}");
+            assert_eq!(t.memory.get("host", "cause"), None);
+            assert!(t.emits.iter().any(|e| e.kind == EventKind::PressureClear));
+            assert_eq!(panel(&t, &good()), "🟢 모두 정상", "{cause}");
+        }
     }
 }

@@ -685,12 +685,16 @@ minute, like the [board](#coordination-coord). After an uncertain create it is n
 it stays in doubt until the lead names the message it found (board destination
 `ops:<channel id>`).
 Its colour is the worst state: green when all is fine, amber when something is worth a look (host
-busy, a limit of a provider a live session uses at 90 % or more, a job with a failure, the lead in
-error), red when it needs you (host in alert, the lead held by OMP's usage limit or for the owner,
-a job failing twice or waiting for your ack). A spent limit of a provider no live session uses
-does not change the colour. It shows:
+busy or recovering, a limit of a provider a live session uses at 90 % or more, a job with a
+failure, the lead in error), red when it needs you (host in alert, the lead held by OMP's usage
+limit or for the owner, a job failing twice or waiting for your ack). A spent limit of a provider
+no live session uses does not change the colour. Amber and red name every reason after the
+summary, the most serious first (`🔴 확인이 필요해요: 디스크 여유 3 GB · 작업 실패 (github)`,
+`🟡 Worth a look: anthropic limit 100%`). It shows:
 
-- 🖥️ host: load bar and per cent, free memory and disk, live sessions (the lead and the lanes)
+- 🖥️ host: load bar and per cent with the host's state (ready, busy, or in alert for its cause:
+  overloaded, low memory, low disk; recovering once the checks pass again until the pressure
+  job's next tick clears the alert), free memory and disk, live sessions (the lead and the lanes)
   of `max_sessions` (load and memory rounded to 5 %, so noise does not edit the panel);
 - 🔋 usage: one line per provider, by the name OMP reports, with its most used limit, a bar, the
   per cent and the reset time;
@@ -991,8 +995,8 @@ tick. Without a pressure job, session starts use the same rule with the defaults
 | `disk_path` | string | your home folder | absolute path | File system checked for disk space. |
 | `max_sessions` | integer | `20` | 0–1000; `0` = off | Live sessions, the lead's included, at or above this hold lane starts. |
 
-Events: `pressure.alert` (`reasons`), `pressure.clear`, `pressure.ready` (`load`),
-`pressure.busy` (`load`).
+Events: `pressure.alert` (`reasons`, `cause`: the failing checks among `disk`, `memory`, `load`),
+`pressure.clear`, `pressure.ready` (`load`), `pressure.busy` (`load`).
 
 ```toml
 [jobs.host]

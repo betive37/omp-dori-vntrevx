@@ -1,5 +1,15 @@
 # Changelog
 
+## 0.2.7 (Unreleased)
+
+- The ops panel names why it is not green after its summary, the most serious first
+  (`🔴 확인이 필요해요: 디스크 여유 3 GB`, `🟡 Worth a look: anthropic limit 100%`). The host
+  line names the alert's cause ("과부하"/"overloaded" for load only, "메모리 부족"/"low memory",
+  "디스크 부족"/"low disk"), and so do the alert post and its recent line: a low disk at 20 % load
+  showed as "과부하" and "서버 부하가 5분 넘게 높아요". `pressure.alert` carries a `cause` field.
+  A cause that has passed shows as recovering until the pressure job's next tick clears the
+  alert, and the load margin now applies only once the load itself was over the line.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
