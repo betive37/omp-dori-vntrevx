@@ -165,7 +165,13 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 
 30. When the daemon admits an owner message as a request, it adds the eyes reaction (U+1F440) to that
     exact message and records the mark. Failure to react is logged and never causes the message to
-    be admitted again.
+    be admitted again. Once the request's answer is posted (every part of it confirmed, wherever it
+    went, a thread included), the daemon adds the check mark (U+2705) to that same message next to
+    the eyes, after the answer and never holding it or the next answer up. An answer in doubt,
+    abandoned or dropped, a refused or failed post and a hold notice add none; an answer posted
+    later adds it then. The check mark is recorded once added or tried, so it is added once: a
+    failure is logged once per run and never retried, and after a restart a check mark not
+    recorded for an answer posted within the last 30 minutes is added then.
 31. Sessions may add or remove the bot's own reaction with any emoji on a message in an allowed
     channel; emoji are URL-encoded in the reaction route. Adding a reaction to an owner request
     counts as its read mark.

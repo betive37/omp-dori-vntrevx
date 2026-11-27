@@ -124,7 +124,11 @@ Totals: KEEP 36, SIMPLIFY 12, MERGE 3, DROP 11 (62 capabilities).
    position write: stop that platform's intake, show it unhealthy, re-check every 60 s; never poll
    past an unsaved position.
 6. MSG-04 Each admitted new message (not edits) gets one "eyes" reaction, sent in parallel with
-   hand-off. A failure is logged once per platform per run; the message is still delivered.
+   hand-off. Once its answer is posted it also gets a done reaction, as on Discord (DISC-OUT req.
+   30): Slack adds `white_check_mark` next to the eyes; Telegram sets 👌 (U+1F44C), which replaces
+   the eyes, because a bot sets one reaction per message and ✅ is not among the emoji the Bot API
+   lets a bot set (`ReactionTypeEmoji`). A failure is logged once per platform per run; the message
+   is still delivered and the done reaction is not tried again.
 7. MSG-05 A send names platform, account, conversation, optional sub-conversation, text, and
    optionally a reply target, an edit target or a file. Only the daemon performs sends.
 8. MSG-05 Each send ends as exactly one of: confirmed (all created message IDs), rejected (nothing
@@ -230,8 +234,9 @@ Totals: KEEP 36, SIMPLIFY 12, MERGE 3, DROP 11 (62 capabilities).
     and under Slack's upload path, else refuse before sending bytes. Send bytes without following
     redirects; require 200. Complete into the channel (optional thread, title defaults to the
     name); the completion must list the same file ID, else uncertain.
-48. SLACK-12 Admitted new messages get the "eyes" reaction when the app has the reactions scope;
-    without it receipts are skipped and status says so once.
+48. SLACK-12 Admitted new messages get the "eyes" reaction, and `white_check_mark` once their answer
+    is posted, when the app has the reactions scope; without it receipts are skipped and status
+    says so once.
 
 ### Voice (VOICE)
 

@@ -17,7 +17,8 @@
 //! - Posts (SLACK req. 45-47): a post answers in the request's thread and records that thread; the
 //!   answer must carry the channel and a `digits.digits` timestamp, else it is uncertain. Uploads
 //!   allocate a ticket whose URL must be https on exactly `files.slack.com` under Slack's upload path
-//!   before any byte is sent. The seen mark is the `eyes` reaction (SLACK req. 48).
+//!   before any byte is sent. The seen mark is the `eyes` reaction, the done mark once the answer is
+//!   posted `white_check_mark` (SLACK req. 48).
 
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -649,6 +650,35 @@ pub(crate) struct SlackRelay {
     receipts: AtomicBool,
 }
 
+impl SlackRelay {
+    /// Adds the reaction `name` to an admitted message when the app has the reactions scope
+    /// (SLACK req. 48); one already there counts as added.
+    async fn react(&self, room: &str, message: &str, name: &str) -> Result<(), String> {
+        if !self.receipts.load(Ordering::Acquire) {
+            return Ok(());
+        }
+        let (channel, _) = room_of(room).ok_or("bad room")?;
+        let body = json!({"channel": channel, "timestamp": message, "name": name});
+        match self
+            .api
+            .call("reactions.add", &body, Kind::Idempotent, false)
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(e) if e.why == "already_reacted" => Ok(()),
+            Err(e) if e.why == "missing_scope" || e.why == "not_allowed_token_type" => {
+                self.receipts.store(false, Ordering::Release);
+                self.shared.set(|h| {
+                    h.last_error = Some("seen marks skipped: the app lacks reactions:write".into());
+                });
+                log::warn("Slack seen marks skipped: no reactions scope", &[]);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string()),
+        }
+    }
+}
+
 impl Relay for SlackRelay {
     const NAME: &'static str = NAME;
     const REPEATABLE: bool = false;
@@ -726,28 +756,11 @@ impl Relay for SlackRelay {
     }
 
     async fn seen(&self, room: &str, message: &str) -> Result<(), String> {
-        if !self.receipts.load(Ordering::Acquire) {
-            return Ok(());
-        }
-        let (channel, _) = room_of(room).ok_or("bad room")?;
-        let body = json!({"channel": channel, "timestamp": message, "name": "eyes"});
-        match self
-            .api
-            .call("reactions.add", &body, Kind::Idempotent, false)
-            .await
-        {
-            Ok(_) => Ok(()),
-            Err(e) if e.why == "already_reacted" => Ok(()),
-            Err(e) if e.why == "missing_scope" || e.why == "not_allowed_token_type" => {
-                self.receipts.store(false, Ordering::Release);
-                self.shared.set(|h| {
-                    h.last_error = Some("seen marks skipped: the app lacks reactions:write".into());
-                });
-                log::warn("Slack seen marks skipped: no reactions scope", &[]);
-                Ok(())
-            }
-            Err(e) => Err(e.to_string()),
-        }
+        self.react(room, message, "eyes").await
+    }
+
+    async fn done(&self, room: &str, message: &str) -> Result<(), String> {
+        self.react(room, message, "white_check_mark").await
     }
 
     fn typing(&self, _room: &str) -> impl Future<Output = Result<(), String>> + Send {

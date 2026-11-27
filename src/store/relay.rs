@@ -16,6 +16,14 @@ const KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
 const OWED_KEEP: i64 = 200;
 /// Owed replies older than this are no longer reported (DISC-OUT req. 34).
 pub(crate) const OWED_WINDOW_MS: i64 = 30 * 60 * 1000;
+/// A request's done mark is recorded as a read mark under the request's message with this suffix,
+/// which no platform's message ID carries (MSG-04).
+const DONE_MARK: &str = ":done";
+
+/// The read-mark key of the done mark of the request `message`.
+pub(crate) fn done_mark(message: &str) -> String {
+    format!("{message}{DONE_MARK}")
+}
 
 /// A room's read position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -979,6 +987,21 @@ impl Reads {
             params![relay, room, message],
             |r| r.get(0),
         )
+    }
+
+    /// Hand-offs whose answer was posted since `since_ms` and whose done mark is not recorded.
+    pub(crate) fn done_owed(
+        &self,
+        relay: &str,
+        since_ms: i64,
+    ) -> rusqlite::Result<Vec<HandoffRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT {HANDOFF_COLUMNS} FROM handoffs h WHERE relay = ?1 AND answer = 'posted' \
+             AND updated_ms >= ?2 AND NOT EXISTS (SELECT 1 FROM read_marks m WHERE m.relay = h.relay \
+             AND m.room = h.room AND m.message = h.message || ?3) ORDER BY created_ms, seq"
+        ))?;
+        stmt.query_map(params![relay, since_ms, DONE_MARK], handoff_from_row)?
+            .collect()
     }
 
     /// Owed replies admitted since `since_ms`, newest first.
