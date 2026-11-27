@@ -318,7 +318,17 @@ fn candidates(exe: &Path) -> BTreeSet<String> {
             }
         }
     }
-    out.extend(ENV.iter().map(|b| b.name.to_owned()));
+    for binding in ENV {
+        assert!(
+            out.contains(binding.name),
+            "installed OMP does not expose the known binding {} as a literal",
+            binding.name
+        );
+    }
+    assert!(
+        out.contains("PI_EDIT_VARIANT"),
+        "installed OMP lacks the independent documented environment-binding witness"
+    );
     out
 }
 
@@ -349,10 +359,14 @@ fn overridden_by(
         "config set {id} under {probe}: {out:?}"
     );
     let report: Value = serde_json::from_slice(&out.stdout).unwrap();
-    report["overriddenBy"]
-        .as_str()
-        .filter(|s| !matches!(*s, "project" | "overlay" | "runtime"))
-        .map(str::to_owned)
+    let provenance = report
+        .get("overriddenBy")
+        .expect("stock config set must report override provenance");
+    assert!(
+        provenance.is_null() || provenance.as_str().is_some_and(|name| names.contains(name)),
+        "config set {id} under {probe} has an unclassified override: {provenance}"
+    );
+    provenance.as_str().map(str::to_owned)
 }
 
 /// The (setting, variable) pairs the table lacks or names wrongly.
