@@ -2,7 +2,6 @@
 //! Only an exact-identity timeout with proven exit may retry; every attempt rechecks the lease.
 
 use std::sync::Arc;
-use std::time::Duration;
 
 use tokio::sync::watch;
 
@@ -11,7 +10,6 @@ use super::record::Record;
 use crate::host::startup::{self, Cleanup, Recovery, StartupOutcome, StartupStage};
 use crate::host::{Control, Runtime, StartError, StartSpec, Started};
 use crate::store::lanes::Revision;
-use crate::sys::now_ms;
 
 pub(super) struct Launch<'a> {
     pub(super) record: &'a mut Record,
@@ -138,23 +136,18 @@ impl<R: Runtime> Lanes<R> {
             return Err(cancelled());
         }
         if let (Some(recovery), Some(id)) = (recovery, &launch.spec.expected_id) {
-            let episode = recovery
-                .begin(id, false)
-                .await
-                .map_err(|detail| rejected(detail, Cleanup::Unknown))?;
-            if let Some(next) = episode.next_ms {
-                let delay = Duration::from_millis(
-                    u64::try_from(next.saturating_sub(now_ms())).unwrap_or(0),
-                );
-                tokio::select! {
-                    () = startup::cancelled(cancel) => return Err(cancelled()),
-                    () = tokio::time::sleep(delay) => {}
+            recovery.admit(id, cancel.clone()).await.map_err(|detail| {
+                if *cancel.borrow() {
+                    cancelled()
+                } else {
+                    rejected(detail, Cleanup::Unknown)
                 }
-                recovery
-                    .begin(id, false)
-                    .await
-                    .map_err(|detail| rejected(detail, Cleanup::Unknown))?;
-            }
+            })?;
+            let episode = recovery
+                .read()
+                .await
+                .map_err(|detail| rejected(detail, Cleanup::Unknown))?
+                .ok_or_else(|| rejected("recovery episode disappeared".into(), Cleanup::Unknown))?;
             let prior = previous_exit(&self.env.state_dir, launch.record)
                 .await
                 .map_err(|detail| rejected(detail, Cleanup::Unknown))?;
@@ -174,6 +167,7 @@ impl<R: Runtime> Lanes<R> {
                 "starting existing session; attempt {}",
                 episode.retries.saturating_add(1)
             ));
+            launch.record.lost = None;
         }
         if *cancel.borrow() {
             return Err(cancelled());
@@ -196,19 +190,18 @@ impl<R: Runtime> Lanes<R> {
         launch: &Launch<'_>,
         cancel: watch::Receiver<bool>,
     ) -> Result<(Arc<R::Session>, Started), StartError> {
-        let started = runtime.start_supervised(launch.spec.clone(), cancel);
-        tokio::pin!(started);
-        tokio::select! {
-            result = &mut started => result,
-            () = tokio::time::sleep(startup::STARTUP_NOTICE) => {
-                let detail = match &launch.spec.expected_id {
-                    Some(id) => format!("still starting existing session {id}; conversation and work retained"),
-                    None => "still starting the new lane session".into(),
-                };
-                self.alert(&launch.record.key, "session starting", &detail, true);
-                started.await
-            }
-        }
+        // One allocation per process attempt keeps its large I/O future out of every lane RPC frame.
+        let started = Box::pin(runtime.start_supervised(launch.spec.clone(), cancel));
+        startup::with_notice(started, || {
+            let detail = match &launch.spec.expected_id {
+                Some(id) => {
+                    format!("still starting existing session {id}; conversation and work retained")
+                }
+                None => "still starting the new lane session".into(),
+            };
+            self.alert(&launch.record.key, "session starting", &detail, true);
+        })
+        .await
     }
 }
 
@@ -227,17 +220,13 @@ async fn previous_exit(state: &std::path::Path, rec: &Record) -> Result<Cleanup,
 }
 
 pub(super) async fn stop<S: Control>(session: &S) -> Stopped {
-    match tokio::time::timeout(crate::host::lead::STOP_BUDGET, session.close(true)).await {
-        Ok(Ok(stopped)) => Stopped {
+    match session.close(true).await {
+        Ok(stopped) => Stopped {
             detail: format!("{}: {:?}", stopped.how, stopped.detail),
             cleanup: stopped.cleanup,
         },
-        Ok(Err(detail)) => Stopped {
+        Err(detail) => Stopped {
             detail,
-            cleanup: Cleanup::Unknown,
-        },
-        Err(_) => Stopped {
-            detail: "stop deadline passed; process exit is unconfirmed".into(),
             cleanup: Cleanup::Unknown,
         },
     }
