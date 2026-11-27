@@ -222,7 +222,11 @@ in their own areas; this spec only states what lifecycle needs from them.
 46. Hold and continue are refused while a close is in progress.
 47. A held lane that starts a turn (a queued message, a background result) stays held. The daemon tells the lead once
     per active stretch; the next stretch after it went idle is reported again. Nothing ever continues a held lane
-    except an explicit continue or reopen.
+    except an explicit continue or reopen. A lane may pause its own goal while it waits for an answer; that is no
+    hold, since every pause the daemon makes is recorded as one (44). Before a message from the owner or the lead
+    (not a daemon notice or reminder) is delivered to a running, rejected or claimed lane whose goal is paused,
+    the daemon resumes the goal, so the answer arrives. A goal blocked by its budget is never resumed this way.
+    While a paused or blocked goal still keeps such messages out, the lead is told once, with that reason.
 
 ### Long-term suspension and giving up (LANE-19)
 

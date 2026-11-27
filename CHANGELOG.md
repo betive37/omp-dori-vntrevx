@@ -72,6 +72,14 @@
   them; current and uncertain attempts are never discarded merely because they are old.
 - Automatic update switch-back refuses an old reader after the new hub migrated the store beyond
   its support, leaving the new version selected with an owner-attention explanation.
+- Your answer in a lane's thread now reaches a lane that paused its own goal while waiting for
+  you. A paused goal takes no messages, so such a lane never got the answer: every delivery was
+  set aside as `not ready: Idle`, and only `lane.pause` then `lane.resume` freed it. Now a message
+  from you or the lead resumes the goal of a lane that paused it itself, then is delivered. A lane
+  the lead or you held (`lane.pause`) stays held, and hub reminders resume nothing.
+- A delivery set aside now records the check that refused it (`not ready: the goal is paused`)
+  instead of only the session status. While a paused or budget-blocked goal still keeps your or
+  the lead's messages out, the lead gets one `messages undelivered` alert naming the reason.
 
 ## 0.2.6 (2026-11-27)
 

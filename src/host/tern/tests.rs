@@ -213,7 +213,10 @@ async fn deliveries_go_through_the_bridge_and_not_current_keeps_them_pending() {
     let out = session
         .deliver(delivery("[cataly:busy0001] later", false))
         .await;
-    assert_eq!(out, DeliverOutcome::NotReady(Status::Idle));
+    assert_eq!(
+        out,
+        DeliverOutcome::NotReady(Status::Idle, "not current".into())
+    );
     // Steering needs a running turn; another session is never written.
     assert!(matches!(
         session.deliver(delivery("x", true)).await,
@@ -223,7 +226,7 @@ async fn deliveries_go_through_the_bridge_and_not_current_keeps_them_pending() {
     other.expected_session = "s9".into();
     assert!(matches!(
         session.deliver(other).await,
-        DeliverOutcome::NotReady(_)
+        DeliverOutcome::NotReady(..)
     ));
     // A turn starts and the session is working: a steer goes as a steer.
     session.port.event(&json!({ "kind": "agent_start" }));
@@ -363,7 +366,7 @@ async fn a_silent_link_is_lost_after_45_s_and_the_same_process_restores_it() {
     assert_eq!(session.snapshot().status, Status::Unknown);
     assert!(matches!(
         session.deliver(delivery("x", false)).await,
-        DeliverOutcome::NotReady(Status::Unknown)
+        DeliverOutcome::NotReady(Status::Unknown, _)
     ));
     tokio::time::sleep(Duration::from_millis(400)).await;
     let (_, lost) = events.recv().await.unwrap();
@@ -397,6 +400,6 @@ async fn a_user_switch_moves_the_current_session_and_deliveries_follow_it() {
     // A delivery recorded for s1 is not written into s2 (PATCH-01 rule 2).
     assert!(matches!(
         session.deliver(delivery("[cataly:aa] x", false)).await,
-        DeliverOutcome::NotReady(_)
+        DeliverOutcome::NotReady(..)
     ));
 }

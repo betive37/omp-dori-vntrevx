@@ -1025,15 +1025,25 @@ impl Control for Session {
 
     async fn deliver(&self, d: Delivery) -> DeliverOutcome {
         let snapshot = self.snapshot();
-        let Ok(_busy) = self.begin() else {
-            return DeliverOutcome::NotReady(snapshot.status);
+        let _busy = match self.begin() {
+            Ok(busy) => busy,
+            Err(why) => return DeliverOutcome::NotReady(snapshot.status, why),
         };
         let status = snapshot.status;
-        if snapshot.input_blocked
-            || snapshot.session_id.as_deref() != Some(d.expected_session.as_str())
-            || d.text.trim().is_empty()
-        {
-            return DeliverOutcome::NotReady(status);
+        let why = if snapshot.input_blocked {
+            Some("input is blocked".to_string())
+        } else if snapshot.session_id.as_deref() != Some(d.expected_session.as_str()) {
+            Some(format!(
+                "the session is not the expected {}",
+                d.expected_session
+            ))
+        } else if d.text.trim().is_empty() {
+            Some("the text is blank".into())
+        } else {
+            None
+        };
+        if let Some(why) = why {
+            return DeliverOutcome::NotReady(status, why);
         }
         if d.text.len() > TEXT_MAX {
             return DeliverOutcome::Refused("text over 256 KiB".into());
@@ -1044,7 +1054,7 @@ impl Control for Session {
             Timing::Any => matches!(status, Status::Idle | Status::Working),
         };
         if !timing_ok {
-            return DeliverOutcome::NotReady(status);
+            return DeliverOutcome::wrong_timing(status);
         }
         let idle = status == Status::Idle;
         if d.steer && idle {
@@ -1067,7 +1077,7 @@ impl Control for Session {
         let outcome = match self.port.command("deliver", fields).await {
             Ok(reply) => match Self::refused(&reply) {
                 // The user is switching or another session is current: kept pending (PATCH-01 rule 7).
-                Some(r) if r == "not current" => DeliverOutcome::NotReady(status),
+                Some(r) if r == "not current" => DeliverOutcome::NotReady(status, r),
                 Some(r) => DeliverOutcome::Refused(r),
                 None => DeliverOutcome::Delivered {
                     turn_started,

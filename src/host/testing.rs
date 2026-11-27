@@ -35,6 +35,8 @@ pub(crate) struct FakeState {
     pub(crate) answer_prompts: bool,
     /// Append the prompt's user entry to the session file.
     pub(crate) write_entries: bool,
+    /// The goal status `get_state` reports (`active`, `paused`, ...); `None` is no goal.
+    pub(crate) goal: Option<&'static str>,
 }
 
 pub(crate) struct Fake {
@@ -76,6 +78,7 @@ impl Fake {
             extra_usage: false,
             answer_prompts: true,
             write_entries: true,
+            goal: None,
         });
         fake.dir = Some(dir);
         fake
@@ -224,7 +227,8 @@ fn answer(command: &Value, state: &Arc<Mutex<FakeState>>) -> Vec<Value> {
             let mut data = json!({
                 "sessionId": st.session_id, "sessionFile": st.file.display().to_string(),
                 "isStreaming": st.streaming, "isCompacting": false, "queuedMessageCount": 0,
-                "isSettled": !st.streaming, "goal": null,
+                "isSettled": !st.streaming,
+                "goal": st.goal.map(|g| json!({"goal": {"status": g, "objective": "o"}})),
                 "model": {"provider": st.model.0, "id": st.model.1},
             });
             if st.extra_usage {

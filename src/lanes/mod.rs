@@ -42,7 +42,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
 
 use crate::config::Config;
-use crate::host::inbox::{HUB_SENDER, Mailbox, Message, Note, ReceiptState};
+use crate::host::inbox::{HUB_SENDER, LEAD, Mailbox, Message, Note, ReceiptState};
 use crate::host::lead::{Events, Factory};
 use crate::host::{Control, Runtime, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
@@ -337,9 +337,11 @@ impl<R: Runtime> Lanes<R> {
         }
     }
 
-    /// Flushes the lane's inbox and acts on what it found ([`Lanes::noted`]). `locked`: the
-    /// caller holds the lane's turn.
+    /// Flushes the lane's inbox and acts on what it found ([`Lanes::noted`]); a goal the lane
+    /// paused itself is resumed first when the owner's or the lead's message waits
+    /// ([`Lanes::resume_for_answer`]). `locked`: the caller holds the lane's turn.
     async fn flush_inbox(&self, key: &str, session: &R::Session, locked: bool) {
+        self.resume_for_answer(key, session, false, locked).await;
         let notes = self
             .mailbox(key)
             .flush(Some(session), false)
@@ -1363,13 +1365,18 @@ impl<R: Runtime> Lanes<R> {
         let mailbox = self.mailbox(key);
         let session = self.session(key);
         let message = Message {
-            sender: "lead".into(),
+            sender: LEAD.into(),
             text,
             urgent,
             owner: false,
             identity,
             request_id: None,
         };
+        if let Some(s) = &session
+            && life::is_answer(LEAD, urgent, false, message.identity.as_deref())
+        {
+            self.resume_for_answer(key, s, true, locked).await;
+        }
         match mailbox.deliver(&message, session.as_deref(), false).await {
             Ok((_, _, notes)) => self.noted(key, notes, locked).await,
             Err(e) => log::warn("lane notice not stored", &[("lane", &key), ("error", &e)]),
@@ -1441,6 +1448,7 @@ impl<R: Runtime> Lanes<R> {
                 .await;
             return Ok(format!("{out:?}"));
         }
+        self.resume_for_answer(key, &session, true, true).await;
         let (receipt, _, notes) = mailbox.deliver(&message, Some(&*session), false).await?;
         drop(turn);
         self.noted(key, notes, false).await;
@@ -1657,6 +1665,16 @@ impl<R: Runtime> Lanes<R> {
             .is_some_and(|s| s.snapshot().session_id != rec.session_id)
         {
             return Err("the lane's session identity cannot be verified".into());
+        }
+        if let Some(s) = &session
+            && life::is_answer(
+                &message.sender,
+                message.urgent,
+                message.owner,
+                message.identity.as_deref(),
+            )
+        {
+            self.resume_for_answer(key, s, true, false).await;
         }
         let mailbox = self.mailbox(key);
         let (receipt, _, notes) = mailbox.deliver(&message, session.as_deref(), false).await?;

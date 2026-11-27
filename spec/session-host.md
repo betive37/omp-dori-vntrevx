@@ -194,14 +194,16 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
     (default), only while working, or either.
 50. Checks, in this order, against a fresh readback: bound identity matches the expected id; not faulted, stopping
     or held; no pending dialog; goal not paused or blocked; text not blank; text at most 256 KiB; the timing rule
-    matches the current status. A failed check returns "not ready" with the current status and changes nothing.
+    matches the current status. A failed check returns "not ready" with the current status and the check that
+    failed (for example "the goal is paused" while the status reads idle), and changes nothing.
 51. Wake: if the session is idle the daemon sends prompt (with follow-up as the streaming behaviour, so a turn that
     starts in between queues the text instead of failing). This starts a turn. If working, it sends follow_up,
     which OMP runs after the current turn.
 52. A steer delivery (explicitly requested) sends steer and requires a running turn; with none it is refused.
 53. Text whose first non-space character is "/" is sent with a short fixed first line marking it as a message, so
     OMP does not run it as a command. Cataly never passes OMP commands through delivery.
-54. Results: delivered (and whether a new turn was started), not ready (status), refused (reason), or ambiguous.
+54. Results: delivered (and whether a new turn was started), not ready (status and failed check), refused (reason),
+    or ambiguous.
 55. Latency target: one readback plus one command round trip; no sleep or poll in the path. The daemon records the
     time from accepting a delivery to the next agent_start event and exposes it for measurement.
 

@@ -577,6 +577,98 @@ fn pause_resume_and_a_held_lane_that_turns() {
     hub.stop();
 }
 
+/// A lane that paused its own goal to wait for an answer is not held: the owner's thread message
+/// and the lead's message each resume the goal and are delivered (LANE req. 47). A goal blocked by
+/// its budget keeps them out, and the lead hears the real reason.
+#[test]
+fn a_lane_waiting_with_its_own_paused_goal_gets_the_answer() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("[lanes.oversight]\nsweep = \"1s\"\n");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    fake.thread(THREAD, CH);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!("{config}{}", fake.config(&token, OWNER, &[CH])));
+    start(&mut hub);
+    open(
+        &hub,
+        "w-1",
+        &json!({ "thread": format!("discord:{THREAD}"), "cwd": work }),
+    );
+    let rec = record(&hub, "w-1");
+    let id = rec["session_id"].as_str().unwrap();
+    let session_file = || std::fs::read_to_string(rec["session_file"].as_str().unwrap()).unwrap();
+    hub.until(WAIT, || {
+        (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
+    });
+    // The lane sets its goal to `status` in a turn of its own, as OMP's goal tool does while the
+    // lane waits on the owner.
+    let set_goal_in_a_turn = |status: &str| {
+        let before = session_file().matches("background result read").count();
+        std::fs::write(data(&hub).join(format!("goal-{id}")), status).unwrap();
+        std::fs::write(data(&hub).join(format!("background-{id}")), "").unwrap();
+        hub.until(WAIT, || {
+            (session_file().matches("background result read").count() > before).then_some(())
+        });
+    };
+    set_goal_in_a_turn("paused");
+    fake.say(FakeDiscord::message(
+        THREAD,
+        700_000_000_000_000_001,
+        OWNER,
+        "A, the first design",
+    ));
+    hub.until(WAIT, || {
+        session_file().contains("A, the first design").then_some(())
+    });
+    assert_eq!(goal(&hub, &rec["session_id"]), "active");
+    assert_eq!(record(&hub, "w-1")["state"], "running");
+    let resumed = || {
+        events_of(&hub, "lane.alert")
+            .into_iter()
+            .filter(|e| e["text"].as_str().unwrap().contains("goal resumed"))
+            .count()
+    };
+    assert_eq!(resumed(), 1);
+    // The lead's message does the same.
+    set_goal_in_a_turn("paused");
+    lane(
+        &hub,
+        "send",
+        &json!({ "key": "w-1", "text": "the owner picked A" }),
+    )
+    .unwrap();
+    hub.until(WAIT, || {
+        session_file().contains("the owner picked A").then_some(())
+    });
+    assert_eq!(goal(&hub, &rec["session_id"]), "active");
+    assert_eq!(resumed(), 2);
+    // A goal blocked by its budget is not the lane's to lift: the message waits and the lead
+    // hears why.
+    set_goal_in_a_turn("budget-limited");
+    fake.say(FakeDiscord::message(
+        THREAD,
+        700_000_000_000_000_002,
+        OWNER,
+        "any news?",
+    ));
+    let alert = hub.until(WAIT, || {
+        events_of(&hub, "lane.alert")
+            .into_iter()
+            .find(|e| e["text"].as_str().unwrap().contains("messages undelivered"))
+    });
+    assert!(
+        alert["text"]
+            .as_str()
+            .unwrap()
+            .contains("the goal is blocked by its budget"),
+        "{alert}"
+    );
+    assert!(!session_file().contains("any news?"));
+    assert_eq!(resumed(), 2);
+    hub.stop();
+}
+
 /// Check 6: park, then reopen on the exact file with a new run ID; a header naming another session
 /// refuses the reopen.
 #[test]

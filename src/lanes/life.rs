@@ -10,9 +10,11 @@ use std::time::{Duration, Instant};
 use super::record::{Claim, Intent, Record, State, Watch};
 use super::{Lanes, git};
 use crate::host::dialogs::GoalStatus;
+use crate::host::inbox::LEAD;
 use crate::host::{Control, Runtime, SessionEvent, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
+use crate::store::host::InboxRow;
 use crate::store::lanes::Revision;
 use crate::sys::now_ms;
 
@@ -67,6 +69,17 @@ pub(super) async fn goal_to<S: Control>(
     } else {
         Err(format!("the goal reads back {:?}", goal.status).to_lowercase())
     }
+}
+
+/// Whether a message is one a waiting lane waits for: the owner's, or the lead's own (`lane.send`,
+/// an objection). Hub notices and reminders carry an identity and resume nothing (OPC-34).
+pub(super) fn is_answer(sender: &str, urgent: bool, owner: bool, identity: Option<&str>) -> bool {
+    owner || (urgent && sender == LEAD && identity.is_none())
+}
+
+/// A pending inbox row that [`is_answer`].
+pub(super) fn answers(row: &InboxRow) -> bool {
+    row.state == "pending" && is_answer(&row.sender, row.urgent, row.owner, row.identity.as_deref())
 }
 
 /// A tern hold (LANE req. 44 in a terminal session). OMP refuses a goal change while a turn runs
@@ -209,6 +222,73 @@ impl<R: Runtime> Lanes<R> {
         self.status_word(&rec).await;
         self.nudge.notify_one();
         Ok("continued".into())
+    }
+
+    /// A lane may pause its own goal while it waits for an answer (OMP's goal tool offers that when
+    /// blocked on the user), and a paused goal takes no delivery (HOST req. 50). Every pause the
+    /// hub makes is a hold and recorded as one (LANE req. 44), so a paused goal on a lane that is
+    /// not held is the lane's own: before the owner's or the lead's message is delivered, it is
+    /// resumed (LANE req. 47). `incoming`: such a message is being delivered now; otherwise one
+    /// must wait in the inbox. `locked`: the caller holds the lane's turn.
+    pub(super) async fn resume_for_answer(
+        &self,
+        key: &str,
+        session: &R::Session,
+        incoming: bool,
+        locked: bool,
+    ) {
+        let paused = || {
+            session
+                .snapshot()
+                .goal
+                .as_ref()
+                .is_some_and(|g| g.status == GoalStatus::Paused)
+        };
+        if !paused()
+            || (!incoming
+                && !self
+                    .mailbox(key)
+                    .list()
+                    .await
+                    .is_ok_and(|rows| rows.iter().any(|(_, row)| answers(row))))
+        {
+            return;
+        }
+        // The turn keeps a hold from landing between the state read and the resume.
+        let _turn = if locked {
+            None
+        } else {
+            match self.turn(key).await {
+                Ok(turn) => Some(turn),
+                Err(_) => return,
+            }
+        };
+        let Ok((rec, _)) = self.load(key).await else {
+            return;
+        };
+        if !matches!(rec.state, State::Running | State::Rejected | State::Claimed)
+            || rec.intent.is_some()
+            || !paused()
+        {
+            return;
+        }
+        match goal_to(session, "resume", &GOING).await {
+            Ok(_) => {
+                self.alert(
+                    key,
+                    "goal resumed",
+                    "the lane had paused its own goal to wait; a message from the owner or the \
+                     lead resumed it and is delivered",
+                    false,
+                );
+            }
+            Err(e) => {
+                log::warn(
+                    "the lane's own paused goal was not resumed",
+                    &[("lane", &key), ("error", &e)],
+                );
+            }
+        }
     }
 
     /// Park or abandon (LANE req. 48-52).
