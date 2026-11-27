@@ -18,7 +18,7 @@ use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::relay::intake::Health;
 use crate::relay::text::DISCORD_LIMIT;
-use crate::store::lead::{LeadDone, LeadWrite, QuestionRow};
+use crate::store::lead::{LeadDone, LeadWrite, QuestionRow, UNTOLD_PAGE};
 
 /// The question as posted: its ID, text, numbered options with the recommended one marked, and how
 /// to answer it.
@@ -82,6 +82,24 @@ const UNTOLD_WINDOW_MS: i64 = 24 * 3_600_000;
 
 /// Told privately when a press was acknowledged but could not be recorded.
 const NOT_RECORDED: &str = "Your answer could not be recorded. Press the button again.";
+/// Told privately when a press was acknowledged but the question was settled a moment earlier.
+const ALREADY: &str = "This question was already answered.";
+
+/// How a press's answer starts in the ledger, before the interaction ID; a reply's starts with
+/// "owner message".
+const PRESS: &str = "owner press ";
+
+/// The ledger outcome of press `interaction` choosing option `n` (from 1).
+fn press_outcome(interaction: &str, q: &QuestionRow, n: usize) -> String {
+    format!("{PRESS}{interaction}: {}", picked(q, n))
+}
+
+/// The option a press's recorded outcome names, read back with the same words it was written
+/// with ([`press_outcome`]); `None` when it names none of the question's options.
+fn pressed_option(q: &QuestionRow, outcome: &str) -> Option<usize> {
+    let (_, choice) = outcome.strip_prefix(PRESS)?.split_once(": ")?;
+    (1..=q.options.len()).find(|n| picked(q, *n) == choice)
+}
 
 fn excerpt(text: &str) -> String {
     if text.chars().count() <= EXCERPT_MAX {
@@ -174,63 +192,87 @@ impl<T: Runtime> Intake<T> {
             log::info("press not acknowledged", &[("error", &e)]);
             return true;
         }
-        let picked = picked(&q, n + 1);
         let write = LeadWrite::QuestionSettle {
             id: q.id.clone(),
             state: "answered".into(),
-            outcome: format!("owner press {}: {picked}", press.id),
+            outcome: press_outcome(&press.id, &q, n + 1),
         };
-        match self.store.lead(write).await {
-            Ok(LeadDone::Done) => {}
-            // Settled a moment earlier by a reply or the lead, which closed it.
-            Ok(_) => return true,
+        let unsettled = match self.store.lead(write).await {
+            Ok(LeadDone::Done) => None,
+            // Settled a moment earlier by another press, a reply or the lead, which closed it.
+            Ok(_) => Some(ALREADY),
             Err(e) => {
                 log::warn("question answer not recorded", &[("error", &e)]);
-                // Acknowledged but not recorded: the owner hears so privately and may press again.
-                let note = json!({ "content": NOT_RECORDED, "flags": 64 });
-                if let Err(e) = self
-                    .rest
-                    .follow_up(self.application, &press.token, note)
-                    .await
-                {
-                    log::info("unrecorded press not reported", &[("error", &e)]);
-                }
-                return true;
+                // Acknowledged but not recorded: the owner may press again.
+                Some(NOT_RECORDED)
             }
+        };
+        if let Some(text) = unsettled {
+            // The acknowledgement showed nothing; the owner hears privately why nothing changed.
+            let note = json!({ "content": text, "flags": 64 });
+            if let Err(e) = self
+                .rest
+                .follow_up(self.application, &press.token, note)
+                .await
+            {
+                log::info("unsettled press not reported", &[("error", &e)]);
+            }
+            return true;
         }
-        self.tell_pressed(&q, n + 1);
+        self.tell_pressed(&q, picked(&q, n + 1), &shown(&q, n + 1));
         true
     }
 
-    /// Tells the lead that the owner's press chose option `n` (from 1) and closes the question.
-    fn tell_pressed(&self, q: &QuestionRow, n: usize) {
+    /// Tells the lead what the owner's press chose (`outcome`) and closes the question with the
+    /// choice as its message lists it (`shown`; empty when unknown).
+    fn tell_pressed(&self, q: &QuestionRow, outcome: String, shown: &str) {
         (self.events)(
             Emit::new(EventKind::QuestionAnswered, Severity::Info, true, &q.id)
                 .with("question", &q.id)
-                .with("outcome", picked(q, n))
+                .with("outcome", outcome)
                 .with("text", excerpt(&q.text)),
         );
-        let status = format!("Answered by the owner: {}", shown(q, n));
+        let status = if shown.is_empty() {
+            "Answered by the owner.".to_string()
+        } else {
+            format!("Answered by the owner: {shown}")
+        };
         close(Arc::clone(&self.rest), q, &status);
     }
 
-    /// At start: a press recorded in the last day whose event is missing (the hub stopped between
-    /// the two writes) is told to the lead now, and its question closed.
+    /// At start: every press recorded in the last day whose event is missing (the hub stopped
+    /// between the two writes) is told to the lead now, and its question closed. A recorded
+    /// outcome that names none of the options is passed on as it was recorded.
     pub(in super::super) async fn tell_untold_presses(&self) {
         let since = crate::sys::now_ms() - UNTOLD_WINDOW_MS;
-        let untold = match self.store.read(move |r| r.pressed_untold(since)).await {
-            Ok(rows) => rows,
-            Err(e) => return log::warn("untold presses not read", &[("error", &e)]),
-        };
-        for q in untold {
-            let n = q
-                .outcome
-                .as_deref()
-                .and_then(|o| o.split_once(": option "))
-                .and_then(|(_, rest)| rest.split_once(' '))
-                .and_then(|(n, _)| n.parse::<usize>().ok());
-            if let Some(n) = n {
-                self.tell_pressed(&q, n);
+        let mut after = String::new();
+        loop {
+            let from = after.clone();
+            let page = match self
+                .store
+                .read(move |r| r.pressed_untold(since, PRESS, &from))
+                .await
+            {
+                Ok(rows) => rows,
+                Err(e) => return log::warn("untold presses not read", &[("error", &e)]),
+            };
+            let Some(last) = page.last() else {
+                return;
+            };
+            after.clone_from(&last.id);
+            let full = page.len() == UNTOLD_PAGE;
+            for q in page {
+                let outcome = q.outcome.clone().unwrap_or_default();
+                match pressed_option(&q, &outcome) {
+                    Some(n) => self.tell_pressed(&q, picked(&q, n), &shown(&q, n)),
+                    None => {
+                        let raw = outcome.strip_prefix(PRESS).unwrap_or(&outcome).to_string();
+                        self.tell_pressed(&q, raw, "");
+                    }
+                }
+            }
+            if !full {
+                return;
             }
         }
     }
@@ -276,6 +318,33 @@ mod tests {
         );
         assert!(!escaped.contains("\\…"), "{escaped}");
         assert_eq!(excerpt(&"q".repeat(900)).chars().count(), EXCERPT_MAX);
+    }
+
+    #[test]
+    fn a_press_outcome_reads_back_as_its_option() {
+        let q = QuestionRow {
+            id: "0a1b2c3d".into(),
+            text: "Which?".into(),
+            source: "discord:1/2".into(),
+            thread: None,
+            options: vec!["a".into(), "b: or c".into()],
+            recommended: None,
+            lead_may: false,
+            request: None,
+            room: None,
+            message: None,
+            state: "answered".into(),
+            outcome: None,
+            created_ms: 0,
+        };
+        // The recorded words: restart recovery and the ledger's readers depend on them.
+        let outcome = press_outcome("700000000000000001", &q, 2);
+        assert_eq!(outcome, "owner press 700000000000000001: option 2 (b: or c)");
+        assert_eq!(pressed_option(&q, &outcome), Some(2));
+        assert_eq!(pressed_option(&q, &press_outcome("7", &q, 1)), Some(1));
+        assert_eq!(pressed_option(&q, "owner press 7: option 3 (c)"), None);
+        assert_eq!(pressed_option(&q, "owner press 7: chose b"), None);
+        assert_eq!(pressed_option(&q, "owner message 7: option 1 (a)"), None);
     }
 
     #[test]

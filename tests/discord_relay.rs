@@ -2176,8 +2176,9 @@ fn a_press_on_a_long_question_keeps_the_choice_in_view() {
     assert!(hub.stop().success());
 }
 
-/// A press recorded just before the hub stopped, its event not yet written: the next start tells
-/// the lead and closes the question's buttons, once.
+/// Presses recorded just before the hub stopped, their events not yet written: the next start
+/// tells the lead about each (more than one page of them) and closes the question's buttons, once.
+/// An outcome in other words than today's is passed on as recorded.
 #[test]
 fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
     let fake = FakeDiscord::start();
@@ -2200,14 +2201,32 @@ fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
         )
         .unwrap();
     assert_eq!(settled, 1);
+    let copies = "INSERT INTO questions (id, text, source, options, state, outcome, created_ms, \
+                  settled_ms) SELECT ?1, text, source, options, state, ?2, created_ms, settled_ms \
+                  FROM questions WHERE id = ?3";
+    for n in 0..60 {
+        let outcome = "owner press 8: option 1 (a)";
+        db.execute(copies, [&format!("copy{n:02}"), outcome, &id])
+            .unwrap();
+    }
+    db.execute(copies, ["older", "owner press 9: an older wording", &id])
+        .unwrap();
     drop(db);
     hub.start();
     ready(&hub);
-    let told = hub.until(WAIT, || {
+    let answered = |hub: &TestHub| -> Vec<Value> {
         hub.events()
             .into_iter()
-            .find(|e| e["kind"] == "question.answered")
-    });
+            .filter(|e| e["kind"] == "question.answered")
+            .collect()
+    };
+    let all = hub.until(WAIT, || Some(answered(&hub)).filter(|a| a.len() == 62));
+    let told = all.iter().find(|e| e["subject"] == id.as_str()).unwrap();
+    let older = all.iter().find(|e| e["subject"] == "older").unwrap();
+    assert!(
+        older["text"].as_str().unwrap().contains(": an older wording — Which?"),
+        "{older}"
+    );
     let said = format!("question {id}: option 2 (b) — Which?");
     assert!(told["text"].as_str().unwrap().contains(&said), "{told}");
     let edited = closed(&fake, &message);
@@ -2222,13 +2241,6 @@ fn a_press_recorded_before_a_stop_is_told_at_the_next_start() {
     hub.start();
     ready(&hub);
     std::thread::sleep(Duration::from_secs(1));
-    assert_eq!(
-        hub.events()
-            .iter()
-            .filter(|e| e["kind"] == "question.answered")
-            .count(),
-        1,
-        "told once"
-    );
+    assert_eq!(answered(&hub).len(), 62, "told once");
     assert!(hub.stop().success());
 }
