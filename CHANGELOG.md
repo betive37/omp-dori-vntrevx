@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Repeating a recorded lane step could fail if its evidence file was removed or its tool facts were
+  unavailable. Identical steps now return unchanged without reading their evidence again.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
