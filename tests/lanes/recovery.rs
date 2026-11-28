@@ -70,6 +70,125 @@ fn shutdown_during_recovery_leaves_the_episode_resumable() {
     hub.stop();
 }
 
+/// The same interrupted recovery, found again only after its window closed (the hub was down for
+/// hours), is nobody's live episode any more: the lane resumes in a fresh one instead of holding.
+#[test]
+fn an_interrupted_recovery_found_past_its_window_resumes_in_a_fresh_episode() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "late", &json!({}));
+    let before = record(&hub, "late");
+    hub.stop();
+    stall_resumes(&hub);
+    start(&mut hub);
+    hub.until(WAIT, || {
+        data(&hub).join("resume-started").exists().then_some(())
+    });
+    hub.stop();
+    let aged = db(&hub)
+        .execute(
+            "UPDATE startup_episodes SET started_ms = started_ms - 7200000, \
+             deadline_ms = deadline_ms - 7200000 WHERE target = 'lane:late' AND state = 'active'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(aged, 1);
+    std::fs::rename(hub.root.join("bin/omp-real"), hub.root.join("bin/omp")).unwrap();
+    start(&mut hub);
+    let after = hub.until(WAIT, || {
+        let rec = record(&hub, "late");
+        assert_ne!(rec["state"], "held", "{rec}");
+        (rec["live"] == true && rec["lost"].is_null()).then_some(rec)
+    });
+    assert_eq!(after["session_id"], before["session_id"]);
+    assert_eq!(after["run_id"], before["run_id"]);
+    hub.until(WAIT, || {
+        let state: String = db(&hub)
+            .query_row(
+                "SELECT state FROM startup_episodes WHERE target = 'lane:late'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (state == "bound").then_some(())
+    });
+    hub.stop();
+}
+
+/// A reopen that comes up fenced (a model mismatch) recorded its startup, so its episode ends.
+/// Once the owner continues the lane and its process exits, recovery four minutes into that old
+/// window retries normally instead of reading the window and holding at once.
+#[test]
+fn a_fenced_reopen_ends_its_episode_and_a_later_exit_recovers() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "fenced", &json!({}));
+    let before = record(&hub, "fenced");
+    lane(&hub, "park", &json!({"key":"fenced","reason":"later"})).unwrap();
+    hub.fixture("omp", "model", Some("fake/other"));
+    let _ = lane(&hub, "reopen", &json!({"key":"fenced"}));
+    let fenced = hub.until(WAIT, || {
+        let rec = record(&hub, "fenced");
+        (rec["live"] == true && rec["state"] == "held").then_some(rec)
+    });
+    assert!(
+        fenced["status"]
+            .as_str()
+            .unwrap()
+            .contains("start held: model"),
+        "{fenced}"
+    );
+    let episode = |hub: &TestHub| -> (String, i64) {
+        db(hub)
+            .query_row(
+                "SELECT state, started_ms FROM startup_episodes WHERE target = 'lane:fenced'",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .unwrap()
+    };
+    let (state, began) = episode(&hub);
+    assert_eq!(state, "bound", "the fenced startup ended its episode");
+    hub.fixture("omp", "model", None);
+    lane(&hub, "resume", &json!({"key":"fenced"})).unwrap();
+    let status = Command::new("kill")
+        .args(["-KILL", &fenced["pid"].to_string()])
+        .status()
+        .unwrap();
+    assert!(status.success());
+    hub.until(WAIT, || {
+        (!record(&hub, "fenced")["lost"].is_null()).then_some(())
+    });
+    hub.stop();
+    // Four minutes into that window: one minute left, less than an attempt and its cleanup. The
+    // start time stays, since the pending reopen names its episode by it.
+    let now = i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap();
+    db(&hub)
+        .execute(
+            "UPDATE startup_episodes SET deadline_ms = ?1 WHERE target = 'lane:fenced'",
+            [now + 60_000],
+        )
+        .unwrap();
+    start(&mut hub);
+    let after = hub.until(WAIT, || {
+        let rec = record(&hub, "fenced");
+        (rec["live"] == true && rec["lost"].is_null() && rec["state"] != "held").then_some(rec)
+    });
+    assert_eq!(after["session_id"], before["session_id"]);
+    let renewed = hub.until(WAIT, || {
+        let (state, renewed) = episode(&hub);
+        (state == "bound").then_some(renewed)
+    });
+    assert!(renewed > began, "a fresh episode");
+    hub.stop();
+}
+
 #[test]
 fn held_recovery_keeps_its_first_reason_without_starting_or_alerting_again() {
     let (mut hub, _) = lane_hub("");
