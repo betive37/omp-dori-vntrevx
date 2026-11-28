@@ -6,6 +6,13 @@
   does: after one stall alert, a lane that moved on only through steps was never reminded or
   alerted again; now it is when it stalls again.
 
+## 0.2.8 (2026-11-28)
+
+- The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
+  directory had changed at some point, leaving only `lead start --fresh`, which abandons the
+  conversation. 0.2.8 resumes the newest conversation, and a store already held that way is repaired
+  at start (schema 13, additive; the reader floor stays 11).
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
