@@ -1133,10 +1133,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             let settled = turn_over || snap.status == Status::Idle;
             let file = PathBuf::from(file);
             let metadata = std::fs::metadata(&file).ok();
-            if !settled {
-                self.worked_ms.store(now_ms(), Ordering::Release);
-            } else {
+            if settled {
                 self.recover_work(metadata.as_ref());
+            } else {
+                self.worked_ms.store(now_ms(), Ordering::Release);
             }
             // The newest answered request's later turns: read again only when something changed.
             let length = metadata.map(|m| m.len());
