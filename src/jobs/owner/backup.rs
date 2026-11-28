@@ -339,7 +339,7 @@ async fn own_files_not_ignored(
     Ok(found)
 }
 
-/// Compare HEAD with the last successful push to this destination. Without that memory,
+/// Compare HEAD's ancestry with the last successful push to this destination. Without that memory,
 /// only trust the tracking ref when the fetch and push URLs agree.
 async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
     let Some(head) = git_value(git, &["rev-parse", "--verify", "HEAD"]).await? else {
@@ -351,7 +351,17 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
             return Ok(true);
         }
         if let Some(pushed) = git.t.memory.get(PUSHED, "commit") {
-            return Ok(head != pushed);
+            if head == pushed {
+                return Ok(false);
+            }
+            let done = git
+                .run(&["merge-base", "--is-ancestor", &head, pushed], LOCAL)
+                .await?;
+            return match done.exit {
+                crate::sys::command::Exit::Code(0) => Ok(false),
+                crate::sys::command::Exit::Code(1) => Ok(true),
+                _ => Err(format!("git merge-base failed: {}", super::said(&done))),
+            };
         }
     }
     let fetch_url = git_value(git, &["remote", "get-url", &b.remote])
@@ -895,6 +905,43 @@ mod tests {
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
         assert_eq!(git(&remote, &["rev-parse", "main"]), head);
         assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_skips_ancestor_but_not_diverged_head() {
+        let root = crate::sys::fs::tests::scratch("backup-ancestor");
+        let (remote, work) = repos(&root);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-ancestor-ctx");
+        std::fs::write(work.join("notes.md"), "first backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let first = git(&work, &["rev-parse", "HEAD"]);
+        std::fs::write(work.join("notes.md"), "next backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let pushed = git(&remote, &["rev-parse", "main"]);
+        assert_ne!(first, pushed);
+
+        // The owner moved back to a commit already contained in the successful backup.
+        git(&work, &["reset", "--hard", first.trim()]);
+        assert_eq!(git(&work, &["status", "--porcelain"]), "");
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "main"]), pushed);
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), first);
+
+        // A new, divergent commit is not already backed up; still attempt the non-forced push.
+        std::fs::write(work.join("notes.md"), "different backup\n").unwrap();
+        commit(&work, "diverged backup");
+        assert_eq!(live_tick(&ctx, "bk").await, ["backup.push_failed"]);
+        assert_eq!(git(&remote, &["rev-parse", "main"]), pushed);
+        let memory = ctx.store.read(|r| r.memory("bk", false)).await.unwrap();
+        assert!(
+            memory
+                .iter()
+                .any(|(s, c, v)| s == super::PUSHED && c == "commit" && v == pushed.trim())
+        );
     }
 
     #[tokio::test]
