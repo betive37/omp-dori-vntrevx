@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A batch of more than 256 job-event destinations could leave the rest waiting until another event
+  arrived. The router now drains every page without a new event, keeping its delivery concurrency limit.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

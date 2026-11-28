@@ -1,7 +1,8 @@
 //! Routing (WS req. 7, OJ req. 7): every event goes to the rotating owner-readable event log; events
 //! with destinations get one attempt per destination. An attempt is marked durably before it starts,
 //! so a hub that stops mid-attempt leaves it "uncertain" and it is never repeated (DESIGN 9.3).
-//! Destinations: local commands and Discord channels.
+//! Destinations: local commands and Discord channels. Full delivery pages wake the router again so
+//! queued destinations drain without another event, under the same concurrency limit.
 
 use std::fmt::Write as _;
 use std::fs::File;
@@ -140,6 +141,7 @@ async fn deliver_waiting(ctx: &Arc<Ctx>) -> Result<(), JobsError> {
     if waiting.is_empty() {
         return Ok(());
     }
+    let full_page = waiting.len() == PAGE as usize;
     let config = ctx.config();
     for (event_id, destination) in waiting {
         let Some(dest) = config.destination(&destination) else {
@@ -173,6 +175,9 @@ async fn deliver_waiting(ctx: &Arc<Ctx>) -> Result<(), JobsError> {
                 );
             }
         });
+    }
+    if full_page {
+        ctx.route_wake.notify_one();
     }
     Ok(())
 }
@@ -404,6 +409,43 @@ mod tests {
     use super::*;
     use crate::jobs::tests::ctx_with;
     use crate::store::tests::event;
+
+    #[tokio::test]
+    async fn full_pages_drain_without_another_event() {
+        let (ctx, _stop, _dir) = ctx_with("", "route-pages");
+        let events = (0..100)
+            .map(|_| event("j", "run.done", &["gone-a", "gone-b", "gone-c"]))
+            .collect();
+        let records = ctx.stream.append(events).await.unwrap();
+        // Consume the batch's wake as an already-running router would.
+        ctx.route_wake.notified().await;
+        loop {
+            deliver_waiting(&ctx).await.unwrap();
+            // Drive only the pages the router wakes itself for; do not send another event.
+            tokio::select! {
+                biased;
+                () = ctx.route_wake.notified() => {}
+                () = std::future::ready(()) => break,
+            }
+        }
+        let waiting = ctx.store.read(|r| r.waiting_deliveries(300)).await.unwrap();
+        assert_eq!(waiting.len(), 0, "every queued destination must be drained");
+        let states = ctx
+            .store
+            .read(move |r| {
+                records
+                    .into_iter()
+                    .map(|record| r.deliveries(record.id))
+                    .collect::<rusqlite::Result<Vec<_>>>()
+            })
+            .await
+            .unwrap();
+        assert_eq!(states.len(), 100);
+        for deliveries in states {
+            assert_eq!(deliveries.len(), 3);
+            assert!(deliveries.iter().all(|(_, state, _)| state == "failed"));
+        }
+    }
 
     #[tokio::test]
     async fn log_and_command_destination() {
