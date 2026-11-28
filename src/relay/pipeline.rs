@@ -1188,12 +1188,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
-    /// Stores what one read found for `h`. A request with no answer stops waiting only once both
-    /// its hand-off and the lead's last work are older than the owed window: while the lead works,
-    /// an unfinished turn (`Pending`) and a request still queued behind it (`NotFound`) keep
-    /// waiting however long the turn runs, and a request queued behind it keeps the window after
-    /// the turn ends to reach the transcript. The next input entering the transcript ends the wait
-    /// sooner (DISC-OUT req. 21-22).
+    /// Stores what one read found for `h`. A request to the lead with no answer stops waiting only
+    /// once both its hand-off and the lead's last work are older than the owed window: while the
+    /// lead works, an unfinished turn (`Pending`) and a request still queued behind it (`NotFound`)
+    /// keep waiting, and a request queued behind it keeps the window after the turn ends to reach
+    /// the transcript. The next input entering the transcript ends the wait sooner (DISC-OUT req.
+    /// 21-22). A request handed to a lane is never in the lead's transcript: the lead's work does
+    /// not extend it, and it ends once its hand-off is older than the window.
     async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
         let answer = |answer: &str| RelayWrite::Answer {
             relay: R::NAME.into(),
@@ -1243,7 +1244,11 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             // `NotFound` a request that never reached this transcript (another session file, or
             // outside the part read): neither waits on work still running.
             Reply::NotFound | Reply::Pending => {
-                let since = h.created_ms.max(self.worked_ms.load(Ordering::Acquire));
+                let since = if h.target == inbox::LEAD {
+                    h.created_ms.max(self.worked_ms.load(Ordering::Acquire))
+                } else {
+                    h.created_ms
+                };
                 if now_ms() - since > OWED_WINDOW_MS {
                     self.store
                         .relay(answer("abandoned"))

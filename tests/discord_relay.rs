@@ -272,6 +272,21 @@ fn handoffs(hub: &TestHub) -> i64 {
     .unwrap()
 }
 
+/// Moves both Discord hand-offs 31 minutes back, past the 30 min owed window, while the hub runs.
+fn age_handoffs(hub: &TestHub) {
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    // The hub's writer does not wait for the lock: hold it as briefly as possible.
+    db.execute_batch("PRAGMA synchronous=OFF").unwrap();
+    let aged = db
+        .execute(
+            "UPDATE handoffs SET created_ms = created_ms - 31 * 60 * 1000 WHERE relay = 'discord'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(aged, 2);
+}
+
 /// A request whose turn outlasts the 30 min owed window, and a request queued behind that turn,
 /// keep waiting while the lead works; each answer is posted once its turn ends (DISC-OUT req.
 /// 21-22). The hand-offs are aged in the store rather than waited out.
@@ -307,18 +322,7 @@ fn answers_wait_for_a_turn_longer_than_the_owed_window() {
     // Handed to the lead, it waits behind the turn, not in the transcript yet (NotFound).
     hub.until(WAIT, || (handoffs(&hub) == 2).then_some(()));
     assert_eq!(requests(&hub).len(), 1);
-    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
-    db.busy_timeout(Duration::from_secs(10)).unwrap();
-    // The hub's writer does not wait for the lock: hold it as briefly as possible.
-    db.execute_batch("PRAGMA synchronous=OFF").unwrap();
-    let aged = db
-        .execute(
-            "UPDATE handoffs SET created_ms = created_ms - 31 * 60 * 1000 WHERE relay = 'discord'",
-            [],
-        )
-        .unwrap();
-    assert_eq!(aged, 2);
-    drop(db);
+    age_handoffs(&hub);
     // Typing renews every 8 s while a request waits and the turn runs: the second renewal comes
     // from a round that began after the hand-offs aged.
     let typing = format!("/channels/{CH}/typing");
@@ -898,14 +902,9 @@ fn a_lane_thread_keeps_the_leads_answer_in_the_channel() {
     );
     // The owner follows up in the thread: the lane takes it, the lead does not. A thread that
     // appears while the hub runs is read from the hub's start on, so the message is made now.
-    let since_epoch = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis();
-    let now = u64::try_from(since_epoch).unwrap() - 1_420_070_400_000;
     fake.say(FakeDiscord::message(
         source,
-        (now << 22) + 1,
+        now_id(),
         OWNER,
         "follow-up for the lane",
     ));
@@ -918,6 +917,94 @@ fn a_lane_thread_keeps_the_leads_answer_in_the_channel() {
             .then_some(())
     });
     assert_eq!(requests(&hub).len(), 1, "the lead got only the request");
+    assert!(hub.stop().success());
+}
+
+/// A Discord message ID made now.
+fn now_id() -> u64 {
+    let since_epoch = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis();
+    let now = u64::try_from(since_epoch).unwrap() - 1_420_070_400_000;
+    (now << 22) + 1
+}
+
+/// A request handed to a lane is never in the lead's transcript: the lead's work does not keep it
+/// waiting, and it ends once its hand-off is older than the 30 min owed window, while the lead's
+/// own request in a longer turn still waits.
+#[test]
+fn a_lane_hand_off_ends_after_the_owed_window_while_the_lead_works() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    let work = hub.root.join("work");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}[lanes]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    hub.fixture("omp", "hold", Some("the long job"));
+    hub.fixture("omp", "hold-busy", Some(""));
+    hub.start();
+    ready(&hub);
+    let thread = "800000000000000191";
+    fake.put(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_191,
+        OWNER,
+        "start the work",
+    ));
+    fake.start_thread(CH, thread, support::discord::BOT);
+    let params = json!({
+        "key": "w-1",
+        "title": "Work w-1",
+        "brief": "Do the work.",
+        "checks": [{ "kind": "command", "argv": ["true"] }],
+        "thread": format!("discord:{thread}"),
+        "cwd": work,
+    });
+    let out = hub.cli(&["lane", "open", "--json", "--params", &params.to_string()]);
+    assert!(
+        out.status.success(),
+        "{}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // The lane's kickoff turn ends before the lead's long turn holds the fake.
+    let lanes = hub.json(&["lane", "list", "--json", "--params", "{\"all\":true}"]);
+    let file = lanes[0]["session_file"].as_str().unwrap().to_string();
+    hub.until(WAIT, || {
+        std::fs::read_to_string(&file)
+            .unwrap_or_default()
+            .contains("\"assistant\"")
+            .then_some(())
+    });
+    let long = "800000000000000192";
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_192,
+        OWNER,
+        "the long job",
+    ));
+    let tag = format!("[discord {CH}/{long}]");
+    hub.until(WAIT, || {
+        requests(&hub)
+            .iter()
+            .any(|r| r.contains(&tag))
+            .then_some(())
+    });
+    let lane = now_id();
+    fake.say(FakeDiscord::message(
+        thread,
+        lane,
+        OWNER,
+        "follow-up for the lane",
+    ));
+    hub.until(WAIT, || (handoffs(&hub) == 2).then_some(()));
+    age_handoffs(&hub);
+    hub.until(WAIT, || {
+        (answer_state(&hub, &lane.to_string()) == "abandoned").then_some(())
+    });
+    assert_eq!(answer_state(&hub, long), "waiting");
     assert!(hub.stop().success());
 }
 

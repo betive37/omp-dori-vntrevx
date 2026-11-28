@@ -5,9 +5,16 @@
 - The lead's answer is no longer lost when its turn runs past 30 minutes. A turn that ran longer
   (subagents, long tool calls), or a message of yours waiting behind such a turn, was given up 30
   minutes after it arrived, and the answer that came later was never posted. While the lead works,
-  the message now waits for its answer however long the turn runs; the next message that reaches
-  the lead still ends the wait, and a message with no answer is given up only once the lead has
-  also been idle for 30 minutes. Discord, Telegram and Slack alike.
+  a message to the lead now keeps waiting for its answer; the next message that reaches the lead
+  still ends the wait, and a message with no answer is given up only once the lead has also been
+  idle for 30 minutes. Messages handed to a lane keep the 30-minute limit. Limits: a message whose
+  line in the lead's session file is pushed out of the last 8 MiB read, or whose session file
+  changed, waits until the lead has been idle for 30 minutes and is then given up; after a hub
+  restart the lead's earlier work is not remembered, so an old message is given up as before. A
+  message queued behind a long turn can still go in doubt when its delivery is not confirmed
+  within 30 seconds (a separate cause, fixed by
+  [PR #314](https://github.com/vntrevx/Cataly/pull/314)); the full effect for such messages needs
+  both. Discord, Telegram and Slack alike.
 
 ## 0.2.7 (2026-11-28)
 

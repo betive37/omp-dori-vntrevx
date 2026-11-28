@@ -126,7 +126,8 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     While the session works, a pending reply waits however long the turn runs, also when the
     request is still queued behind it. A pending reply with no answer is abandoned the same way
     only once both its hand-off and the session's last work (a turn running) are more than 30
-    minutes old.
+    minutes old. The daemon remembers that work only while it runs: after a restart the hand-off's
+    age alone counts.
 23. The daemon reads the answer from OMP's public surfaces (rpc-ui events or the session file) and
     confirms it is persisted in the transcript before posting. It never posts text it only saw in a
     transient event.
