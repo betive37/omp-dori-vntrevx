@@ -733,6 +733,19 @@ impl Relay for SlackRelay {
         })
     }
 
+    /// A request at the top of a channel is answered in its own thread, every part and every
+    /// later turn; the first part there still counts as the linked reply.
+    fn answer_room(
+        &self,
+        room: &str,
+        source: &str,
+    ) -> impl Future<Output = Result<Option<String>, String>> + Send {
+        std::future::ready(Ok(match room_of(room) {
+            Some((channel, None)) if valid_ts(source) => Some(format!("{channel}:{source}")),
+            _ => None,
+        }))
+    }
+
     async fn post(
         &self,
         room: &str,

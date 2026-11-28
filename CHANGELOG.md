@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Slack: a long answer to a request at the top of a channel, or the lead's later turn, posted only
+  its first part in the request's thread and the rest at the channel's top level. Every part and
+  every later turn now goes into the request's thread.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
