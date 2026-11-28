@@ -7,6 +7,13 @@
   now opens a lane under a fresh key (`<id>-2`, `<id>-3`, ...) and the item remembers it; an item
   added again waits while its earlier lane is still open.
 
+## 0.2.8 (2026-11-28)
+
+- The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
+  directory had changed at some point, leaving only `lead start --fresh`, which abandons the
+  conversation. 0.2.8 resumes the newest conversation, and a store already held that way is repaired
+  at start (schema 13, additive; the reader floor stays 11).
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
