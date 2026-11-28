@@ -68,6 +68,8 @@
   remains unsupported: the shell and systemd user manager must agree on the config home to find
   the unit. OMP child processes now also follow the shell's XDG homes.
   Explicit service commands refuse absolute non-UTF-8 XDG homes rather than silently using defaults.
+- Repeating a recorded lane step could fail if its evidence file was removed or its tool facts were
+  unavailable. Identical steps now return unchanged without reading their evidence again.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
