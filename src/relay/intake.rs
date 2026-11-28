@@ -285,8 +285,10 @@ impl<R: Relay, T: Runtime> Round<R, T> {
             }
         };
         let _ = halt.send(true);
-        let _ = task.await;
-        end
+        match task.await {
+            Ok(failed @ (Stop::Fatal(_) | Stop::Retry(_))) if matches!(end, Stop::Again) => failed,
+            _ => end,
+        }
     }
 
     async fn busy(&self) -> bool {
