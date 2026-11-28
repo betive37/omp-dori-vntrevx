@@ -965,14 +965,7 @@ impl<R: Runtime> Lead<R> {
                 ],
             );
         }
-        // A quota block of an earlier process holds the new one too, until a turn completes.
-        let quota = self
-            .env
-            .store
-            .read(|r| r.meta(QUOTA_KEY))
-            .await
-            .map_err(|e| format!("lead quota block: {e}"))?
-            .filter(|message| !message.is_empty());
+        let quota = self.kept_quota().await?;
         let handle = super::random_hex(8);
         let runtime = (self.env.make)(&config, &exe, kind);
         let spec = lead_spec(handle.clone(), &settings, cwd, target, expected, quota);
@@ -1563,6 +1556,14 @@ impl<R: Runtime> Lead<R> {
         if let Err(e) = self.env.store.lead(write).await {
             log::warn("lead quota block not recorded", &[("error", &e)]);
         }
+    }
+
+    /// The quota block an earlier process left: the next session starts with it, until a turn
+    /// completes.
+    async fn kept_quota(&self) -> Result<Option<String>, String> {
+        let kept = self.env.store.read(|r| r.meta(QUOTA_KEY)).await;
+        kept.map(|q| q.filter(|message| !message.is_empty()))
+            .map_err(|e| format!("lead quota block: {e}"))
     }
 
     /// A turn ended with the quota exhausted: the block is kept, the owner is alerted and the lead
