@@ -471,6 +471,7 @@ async fn serve(paths: &Paths, config: Config, store: Store, cleanup: Cleanup) ->
         store.clone(),
         lead_cwd,
         paths.files_dir.clone(),
+        shutdown_rx.clone(),
     );
     let (lead, lanes, agent_start, relays) = sessions(
         paths,

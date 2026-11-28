@@ -134,6 +134,10 @@
   CRLF endings do not count toward either limit or appear in the saved bytes; a bare `\r` at EOF
   remains data. The file and its directory are synced before the event reports it saved; a sync
   failure is reported in the event instead.
+- Stream jobs: a job whose restarts were used up started again, with a fresh restart count, every
+  time the hub restarted. The used restarts and the ended state are now kept with the job; after a
+  hub restart an ended job is listed as exhausted, with its last exit, and not run until it is
+  stopped and started again. A child that ends while the hub itself stops is not counted.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
