@@ -509,6 +509,90 @@ fn slack_does_not_ack_a_full_arrival_queue() {
     );
 }
 
+fn slack_redelivery_after_release(state: &str) {
+    let slack = FakeSlack::start();
+    let mut hub = relay_hub(None, Some(&slack), "");
+    hub.start();
+    ready(&hub, &["slack"]);
+    let ts = slack.ts();
+    let event = json!({"type": "message", "channel": GEN, "channel_type": "channel",
+        "user": fake_slack::OWNER, "text": format!("<@{}> original request", fake_slack::ACCOUNT),
+        "ts": ts});
+    slack.push(event.clone());
+    slack.wait(WAIT, |f| slack_posts_in(f, GEN, &ts).pop());
+    ready(&hub, &["slack"]);
+    assert!(hub.stop().success());
+
+    // Keep a real hand-off's identity and digest, but seed the terminal state and held queue
+    // left by an unsuccessful hand-off. The owner gives it up through the real release command.
+    let seq: i64 = ts.replace('.', "").parse().unwrap();
+    let raw = event.to_string();
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.execute(
+        "UPDATE handoffs SET state = ?1 WHERE relay = 'slack' AND room = ?2 AND message = ?3",
+        [state, GEN, ts.as_str()],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE positions SET held = 'test hand-off' WHERE relay = 'slack' AND room = ?1",
+        [GEN],
+    )
+    .unwrap();
+    db.execute(
+        "INSERT INTO arrival_queue \
+         (relay, room, message, seq, position_at, raw, bytes, created_ms) \
+         VALUES ('slack', ?1, ?2, ?3, ?3 - 1, ?4, ?5, 0)",
+        rusqlite::params![GEN, ts, seq, raw, i64::try_from(raw.len()).unwrap()],
+    )
+    .unwrap();
+    drop(db);
+    hub.start();
+    hub.until(WAIT, || {
+        let s = status(&hub, "slack");
+        (s["health"]["state"] == "connected" && s["counts"]["held"] == 1).then_some(())
+    });
+    assert_eq!(status(&hub, "slack")["counts"]["queued"], 1);
+    assert!(hub.cli(&["slack", "release", GEN]).status.success());
+    assert_eq!(status(&hub, "slack")["counts"]["queued"], 0);
+    assert!(hub.stop().success());
+    hub.start();
+    ready(&hub, &["slack"]);
+
+    let redelivered = slack.push(event);
+    slack.wait(WAIT, |f| {
+        f.acks()
+            .iter()
+            .any(|(id, _)| id == &redelivered)
+            .then_some(())
+    });
+    // The ack follows the arrival transaction, so no sleep is needed to check its queue effect.
+    let s = status(&hub, "slack");
+    assert_eq!(s["counts"]["queued"], 0, "{state} redelivery requeued: {s}");
+    assert_eq!(
+        s["counts"]["held"], 0,
+        "{state} redelivery held the room: {s}"
+    );
+    let newer = slack.say(
+        GEN,
+        fake_slack::OWNER,
+        &format!("<@{}> the next request", fake_slack::ACCOUNT),
+        None,
+    );
+    slack.wait(WAIT, |f| slack_posts_in(f, GEN, &newer).pop());
+    assert_eq!(requests(&hub, &format!("[slack {GEN}/{ts}]")).len(), 1);
+    assert!(hub.stop().success());
+}
+
+#[test]
+fn slack_does_not_requeue_a_released_in_doubt_handoff() {
+    slack_redelivery_after_release("in_doubt");
+}
+
+#[test]
+fn slack_does_not_requeue_a_released_failed_handoff() {
+    slack_redelivery_after_release("failed");
+}
+
 /// Check 1, start-up: a webhook or a non-bot identity keeps intake off and nothing is polled.
 #[test]
 fn telegram_refuses_a_webhook_and_a_non_bot() {

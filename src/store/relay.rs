@@ -431,9 +431,11 @@ fn arrive(
     now: i64,
 ) -> rusqlite::Result<Arrived> {
     let (relay, room, message, seq, parent, raw) = w;
+    // A release removes doubtful or failed messages from the queue but retains their hand-offs.
+    // Those terminal records still prevent redelivery from reopening the released room.
     let handled: bool = tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM handoffs WHERE relay = ?1 AND room = ?2 AND message = ?3 \
-             AND state = 'delivered')",
+             AND state IN ('delivered', 'in_doubt', 'failed'))",
         params![relay, room, message],
         |r| r.get(0),
     )?;
