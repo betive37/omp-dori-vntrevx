@@ -87,6 +87,10 @@ function marked(ctx: Ctx): boolean {
 	return branch.some(e => e.type === "custom" && e.customType === MARKER);
 }
 
+function continuing(reason: unknown): boolean {
+	return reason === "new" || reason === "fork" || reason === "session_branch";
+}
+
 /** Drops run timing, job bookkeeping and file locations from result details (EVR req. 13). */
 function stable(value: unknown): unknown {
 	if (Array.isArray(value)) return value.map(stable);
@@ -168,6 +172,7 @@ export class Bridge {
 	token: string | undefined; parent = "";
 	private reportedCapabilities: string | undefined;
 	private registered = new Set<string>();
+	private switchTo: Json | undefined;
 
 	constructor(readonly pi: Pi, readonly deps: Deps) {
 		this.token = deps.env.CATALY_LAUNCH || undefined;
@@ -187,8 +192,13 @@ export class Bridge {
 				this.calls.clear(); this.fallbackTo = ""; this.lastAnswer = false;
 				this.session = id;
 				owners.set(String(ctx.agent?.id), id);
-				const answer = await this.request("bridge.switch", { session: id, file: this.file(), ...transition }, TOOL_MS);
+				const change: Json = this.switchTo = { session: id, file: this.file(), ...transition };
+				const answer = await this.request("bridge.switch", change, TOOL_MS);
+				if (this.switchTo !== change) return;
+				if (!answer && continuing(change.reason)) return this.wire?.close();
+				this.switchTo = undefined;
 				this.apply(answer ?? { role: "none" });
+				if (this.role !== "none") this.resend();
 				this.capabilities();
 			}
 			return;
@@ -224,20 +234,25 @@ export class Bridge {
 		if (!this.wire) return this.retry();
 		this.lastRx = Date.now();
 		const [cwd, agent, mode] = [this.ctx.cwd ?? "", this.ctx.agent?.kind ?? "main", this.ctx.mode ?? ""].map(String);
-		const ids = { version: VERSION, token: this.token, key: this.key, session: this.session, file: this.file(), parent: this.parent };
+		const ids = { version: VERSION, token: this.token, key: this.key, session: this.session, file: this.file(), parent: this.parent,
+			continuation: continuing(this.switchTo?.reason) ? this.switchTo?.reason : undefined };
 		const caps = { model_resolution_version: MODEL_RESOLUTION };
 		const hello = { ext: PROTOCOL, ...ids, ...caps, pid: process.pid, cwd, agent, mode, marker: marked(this.ctx), ...this.facts(this.ctx) };
-		const answer = await this.request("bridge.hello", hello, TOOL_MS, true);
+		let answer = await this.request("bridge.hello", hello, TOOL_MS, true);
 		this.token = undefined;
-		if (!answer) return this.wire?.close();
-		if (answer.role !== "lead" && answer.role !== "lane") {
-			// Role none: inert for this session (EXT req. 4).
-			return this.apply({ ...answer, role: "none" });
-		}
+		if (!answer || (this.wired && hello.session !== this.session)) return this.wire?.close();
+		if (answer.role !== "lead" && answer.role !== "lane") return this.apply({ ...answer, role: "none" });
 		[this.attempt, this.key] = [0, String(answer.key ?? "")];
-		owners.set(String(this.ctx.agent?.id), this.parent || this.session);
-		this.tern ||= answer.tern === true;
+		const change = this.switchTo;
+		if (change && continuing(change.reason)) {
+			answer = await this.request("bridge.switch", change, TOOL_MS);
+			if (this.switchTo !== change) return;
+			if (!answer) return this.wire?.close();
+			this.switchTo = undefined;
+		}
 		this.apply(answer);
+		if (this.role === "none") return;
+		owners.set(String(this.ctx.agent?.id), this.parent || this.session);
 		if (!this.wired) this.wire_up();
 		else this.resend();
 		this.reportedCapabilities = undefined; // A new connection needs its own snapshot, including after a hub restart.
@@ -256,6 +271,7 @@ export class Bridge {
 		if (typeof answer.tern === "boolean") this.tern = answer.tern;
 		if (Array.isArray(answer.tools) || this.role === "none") this.set_tools(answer);
 		if (this.role === "none") {
+			this.switchTo = undefined;
 			[this.key, this.guidance, this.pin, this.shell, this.tern] = [undefined, "", undefined, false, false];
 			owners.delete(String(this.ctx?.agent?.id));
 			this.queue = []; this.queued = 0; this.dropped = 0;

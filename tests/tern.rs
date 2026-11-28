@@ -412,6 +412,56 @@ fn a_return_to_the_tern_lead_reattaches_its_port() {
         .status();
 }
 
+#[test]
+fn a_pending_continuation_reconnects_before_replaying_its_switch() {
+    let (hub, work) = tern_hub(None);
+    let block = block_of(&hub);
+    let token = block["token"].as_str().unwrap();
+    let pid = block["pid"].as_u64().unwrap();
+    let file = work.join("s1.jsonl");
+    std::fs::write(&file, "").unwrap();
+    let mut bridge = Bridge::connect(&hub.socket());
+    let mut key = bridge.accept(&hello(token, "s1", &file, pid))["key"].clone();
+    hub.until(Duration::from_secs(20), || {
+        (hub.json(&["lead", "status", "--json"])["phase"] == "live").then_some(())
+    });
+    for (reason, reached_hub) in [("new", false), ("fork", true), ("session_branch", false)] {
+        let file = work.join(format!("{reason}.jsonl"));
+        std::fs::write(&file, "").unwrap();
+        let change = json!({"session":reason,"file":file,"reason":reason});
+        if reached_hub {
+            assert_eq!(bridge.request("bridge.switch", &change)["role"], "lead");
+        }
+        drop(bridge);
+        // A continuation hint never exempts the reconnect from its process check.
+        let mut other = Bridge::connect(&hub.socket());
+        let refused = other.request(
+            "bridge.hello",
+            &json!({
+                "ext":1,"key":key,"session":reason,"file":file,"pid":pid + 7,
+                "agent":"main","continuation":reason,
+            }),
+        );
+        assert_eq!(refused["role"], "none", "{refused}");
+        bridge = Bridge::connect(&hub.socket());
+        let welcome = bridge.request(
+            "bridge.hello",
+            &json!({
+                "ext":1,"key":key,"session":reason,"file":file,"pid":pid,
+                "agent":"main","continuation":reason,"idle":true,"model":"fake/primary",
+                "model_resolution_version":1,
+            }),
+        );
+        assert_eq!(welcome["role"], "lead", "{welcome}");
+        assert_eq!(welcome["tern"], true, "{welcome}");
+        key = welcome["key"].clone();
+        assert_eq!(bridge.request("bridge.switch", &change)["role"], "lead");
+    }
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
+}
+
 /// A compaction's recap waits for a delivery still in flight to the lead, whose reply only the
 /// bridge connection reads: 0.2.2 waited for the recap on that connection, read nothing more, and
 /// the delivery was in doubt after 10 s (CI, slow Intel macOS, on the first wake after a start).

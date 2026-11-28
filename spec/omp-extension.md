@@ -144,10 +144,15 @@ logic can move to Rust, leaving the extension as a forwarder.
    role: the extension re-appends the marker and the daemon links the new ID to the same lane or lead record
    (lane-lifecycle requirement 38). Resumes and tree moves are resolved against the stored lead anchor or an
    open lane's current session ID and transcript file, not the connection's previous role. Returning to a
-   terminal session reattaches its port only after the normal process-ID and session checks. An unrelated
-   session loses its reconnect key, tools and process role; its CLI children remain unplaced, never owner.
-   Subsequent calls on the old connection are refused. A missing switch reply also clears the extension's
-   role and key and cancels queued reconnects with the old authority.
+   terminal session, including a lane reached by its marker after an unrelated session, reattaches its port
+   only after the normal process-ID and session checks. An unrelated session loses its reconnect key, tools
+   and this connection's adopted process role; its CLI children remain unplaced, never owner. Other processes
+   of the same handle keep their roles. Subsequent calls on the old connection are refused. A missing reply
+   for a resume, tree or current move clears the extension's role and key and cancels queued reconnects.
+   A new/fork/branch continuation instead keeps its role pending and replays the switch after reconnecting,
+   before buffered events. Its hello identifies the pending continuation; only a valid reconnect key and
+   the same terminal process permit the new identity. The switch saves the lead binding or lane record
+   before acknowledging it. Accepted switches refresh the terminal snapshot.
 9. Subagents: in the same process, a subagent's events carry agent kind "sub"; the extension sends them on the
    parent's connection, tagged with the subagent ID. A subagent running as a separate worker opens its own
    connection and its hello names the parent session ID from the session header; the daemon applies the parent's

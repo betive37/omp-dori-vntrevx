@@ -237,16 +237,16 @@ impl Links {
         }
     }
 
-    /// A switch leaves this identity: revoke both its reconnect key and its processes' CLI role.
-    pub(crate) fn revoke(&self, handle: &str, key: &str) {
+    /// Revoke this connection's key and adopted process, not other processes of the same session.
+    pub(crate) fn revoke(&self, handle: &str, key: &str, pid: Option<u32>) {
         let mut inner = self.lock();
         inner.capabilities.remove(key);
         if inner.links.get(handle).is_some_and(|link| link.key == key) {
             inner.links.remove(handle);
-            for (_, owner, role) in &mut inner.pids {
-                if owner == handle {
-                    *role = None;
-                }
+        }
+        for (process, owner, role) in &mut inner.pids {
+            if Some(*process) == pid && owner == handle {
+                *role = None;
             }
         }
         if inner
@@ -516,13 +516,13 @@ mod tests {
         let links = Links::default();
         links.connect("lead", Role::Lead, "lead-key", "lead-session");
         links.adopt(40, "lead", Role::Lead);
-        links.revoke("lead", "stale-key");
+        links.revoke("lead", "stale-key", None);
         assert_eq!(
             links.place(&[41, 40]),
             Some(("lead".into(), Some(Role::Lead)))
         );
 
-        links.revoke("lead", "lead-key");
+        links.revoke("lead", "lead-key", Some(40));
         assert_eq!(links.by_key("lead-key"), None);
         assert_eq!(links.place(&[41, 40]), Some(("lead".into(), None)));
         links.connect("lane", Role::Lane, "lane-key", "lane-session");
@@ -531,18 +531,44 @@ mod tests {
             links.place(&[41, 40]),
             Some(("lane".into(), Some(Role::Lane)))
         );
-        links.revoke("lead", "lead-key");
+        links.revoke("lead", "lead-key", Some(40));
         assert_eq!(
             links.place(&[41, 40]),
             Some(("lane".into(), Some(Role::Lane)))
         );
-        links.revoke("lane", "lane-key");
+        links.revoke("lane", "lane-key", Some(40));
         assert_eq!(links.place(&[41, 40]), Some(("lane".into(), None)));
         assert_eq!(
             links.place(&[99]),
             None,
             "only a non-session process may be owner"
         );
+    }
+
+    #[test]
+    fn revoking_one_connection_preserves_other_processes_of_the_same_handle() {
+        let links = Links::default();
+        links.connect("lane", Role::Lane, "original", "session");
+        links.adopt(40, "lane", Role::Lane);
+        links.connect("lane", Role::Lane, "visitor", "session");
+        links.adopt(50, "lane", Role::Lane);
+        links.revoke("lane", "visitor", Some(50));
+        assert_eq!(links.place(&[51, 50]), Some(("lane".into(), None)));
+        assert_eq!(
+            links.place(&[41, 40]),
+            Some(("lane".into(), Some(Role::Lane)))
+        );
+
+        links.connect("lane", Role::Lane, "latest", "session");
+        links.adopt(60, "lane", Role::Lane);
+        // An older connection still revokes its own process, not the newer link or process.
+        links.revoke("lane", "original", Some(40));
+        assert_eq!(links.place(&[41, 40]), Some(("lane".into(), None)));
+        assert_eq!(
+            links.place(&[61, 60]),
+            Some(("lane".into(), Some(Role::Lane)))
+        );
+        assert_eq!(links.by_key("latest"), Some(("lane".into(), Role::Lane)));
     }
 
     /// A hello is a connection, not a new conversation: only a new conversation, or the lead's

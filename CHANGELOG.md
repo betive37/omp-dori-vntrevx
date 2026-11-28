@@ -5,7 +5,9 @@
 - Resuming another session in a Tern lead could keep the lead's tools. The bridge now checks the
   destination's identity, revokes unrelated sessions' tools and CLI role, and restores terminal
   control when returning to a known session. New sessions, forks and branch/btw continuations keep
-  their role; a missing switch reply drops the old tools and reconnect key.
+  their role and persist their new identity. Lost continuation replies are replayed on reconnect;
+  unrelated resumes drop the old tools and reconnect key. Returning lanes can reconnect by their
+  session marker, and a switch revokes only that connection's process role.
 
 ## 0.2.8 (2026-11-28)
 

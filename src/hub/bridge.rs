@@ -90,7 +90,7 @@ fn lane_tool() -> Value {
 
 /// Who the hello is, if anyone: the session handle and role, and whether the hub launched it on a
 /// new conversation. A reconnect, a resume and a resume by hand continue one.
-async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String> {
+async fn decide(hub: &Hub, hello: &Hello, raw: &Value) -> Result<(String, Role, bool), String> {
     if hello.ext != PROTOCOL {
         return Err(format!(
             "bridge protocol {} where this hub speaks {PROTOCOL}; install the matching bridge",
@@ -121,11 +121,9 @@ async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String
     }
     // A resume by hand carries the marker; the hub decides by the session's identity (EXT-02).
     if hello.marker
-        && let Some(s) = hub.lead.snapshot()
-        && !hello.session.is_empty()
-        && s.session_id.as_deref() == Some(hello.session.as_str())
+        && let Some((handle, role)) = switched(hub, raw).await
     {
-        return Ok((s.handle.clone(), Role::Lead, false));
+        return Ok((handle, role, false));
     }
     Err("not a session of this hub".into())
 }
@@ -163,6 +161,45 @@ async fn switched(hub: &Hub, params: &Value) -> Option<(String, Role)> {
         .await
         .ok()
         .flatten()
+}
+
+/// A continuation is acknowledged only once its identity survives reconnects and restarts.
+async fn continue_session(hub: &Hub, handle: &str, role: Role, params: &Value) -> bool {
+    let (Some(session), Some(file)) = (
+        params
+            .get("session")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+        params
+            .get("file")
+            .and_then(Value::as_str)
+            .filter(|s| !s.is_empty()),
+    ) else {
+        return false;
+    };
+    let result = match role {
+        Role::Lead => hub
+            .store
+            .host(crate::store::host::HostWrite::ContinueLead(
+                crate::store::host::SessionUpdate {
+                    handle: handle.into(),
+                    session_id: Some(session.into()),
+                    session_file: Some(file.into()),
+                    ..crate::store::host::SessionUpdate::default()
+                },
+            ))
+            .await
+            .map(|_| ())
+            .map_err(|error| error.to_string()),
+        Role::Lane => hub.lanes.continue_session(handle, session, file).await,
+    };
+    if let Err(error) = &result {
+        log::warn(
+            "continued session identity not saved",
+            &[("handle", handle), ("error", error)],
+        );
+    }
+    result.is_ok()
 }
 
 /// The root session a subagent's `parent` names: a session ID as sent, or (from a worker in its own
@@ -257,7 +294,17 @@ pub(crate) async fn serve<R, W>(
 {
     let raw = params.clone();
     let hello: Hello = serde_json::from_value(params).unwrap_or_default();
-    let decided = match decide(hub, &hello).await {
+    let continuing = matches!(
+        raw.get("continuation").and_then(Value::as_str),
+        Some("new" | "fork" | "session_branch")
+    ) && hello.token.as_deref().is_none_or(str::is_empty)
+        && hello.agent != "sub"
+        && hello
+            .key
+            .as_deref()
+            .and_then(|key| hub.links.by_key(key))
+            .is_some();
+    let decided = match decide(hub, &hello, &raw).await {
         Ok((handle, role, fresh)) => placed(hub, &handle, role, worker)
             .await
             .map(|()| (handle, role, fresh)),
@@ -276,7 +323,7 @@ pub(crate) async fn serve<R, W>(
         }
         Ok((handle, role, fresh)) => match (!sub).then(|| hub.links.port(&handle)).flatten() {
             Some(port) => port
-                .attach(&raw, &key, tx.clone())
+                .attach(&raw, &key, tx.clone(), continuing)
                 .map(|()| (handle, role, fresh, Some(port))),
             None => Ok((handle, role, fresh, None)),
         },
@@ -392,7 +439,8 @@ pub(crate) async fn serve<R, W>(
                     request.params.get("reason").and_then(Value::as_str),
                     Some("new" | "fork" | "session_branch")
                 ) {
-                    Some((handle.clone(), role))
+                    (sub || continue_session(hub, &handle, role, &request.params).await)
+                        .then(|| (handle.clone(), role))
                 } else {
                     switched(hub, &request.params).await
                 };
@@ -416,7 +464,7 @@ pub(crate) async fn serve<R, W>(
                                         map.insert("file".into(), file.clone());
                                     }
                                 }
-                                port.attach(&hello, &key, tx.clone()).is_ok()
+                                port.attach(&hello, &key, tx.clone(), false).is_ok()
                             });
                             attached.then_some((h, r, pin, target))
                         }
@@ -425,7 +473,7 @@ pub(crate) async fn serve<R, W>(
                 };
                 let answer = if let Some((next_handle, next_role, pin, target)) = next {
                     if next_handle != handle {
-                        hub.links.revoke(&handle, &key);
+                        hub.links.revoke(&handle, &key, adopted_pid);
                         if let Some(old) = port.take() {
                             old.detach(&key);
                         }
@@ -458,7 +506,7 @@ pub(crate) async fn serve<R, W>(
                     answer
                 } else {
                     active = false;
-                    hub.links.revoke(&handle, &key);
+                    hub.links.revoke(&handle, &key, adopted_pid);
                     if let Some(old) = port.take() {
                         old.detach(&key);
                     }

@@ -15,7 +15,7 @@ struct Bridge {
 }
 
 impl Bridge {
-    fn lead(hub: &TestHub, session: &Value) -> Self {
+    fn connect(hub: &TestHub, session: &Value, role: &str) -> Self {
         let writer = UnixStream::connect(hub.socket()).unwrap();
         writer
             .set_read_timeout(Some(Duration::from_secs(20)))
@@ -28,10 +28,11 @@ impl Bridge {
         let answer = bridge.call(
             "bridge.hello",
             &json!({
-                "ext": 1, "marker": true, "session": session["session_id"], "agent": "main",
+                "ext": 1, "marker": true, "session": session["session_id"],
+                "file": session["session_file"], "agent": "main",
             }),
         );
-        assert_eq!(answer["ok"]["role"], "lead", "{answer}");
+        assert_eq!(answer["ok"]["role"], role, "{answer}");
         bridge
     }
 
@@ -108,7 +109,7 @@ fn open_lane(hub: &TestHub) -> Value {
 fn bridge_switch_keeps_branch_and_fork_roles() {
     let (mut hub, lead) = lead_hub();
     let lane = open_lane(&hub);
-    let mut bridge = Bridge::lead(&hub, &lead);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
     for (role, original) in [("lead", &lead), ("lane", &lane)] {
         assert_eq!(bridge.switch(original, "resume")["role"], role);
         for (reason, branch) in [
@@ -130,10 +131,68 @@ fn bridge_switch_keeps_branch_and_fork_roles() {
 }
 
 #[test]
+fn bridge_continuations_round_trip_through_the_other_role() {
+    let (mut hub, lead) = lead_hub();
+    let lane = open_lane(&hub);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
+    let mut sessions = [lead, lane];
+    for reason in ["new", "fork", "session_branch"] {
+        for index in 0..2 {
+            let role = ["lead", "lane"][index];
+            assert_eq!(bridge.switch(&sessions[index], "resume")["role"], role);
+            let continued = json!({
+                "session_id": format!("{role}-{reason}"),
+                "session_file": format!("/{role}-{reason}.jsonl"),
+            });
+            assert_eq!(bridge.switch(&continued, reason)["role"], role);
+            sessions[index] = continued;
+            let other = 1 - index;
+            assert_eq!(
+                bridge.switch(&sessions[other], "resume")["role"],
+                ["lead", "lane"][other]
+            );
+            let returned = bridge.switch(&sessions[index], "resume");
+            assert_eq!(returned["role"], role, "{role} {reason}: {returned}");
+        }
+    }
+    drop(bridge);
+    // A new marker-based connection must use the stored continued identity as well.
+    drop(Bridge::connect(&hub, &sessions[0], "lead"));
+    drop(Bridge::connect(&hub, &sessions[1], "lane"));
+    hub.stop();
+}
+
+#[test]
+fn bridge_lane_returns_by_marker_after_an_unrelated_session() {
+    let (mut hub, lead) = lead_hub();
+    let lane = open_lane(&hub);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
+    assert_eq!(bridge.switch(&lane, "resume")["role"], "lane");
+    assert_eq!(
+        bridge.switch(
+            &json!({"session_id":"other","session_file":"/other.jsonl"}),
+            "resume"
+        )["role"],
+        "none"
+    );
+    drop(bridge);
+    let copied = json!({"session_id":lane["session_id"],"session_file":"/copy.jsonl"});
+    drop(Bridge::connect(&hub, &copied, "none"));
+    let mut returned = Bridge::connect(&hub, &lane, "lane");
+    let steps = returned.call(
+        "bridge.tool",
+        &json!({"call":"returned-lane", "input":{"op":"steps"}}),
+    );
+    assert_eq!(steps["ok"]["error"], false, "{steps}");
+    drop(returned);
+    hub.stop();
+}
+
+#[test]
 fn bridge_switch_to_unrelated_session_revokes_lead_tools() {
     let (mut hub, lead) = lead_hub();
     let unrelated = json!({"session_id":"unrelated","session_file":"/unrelated.jsonl"});
-    let mut bridge = Bridge::lead(&hub, &lead);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
     assert_eq!(bridge.switch(&unrelated, "resume")["role"], "none");
     let refused = bridge.call(
         "bridge.tool",
@@ -153,9 +212,10 @@ fn bridge_switch_to_unrelated_session_revokes_lead_tools() {
 #[test]
 fn bridge_switch_rechecks_lead_and_lane_identity_except_for_new() {
     let (mut hub, lead) = lead_hub();
-    let mut bridge = Bridge::lead(&hub, &lead);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
     let fresh = json!({"session_id":"fresh","session_file":"/fresh.jsonl"});
     assert_eq!(bridge.switch(&fresh, "new")["role"], "lead");
+    let lead = fresh; // The continuation, not its predecessor, is now the lead anchor.
     assert_eq!(bridge.switch(&lead, "resume")["role"], "lead");
 
     let lane = open_lane(&hub);

@@ -58,6 +58,34 @@ fn bind(db: &mut Connection, handle: &str, id: &str, now: i64) {
 }
 
 #[test]
+fn a_continued_identity_moves_the_anchor_and_its_pin_together() {
+    let mut db = database();
+    attempt(&mut db, "lead", "fresh", 1);
+    bind(&mut db, "lead", "original", 2);
+    let tx = db.transaction().unwrap();
+    continued(
+        &tx,
+        &SessionUpdate {
+            handle: "lead".into(),
+            session_id: Some("fork".into()),
+            session_file: Some("/sessions/fork.jsonl".into()),
+            ..SessionUpdate::default()
+        },
+        3,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    let reads = Reads(db);
+    for pin in [None, Some("fork")] {
+        let selected = reads.lead_target(pin).unwrap();
+        assert!(selected.hold.is_none(), "{selected:?}");
+        let row = selected.row.unwrap();
+        assert_eq!(row.session_id.as_deref(), Some("fork"));
+        assert_eq!(row.session_file.as_deref(), Some("/sessions/fork.jsonl"));
+    }
+}
+
+#[test]
 fn failed_attempt_and_retention_never_replace_the_anchor() {
     let mut db = database();
     attempt(&mut db, "bound", "fresh", 1);
