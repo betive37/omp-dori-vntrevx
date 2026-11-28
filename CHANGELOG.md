@@ -56,6 +56,8 @@
 - After `cataly setup --service off`, a plain `cataly setup` enabled and started the service
   again. The off is now remembered as `[setup] service = false`; setup leaves the service off
   until `--service on` or `cataly service enable`.
+- Setup can update settings under a table header with a trailing comment, such as `[lead] # main`,
+  without adding a duplicate table and failing validation. The header and its comment are kept.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
