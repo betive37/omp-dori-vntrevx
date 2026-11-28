@@ -338,8 +338,8 @@ operator who configures the daemon (in practice the same person).
   transaction per hand-off removes those windows.
 - Every message in scope was queued, owner or not. Queue only owner messages.
 - One in-doubt hand-off stopped every conversation until the operator abandoned it, and
-  abandonment needed proof that the old lead process was dead. Hold only that conversation, and
-  resolve automatically when the session file is final.
+  abandonment needed proof that the old lead process was dead. Hold no conversation: give up only
+  that message, tell the lead once, and resolve automatically when the session file is final.
 - A "rejected" hand-off outcome existed only because lead delivery went through a line filter
   meant for monitor output. Not needed.
 - A duplicate live event with changed content raised a hard error. Keep the first copy and log.

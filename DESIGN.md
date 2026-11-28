@@ -540,10 +540,13 @@ resets, buying credits and paid overage stay refused, in code:
 - A message found in another session's file is "misdelivered": never resent, owner told once.
 - An owner message a relay handed to the lead or a lane that ends in doubt never holds its room: it is never
   handed again, its queue item is finished, nothing is posted in the room, and the room's next messages go on.
-  The lead hears of it once, from a notice stored before the queue item goes under the batch's once-only
-  identity (the lead inbox's own in-doubt notice; for a lane, the lanes' notice of relayed messages or their
-  alert). A failed hand-off still holds its room for the owner. Rooms an earlier version held for a hand-off in
-  doubt lose that hold when the hub starts; their messages are settled as above.
+  A lane batch in doubt still fences the lane as above. For the lead, and for a lane batch made only of relayed
+  owner messages, the lead hears of it from a notice stored before the queue item goes, under the batch's
+  once-only identity, so it is made once (the lead inbox's own in-doubt notice, or the lanes' notice of the
+  relayed messages). A lane batch that also carries other messages is told by the lanes' usual alert instead,
+  raised with the fence before the queue item goes, without that identity, so it may come more than once. A
+  failed hand-off still holds its room for the owner. Rooms an earlier version held for a hand-off in doubt lose
+  that hold when the hub starts; their messages are settled as above.
 - **Early wake (decision 15).** An owner request from a relay that goes to the lead alone is written before its
   records commit, under a delivery marker derived from its request ID; on Discord, whose Gateway never
   replays a message to a new session, a live message is also handed off while its arrival commits (the

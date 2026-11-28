@@ -858,7 +858,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     // No inbox entry tells the lead of this one: the relay does. The hand-off reads
                     // in doubt before the notice and its queue item goes after it, so a stop in
                     // between neither hands it again nor loses the notice (see `hand_off`). The
-                    // seen mark lets an answer settle the owed reply.
+                    // seen mark shows the owner it was read.
                     let why = format!("the lead's transcript could not be searched ({e})");
                     self.store.relay(handed).await.map_err(|e| e.to_string())?;
                     self.mark_seen(&row.room, &row.message);

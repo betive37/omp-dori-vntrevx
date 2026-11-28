@@ -841,19 +841,25 @@ fn a_lane_thread_goes_on_after_a_hand_off_in_doubt() {
     let now = u64::try_from(since_epoch).unwrap() - 1_420_070_400_000;
     let (lost, next) = ((now << 22) + 1, (now << 22) + 2);
     hub.until(WAIT, || in_lane("Lane instructions").then_some(()));
-    // The lane's OMP takes the message and never writes its entry: in doubt after 30 s.
+    // The lane's OMP takes the message and never writes its entry. Its batch is in doubt once 30 s
+    // have passed and the lane's inbox is next flushed: here by the thread's next message, which
+    // the unconfirmed one does not hold back.
     hub.fixture("omp", "noentry", Some(""));
     fake.say(FakeDiscord::message(source, lost, OWNER, "lost on the way"));
-    hub.until(Duration::from_secs(70), || {
-        (handoff_state(&hub, &lost.to_string()).as_deref() == Some("in_doubt")).then_some(())
+    let envelope = format!("[discord {source}/{lost}] request from the owner");
+    hub.until(WAIT, || {
+        (prompts_with(&hub, &[&envelope]) == 1).then_some(())
     });
-    assert_eq!(status(&hub)["counts"]["held"], 0);
+    std::thread::sleep(Duration::from_secs(31));
     hub.fixture("omp", "noentry", None);
     fake.say(FakeDiscord::message(source, next, OWNER, "the next one"));
     hub.until(WAIT, || in_lane("the next one").then_some(()));
+    hub.until(WAIT, || {
+        (handoff_state(&hub, &lost.to_string()).as_deref() == Some("in_doubt")).then_some(())
+    });
+    assert_eq!(status(&hub)["counts"]["held"], 0);
     assert!(!in_lane("lost on the way"));
     // Never resent, and nothing posted in the thread about it.
-    let envelope = format!("[discord {source}/{lost}] request from the owner");
     assert_eq!(prompts_with(&hub, &[&envelope]), 1);
     assert!(
         !fake
