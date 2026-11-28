@@ -327,10 +327,12 @@ impl Streams {
                     return None;
                 }
             };
-            let Ok(n @ 1..) = read else { break };
+            let Some(output) = read.ok().filter(|&n| n > 0).and_then(|n| chunk.get(..n)) else {
+                break;
+            };
             quiet_since = Instant::now();
             alerted = false;
-            let mut parts = chunk[..n].split(|&b| b == b'\n');
+            let mut parts = output.split(|&b| b == b'\n');
             if let Some(first) = parts.next() {
                 line.push(first);
             }
