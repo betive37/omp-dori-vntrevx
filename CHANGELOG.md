@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Owner messages from Telegram and Slack that had no answer got no reminder and did not keep the
+  lead from stopping or sleeping; only Discord did. Owed messages on every relay now do, and the
+  reminder names the message's own relay.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
