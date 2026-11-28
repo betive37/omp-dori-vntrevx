@@ -111,9 +111,11 @@ pub(crate) enum LeadWrite {
         name: String,
         spec: String,
     },
-    /// A kept job's progress (restarts used, ended); a job stopped meanwhile stays removed.
+    /// A kept job's progress (restarts used, ended), written only to the row of the same start
+    /// (`run`): a job stopped meanwhile stays removed, one started again under its name is kept.
     StreamProgress {
         name: String,
+        run: String,
         spec: String,
     },
     StreamRemove {
@@ -232,9 +234,10 @@ pub(crate) fn write(tx: &Transaction<'_>, w: &LeadWrite, now: i64) -> rusqlite::
              ON CONFLICT (name) DO UPDATE SET spec = excluded.spec",
             params![name, spec, now],
         )?),
-        LeadWrite::StreamProgress { name, spec } => LeadDone::Count(tx.execute(
-            "UPDATE stream_jobs SET spec = ?2 WHERE name = ?1",
-            params![name, spec],
+        LeadWrite::StreamProgress { name, run, spec } => LeadDone::Count(tx.execute(
+            "UPDATE stream_jobs SET spec = ?2 \
+             WHERE name = ?1 AND IFNULL(json_extract(spec, '$.run'), '') = ?3",
+            params![name, spec, run],
         )?),
         LeadWrite::StreamRemove { name } => {
             LeadDone::Count(tx.execute("DELETE FROM stream_jobs WHERE name = ?1", [name])?)

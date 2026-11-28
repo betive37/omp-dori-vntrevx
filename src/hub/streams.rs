@@ -44,6 +44,22 @@ struct Spec {
     /// The restarts are used up: the job stays listed but the hub does not start it again.
     #[serde(default)]
     ended: bool,
+    /// How the last child ended, kept for the list after a hub restart.
+    #[serde(default)]
+    last_exit: Option<String>,
+    /// Which start this is: progress is written only to the row of the same start.
+    #[serde(default)]
+    run: String,
+}
+
+/// How long an ended child waits for the hub's own stop to show: under systemd the control
+/// group's TERM can reach the child before the hub. Such an exit is not the job's and not counted.
+const STOP_GRACE: Duration = Duration::from_secs(1);
+
+fn run_id() -> String {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    format!("{}-{n}", crate::sys::now_ms())
 }
 
 #[derive(Debug, Clone)]
@@ -62,6 +78,7 @@ pub(crate) struct Streams {
     cwd: PathBuf,
     files: PathBuf,
     running: Mutex<HashMap<String, State>>,
+    shutdown: watch::Receiver<bool>,
 }
 
 fn spec_of(input: &Value) -> Result<Spec, String> {
@@ -102,17 +119,26 @@ fn spec_of(input: &Value) -> Result<Spec, String> {
         low: p::LOW.flag(input),
         used: 0,
         ended: false,
+        last_exit: None,
+        run: run_id(),
     })
 }
 
 impl Streams {
-    pub(crate) fn new(jobs: Jobs, store: Store, cwd: PathBuf, files: PathBuf) -> Arc<Self> {
+    pub(crate) fn new(
+        jobs: Jobs,
+        store: Store,
+        cwd: PathBuf,
+        files: PathBuf,
+        shutdown: watch::Receiver<bool>,
+    ) -> Arc<Self> {
         Arc::new(Self {
             jobs,
             store,
             cwd,
             files,
             running: Mutex::new(HashMap::new()),
+            shutdown,
         })
     }
 
@@ -136,7 +162,7 @@ impl Streams {
                         State {
                             phase: "exhausted",
                             restarts: spec.used,
-                            last_exit: None,
+                            last_exit: spec.last_exit,
                             next_restart: None,
                             stop: watch::channel(true).0,
                         },
@@ -262,6 +288,7 @@ impl Streams {
     async fn keep_progress(&self, spec: &Spec) {
         let write = serde_json::to_string(spec).map(|saved| LeadWrite::StreamProgress {
             name: spec.name.clone(),
+            run: spec.run.clone(),
             spec: saved,
         });
         let result = match write {
@@ -274,6 +301,13 @@ impl Streams {
                 &[("job", &spec.name), ("error", &e)],
             );
         }
+    }
+
+    /// Whether the hub is stopping, waiting `STOP_GRACE` for its stop to show.
+    async fn hub_stopping(&self) -> bool {
+        let mut shutdown = self.shutdown.clone();
+        let _ = tokio::time::timeout(STOP_GRACE, shutdown.wait_for(|stop| *stop)).await;
+        *shutdown.borrow()
     }
 
     /// Runs the command until it is stopped or its restarts are used up (WS req. 73).
@@ -304,7 +338,11 @@ impl Streams {
             let Some(exit) = ended else {
                 return;
             };
+            if self.hub_stopping().await {
+                return;
+            }
             self.update(&spec.name, |s| s.last_exit = Some(exit.clone()));
+            spec.last_exit = Some(exit.clone());
             if attempt >= spec.restarts {
                 self.update(&spec.name, |s| s.phase = "exhausted");
                 spec.ended = true;
@@ -433,6 +471,7 @@ mod tests {
                 ctx.store.clone(),
                 dir.to_path_buf(),
                 dir.join("files"),
+                watch::channel(false).1,
             )
         };
         let first = hub(&ctx);
@@ -470,7 +509,7 @@ mod tests {
         second.resume().await;
         let list = second.list();
         assert!(
-            list.starts_with("- once: exhausted, 0 restart(s)"),
+            list.starts_with("- once: exhausted, 0 restart(s), last exit status 1"),
             "{list}"
         );
         assert_eq!(ended(&ctx).await, 1);
@@ -481,5 +520,85 @@ mod tests {
             .await
             .unwrap();
         assert!(kept.is_empty(), "{kept:?}");
+    }
+
+    async fn kept_specs(ctx: &Arc<crate::jobs::Ctx>) -> Vec<Spec> {
+        ctx.store
+            .read(crate::store::Reads::stream_jobs)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(_, spec)| serde_json::from_str(&spec).unwrap())
+            .collect()
+    }
+
+    async fn save(ctx: &Arc<crate::jobs::Ctx>, spec: &Spec) {
+        ctx.store
+            .lead(LeadWrite::StreamSave {
+                name: spec.name.clone(),
+                spec: serde_json::to_string(spec).unwrap(),
+            })
+            .await
+            .unwrap();
+    }
+
+    /// WS-04: a child that ends while the hub stops (systemd's TERM to the whole control group) is
+    /// not counted against the job, so it starts again with the hub.
+    #[tokio::test]
+    async fn an_exit_while_the_hub_stops_is_not_counted() {
+        let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-hub-stop");
+        let (_stopping, shutdown) = watch::channel(true);
+        let streams = Streams::new(
+            crate::jobs::tests::jobs_of(&ctx),
+            ctx.store.clone(),
+            dir.to_path_buf(),
+            dir.join("files"),
+            shutdown,
+        );
+        let spec = spec_of(&json!({"name": "term", "argv": ["sh", "-c", "exit 1"], "restarts": 0}))
+            .unwrap();
+        save(&ctx, &spec).await;
+        let (_job_stop, stopped) = watch::channel(false);
+        Arc::clone(&streams).run(spec, stopped).await;
+        let kept = kept_specs(&ctx).await;
+        assert_eq!(kept.len(), 1);
+        assert!(!kept[0].ended && kept[0].used == 0, "{kept:?}");
+        let events = ctx.store.read(|r| r.events_after(0, 10)).await.unwrap();
+        assert!(events.is_empty(), "{events:?}");
+    }
+
+    /// A task of a stopped job never writes over the job started again under its name.
+    #[tokio::test]
+    async fn a_stopped_start_writes_no_progress() {
+        let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-stale");
+        let streams = Streams::new(
+            crate::jobs::tests::jobs_of(&ctx),
+            ctx.store.clone(),
+            dir.to_path_buf(),
+            dir.join("files"),
+            watch::channel(false).1,
+        );
+        let input = json!({"name": "same", "argv": ["true"]});
+        let mut old = spec_of(&input).unwrap();
+        save(&ctx, &old).await;
+        ctx.store
+            .lead(LeadWrite::StreamRemove {
+                name: "same".into(),
+            })
+            .await
+            .unwrap();
+        let new = spec_of(&input).unwrap();
+        save(&ctx, &new).await;
+        old.ended = true;
+        streams.keep_progress(&old).await;
+        let kept = kept_specs(&ctx).await;
+        assert!(
+            kept.len() == 1 && !kept[0].ended && kept[0].run == new.run,
+            "{kept:?}"
+        );
+        let mut new = new;
+        new.used = 2;
+        streams.keep_progress(&new).await;
+        assert_eq!(kept_specs(&ctx).await[0].used, 2);
     }
 }
