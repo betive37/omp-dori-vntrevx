@@ -4,7 +4,8 @@
 
 - Removing a worker keeps the SSH host-key pin while another worker uses the same host and port
   (ignoring host-name letter case), so other users on that host can still connect. The last worker's
-  removal drops the pin.
+  removal drops every case variant of the pin. Enrolling a worker replaces case variants instead of
+  adding duplicate pins.
 
 ## 0.2.8 (2026-11-28)
 

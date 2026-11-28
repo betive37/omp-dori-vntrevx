@@ -1622,6 +1622,34 @@ pub(crate) mod tests {
     }
 
     #[test]
+    fn removing_workers_drops_all_shared_host_pin_case_variants() {
+        for port in [22, 2222] {
+            let dir = crate::sys::fs::tests::scratch("worker-shared-pin-variants");
+            let mut config = crate::config::parse(&format!(
+                "[workers.alice]\ndestination = \"alice@BoX\"\nport = {port}\n\
+                 [workers.bob]\ndestination = \"bob@bOx\"\nport = {port}\n"
+            ))
+            .unwrap();
+            let alice = Destination::parse(&format!("alice@BoX:{port}")).unwrap();
+            let bob = Destination::parse(&format!("bob@bOx:{port}")).unwrap();
+            let pins = enrol::known_hosts(&dir);
+            // Older enrolments can leave one pin for each host-name spelling.
+            let all_pins = format!(
+                "{} ssh-ed25519 SHARED\n{} ssh-ed25519 SHARED\n",
+                alice.pin_name(),
+                bob.pin_name()
+            );
+            crate::sys::fs::write_atomic(&pins, all_pins.as_bytes()).unwrap();
+
+            remove_files(&dir, "alice", &alice, &config).unwrap();
+            assert_eq!(std::fs::read_to_string(&pins).unwrap(), all_pins);
+            config.workers.remove("alice");
+            remove_files(&dir, "bob", &bob, &config).unwrap();
+            assert!(std::fs::read_to_string(&pins).unwrap().is_empty());
+        }
+    }
+
+    #[test]
     fn ssh_failures_are_named() {
         assert_eq!(
             classify(
