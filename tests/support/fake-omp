@@ -150,7 +150,7 @@ turn() {
     if [ -f "$dir/approve" ] && printf '%s' "$msg" | grep -q APPROVE; then
         asked=$2
         approval='{"type":"extension_ui_request","id":"approval-1","method":"select","title":"Approve this fake write?","options":["Approve Once","Approve for this session","Deny"]}'
-        if [ -f "$dir/hold" ] && printf '%s' "$msg" | grep -qF "$(cat "$dir/hold")"; then
+        if [ -n "$held" ]; then
             (
                 while [ -d "$dir" ] && [ ! -f "$dir/release" ]; do sleep 0.1; done
                 [ -f "$dir/release" ] && echo "$approval"

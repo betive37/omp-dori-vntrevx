@@ -2411,6 +2411,43 @@ mod tests {
         assert!(!session.alive());
     }
 
+    /// `Snapshot::in_turn` follows the turn OMP runs, not a status that is merely not idle: a goal
+    /// blocked by its budget with no turn running is none, an open dialog is one, a fault ends one.
+    #[tokio::test]
+    async fn only_a_running_turn_or_an_open_dialog_is_a_turn() {
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        // A completed turn needs its transcript, else the readback faults the session.
+        std::fs::write(fake.file(), "{\"type\":\"session\"}\n").unwrap();
+        assert!(!session.snapshot().in_turn(), "idle");
+        fake.set(|s| s.streaming = true);
+        fake.push(json!({"type": "agent_start"}));
+        let running = fake
+            .wait_for(&session, |s| s.turn_started_ms.is_some())
+            .await;
+        assert!(running.in_turn(), "a turn runs: {running:?}");
+        fake.set(|s| {
+            s.streaming = false;
+            s.goal = Some("budget-limited");
+        });
+        fake.push(json!({"type": "agent_end", "isTerminal": true}));
+        let blocked = fake
+            .wait_for(&session, |s| {
+                s.status == Status::Blocked && s.turn_started_ms.is_none()
+            })
+            .await;
+        assert!(!blocked.in_turn(), "blocked by its budget, no turn runs");
+        fake.push(
+            json!({"type": "extension_ui_request", "id": "a1", "method": "select",
+            "title": "Run bash?", "options": ["Approve Once", "Deny"]}),
+        );
+        let asking = fake.wait_for(&session, |s| !s.dialogs.is_empty()).await;
+        assert!(asking.in_turn(), "a dialog waits for its answer");
+        fake.push(json!({"type": "rpc_frame_error"}));
+        let faulted = fake.wait_for(&session, |s| s.status == Status::Error).await;
+        assert!(!faulted.in_turn(), "a fault ends it");
+    }
+
     /// A turn that ends on a model nobody asked for and OMP never reported as a fallback is
     /// reported once, urgent for the owner (DESIGN 6.1); a model the hub asked for is not.
     #[tokio::test]
