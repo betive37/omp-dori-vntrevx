@@ -5,8 +5,9 @@
 - A Telegram or Slack intake restart (a config change, `release` or `reset`) left the old poller or
   socket running beside the new one: Telegram got two long polls (409 and offset races) and Slack
   kept admitting senders removed from `allow`. The old source is now stopped and waited for before
-  the next one starts. Slack finishes admitting and acknowledging an envelope it has already read
-  before stopping; a pending connection or frame read still stops promptly.
+  the next one starts. Slack finishes admitting an envelope it has already read before stopping,
+  then gives its acknowledgement up to 500 ms before closing a stalled connection. Pending
+  connections, frame reads and replayable catch-up reads still stop promptly.
 
 ## 0.2.8 (2026-11-28)
 

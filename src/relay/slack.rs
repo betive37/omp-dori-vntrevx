@@ -54,6 +54,8 @@ const LIMIT: usize = 4000;
 const IDENTITY_TIMEOUT: Duration = Duration::from_secs(10);
 /// Envelopes are acknowledged within 3 s (SLACK req. 38); admission gets this much of it.
 const ADMIT_WITHIN: Duration = Duration::from_millis(2500);
+/// The remaining envelope budget: a stalled acknowledgement must not prevent a restart.
+const ACK_WITHIN: Duration = Duration::from_millis(500);
 const BACKOFF_FIRST: Duration = Duration::from_secs(1);
 const BACKOFF_MAX: Duration = Duration::from_secs(60);
 const FRAME_MAX: usize = 1024 * 1024;
@@ -934,6 +936,17 @@ fn socket_url(url: &str, loopback: bool) -> Option<(bool, String, u16)> {
     ok.then_some((tls, host, port))
 }
 
+/// Acknowledges an admitted or dropped envelope. On failure the caller drops the connection,
+/// keeping the admitted message even if Slack has to redeliver its envelope.
+async fn acknowledge(ws: &mut http::WebSocket, envelope: &str) -> Result<(), String> {
+    let ack = json!({"envelope_id": envelope}).to_string();
+    match tokio::time::timeout(ACK_WITHIN, ws.send(Frame::text(ack))).await {
+        Ok(Ok(())) => Ok(()),
+        Ok(Err(e)) => Err(format!("acknowledgement not sent: {e}")),
+        Err(_) => Err("acknowledgement not sent within 500 ms".into()),
+    }
+}
+
 /// Why one Socket Mode connection ended.
 enum Down {
     Again(String),
@@ -1043,7 +1056,14 @@ impl<T: Runtime> Socket<T> {
                     });
                     if !caught_up {
                         caught_up = true;
-                        match self.catch_up().await {
+                        // Catch-up has no envelope to acknowledge; the next intake can read it
+                        // again from its saved positions without holding up this stop.
+                        let caught = tokio::select! {
+                            biased;
+                            _ = shutdown.changed() => return Down::Shutdown,
+                            result = self.catch_up() => result,
+                        };
+                        match caught {
                             Ok(()) => {
                                 self.shared.catch_up_latency.record(established.elapsed());
                                 self.shared.set(|h| h.caught_up = true);
@@ -1071,9 +1091,8 @@ impl<T: Runtime> Socket<T> {
                     // Admitted or dropped first, acknowledged within 3 s either way.
                     let _ = tokio::time::timeout(ADMIT_WITHIN, self.event(event, read_at)).await;
                 }
-                let ack = json!({"envelope_id": envelope}).to_string();
-                if let Err(e) = ws.send(Frame::text(ack)).await {
-                    return Down::Again(format!("acknowledgement not sent: {e}"));
+                if let Err(e) = acknowledge(&mut ws, envelope).await {
+                    return Down::Again(e);
                 }
             }
         }
@@ -1478,6 +1497,82 @@ mod tests {
             }
             writer.join().unwrap().unwrap();
         }
+    }
+
+    #[tokio::test]
+    async fn a_halt_interrupts_a_pending_catch_up() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let base = Base::parse(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let (socket, writer, _dir) = socket(base);
+        remember(&socket.store, "C1", "1.000001", "1.000001")
+            .await
+            .unwrap();
+        let shared = Arc::clone(&socket.shared);
+        let (halt, halted) = watch::channel(false);
+        {
+            let run = socket.run(halted);
+            tokio::pin!(run);
+            let mut ws = tokio::select! {
+                _ = &mut run => panic!("socket stopped before connecting"),
+                ws = async {
+                    tokio_tungstenite::accept_async(open_socket(&listener).await).await
+                } => ws.unwrap(),
+            };
+            ws.send(Frame::text(json!({"type": "hello"}).to_string()))
+                .await
+                .unwrap();
+            // Keep the catch-up HTTP request unanswered, as with an unresponsive Web API.
+            let (_pending, request) = tokio::select! {
+                _ = &mut run => panic!("socket stopped before catch-up"),
+                request = async {
+                    let (stream, _) = listener.accept().await.unwrap();
+                    let mut stream = BufReader::new(stream);
+                    let mut line = String::new();
+                    stream.read_line(&mut line).await.unwrap();
+                    (stream, line)
+                } => request,
+            };
+            assert!(
+                request.starts_with("GET /conversations.replies?"),
+                "{request}"
+            );
+            tokio::time::pause();
+            halt.send(true).unwrap();
+            assert!(matches!(
+                tokio::time::timeout(Duration::from_secs(1), &mut run).await,
+                Ok(Stop::Shutdown)
+            ));
+            assert!(!shared.health().caught_up);
+            tokio::time::resume();
+        }
+        writer.join().unwrap().unwrap();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn a_stalled_acknowledgement_has_a_deadline() {
+        let (stream, mut peer) = tokio::io::duplex(1);
+        let io: Box<dyn http::Io> = Box::new(stream);
+        let mut ws = http::WebSocket::from_raw_socket(
+            io,
+            tokio_tungstenite::tungstenite::protocol::Role::Client,
+            None,
+        )
+        .await;
+        let started = tokio::time::Instant::now();
+        // The peer stays open but never drains its one-byte buffer. The outer deadline makes
+        // removing the send timeout fail rather than leaving the test hung as well.
+        let why = tokio::time::timeout(Duration::from_secs(1), acknowledge(&mut ws, "read"))
+            .await
+            .unwrap()
+            .unwrap_err();
+        assert_eq!(why, "acknowledgement not sent within 500 ms");
+        assert!(started.elapsed() >= ACK_WITHIN);
+        assert!(started.elapsed() < Duration::from_secs(1));
+        // connect returns on this error, dropping the partially written socket, not the queue.
+        drop(ws);
+        let mut byte = [0];
+        peer.read_exact(&mut byte).await.unwrap();
+        assert_eq!(peer.read(&mut byte).await.unwrap(), 0);
     }
 
     #[test]
