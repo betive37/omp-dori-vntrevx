@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A worker lane's report or step with `files` read those files on the hub, at the worker's path:
+  a file only on the worker was refused as missing, and a hub file at the same path was recorded
+  instead. They are now read on the worker (at most 8 MiB per file there).
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
