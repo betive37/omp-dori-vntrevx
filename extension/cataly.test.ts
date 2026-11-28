@@ -440,3 +440,35 @@ test("a session without Tern answers model.resolve and still takes no other comm
 	expect(await ask({ op: "model", model: "fake/second" })).toBeUndefined();
 	expect(calls).toEqual([]);
 });
+
+test("a lane.review gets the per-op wait the hub serves, so an answer after 5 s still arrives", async () => {
+	const pi = fakePi();
+	const sent: any[] = [];
+	let answer: (() => void) | undefined;
+	const connect: Deps["connect"] = async (_path, onLine) => ({
+		write(line: string) {
+			const msg = JSON.parse(line);
+			sent.push(msg);
+			const reply = (ok: unknown) => onLine(JSON.stringify({ v: 1, id: msg.id, ok }));
+			if (msg.method === "bridge.hello")
+				queueMicrotask(() => reply({ role: "lead", key: "k1", tools: [{ name: "cataly_lead", parameters: { type: "object" }, op_timeout_ms: { "lane.review": 2_100_000 } }] }));
+			if (msg.method === "bridge.tool") answer = () => reply({ text: `did ${msg.params.input.op}` });
+		},
+		close() {},
+	});
+	bridge(pi, { env: { CATALY_LAUNCH: "tok", CATALY_SOCKET: "/x.sock" }, connect, uid: () => 1 });
+	const ctx = ctxOf(pi);
+	await pi.emit("session_start", {}, ctx);
+	// A fake clock: timers armed during the call fire if they end before the hub's answer at 6 s.
+	const real = globalThis.setTimeout;
+	const timers: [() => void, number][] = [];
+	globalThis.setTimeout = ((fn: () => void, ms: number) => (timers.push([fn, ms]), 0)) as any;
+	try {
+		const call = pi.tools[0].execute("call-r", { op: "lane.review", pr: "o/r#1" }, undefined, undefined, ctx);
+		for (const [fn, ms] of timers) if (ms <= 6_000) fn();
+		answer?.();
+		expect((await call).content[0].text).toBe("did lane.review");
+	} finally {
+		globalThis.setTimeout = real;
+	}
+});

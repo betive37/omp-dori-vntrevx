@@ -29,6 +29,9 @@ use crate::sys::now_ms;
 
 /// A review may take this long.
 const REVIEW_LIMIT: Duration = Duration::from_mins(30);
+/// The lead's bridge waits this long for `lane.review`, which answers only once the review ends:
+/// the limit, the kill grace and the fetch and record around it.
+pub(crate) const REVIEW_WAIT: Duration = REVIEW_LIMIT.saturating_add(Duration::from_mins(5));
 const REVIEW_CAP: u64 = 4 * 1024 * 1024;
 const KEEP_CHARS: usize = 4000;
 const DIAG_LINES: usize = 200;

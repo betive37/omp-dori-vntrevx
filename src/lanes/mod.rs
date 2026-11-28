@@ -25,6 +25,7 @@ mod remote;
 mod reopen;
 mod replies;
 mod review;
+pub(crate) use review::REVIEW_WAIT;
 pub(crate) mod shell;
 pub(crate) mod slots;
 mod starts;
