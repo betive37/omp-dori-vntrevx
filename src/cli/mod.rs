@@ -354,6 +354,11 @@ fn events(p: &Parsed, hub: &mut Client, as_json: bool) -> Result<(), Failure> {
         CALL_TIMEOUT,
     )?;
     let events: Events = decode(reply)?;
+    if let Some(after) = events.more {
+        out::error_line(&format!(
+            "event list cut to fit the reply limit; read omitted events with `cataly events --after {after}`"
+        ));
+    }
     events
         .events
         .into_iter()

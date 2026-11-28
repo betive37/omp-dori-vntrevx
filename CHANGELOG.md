@@ -158,6 +158,9 @@
 - A batch of more than 256 job-event destinations could leave the rest waiting until another event
   arrived. The router now drains every page without a new event, keeping its delivery concurrency limit.
   Deliveries wait for a slot before being marked started, so a restart keeps those still queued.
+- Large event bodies could make `events` fail with "bad reply". Event pages now fit within the
+  control-socket line limit, keeping the newest events in the default view. The CLI reports a
+  byte-limited list and prints an `--after` cursor for reading the omitted events.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

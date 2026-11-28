@@ -486,6 +486,11 @@ relay destinations, or kept locally. Messenger posts never mention anyone and pa
   Request `{v, id, method, params}`; reply `{v, id, ok}` or `{v, id, err: {code, message}}`. Streams
   (`events.follow`, `session.follow`) send `{v, id, item}` lines until cancelled. A request runs to completion
   even if its caller disconnects; every mutating method takes an optional caller request ID for dedupe.
+  `events.since` pages fit the line limit with room for the reply envelope. Without `after` or
+  `since_ms`, they keep the newest selected events; with either cursor, they keep an oldest-first
+  prefix. Byte-limited replies include `more`, an `after` cursor for reading omitted events. In
+  latest mode it replays the selected range from its old end, possibly repeating newer events
+  already shown. The CLI prints this hint on stderr, leaving JSON event lines unchanged.
 - **Bridge link.** Same socket: `hello` (protocol version, OMP version, launch token, session ID and file, PID,
   cwd, agent kind, run mode) → role answer with guidance text, tools to show, model pin, shell-rules flag. Then
   events with per-connection sequence numbers, heartbeats every 15 s (45 s = closed), bounded buffering on the
