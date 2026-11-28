@@ -135,6 +135,7 @@ impl ApiError {
                 "ratelimited"
                     | "no success field"
                     | "invalid_auth"
+                    | "token_expired"
                     | "token_revoked"
                     | "account_inactive"
                     | "not_authed"
@@ -1301,6 +1302,7 @@ mod tests {
         assert!(reconnects(Some(401), "refused"));
         for why in [
             "invalid_auth",
+            "token_expired",
             "token_revoked",
             "account_inactive",
             "not_authed",
