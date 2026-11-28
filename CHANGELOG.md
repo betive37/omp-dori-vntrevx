@@ -148,6 +148,9 @@
   object is missing, retry the non-forced push. Destination records hash expanded URLs and the branch
   instead of retaining URL credentials; direct URLs also honor URL rewrites. No branch upstream is
   required, and a repository with no HEAD is left alone.
+  changed. An unchanged tick now pushes commits missing from the configured backup remote and
+  branch, even without pending-push memory or a branch upstream. A missing remote-tracking ref
+  also triggers a push; a repository with no commit is left alone.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
