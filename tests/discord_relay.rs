@@ -1363,7 +1363,10 @@ fn live_passes_do_not_skip_owner_messages_during_catch_up() {
         );
         assert_eq!(held_position, baseline.to_string());
         assert_eq!(asked.len(), 2, "only the two owner messages reach the lead");
-        settled(&hub);
+        hub.until(WAIT, || {
+            let s = status(&hub);
+            (s["counts"]["owed_settled"] == 2 && s["counts"]["queued"] == 0).then_some(())
+        });
         // Once this room is caught up, live passes advance normally again.
         let after = 950_000_000_000_000_000;
         fake.say(FakeDiscord::message(CH, after, OTHER, "after catch-up"));

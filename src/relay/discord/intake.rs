@@ -206,6 +206,8 @@ struct Scope {
     lookups: VecDeque<(Snowflake, Option<Snowflake>)>,
     /// The first active-thread listing of this run is done.
     listed_once: bool,
+    /// Live passes must not overtake owner messages still undiscovered by REST.
+    catching_up: HashSet<Snowflake>,
 }
 
 impl Scope {
@@ -304,8 +306,6 @@ pub(crate) struct Intake<T: Runtime> {
     /// When the current connection was established, for the catch-up latency.
     established: Mutex<Option<Instant>>,
     catch_up_backoff: Mutex<(Duration, Option<Instant>)>,
-    /// Live passes must not overtake owner messages still undiscovered by REST.
-    catching_up: Mutex<HashSet<Snowflake>>,
     turn_running: AtomicBool,
     /// A turn ended (no continuation) since the last turn start.
     turn_ended: AtomicBool,
@@ -418,7 +418,6 @@ impl<T: Runtime> Intake<T> {
             started_ms: now_ms(),
             established: Mutex::new(None),
             catch_up_backoff: Mutex::new((CATCH_UP_FIRST, None)),
-            catching_up: Mutex::new(HashSet::new()),
             turn_running: AtomicBool::new(false),
             turn_ended: AtomicBool::new(false),
             typed: Mutex::new(None),
@@ -450,19 +449,20 @@ impl<T: Runtime> Intake<T> {
 
     async fn flag(&self, on: bool) {
         if on {
-            let scope = self.scope();
-            let mut rooms = self
-                .catching_up
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner);
-            rooms.clear();
-            rooms.extend(
-                scope
-                    .listed
+            let mut scope = self.scope();
+            let Scope {
+                listed,
+                threads,
+                catching_up,
+                ..
+            } = &mut *scope;
+            catching_up.clear();
+            catching_up.extend(
+                listed
                     .iter()
                     .filter(|(_, l)| !l.forum())
                     .map(|(c, _)| *c)
-                    .chain(scope.threads.keys().copied()),
+                    .chain(threads.keys().copied()),
             );
         }
         let write = RelayWrite::Flag {
@@ -611,6 +611,7 @@ impl<T: Runtime> Intake<T> {
                 threads,
                 lookups,
                 listed_once,
+                ..
             } = &mut *scope;
             listed.retain(|c, _| new.channels.contains(c));
             listed.extend(found.listed);
@@ -909,9 +910,8 @@ impl<T: Runtime> Intake<T> {
                 let threads = scope.threads.iter().map(|(t, p)| (*t, Some(*p)));
                 listed.chain(threads).collect()
             };
-            self.catching_up
-                .lock()
-                .unwrap_or_else(PoisonError::into_inner)
+            self.scope()
+                .catching_up
                 .extend(rooms.iter().map(|(room, _)| *room));
             for (room, parent) in rooms {
                 match self.read_room(room, parent).await {
@@ -924,10 +924,7 @@ impl<T: Runtime> Intake<T> {
                     },
                     other => other?,
                 }
-                self.catching_up
-                    .lock()
-                    .unwrap_or_else(PoisonError::into_inner)
-                    .remove(&room);
+                self.scope().catching_up.remove(&room);
             }
             Ok::<(), RestError>(())
         }
@@ -1099,13 +1096,7 @@ impl<T: Runtime> Intake<T> {
         }
         match gate {
             Gate::Pass => {
-                if read_at.is_some()
-                    && self
-                        .catching_up
-                        .lock()
-                        .unwrap_or_else(PoisonError::into_inner)
-                        .contains(&room)
-                {
+                if read_at.is_some() && self.scope().catching_up.contains(&room) {
                     return;
                 }
                 let _ = self
