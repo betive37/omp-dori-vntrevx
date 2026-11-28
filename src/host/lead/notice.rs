@@ -162,7 +162,10 @@ impl Cause {
             Self::Transcript
         } else if has("fresh") && has("did not bind") {
             Self::Fresh
-        } else if has("lease") || has("is held by") {
+        } else if has("unknown lease")
+            || has("is held by a running OMP")
+            || has("is held by another OMP")
+        {
             Self::InUse
         } else if has("changed during recovery") || has("conflicts with --fresh") || has("differs")
         {
@@ -684,6 +687,7 @@ Other|a lead is already running";
         })
         .into();
         reasons.push(("Rejected", StartError::Refused("r".into()).to_string()));
+        assert_ne!(Cause::of("OMP release notes unavailable"), Cause::InUse);
         for line in WRITTEN.lines() {
             let (cause, reason) = line.split_once('|').unwrap();
             assert!(
