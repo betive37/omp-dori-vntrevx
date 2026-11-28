@@ -1174,7 +1174,11 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 }
             }
         }
-        // One delivery at a time, in request order (DISC-OUT req. 28).
+        self.post_answers().await
+    }
+
+    /// Posts the answers being posted, one delivery at a time in request order (DISC-OUT req. 28).
+    async fn post_answers(self: &Arc<Self>) -> Result<(), String> {
         let posting = self
             .store
             .read(|r| r.answers_open(R::NAME))
