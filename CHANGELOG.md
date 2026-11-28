@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- **A quota-blocked lead stays blocked after its sleep or a restart.** The block a usage-limit
+  error sets was kept only in the running session, so once the lead slept, restarted or the hub
+  restarted, hub notes and other automatic input reached the model again without your decision.
+  The block is now kept in the store and the next lead session starts with it; only your messages
+  reach the lead until one of its turns completes.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
