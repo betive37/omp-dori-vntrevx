@@ -137,13 +137,20 @@ does not see your shell's environment, so it:
 - writes one `PATH=` line into the unit, made of the folders where `omp`, `bun`, `gh`, `git` and
   the Tern executable are found now, then `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
   repeats and folders with `:`, `"`, `\` or control characters are left out. The line is printed;
-- keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` values from the current
-  environment in the unit or agent, so the hub uses the same config, store and program folder;
-  unset, empty and relative values are ignored. Refresh captures these values again;
+- keeps absolute `XDG_STATE_HOME` and `XDG_DATA_HOME` values from the current environment in the
+  unit or agent, so the hub uses the same store and program folder. On macOS this also preserves
+  `XDG_CONFIG_HOME`. Unset, empty and relative values are ignored; explicit service commands
+  refuse absolute non-UTF-8 values before writing the definition. Refresh captures these values again;
 - reads provider keys from `secrets/service.env` next to the config file (owner-only, mode `600`).
   A new file gets each `[sessions] credentials` name found in your current environment as
   `NAME=value`, and the others as commented lines to fill in. An existing file is never changed;
   the names it lacks are printed. Restart the service after editing it.
+
+On Linux, a shell-only custom `XDG_CONFIG_HOME` remains unsupported. The shell and systemd user
+manager must agree on the config home: the unit is written below the shell's config home, but the
+manager searches its own. The unit's `Environment=` line cannot change where the manager looks.
+Rolling back to a version without XDG preservation can also remove these settings on refresh.
+Automatic update/rollback still does not pass non-UTF-8 environment values to its refresh subprocess.
 
 ## Value formats
 

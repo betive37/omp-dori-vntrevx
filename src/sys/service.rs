@@ -6,7 +6,9 @@
 //! A service starts with the manager's bare environment, so the definition carries what the hub
 //! needs: a PATH holding the folders of the tools it runs, absolute XDG config/state/data homes
 //! from the environment at enable or refresh, and an owner-only environment file with the provider
-//! keys listed in `[sessions] credentials`.
+//! keys listed in `[sessions] credentials`. Absolute non-UTF-8 homes are refused. On Linux a
+//! shell-only `XDG_CONFIG_HOME` remains unsupported: the shell and user manager must agree on the
+//! config home so the manager can find the unit.
 //! systemd reads that file itself (`EnvironmentFile=`); launchd has no such key, so the agent runs
 //! `/bin/sh`, which reads the file and replaces itself with the hub (`exec`, same process).
 //!
@@ -16,6 +18,7 @@
 //! built from an allow-list (`sys::command`).
 
 use std::collections::HashSet;
+use std::ffi::OsString;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -124,21 +127,25 @@ fn xml_escape(text: &str) -> String {
 }
 
 /// The unit or agent text for `unit`.
-pub(crate) fn definition(unit: &Unit<'_>) -> String {
-    definition_with_env(unit, cfg!(target_os = "macos"), |k| std::env::var(k).ok())
+pub(crate) fn definition(unit: &Unit<'_>) -> Result<String, String> {
+    definition_with_env(unit, cfg!(target_os = "macos"), |k| std::env::var_os(k))
 }
 
 fn definition_with_env(
     unit: &Unit<'_>,
     macos: bool,
-    lookup: impl Fn(&str) -> Option<String>,
-) -> String {
+    lookup: impl Fn(&str) -> Option<OsString>,
+) -> Result<String, String> {
     let xdg = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"]
         .into_iter()
         .filter_map(|name| {
             lookup(name)
                 .filter(|value| Path::new(value).is_absolute())
-                .map(|value| (name, value))
+                .map(|value| {
+                    value.into_string().map(|value| (name, value)).map_err(|_| {
+                        format!("{name} is not valid UTF-8; user service paths must be UTF-8")
+                    })
+                })
         });
     if macos {
         let exe = xml_escape(&unit.command.display().to_string());
@@ -155,7 +162,8 @@ fn definition_with_env(
   <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>{script}</string><string>{env_file}</string><string>{exe}</string></array>\n\
   <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string>"
         );
-        for (name, value) in xdg {
+        for entry in xdg {
+            let (name, value) = entry?;
             let _ = write!(
                 text,
                 "<key>{name}</key><string>{}</string>",
@@ -169,7 +177,7 @@ fn definition_with_env(
   <key>ThrottleInterval</key><integer>5</integer>\n\
 </dict>\n</plist>\n",
         );
-        text
+        Ok(text)
     } else {
         let exe = systemd_escape(&unit.command.display().to_string());
         let env_file = systemd_escape(&unit.env_file.display().to_string());
@@ -178,7 +186,8 @@ fn definition_with_env(
             "[Unit]\nDescription=Cataly hub\n\n[Service]\nType=notify\nNotifyAccess=main\n\
 Environment=\"PATH={path}\"\nEnvironment=\"MALLOC_ARENA_MAX=1\"\n"
         );
-        for (name, value) in xdg {
+        for entry in xdg {
+            let (name, value) = entry?;
             systemd_environment(&mut text, name, &value);
         }
         let _ = write!(
@@ -187,7 +196,7 @@ Environment=\"PATH={path}\"\nEnvironment=\"MALLOC_ARENA_MAX=1\"\n"
 ExecStart={exe} hub\nRestart=on-failure\nRestartSec=5\nWatchdogSec=30\n\n\
 [Install]\nWantedBy=default.target\n"
         );
-        text
+        Ok(text)
     }
 }
 
@@ -379,9 +388,10 @@ async fn install(
 }
 
 fn write_definition(path: &Path, unit: &Unit<'_>) -> Result<(), String> {
+    let text = definition(unit)?;
     let dir = path.parent().ok_or("the service file has no folder")?;
     std::fs::create_dir_all(dir).map_err(|e| format!("{}: {e}", dir.display()))?;
-    super::fs::write_atomic(path, definition(unit).as_bytes()).map_err(|e| e.to_string())
+    super::fs::write_atomic(path, text.as_bytes()).map_err(|e| e.to_string())
 }
 
 /// Rewrites the service Cataly created with `unit` and has the manager read it again, so the next
@@ -469,7 +479,7 @@ mod tests {
     fn definition_restarts_after_failure_with_path_and_keys() {
         let line = path_line([Path::new("/h/.bun/bin"), Path::new("/opt/homebrew/bin")]);
         let env_file = Path::new("/h/.config/cataly/secrets/service.env");
-        let text = definition(&unit(&line, env_file));
+        let text = definition(&unit(&line, env_file)).unwrap();
         if cfg!(target_os = "macos") {
             assert!(text.contains(
                 "<string>/h/.config/cataly/secrets/service.env</string><string>/h/.local/bin/cataly</string></array>"
@@ -495,7 +505,7 @@ mod tests {
     #[test]
     fn both_definitions_escape_their_values() {
         let env_file = Path::new("/h/100%/a&b");
-        let text = definition(&unit("/x%y", env_file));
+        let text = definition(&unit("/x%y", env_file)).unwrap();
         if cfg!(target_os = "macos") {
             assert!(text.contains("<string>/h/100%/a&amp;b</string>"));
         } else {
@@ -526,7 +536,8 @@ mod tests {
             vars.iter()
                 .find(|(k, _)| *k == name)
                 .map(|(_, v)| (*v).into())
-        });
+        })
+        .unwrap();
         for (name, value) in &vars[..3] {
             let expected = if macos {
                 format!("<key>{name}</key><string>{value}</string>")
@@ -545,9 +556,26 @@ mod tests {
             for value in [None, Some(""), Some("relative"), Some("~/config")] {
                 let text =
                     definition_with_env(&unit("/bin", Path::new("/h/service.env")), macos, |_| {
-                        value.map(str::to_string)
-                    });
+                        value.map(OsString::from)
+                    })
+                    .unwrap();
                 assert!(!text.contains("XDG_"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn definition_refuses_non_utf8_xdg_homes() {
+        use std::os::unix::ffi::OsStringExt as _;
+
+        let unit = unit("/bin", Path::new("/h/service.env"));
+        for macos in [false, true] {
+            for name in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"] {
+                let error = definition_with_env(&unit, macos, |key| {
+                    (key == name).then(|| OsString::from_vec(b"/h/invalid-\xff".to_vec()))
+                })
+                .unwrap_err();
+                assert!(error.contains(name) && error.contains("UTF-8"), "{error}");
             }
         }
     }
@@ -557,12 +585,12 @@ mod tests {
         let unit = unit("/bin", Path::new("/h/service.env"));
         let lookup =
             |name: &str| (name == "XDG_STATE_HOME").then(|| "/h/100%/a&b<\"q\">\\x\n\t".into());
-        let systemd = definition_with_env(&unit, false, lookup);
+        let systemd = definition_with_env(&unit, false, lookup).unwrap();
         assert!(
             systemd.contains("Environment=\"XDG_STATE_HOME=/h/100%%/a&b<\\\"q\\\">\\\\x\\n\\t\"\n"),
             "{systemd}"
         );
-        let launchd = definition_with_env(&unit, true, lookup);
+        let launchd = definition_with_env(&unit, true, lookup).unwrap();
         assert!(launchd.contains(
             "<key>XDG_STATE_HOME</key><string>/h/100%/a&amp;b&lt;&quot;q&quot;&gt;\\x\n\t</string>"
         ), "{launchd}");
@@ -680,7 +708,7 @@ mod tests {
         }
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            definition(&unit(&line, &env_file))
+            definition(&unit(&line, &env_file)).unwrap()
         );
         assert_eq!(
             std::fs::read_to_string(&marker).unwrap(),
@@ -750,7 +778,7 @@ mod tests {
         start_with(&manager).await.unwrap();
         assert_eq!(
             std::fs::read_to_string(&file).unwrap(),
-            definition(&unit(&line, &env_file))
+            definition(&unit(&line, &env_file)).unwrap()
         );
         let calls = std::fs::read_to_string(&log).unwrap();
         if cfg!(target_os = "macos") {
