@@ -367,7 +367,20 @@ fn slack_threads_allowlist_acks_and_uploads() {
 /// request's thread: no part reaches the channel top level.
 #[test]
 fn a_long_slack_answer_and_its_later_turn_stay_in_the_request_thread() {
+    long_answer_in_thread(0);
+}
+
+/// A rate limit beyond the client's retry budget on the first part keeps the answer in the
+/// request's thread once Slack takes posts again.
+#[test]
+fn a_rate_limited_slack_answer_stays_in_the_request_thread() {
+    long_answer_in_thread(1);
+}
+
+/// A long answer and a later turn to a top-level mention, the first `limited` posts answered 429.
+fn long_answer_in_thread(limited: u32) {
     let slack = FakeSlack::start();
+    slack.limit_posts(limited);
     let mut hub = relay_hub(None, Some(&slack), "");
     let long = "word ".repeat(1800);
     hub.fixture("omp", "answer.json", Some(&json!(long).to_string()));

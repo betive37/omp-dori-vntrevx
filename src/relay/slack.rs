@@ -686,6 +686,7 @@ impl Relay for SlackRelay {
     const NAME: &'static str = NAME;
     const REPEATABLE: bool = false;
     const LIVE_ONCE: bool = false;
+    const REFUSED_FALLBACK: bool = false;
 
     fn parts(&self, answer: &str) -> Result<Vec<String>, String> {
         let answer = answer.trim();
