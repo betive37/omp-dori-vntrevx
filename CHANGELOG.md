@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- `cataly setup` no longer resets a `[destinations.cataly-ops]` you pointed elsewhere to the
+  `#cataly-ops` channel, and no longer creates that channel when the destination is already set.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
