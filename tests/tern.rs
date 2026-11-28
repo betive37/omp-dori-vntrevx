@@ -382,20 +382,26 @@ fn a_return_to_the_tern_lead_reattaches_its_port() {
         .command(&["lead", "send", "after return"])
         .spawn()
         .unwrap();
-    let cmd = bridge.command(&idle);
-    assert_eq!(cmd["op"], "deliver", "{cmd}");
-    assert!(
-        cmd["text"].as_str().unwrap().contains("after return"),
-        "{cmd}"
-    );
-    write_entry(
-        &file,
-        cmd["text"].as_str().unwrap(),
-        cmd["id"].as_str().unwrap(),
-    );
-    bridge.reply(&cmd, json!({"sent":true}));
-    bridge.event("s1", "agent_start", &json!({}));
-    bridge.event("s1", "agent_end", &json!({"will_continue":false}));
+    // Lane notifications may arrive before the owner's message; confirm every delivery.
+    let started = Instant::now();
+    loop {
+        assert!(
+            started.elapsed() < Duration::from_secs(20),
+            "the owner's message was not delivered after returning to the lead"
+        );
+        let cmd = bridge.command(&idle);
+        assert_eq!(cmd["op"], "deliver", "{cmd}");
+        assert_eq!(cmd["session"], "s1", "{cmd}");
+        let text = cmd["text"].as_str().unwrap();
+        let owner_message = text.contains("after return");
+        write_entry(&file, text, cmd["id"].as_str().unwrap());
+        bridge.reply(&cmd, json!({"sent":true}));
+        bridge.event("s1", "agent_start", &json!({}));
+        bridge.event("s1", "agent_end", &json!({"will_continue":false}));
+        if owner_message {
+            break;
+        }
+    }
     assert!(sending.wait().unwrap().success());
     hub.until(Duration::from_secs(20), || {
         let status = hub.json(&["lead", "status", "--json"]);
