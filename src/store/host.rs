@@ -208,6 +208,18 @@ pub(crate) enum HostWrite {
     LeadIntent(anchor::Intent),
     Episode(episode::Change),
     Admit(Admit),
+    /// Reserves a caller ID before steering, which has no inbox row (LANE req. 33).
+    SteerReceipt {
+        target: String,
+        request_id: String,
+        digest: String,
+        session: String,
+    },
+    /// A definite refusal wrote no steering input, so the caller may try its ID again.
+    RemoveSteerReceipt {
+        target: String,
+        request_id: String,
+    },
     /// Records a delivery as sent and moves its inbox rows to `sent`, before the write to OMP.
     Send {
         delivery: DeliveryRow,
@@ -335,6 +347,24 @@ pub(super) fn write(
         HostWrite::LeadIntent(i) => anchor::intent(tx, *i),
         HostWrite::Episode(change) => episode::write(tx, change, now),
         HostWrite::Admit(a) => admit(tx, a, now).map(HostDone::Admitted),
+        HostWrite::SteerReceipt {
+            target,
+            request_id,
+            digest,
+            session,
+        } => tx
+            .execute(
+                "INSERT INTO receipts (target, request_id, digest, inbox_id, created_ms, session) \
+                 VALUES (?1, ?2, ?3, NULL, ?4, ?5)",
+                params![target, request_id, digest, now, session],
+            )
+            .map(HostDone::Rows),
+        HostWrite::RemoveSteerReceipt { target, request_id } => tx
+            .execute(
+                "DELETE FROM receipts WHERE target = ?1 AND request_id = ?2 AND inbox_id IS NULL",
+                params![target, request_id],
+            )
+            .map(HostDone::Rows),
         HostWrite::Send { delivery, inbox } => {
             send(tx, delivery, inbox, now)?;
             Ok(HostDone::Done)

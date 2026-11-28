@@ -180,6 +180,8 @@ in their own areas; this spec only states what lifecycle needs from them.
     (default 20, at most 40); follow events from a cursor, with an explicit gap marker when events were lost; send a
     message with a caller ID, either queued for the next turn or as steering of the current turn, and look up its
     receipt by ID (a lost reply is never answered by sending again); interrupt the current turn; switch model.
+    Steering records its receipt before submission. A definite refusal removes it so the ID can be retried;
+    an uncertain result retains it and fences further messages until released, without resending.
     Every control names the revision it saw and is refused if the lane's session changed since.
 34. Observe and answer: the lead may read a lane's live state and pending dialog and answer it with one of: cancel,
     yes/no, a text value, or per-question selected options with optional free text. Answers over 64 KiB are refused.

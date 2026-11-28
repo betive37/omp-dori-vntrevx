@@ -253,6 +253,148 @@ fn open_preview_refusals_and_dedupe() {
     hub.stop();
 }
 
+/// A model change is refused while working, but first reads the fake's running state back.
+fn working_for_steering(hub: &TestHub, key: &str) {
+    hub.fixture("omp", "busy", Some(""));
+    let refused = lane(
+        hub,
+        "model",
+        &json!({ "key": key, "model": "fake/primary" }),
+    )
+    .unwrap_err();
+    assert!(refused.contains("the session is not idle"), "{refused}");
+    assert_eq!(
+        lane(hub, "read", &json!({ "key": key })).unwrap()["status"],
+        "working"
+    );
+}
+
+fn steering_commands(hub: &TestHub) -> Vec<Value> {
+    std::fs::read_to_string(data(hub).join("prompts"))
+        .unwrap()
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).unwrap())
+        .filter(|line| line["type"] == "steer")
+        .collect()
+}
+
+fn has_steering_receipt(hub: &TestHub, key: &str, id: &str) -> bool {
+    recovery::db(hub)
+        .query_row(
+            "SELECT EXISTS (SELECT 1 FROM receipts WHERE target = ?1 AND request_id = ?2 AND inbox_id IS NULL)",
+            [key, id],
+            |row| row.get(0),
+        )
+        .unwrap()
+}
+
+/// LANE req. 33: a lost steering reply never causes the same command to be written again.
+#[test]
+fn steer_request_ids_are_once_only_per_lane() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    for key in ["steer-a", "steer-b"] {
+        open(&hub, key, &json!({}));
+    }
+    for key in ["steer-a", "steer-b"] {
+        working_for_steering(&hub, key);
+        let request =
+            json!({ "key": key, "text": "change direction", "steer": true, "id": "same-id" });
+        let first = lane(&hub, "send", &request).unwrap();
+        assert!(first.as_str().unwrap().starts_with("Delivered"), "{first}");
+        let again = lane(&hub, "send", &request).unwrap();
+        assert!(again.as_str().unwrap().contains("earlier"), "{again}");
+        assert!(has_steering_receipt(&hub, key, "same-id"));
+    }
+    assert_eq!(
+        steering_commands(&hub).len(),
+        2,
+        "one command per target, not per retry"
+    );
+    hub.stop();
+}
+
+/// A readback that is no longer working, or an explicit refusal, leaves the ID retryable.
+#[test]
+fn steer_request_id_is_retryable_after_definite_refusal() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "steer-a", &json!({}));
+    working_for_steering(&hub, "steer-a");
+    let request =
+        json!({ "key": "steer-a", "text": "change direction", "steer": true, "id": "retry-id" });
+    hub.fixture("omp", "busy", None);
+    let not_ready = lane(&hub, "send", &request).unwrap();
+    assert!(
+        not_ready.as_str().unwrap().starts_with("NotReady"),
+        "{not_ready}"
+    );
+    assert!(!has_steering_receipt(&hub, "steer-a", "retry-id"));
+    assert_eq!(steering_commands(&hub), [] as [Value; 0]);
+    working_for_steering(&hub, "steer-a");
+    hub.fixture("omp", "steer-result", Some("refuse"));
+    let refused = lane(&hub, "send", &request).unwrap();
+    assert!(
+        refused.as_str().unwrap().starts_with("Refused"),
+        "{refused}"
+    );
+    assert!(!has_steering_receipt(&hub, "steer-a", "retry-id"));
+    hub.fixture("omp", "steer-result", None);
+    let accepted = lane(&hub, "send", &request).unwrap();
+    assert!(
+        accepted.as_str().unwrap().starts_with("Delivered"),
+        "{accepted}"
+    );
+    let again = lane(&hub, "send", &request).unwrap();
+    assert!(again.as_str().unwrap().contains("earlier"), "{again}");
+    assert_eq!(
+        steering_commands(&hub).len(),
+        2,
+        "only the refusal and accepted retry reached OMP"
+    );
+    hub.stop();
+}
+
+/// An uncertain steering command fences later messages, and release never erases its receipt.
+#[test]
+fn steer_request_id_survives_an_uncertain_result_and_release() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "steer-a", &json!({}));
+    working_for_steering(&hub, "steer-a");
+    hub.fixture("omp", "steer-result", Some("unknown"));
+    let request = json!({ "key": "steer-a", "text": "change direction", "steer": true, "id": "uncertain-id" });
+    let uncertain = lane(&hub, "send", &request).unwrap();
+    assert!(
+        uncertain.as_str().unwrap().starts_with("InDoubt"),
+        "{uncertain}"
+    );
+    assert!(
+        record(&hub, "steer-a")["doubt"]
+            .as_str()
+            .unwrap()
+            .contains("uncertain-id")
+    );
+    assert!(has_steering_receipt(&hub, "steer-a", "uncertain-id"));
+    let blocked = lane(
+        &hub,
+        "send",
+        &json!({ "key": "steer-a", "text": "next instruction", "id": "new-id" }),
+    )
+    .unwrap_err();
+    assert!(blocked.contains("in doubt"), "{blocked}");
+    lane(
+        &hub,
+        "release",
+        &json!({ "key": "steer-a", "note": "checked the transcript" }),
+    )
+    .unwrap();
+    let again = lane(&hub, "send", &request).unwrap();
+    assert!(again.as_str().unwrap().contains("earlier"), "{again}");
+    assert_eq!(steering_commands(&hub).len(), 1);
+    hub.stop();
+}
+
 /// Check 2: a model mismatch at start keeps the process, sends no brief, marks the start held and
 /// tells the lead.
 #[test]

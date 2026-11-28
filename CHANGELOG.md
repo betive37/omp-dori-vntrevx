@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Retrying a lane steering message with the same caller ID no longer steers twice. The receipt is
+  stored before sending; a definite refusal allows retry, and an uncertain result blocks further
+  messages until released without resending the original.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
