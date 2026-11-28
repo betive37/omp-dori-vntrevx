@@ -516,6 +516,9 @@ async fn serve(paths: &Paths, config: Config, store: Store, cleanup: Cleanup) ->
     hub.workers.shutdown().await;
     // Running job children get TERM, then KILL after the grace; their real end is recorded.
     jobs.drain(KILL_GRACE * 2 + Duration::from_secs(2)).await;
+    // A voice call, told to stop with the rest, finishes its accounting while the store is open.
+    #[cfg(feature = "voice")]
+    hub.voice.wound_down().await;
     let _ = std::fs::remove_file(&paths.socket);
     code
 }
