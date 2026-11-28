@@ -1783,6 +1783,16 @@ fn a_wake_after_a_lifted_hold_begins_a_fresh_episode_and_delivers() {
     let old = left_episode(&db, &session, "active");
     hub.start();
     held(&hub, 20);
+    let status = hub.cli(&["lead", "status"]);
+    let status = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status.contains("lead     held (The lead's conversation is recorded in more than one"),
+        "{status}"
+    );
+    assert!(
+        !status.contains("ambiguous lead binding"),
+        "no raw reason: {status}"
+    );
     assert!(hub.stop().success());
     db.execute("UPDATE lead_anchor SET hold = NULL", [])
         .unwrap();
