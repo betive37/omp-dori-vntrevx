@@ -23,6 +23,7 @@ use crate::sys::ErrorClass;
 use crate::sys::latency::Latency;
 
 pub(crate) use read::Reads;
+pub(crate) use schema::latest as latest_schema;
 use writer::Request;
 
 /// Read connections kept open.

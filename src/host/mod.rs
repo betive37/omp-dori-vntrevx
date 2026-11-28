@@ -2,7 +2,7 @@
 //! implementation, the session actor, the per-target inbox with delivery confirmation from session
 //! files, and the standing lead.
 //!
-//! `Runtime::start` returns a session handle implementing [`Control`]; the terminal runtime of
+//! `Runtime::start_supervised` returns a session handle implementing [`Control`]; the terminal runtime of
 //! milestone 6 implements the same two traits over the bridge connection instead of rpc-ui.
 
 pub(crate) mod bridge;
@@ -11,6 +11,9 @@ pub(crate) mod headless;
 pub(crate) mod hosted;
 pub(crate) mod inbox;
 pub(crate) mod lead;
+pub(crate) mod model;
+#[path = "lead/startup.rs"]
+pub(crate) mod startup;
 pub(crate) mod tern;
 #[cfg(test)]
 pub(crate) mod testing;
@@ -52,10 +55,20 @@ pub(crate) struct StartSpec {
     pub(crate) instructions: Option<PathBuf>,
     /// `--max-cost` in US dollars: OMP's own backstop to a lane's cost ceiling (WS-18).
     pub(crate) max_cost: Option<f64>,
-    /// `--tools`: the look-only tool set of a review lane (OPC-46).
-    pub(crate) tools: Option<String>,
+    /// The inspection profile of a review lane (OPC-46), rendered by the hosted-tool policy.
+    pub(crate) look_only: bool,
     /// The worker the session runs on (design 2.1); `None` runs it here.
     pub(crate) worker: Option<String>,
+}
+
+impl StartSpec {
+    pub(crate) fn tool_role(&self) -> crate::omp::tools::Role {
+        match self.role {
+            Role::Lead => crate::omp::tools::Role::Lead,
+            Role::Lane if self.look_only => crate::omp::tools::Role::LookOnly,
+            Role::Lane => crate::omp::tools::Role::Lane,
+        }
+    }
 }
 
 /// A bound session (DESIGN 4.1 `Started`).
@@ -74,16 +87,44 @@ pub(crate) struct Started {
 pub(crate) enum StartError {
     /// Refused before anything was spawned.
     Refused(String),
-    /// The child was spawned and closed again.
-    Failed(String),
+    /// Startup failed with phase and process-ownership evidence.
+    Startup {
+        stage: startup::StartupStage,
+        outcome: startup::StartupOutcome,
+        cleanup: startup::Cleanup,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for StartError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             Self::Refused(r) => write!(f, "refused: {r}"),
-            Self::Failed(r) => write!(f, "failed: {r}"),
+            Self::Startup {
+                stage,
+                outcome,
+                cleanup,
+                detail,
+            } => {
+                write!(
+                    f,
+                    "startup {stage:?} {outcome:?}: {detail} (cleanup: {cleanup:?})"
+                )
+            }
         }
+    }
+}
+
+impl StartError {
+    pub(crate) const fn retryable(&self) -> bool {
+        matches!(
+            self,
+            Self::Startup {
+                outcome: startup::StartupOutcome::Timeout,
+                cleanup: startup::Cleanup::LocalReaped | startup::Cleanup::WorkerReaped,
+                ..
+            }
+        )
     }
 }
 
@@ -116,15 +157,29 @@ pub(crate) enum DeliverOutcome {
         turn_started: bool,
         written: Option<Instant>,
     },
-    NotReady(Status),
+    /// A check of HOST req. 50 failed: the current status and the check that failed, so a record
+    /// of it shows the real reason (a paused goal reads Idle).
+    NotReady(Status, String),
     Refused(String),
     /// Written, outcome unknown: never resent automatically.
     InDoubt(String),
 }
 
+impl DeliverOutcome {
+    /// Not ready because the delivery's timing rule does not match `status` (HOST req. 50).
+    pub(crate) fn wrong_timing(status: Status) -> Self {
+        let now = format!("{status:?}").to_lowercase();
+        Self::NotReady(
+            status,
+            format!("the session is {now}; the timing rule waits"),
+        )
+    }
+}
+
 /// How a session ended (HOST req. 69).
 #[derive(Clone, Debug, PartialEq, Eq, Serialize)]
 pub(crate) struct StopRecord {
+    pub(crate) cleanup: startup::Cleanup,
     /// `clean`, `forced`, `term`, `kill`, `exited`, `failed`.
     pub(crate) how: String,
     pub(crate) detail: Option<String>,
@@ -258,10 +313,11 @@ pub(crate) trait Runtime: Send + Sync + 'static {
     /// The runtime's name as stored with each session (`headless`, `tern`).
     fn kind(&self) -> &'static str;
 
-    /// Spawns and binds a session; returns only after the handshake completed or failed (HOST req. 28).
-    fn start(
+    /// Cooperative startup cancellation: ownership cleanup finishes before this returns.
+    fn start_supervised(
         &self,
         spec: StartSpec,
+        cancel: tokio::sync::watch::Receiver<bool>,
     ) -> impl Future<Output = Result<(Arc<Self::Session>, Started), StartError>> + Send;
 }
 
@@ -279,7 +335,11 @@ pub(crate) trait Control: Send + Sync + 'static {
     fn refresh(&self) -> impl Future<Output = Result<(), String>> + Send;
     fn deliver(&self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send;
     fn interrupt(&self) -> impl Future<Output = Result<String, String>> + Send;
-    fn set_model(&self, selector: &str) -> impl Future<Output = Result<String, String>> + Send;
+    /// Moves the session to what OMP resolves `selector` to; `Ok` is that resolution, confirmed.
+    fn set_model(
+        &self,
+        selector: &str,
+    ) -> impl Future<Output = Result<model::Resolution, String>> + Send;
     /// One OMP goal operation (`create`, `pause`, `resume`, `drop`, `get`) followed by a fresh
     /// readback; returns the goal the readback shows (HOST-19).
     fn goal(

@@ -111,6 +111,10 @@ pub(crate) struct Report {
     /// it through the user service. Reports from earlier versions lack it.
     #[serde(default)]
     pub(crate) service_refresh: bool,
+    /// The newest store schema the binary reads: it opens a store whose `meta.min_reader` is at
+    /// most this. Reports up to 0.2.6 lack it, which makes the capability unknown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) store_reader: Option<i64>,
 }
 
 /// This binary's report.
@@ -123,6 +127,7 @@ pub(crate) fn report() -> Report {
         omp_minimum: crate::omp::MINIMUM.to_string(),
         extension_protocol: crate::hub::bridge::PROTOCOL,
         service_refresh: true,
+        store_reader: Some(crate::store::latest_schema()),
     }
 }
 

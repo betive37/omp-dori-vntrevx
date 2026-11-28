@@ -35,16 +35,20 @@ impl Runtime for Hosted {
         }
     }
 
-    async fn start(&self, spec: StartSpec) -> Result<(Arc<Hosting>, Started), StartError> {
+    async fn start_supervised(
+        &self,
+        spec: StartSpec,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Hosting>, Started), StartError> {
         match self {
-            Self::Headless(r) => r
-                .start(spec)
+            Self::Headless(runtime) => runtime
+                .start_supervised(spec, cancel)
                 .await
-                .map(|(s, started)| (Arc::new(Hosting::Headless(s)), started)),
-            Self::Tern(r) => r
-                .start(spec)
+                .map(|(session, started)| (Arc::new(Hosting::Headless(session)), started)),
+            Self::Tern(runtime) => runtime
+                .start_supervised(spec, cancel)
                 .await
-                .map(|(s, started)| (Arc::new(Hosting::Tern(s)), started)),
+                .map(|(session, started)| (Arc::new(Hosting::Tern(session)), started)),
         }
     }
 }
@@ -92,7 +96,7 @@ impl Control for Hosting {
         each!(self, s => s.interrupt().await)
     }
 
-    async fn set_model(&self, selector: &str) -> Result<String, String> {
+    async fn set_model(&self, selector: &str) -> Result<super::model::Resolution, String> {
         each!(self, s => s.set_model(selector).await)
     }
 

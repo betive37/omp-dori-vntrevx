@@ -77,6 +77,24 @@ pub(crate) struct Voice<R: Runtime> {
     control: Mutex<Option<mpsc::Sender<Control>>>,
     state: Mutex<State>,
     wake: Notify,
+    /// A call runs: the hub's stop waits for it to wind down.
+    calling: watch::Sender<bool>,
+}
+
+/// Marks a call running until dropped, also when its task ends by a panic.
+struct Calling<'a>(&'a watch::Sender<bool>);
+
+impl<'a> Calling<'a> {
+    fn begin(flag: &'a watch::Sender<bool>) -> Self {
+        flag.send_replace(true);
+        Self(flag)
+    }
+}
+
+impl Drop for Calling<'_> {
+    fn drop(&mut self) {
+        self.0.send_replace(false);
+    }
 }
 
 fn id(v: &Value) -> Option<u64> {
@@ -119,6 +137,7 @@ impl<R: Runtime> Voice<R> {
                 reason: None,
             }),
             wake: Notify::new(),
+            calling: watch::channel(false).0,
         })
     }
 
@@ -238,6 +257,13 @@ impl<R: Runtime> Voice<R> {
         Ok((on, key))
     }
 
+    /// Waits until no call runs. Told to stop, a call winds down (its accounting and summary)
+    /// within [`WIND_DOWN`]; the hub waits for it so the store is still open for its writes. A
+    /// ledger write cut off by the hub's exit would hold voice across the restart.
+    pub(crate) async fn wound_down(&self) {
+        let _ = self.calling.subscribe().wait_for(|calling| !*calling).await;
+    }
+
     /// The supervised task: one call at a time while the settings allow it.
     pub(crate) async fn run(
         self: Arc<Self>,
@@ -282,6 +308,7 @@ impl<R: Runtime> Voice<R> {
         config: &mut watch::Receiver<Arc<Config>>,
         shutdown: &mut watch::Receiver<bool>,
     ) -> Ended {
+        let _calling = Calling::begin(&self.calling);
         let (feed, gateway) = mpsc::channel(FEED);
         {
             let mut gate = lock(&self.gate);

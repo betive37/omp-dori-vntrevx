@@ -169,7 +169,7 @@ impl<T: Runtime> Intake<T> {
             return false;
         };
         if !press.by_owner(self.application, self.owner) {
-            self.refuse(press, "Only the owner can answer this.").await;
+            self.refuse(press, "Only Master can answer this.").await;
             return true;
         }
         let Some(n) = press
@@ -228,9 +228,9 @@ impl<T: Runtime> Intake<T> {
                 .with("text", excerpt(&q.text)),
         );
         let status = if shown.is_empty() {
-            "Answered by the owner.".to_string()
+            "Answered by Master.".to_string()
         } else {
-            format!("Answered by the owner: {shown}")
+            format!("Answered by Master: {shown}")
         };
         close(Arc::clone(&self.rest), q, &status);
     }
@@ -299,7 +299,7 @@ mod tests {
     fn a_long_question_is_cut_so_its_status_shows() {
         let options = vec!["o".repeat(200); 4];
         let body = body("0a1b2c3d", &"q".repeat(1000), &options, Some(2));
-        let status = format!("Answered by the owner: 2. {}", "o".repeat(200));
+        let status = format!("Answered by Master: 2. {}", "o".repeat(200));
         let short = closed("short", &status);
         assert_eq!(short, format!("short\n\n{status}"));
         let cut = closed(&body, &status);

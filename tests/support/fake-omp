@@ -16,6 +16,8 @@
 #                               prompt_result and session_settled. omp-data/slow makes the turn take 2 s
 #                               in the background (get_state then reports streaming, and a prompt or
 #                               follow-up meanwhile waits for the turn end, as OMP's follow-up does);
+#                               omp-data/followup (a JSON string) adds a background result after the
+#                               answer and a second turn ending with that text;
 #                               with omp-data/hold (a text) a message containing that text waits for
 #                               omp-data/release before its answer;
 #                               omp-data/noentry answers the prompt and writes nothing; with omp-data/ask
@@ -27,7 +29,89 @@
 #   with omp-data/slow-start     the first rpc-ui start answers nothing until its input closes, then
 #                               exits 1 (a start slower than the probe allows, as after an OMP update
 #                               under load); the fixture is used up and later starts are normal.
+#   model selectors              as stock OMP: `--model=p/id:<level>` runs p/id at that thinking level
+#                               (an explicit --thinking wins) unless omp-data/literal lists the whole
+#                               selector as a catalogue ID; omp-data/clamp (a level) is the level the
+#                               session then runs instead. get_state reports `thinkingLevel`;
+#                               set_model and set_thinking_level change what it reports.
+#   the bridge (read-only)       an rpc-ui session with a launch token says hello on CATALY_SOCKET as the
+#                               Cataly extension does, with model_resolution_version 1 (none with
+#                               omp-data/old-bridge), writes its reconnect key to omp-data/bridge-<id>,
+#                               and answers `model.resolve` as OMP's `ctx.models.resolve` would, or
+#                               `model_unverified` with omp-data/unresolvable. omp-data/no-bridge: none.
 dir=$(cd "$(dirname "$0")" && pwd)/omp-data
+
+# The fake bridge (python3, standard library only): argv socket token session file pid data
+# thinking. It ends with its OMP process (a zombie counts as gone) or when the hub closes the
+# connection.
+BRIDGE='
+import json, os, select, socket, subprocess, sys, time
+path, token, session, file, pid, data, thinking = sys.argv[1:8]
+LEVELS = {"off", "minimal", "low", "medium", "high", "xhigh", "max"}
+PROC = os.path.isdir("/proc/self")
+def alive():
+    if PROC:
+        try:
+            with open("/proc/%s/stat" % pid) as f:
+                return f.read().rsplit(")", 1)[1].split()[0] != "Z"
+        except OSError:
+            return False
+    # No /proc (macOS): the state column of ps, empty once the process is gone.
+    state = subprocess.run(["ps", "-o", "stat=", "-p", pid], stdout=subprocess.PIPE,
+                           stderr=subprocess.DEVNULL, text=True).stdout.strip()
+    return state != "" and "Z" not in state
+def literal(selector):
+    try:
+        with open(os.path.join(data, "literal")) as f:
+            return selector in f.read().split()
+    except OSError:
+        return False
+def resolve(cmd):
+    selector = str(cmd.get("selector") or "")
+    if os.path.exists(os.path.join(data, "unresolvable")) or "/" not in selector:
+        return {"model_unverified": "OMP does not know the model " + selector}
+    provider, ident = selector.split("/", 1)
+    level = None
+    base, _, suffix = ident.rpartition(":")
+    if base and suffix in LEVELS and not literal(selector):
+        ident, level = base, suffix
+    if cmd.get("thinking") is not None:
+        level = str(cmd["thinking"])
+    observed = thinking or None
+    return {"model_resolution": {"version": 1, "selector": selector, "provider": provider, "id": ident,
+            "thinking": {"requested": level, "observed": observed}}}
+sock = socket.socket(socket.AF_UNIX)
+sock.connect(path)
+def send(n, method, params):
+    sock.sendall((json.dumps({"v": 1, "id": n, "method": method, "params": params}) + "\n").encode())
+hello = {"ext": 1, "token": token, "session": session, "file": file, "pid": int(pid), "agent": "main",
+         "version": "fake", "idle": True}
+if not os.path.exists(os.path.join(data, "old-bridge")):
+    hello["model_resolution_version"] = 1
+send(1, "bridge.hello", hello)
+buf, beat = b"", time.time()
+while alive():
+    if time.time() - beat > 10:
+        send(0, "bridge.ping", {})
+        beat = time.time()
+    if not select.select([sock], [], [], 0.2)[0]:
+        continue
+    chunk = sock.recv(65536)
+    if not chunk:
+        break
+    buf += chunk
+    while b"\n" in buf:
+        line, buf = buf.split(b"\n", 1)
+        msg = json.loads(line)
+        if msg.get("id") == 1 and isinstance(msg.get("ok"), dict) and msg["ok"].get("key"):
+            with open(os.path.join(data, "bridge-" + session), "w") as f:
+                f.write(msg["ok"]["key"])
+        cmd = (msg.get("item") or {}).get("cmd")
+        if isinstance(cmd, dict) and cmd.get("op") == "model.resolve":
+            reply = resolve(cmd)
+            reply["n"] = cmd.get("n")
+            send(0, "bridge.reply", reply)
+'
 
 # One turn of the `turns` fixture for the command line $1 with ID $2.
 turn() {
@@ -85,9 +169,20 @@ turn() {
     finish "$answer" "$2"
 }
 
-# Ends a turn with the JSON string $1 as the final answer, for the prompt with ID $2.
+# Ends a turn with the JSON string $1 as the final answer, for the prompt with ID $2. With
+# omp-data/followup (a JSON string) the turn ends awaiting async work, a background result is
+# injected as OMP's async-result message, and a second turn ends with that text.
 finish() {
-    finish_quiet "$1"
+    if [ -f "$dir/followup" ]; then
+        printf '{"type":"message","message":{"role":"assistant","content":[{"type":"text","text":%s}],"stopReason":"stop"}}\n' "$1" >> "$file"
+        printf '{"type":"message_end","message":{"role":"assistant","content":[{"type":"text","text":%s}],"stopReason":"stop"}}\n' "$1"
+        echo '{"type":"agent_end","awaitingAsyncWork":true}'
+        printf '{"type":"custom_message","customType":"async-result","content":"Background job done.","display":true}\n' >> "$file"
+        echo '{"type":"agent_start"}'
+        finish_quiet "$(cat "$dir/followup")"
+    else
+        finish_quiet "$1"
+    fi
     printf '{"type":"prompt_result","id":"%s","agentInvoked":true,"status":"completed","sessionSettled":true}\n' "$2"
     echo '{"type":"session_settled"}'
 }
@@ -107,13 +202,31 @@ rpc() {
     model=fake/primary
     sessions=
     resume=
+    explicit=
     for arg in "$@"; do
         case "$arg" in
         --model=*) model=${arg#--model=} ;;
+        --thinking=*) explicit=${arg#--thinking=} ;;
         --session-dir=*) sessions=${arg#--session-dir=} ;;
         --resume=*) resume=${arg#--resume=} ;;
         esac
     done
+    # The selector as stock OMP reads it: a level suffix is the thinking level unless the whole
+    # selector is a catalogue ID; an explicit --thinking wins; omp-data/clamp is what OMP then runs.
+    thinking=
+    level=${model##*:}
+    if [ "$level" != "$model" ] && ! grep -qxF "$model" "$dir/literal" 2>/dev/null; then
+        case "$level" in off | minimal | low | medium | high | xhigh | max) thinking=$level model=${model%:*} ;; esac
+    fi
+    [ -n "$explicit" ] && thinking=$explicit
+    [ -f "$dir/clamp" ] && thinking=$(cat "$dir/clamp")
+    if [ -n "$resume" ]; then
+        echo $$ >> "$dir/resume-pids"
+        if mv "$dir/slow-resume" "$dir/slow-resume.used" 2>/dev/null; then
+            cat > /dev/null
+            exit 1
+        fi
+    fi
     umask 077
     if [ -n "$resume" ]; then
         file=$resume
@@ -143,30 +256,38 @@ rpc() {
     fi
     # The launch token, so a test can speak for this session's bridge.
     [ -n "$CATALY_LAUNCH" ] && printf '%s %s %s\n' "$CATALY_LAUNCH" "$id" "$$" >> "$dir/launch"
+    # The session's bridge, as the Cataly extension connects once OMP is up (no stdout of its own).
+    if [ -n "$CATALY_LAUNCH" ] && [ -n "$CATALY_SOCKET" ] && [ -n "$file" ] && [ ! -f "$dir/no-bridge" ]; then
+        python3 -c "$BRIDGE" "$CATALY_SOCKET" "$CATALY_LAUNCH" "$id" "$file" "$$" "$dir" "$thinking" \
+            < /dev/null > /dev/null 2>> "$dir/bridge.err" &
+    fi
     # omp-data/child: a shell script a hosted session (one with a launch token) runs once as its own
     # child (a shell or test code inside the session); its output goes to omp-data/child.out.
     if [ -n "$CATALY_LAUNCH" ] && [ -f "$dir/child" ] && mv "$dir/child" "$dir/child.run" 2>/dev/null; then
         sh "$dir/child.run" < /dev/null > "$dir/child.out" 2>&1 &
     fi
     # omp-data/background-<id>: the session runs one turn by itself, as OMP does when a background
-    # job's result arrives (no prompt, no prompt_result). The poller ends with this process: a killed
-    # process stays a zombie until the hub reaps it, and the hub reaps only after this poller lets go
-    # of stdout, so a zombie counts as gone.
+    # job's result arrives: the async-result message, then a turn ending with the file's JSON string
+    # (else "background result read"), with no prompt and no prompt_result. The poller ends with
+    # this process: a killed process stays a zombie until the hub reaps it, and the hub reaps only
+    # after this poller lets go of stdout, so a zombie counts as gone.
     if [ -n "$file" ]; then
         (
             while s=$(ps -o stat= -p $$ 2>/dev/null) && case "$s" in *Z*) false ;; *) true ;; esac; do
                 if [ -f "$dir/background-$id" ]; then
+                    said=$(cat "$dir/background-$id")
                     rm -f "$dir/background-$id"
+                    [ -n "$said" ] || said='"background result read"'
+                    printf '{"type":"custom_message","customType":"async-result","content":"Background job done.","display":true}\n' >> "$file"
                     echo '{"type":"agent_start"}'
-                    finish_quiet '"background result read"'
+                    finish_quiet "$said"
                     echo '{"type":"session_settled"}'
                 fi
                 sleep 0.2
             done
         ) &
     fi
-    state=$(printf '%s,"isStreaming":false,"isCompacting":false,"queuedMessageCount":0,"isSettled":true,"goal":null,"model":{"provider":"%s","id":"%s"}' \
-        "$state" "${model%%/*}" "${model#*/}")
+    state=$(printf '%s,"isStreaming":false,"isCompacting":false,"queuedMessageCount":0,"isSettled":true,"goal":null' "$state")
     echo '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1]}'
     while IFS= read -r line; do
         cid=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -178,7 +299,17 @@ rpc() {
             [ -f "$dir/busy" ] && streaming=true
             goal=null
             [ -s "$gfile" ] && goal=$(printf '{"goal":{"status":"%s","objective":"o"}}' "$(cat "$gfile")")
-            data=$(printf '{%s}' "$state" | sed "s/\"isStreaming\":false/\"isStreaming\":$streaming/; s/\"goal\":null/\"goal\":$goal/") ;;
+            current=$state
+            [ -n "$thinking" ] && current=$(printf '%s,"thinkingLevel":"%s"' "$current" "$thinking")
+            current=$(printf '%s,"model":{"provider":"%s","id":"%s"}' "$current" "${model%%/*}" "${model#*/}")
+            data=$(printf '{%s}' "$current" | sed "s/\"isStreaming\":false/\"isStreaming\":$streaming/; s/\"goal\":null/\"goal\":$goal/") ;;
+        set_model)
+            model=$(printf '%s' "$line" | sed -n 's/.*"provider":"\([^"]*\)".*/\1/p')/$(printf '%s' "$line" | sed -n 's/.*"modelId":"\([^"]*\)".*/\1/p')
+            data='{}' ;;
+        set_thinking_level)
+            thinking=$(printf '%s' "$line" | sed -n 's/.*"level":"\([^"]*\)".*/\1/p')
+            [ -f "$dir/clamp" ] && thinking=$(cat "$dir/clamp")
+            data='{}' ;;
         get_session_lease) data='{"held":[],"unknown":[]}' ;;
         goal)
             op=$(printf '%s' "$line" | sed -n 's/.*"op":"\([a-z]*\)".*/\1/p')

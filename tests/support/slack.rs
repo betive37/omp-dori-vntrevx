@@ -309,7 +309,7 @@ async fn answer(
                 .push(m);
             ok(json!({"channel": channel, "ts": ts}))
         }
-        "chat.update" | "reactions.add" => ok(json!({})),
+        "chat.update" | "reactions.add" | "reactions.remove" => ok(json!({})),
         "conversations.info" => ok(
             json!({"channel": {"id": arg(&query, "channel"), "name": "general",
             "topic": {"value": "the release room"}, "is_im": false}}),

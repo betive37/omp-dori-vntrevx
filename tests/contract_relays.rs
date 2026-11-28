@@ -142,16 +142,22 @@ fn telegram_and_slack_requests_against_stock_omp() {
     let answer = tg.wait(WAIT, |f| tg_replies_to(f, 11).pop());
     assert_eq!(answer.body["chat_id"], 7);
     assert_eq!(answer.body["text"], "ok");
-    let marks = tg.calls("setMessageReaction");
-    assert_eq!(marks.len(), 1, "one seen mark");
-    assert_eq!(marks[0].body["message_id"], 11);
+    let marks = tg.wait(WAIT, |f| {
+        let m = f.calls("setMessageReaction");
+        (m.len() >= 2).then_some(m)
+    });
+    assert_eq!(marks.len(), 2, "one seen mark, one done mark");
+    assert!(marks.iter().all(|m| m.body["message_id"] == 11));
     settled(&hub);
     let ts = slack.say(DM, fake_slack::OWNER, "hello from slack", None);
     let posted = slack.wait(WAIT, |f| slack_posts_in(f, &ts).pop());
     assert_eq!(posted.body["text"], "ok");
-    let reactions = slack.calls("reactions.add");
-    assert_eq!(reactions.len(), 1, "one seen mark");
-    assert_eq!(reactions[0].body["timestamp"], ts.as_str());
+    let reactions = slack.wait(WAIT, |f| {
+        let r = f.calls("reactions.add");
+        (r.len() >= 2).then_some(r)
+    });
+    assert_eq!(reactions.len(), 2, "one seen mark, one done mark");
+    assert!(reactions.iter().all(|r| r.body["timestamp"] == ts.as_str()));
     settled(&hub);
     let rounds = 20;
     for n in 0..rounds {
@@ -170,14 +176,16 @@ fn telegram_and_slack_requests_against_stock_omp() {
         let s = hub.json(&[relay, "status", "--json"]);
         assert_eq!(s["counts"]["owed_settled"], rounds + 1, "{relay}: {s}");
     }
-    assert_eq!(
-        tg.calls("setMessageReaction").len(),
-        usize::try_from(rounds + 1).unwrap()
-    );
-    assert_eq!(
-        slack.calls("reactions.add").len(),
-        usize::try_from(rounds + 1).unwrap()
-    );
+    // A seen mark and a done mark per request.
+    let marks = usize::try_from(2 * (rounds + 1)).unwrap();
+    tg.wait(WAIT, |f| {
+        (f.calls("setMessageReaction").len() >= marks).then_some(())
+    });
+    slack.wait(WAIT, |f| {
+        (f.calls("reactions.add").len() >= marks).then_some(())
+    });
+    assert_eq!(tg.calls("setMessageReaction").len(), marks);
+    assert_eq!(slack.calls("reactions.add").len(), marks);
     std::thread::sleep(Duration::from_secs(10));
     let stats = hub.json(&["stats", "--json"]);
     eprintln!(

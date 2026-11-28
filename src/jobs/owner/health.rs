@@ -131,12 +131,29 @@ fn hub_checks(ctx: &Ctx, config: &Config) -> Vec<Check> {
 }
 
 /// The configured lead's line in `cataly health`. Never a warning: a lead that cannot start alerts
-/// on its own, and a sleeping lead is a normal state.
+/// the owner on its own, and a sleeping lead is a normal state. A recovering start shows its
+/// evidence (target, phase and elapsed time, attempts and next retry, cleanup and lease) and the
+/// inbox; a held lead shows the text the owner was told.
 pub(crate) fn lead_check(view: &crate::host::lead::View) -> Check {
     use crate::host::lead::Phase;
     let said = |state: &str| match &view.reason {
         Some(reason) => format!("{state}: {reason}"),
         None => state.to_string(),
+    };
+    let inbox = format!(
+        "inbox {} waiting, {} notes, {} sent, {} in doubt",
+        view.waiting, view.notes, view.sent, view.in_doubt
+    );
+    let evidence = |state: String| {
+        std::iter::once(state)
+            .chain(
+                view.startup
+                    .iter()
+                    .map(|l| l.split_whitespace().collect::<Vec<_>>().join(" ")),
+            )
+            .chain(std::iter::once(inbox.clone()))
+            .collect::<Vec<_>>()
+            .join("; ")
     };
     match &view.phase {
         Phase::Asleep => {
@@ -151,14 +168,24 @@ pub(crate) fn lead_check(view: &crate::host::lead::View) -> Check {
             )
         }
         Phase::Live => check("lead", "ok", said("running"), None),
+        Phase::Starting | Phase::Stopped if view.recovering => check(
+            "lead",
+            "info",
+            evidence(said("recovering")),
+            Some("cataly lead status"),
+        ),
         Phase::Starting => check("lead", "ok", "starting", None),
         Phase::NotStarted => check("lead", "info", said("not started"), None),
         Phase::Stopped => check("lead", "info", said("stopped"), None),
         Phase::Held => check(
             "lead",
             "info",
-            said("held"),
-            Some("cataly lead status, then cataly lead start"),
+            evidence(
+                view.notice
+                    .as_deref()
+                    .map_or_else(|| said("held"), |n| n.lines().collect::<Vec<_>>().join(" ")),
+            ),
+            Some("fix the cause, then cataly lead start"),
         ),
     }
 }

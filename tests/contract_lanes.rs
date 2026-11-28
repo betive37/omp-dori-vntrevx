@@ -231,9 +231,11 @@ fn hub_restart_brings_three_stock_lanes_back() {
     assert_eq!(l.goal("r-3").as_deref(), Some("paused"));
     assert!(l.hub.stop().success());
     l.start();
+    // Running lanes come back on their exact files; an owner-held lane without a reopen intent
+    // stays down, its record, identity and work kept for an explicit reopen.
     let after: Vec<Value> = l.hub.until(WAIT, || {
         let r: Vec<Value> = keys.iter().map(|k| l.record(k)).collect();
-        r.iter().all(|x| x["live"] == true).then_some(r)
+        r[..2].iter().all(|x| x["live"] == true).then_some(r)
     });
     for (b, a) in before.iter().zip(&after) {
         assert_eq!(a["session_id"], b["session_id"], "{a}");
@@ -244,8 +246,8 @@ fn hub_restart_brings_three_stock_lanes_back() {
             (l.goal(key).as_deref() == Some("active")).then_some(())
         });
     }
-    assert_eq!(l.goal("r-3").as_deref(), Some("paused"));
-    assert_eq!(l.record("r-3")["state"], "held");
+    assert_eq!(after[2]["live"], false, "{}", after[2]);
+    assert_eq!(after[2]["state"], "held", "{}", after[2]);
     let recap = l.hub.until(WAIT, || {
         let r: Vec<Value> = l
             .hub
@@ -256,7 +258,8 @@ fn hub_restart_brings_three_stock_lanes_back() {
         (!r.is_empty()).then_some(r)
     });
     let text = recap[0]["text"].as_str().unwrap();
-    assert!(text.contains("r-3: restarted; stays held"), "{text}");
+    assert!(text.contains("r-3: held: "), "{text}");
+    assert!(text.contains("work retained"), "{text}");
     assert!(text.contains("r-1: restarted; goal active"), "{text}");
     assert!(l.model.seen().iter().all(|m| m == "primary"));
     assert!(l.hub.stop().success());
@@ -272,9 +275,10 @@ fn body_with(model: &FakeModel, marker: &str) -> Option<String> {
         .find(|b| b.contains(marker))
 }
 
-/// A plain `cataly update` with live sessions in stock OMP: the new hub resumes the lead and both
-/// lanes on their exact session files, an active goal stays active and a paused one paused, the
-/// next prompt of each session carries its earlier turn, and the CLI says which sessions came back.
+/// A plain `cataly update` with live sessions in stock OMP: the new hub resumes the lead and the
+/// running lane on their exact session files with its goal still active, keeps the owner-held lane
+/// down with its identity (no reopen intent), carries each earlier turn into the next prompt, and
+/// the CLI says which sessions came back.
 #[test]
 fn update_resumes_the_lead_and_lanes_with_their_history() {
     if !enabled() {
@@ -339,7 +343,7 @@ fn update_resumes_the_lead_and_lanes_with_their_history() {
     let said = String::from_utf8_lossy(&out.stdout).into_owned();
     eprintln!("cataly update: {said}");
     assert!(
-        said.contains("lead를 이어서 열었습니다. lane 2개를 이어서 열었습니다: u-1, u-2."),
+        said.contains("lead를 이어서 열었습니다. lane 1개를 이어서 열었습니다: u-1."),
         "{said}"
     );
     let _ = old.wait();
@@ -360,12 +364,13 @@ fn update_resumes_the_lead_and_lanes_with_their_history() {
         let after = l.record(key);
         assert_eq!(after["session_id"], before["session_id"], "{after}");
         assert_eq!(after["session_file"], before["session_file"], "{after}");
-        assert_eq!(after["live"], true, "{after}");
+        // The owner-held lane without a reopen intent stays down, its identity kept.
+        assert_eq!(after["live"], key == "u-1", "{after}");
     }
+    assert_eq!(l.record("u-2")["state"], "held");
     hub.until(WAIT, || {
         (l.goal("u-1").as_deref() == Some("active")).then_some(())
     });
-    assert_eq!(l.goal("u-2").as_deref(), Some("paused"));
 
     // The conversations came back: each next prompt carries the earlier turn.
     assert!(
@@ -402,7 +407,7 @@ fn tool_results(model: &FakeModel) -> Vec<(String, String)> {
 
 /// Safety 4 in stock OMP: a lane's subagent (the `task` tool) is held by the lane's rules. Its
 /// bridge connects as `sub` with the lane session as parent, so the hub's shell rule blocks its
-/// `bash`; and the overlay's `tools.approval.eval: deny` refuses its `eval` cell.
+/// `bash`; and the overlay leaves `eval` unavailable in the subagent.
 #[test]
 fn a_lane_subagent_is_held_by_shell_rules_and_eval_deny_in_stock_omp() {
     if !enabled() {
@@ -473,13 +478,14 @@ fn a_lane_subagent_is_held_by_shell_rules_and_eval_deny_in_stock_omp() {
         };
         eprintln!("subagent {name} result: {result}");
         assert!(!result.contains("EVAL-RAN"), "{result}");
-        // The hub's lane rule refuses the subagent's `bash`; OMP's user deny refuses its `eval`.
-        let refusal = if *name == "bash" {
-            "Blocked by shell rule"
+        if *name == "bash" {
+            assert!(result.contains("Blocked by shell rule"), "{result}");
         } else {
-            "blocked by user policy"
-        };
-        assert!(result.contains(refusal), "{result}");
+            assert!(
+                result.contains("blocked by user policy") || result.contains("not found"),
+                "{result}"
+            );
+        }
     }
     assert!(l.hub.stop().success());
 }

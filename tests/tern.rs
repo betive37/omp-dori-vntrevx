@@ -83,6 +83,24 @@ impl Bridge {
         self.send("bridge.reply", &fields);
     }
 
+    /// An accepted hello: the welcome, after the start's read-only `model.resolve` is answered as
+    /// stock OMP resolves `fake/primary` (no thinking suffix).
+    fn accept(&mut self, hello: &Value) -> Value {
+        let welcome = self.request("bridge.hello", hello);
+        loop {
+            let cmd = self.line()["item"]["cmd"].clone();
+            if cmd["op"] == "model.resolve" {
+                assert_eq!(cmd["selector"], "fake/primary", "{cmd}");
+                let thinking = json!({ "requested": null, "observed": "high" });
+                let resolution = json!({ "version": 1, "selector": cmd["selector"],
+                    "provider": "fake", "id": "primary", "thinking": thinking });
+                self.reply(&cmd, json!({ "model_resolution": resolution }));
+                return welcome;
+            }
+            assert!(cmd.is_null(), "a command before the model check: {cmd}");
+        }
+    }
+
     fn event(&mut self, session: &str, kind: &str, fields: &Value) {
         let mut params = json!({ "session": session, "kind": kind });
         params
@@ -95,7 +113,7 @@ impl Bridge {
 
 fn hello(token: &str, session: &str, file: &Path, pid: u64) -> Value {
     json!({ "ext": 1, "token": token, "session": session, "file": file, "pid": pid, "agent": "main",
-        "idle": true, "model": "fake/primary" })
+        "idle": true, "model": "fake/primary", "model_resolution_version": 1 })
 }
 
 /// Appends the custom message OMP writes for a delivery to a session file.
@@ -209,7 +227,7 @@ fn tern_lead_is_opened_in_a_block_and_controlled_through_the_bridge() {
     let (file1, file2) = (work.join("s1.jsonl"), work.join("s2.jsonl"));
     std::fs::write(&file1, "").unwrap();
     let mut bridge = Bridge::connect(&hub.socket());
-    let welcome = bridge.request("bridge.hello", &hello(&token, "s1", &file1, pid));
+    let welcome = bridge.accept(&hello(&token, "s1", &file1, pid));
     assert_eq!(
         (welcome["role"].as_str(), welcome["tern"].as_bool()),
         (Some("lead"), Some(true))
@@ -318,7 +336,7 @@ fn a_recap_never_holds_the_bridge_from_reading_replies() {
     let file = work.join("s1.jsonl");
     std::fs::write(&file, "").unwrap();
     let mut bridge = Bridge::connect(&hub.socket());
-    let welcome = bridge.request("bridge.hello", &hello(token, "s1", &file, pid));
+    let welcome = bridge.accept(&hello(token, "s1", &file, pid));
     assert_eq!(welcome["role"], "lead", "{welcome}");
     hub.until(Duration::from_secs(20), || {
         let v = hub.json(&["lead", "status", "--json"]);
@@ -447,7 +465,7 @@ fn a_tern_lead_resumes_in_tern_whatever_the_config_says() {
     let pid = block["pid"].as_u64().unwrap();
     let mut bridge = Bridge::connect(&hub.socket());
     let token = block["token"].as_str().unwrap();
-    let welcome = bridge.request("bridge.hello", &hello(token, id, &file, pid));
+    let welcome = bridge.accept(&hello(token, id, &file, pid));
     assert_eq!(welcome["role"], "lead", "{welcome}");
     hub.until(Duration::from_secs(20), || {
         let v = hub.json(&["lead", "status", "--json"]);
@@ -483,7 +501,7 @@ fn a_tern_lead_resumes_in_tern_whatever_the_config_says() {
     let pid = again["pid"].as_u64().unwrap();
     let mut bridge = Bridge::connect(&hub.socket());
     let token = again["token"].as_str().unwrap();
-    let welcome = bridge.request("bridge.hello", &hello(token, id, &file, pid));
+    let welcome = bridge.accept(&hello(token, id, &file, pid));
     assert_eq!(welcome["role"], "lead", "{welcome}");
     assert!(starting.wait().unwrap().success());
     let live = hub.json(&["lead", "status", "--json"]);
@@ -553,7 +571,7 @@ fn a_headless_lead_resumes_headless_whatever_the_config_says() {
     let mut bridge = Bridge::connect(&hub.socket());
     let token = block["token"].as_str().unwrap();
     let file = work.join("s3.jsonl");
-    let welcome = bridge.request("bridge.hello", &hello(token, "s3", &file, pid));
+    let welcome = bridge.accept(&hello(token, "s3", &file, pid));
     assert_eq!(welcome["role"], "lead", "{welcome}");
     assert!(fresh.wait().unwrap().success());
     let live = hub.json(&["lead", "status", "--json"]);
@@ -587,10 +605,7 @@ fn a_block_ends_when_its_owner_is_gone() {
     let out = output_of(
         std::process::Command::new(&tern).args(["new", "tab", "--json", "--", "sleep", "60"]),
     );
-    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["block"].to_string();
     let data = hub.root.join("bin/tern-data");
     let wrapper = std::fs::read_to_string(data.join(format!("block-{id}.pid"))).unwrap();
     let program = hub.until(Duration::from_secs(10), || {

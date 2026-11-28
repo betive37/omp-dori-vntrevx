@@ -1,9 +1,12 @@
 //! Worker mode (design 2.2, 2.4, 2.5): `cataly worker serve --hub <id>`, started by the worker's sshd
 //! as the forced command of one hub's key. It speaks the worker protocol on channel 0 of the stream
 //! on its stdin and stdout, runs bounded commands and OMP children for the hub, moves bytes of files
-//! under its root, and carries every connection to its bridge socket as a channel to the hub. When
-//! the stream ends (end of input, a write error, 45 s of silence) it closes its OMP children by the
-//! HOST-20 rule (end input, 15 s, TERM, 5 s, KILL) and exits.
+//! under its root, and carries every connection to its bridge socket as a channel to the hub. Each
+//! OMP child belongs to the hub's attempt token: recorded under the root before it starts, its exit
+//! recorded once reaped and then acknowledged on its channel, and answered for by `attempts` after a
+//! reconnect. When the stream ends (end of input, a write error, 45 s of silence) or a newer `serve`
+//! sends TERM, it closes its OMP children by the HOST-20 rule (end input, 15 s, TERM, 5 s, KILL) and
+//! exits.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -16,8 +19,10 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncWriteExt, BufReader};
 use tokio::sync::{Notify, mpsc};
 
+use super::attempt::{self, AttemptState, Attempts, Report};
 use super::mux::{Mux, Timing};
 use super::{FILE_MAX, Hello, LINE_MAX, MARKER, PROTOCOL, Probed, method};
+use crate::host::lead::Lease;
 use crate::proto::{self, Line, Response, code};
 use crate::sys::command::{self, KILL_GRACE, Output, Spec};
 use crate::sys::paths::Paths;
@@ -36,6 +41,10 @@ const EXEC_MAX: Duration = Duration::from_hours(2);
 const FILE_TIMEOUT: Duration = Duration::from_secs(10);
 /// Children of one hub connection at once.
 const CHILDREN_MAX: usize = 16;
+/// `attempts` answers within this time; a token not checked by then is unknown.
+const ATTEMPTS_BOUND: Duration = Duration::from_secs(10);
+/// The lease check after an attempt's OMP ended.
+const LEASE_BOUND: Duration = Duration::from_secs(5);
 
 /// `<config>/worker.toml`, written by `worker init`: where the worker's OMP is and the `PATH` its
 /// commands get (sshd starts the forced command with a short default `PATH`).
@@ -113,11 +122,13 @@ pub(crate) fn run(hub: &str, paths: &Paths) -> u8 {
         Err(e) => return refuse(&e),
     };
     let root = root(paths, hub);
+    let attempts = Attempts::new(&root);
     for dir in [
         &paths.state_dir,
         &paths.state_dir.join("worker"),
         &root,
         &root.join("logs"),
+        attempts.dir(),
         &paths.runtime_dir,
     ] {
         if let Err(e) = crate::sys::fs::ensure_private_dir(dir) {
@@ -141,12 +152,24 @@ pub(crate) fn run(hub: &str, paths: &Paths) -> u8 {
         socket: socket(paths, hub),
         omp: file.omp.unwrap_or_else(|| "omp".into()),
         path: file.path,
+        attempts,
         children: Mutex::new(HashMap::new()),
     };
     let code = runtime.block_on(async move {
         let stdin = tokio::io::stdin();
         let stdout = tokio::io::stdout();
-        serve(Arc::new(worker), stdin, stdout, Timing::STANDARD).await
+        // A newer `serve` takes over with TERM (design 2.4): this one still reaps its children and
+        // records how they ended. Without the handler TERM keeps its default and ends the process.
+        let term = async {
+            use tokio::signal::unix::{SignalKind, signal};
+            match signal(SignalKind::terminate()) {
+                Ok(mut s) => {
+                    s.recv().await;
+                }
+                Err(_) => std::future::pending::<()>().await,
+            }
+        };
+        serve(Arc::new(worker), stdin, stdout, Timing::STANDARD, term).await
     });
     runtime.shutdown_timeout(Duration::from_secs(1));
     code
@@ -161,16 +184,30 @@ pub(crate) struct Worker {
     pub(crate) omp: String,
     /// The `PATH` commands get, when `worker init` captured one.
     pub(crate) path: Option<String>,
+    /// The hub's attempt records under the root.
+    pub(crate) attempts: Attempts,
     /// Spawned children by channel.
-    children: Mutex<HashMap<u32, Child>>,
+    pub(crate) children: Mutex<HashMap<u32, Child>>,
 }
 
-/// A spawned OMP: its PID and the signal that closes it.
-type Child = (Option<u32>, Arc<Notify>);
+/// A spawned OMP: its PID, the signal that closes it, and its attempt token.
+pub(crate) struct Child {
+    pid: Option<u32>,
+    stop: Arc<Notify>,
+    attempt: String,
+}
 
 impl Worker {
     fn children(&self) -> std::sync::MutexGuard<'_, HashMap<u32, Child>> {
         self.children.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// The PID of attempt `token`'s OMP while this connection still runs it.
+    fn live(&self, token: &str) -> Option<u32> {
+        self.children()
+            .values()
+            .find(|c| c.attempt == token)
+            .and_then(|c| c.pid)
     }
 
     /// The program for `argv[0]`: `omp` is the configured OMP.
@@ -233,11 +270,18 @@ impl Worker {
     }
 }
 
-/// Serves one hub connection until the stream ends.
-pub(crate) async fn serve<R, W>(worker: Arc<Worker>, read: R, write: W, timing: Timing) -> u8
+/// Serves one hub connection until the stream ends or `stop` completes.
+pub(crate) async fn serve<R, W, S>(
+    worker: Arc<Worker>,
+    read: R,
+    write: W,
+    timing: Timing,
+    stop: S,
+) -> u8
 where
     R: tokio::io::AsyncRead + Unpin + Send + 'static,
     W: tokio::io::AsyncWrite + Unpin + Send + 'static,
+    S: Future<Output = ()>,
 {
     let _lock = match take_lock(&worker.root.join("serve.lock")).await {
         Ok(lock) => lock,
@@ -266,10 +310,12 @@ where
         }
     });
     let mut reader = BufReader::new(read);
+    let mut stop = std::pin::pin!(stop);
     loop {
         let line = tokio::select! {
             l = proto::read_line(&mut reader, LINE_MAX) => l,
             () = mux.closed() => break,
+            () = &mut stop => break,
         };
         let line = match line {
             Line::Text(l) => l,
@@ -304,11 +350,11 @@ where
     }
     replies.abort();
     let _ = std::fs::remove_file(&worker.socket);
-    // Every OMP child ends by the HOST-20 rule; this waits for the last.
+    // Every OMP child ends by the HOST-20 rule and records how; this waits for the last.
     let stops: Vec<Arc<Notify>> = worker
         .children()
         .values()
-        .map(|(_, n)| Arc::clone(n))
+        .map(|c| Arc::clone(&c.stop))
         .collect();
     for stop in &stops {
         stop.notify_one();
@@ -380,6 +426,24 @@ struct ExecParams {
 
 #[derive(Debug, Default, Deserialize)]
 #[serde(default)]
+struct SpawnParams {
+    argv: Vec<String>,
+    cwd: Option<String>,
+    env: HashMap<String, String>,
+    /// The hub's attempt token (protocol 2), recorded before the process exists.
+    attempt: String,
+    /// The OMP session the start is to bind, for the lease check once it ended.
+    session: Option<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
+struct AttemptsParams {
+    attempts: Vec<String>,
+}
+
+#[derive(Debug, Default, Deserialize)]
+#[serde(default)]
 struct FileParams {
     path: String,
     data: Option<String>,
@@ -412,6 +476,20 @@ async fn handle(
         method::EXEC => exec(worker, parse(params)?).await,
         method::SPAWN => spawn(worker, mux, parse(params)?).await,
         method::SIGNAL => signal(worker, &parse(params)?),
+        method::ATTEMPTS => attempts(worker, parse(params)?).await,
+        method::FORGET_ATTEMPTS => {
+            let p: AttemptsParams = parse(params)?;
+            if p.attempts.len() > attempt::QUERY_MAX {
+                return Err("too many attempt tokens".into());
+            }
+            for token in p.attempts {
+                if worker.live(&token).is_some() {
+                    return Err("attempt is still running; kept".into());
+                }
+                worker.attempts.forget(&token).await?;
+            }
+            Ok(json!({}))
+        }
         method::READ | method::STAT | method::WRITE => {
             let p: FileParams = parse(params)?;
             let (worker, name) = (Arc::clone(worker), name.to_string());
@@ -530,9 +608,11 @@ async fn exec(worker: &Worker, p: ExecParams) -> Result<Value, String> {
     Ok(super::link::exec_reply(&done))
 }
 
-/// Starts the worker's own OMP on a new channel: its stdout flows to the hub, the hub's bytes to its
-/// stdin; the hub's end of input closes it by the HOST-20 rule.
-async fn spawn(worker: &Arc<Worker>, mux: &Mux, p: ExecParams) -> Result<Value, String> {
+/// Starts the worker's own OMP for one attempt on a new channel: its stdout flows to the hub, the
+/// hub's bytes to its stdin. The attempt is recorded before the process exists; the hub's end of
+/// input, the end of the child's output, the stream's end or a stop closes it by the HOST-20 rule,
+/// and then its recorded end goes to the hub as the channel's one `exit` frame.
+async fn spawn(worker: &Arc<Worker>, mux: &Mux, p: SpawnParams) -> Result<Value, String> {
     if p.argv.first().map(String::as_str) != Some("omp") {
         return Err("spawn runs only omp".into());
     }
@@ -548,24 +628,55 @@ async fn spawn(worker: &Arc<Worker>, mux: &Mux, p: ExecParams) -> Result<Value, 
     };
     let env = worker.env(&p.env);
     let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
-    let token = crate::host::random_hex(6);
-    let stderr = worker.root.join("logs").join(format!("omp-{token}.err"));
-    let mut child = command::attach(&argv, Some(&cwd), &env, Some(&stderr), STDERR_CAP)
-        .map_err(|e| e.to_string())?;
-    let (Some(mut stdin), Some(mut stdout)) = (child.take_stdin(), child.take_stdout()) else {
-        child.close(CLOSE_WAIT, KILL_GRACE).await;
-        return Err("OMP's pipes are not available".into());
+    // A refusal before this line started nothing; after it, every failure answers with the state
+    // it recorded, so the hub knows whether a process existed.
+    let mut record = worker.attempts.begin(&p.attempt, p.session.as_deref())?;
+    let stderr = worker
+        .root
+        .join("logs")
+        .join(format!("omp-{}.err", p.attempt));
+    let mut child = match command::attach(&argv, Some(&cwd), &env, Some(&stderr), STDERR_CAP) {
+        Ok(child) => child,
+        Err(e) => {
+            let never = AttemptState::Reaped {
+                exit: attempt::Reaped::NotSpawned,
+                lease: Lease::Unknown,
+            };
+            return Ok(failed(&mut record, &never, &e.to_string()));
+        }
     };
     let pid = child.pid();
-    let (channel, stream) = match mux.open(&json!({ "kind": "spawn", "pid": pid })).await {
+    let pipes = match record.spawned(pid).await {
+        Ok(()) => match (child.take_stdin(), child.take_stdout()) {
+            (Some(stdin), Some(stdout)) => Ok((stdin, stdout)),
+            _ => Err("OMP's pipes are not available".to_string()),
+        },
+        Err(e) => Err(format!("the OMP child's identity was not recorded: {e}")),
+    };
+    let opened = match pipes {
+        Ok(pipes) => mux
+            .open(&json!({ "kind": "spawn", "pid": pid, "attempt": p.attempt }))
+            .await
+            .map(|(channel, stream)| (pipes, channel, stream)),
+        Err(e) => Err(e),
+    };
+    let ((mut stdin, mut stdout), channel, stream) = match opened {
         Ok(opened) => opened,
         Err(e) => {
-            child.close(Duration::ZERO, KILL_GRACE).await;
-            return Err(e);
+            let (exit, _) = child.close(Duration::ZERO, KILL_GRACE).await;
+            let closed = AttemptState::closed(exit, Lease::Unknown);
+            return Ok(failed(&mut record, &closed, &e));
         }
     };
     let stop = Arc::new(Notify::new());
-    worker.children().insert(channel, (pid, Arc::clone(&stop)));
+    worker.children().insert(
+        channel,
+        Child {
+            pid,
+            stop: Arc::clone(&stop),
+            attempt: p.attempt.clone(),
+        },
+    );
     let (mut from_hub, mut to_hub) = tokio::io::split(stream);
     let input = tokio::spawn(async move {
         let _ = tokio::io::copy(&mut from_hub, &mut stdin).await;
@@ -576,18 +687,137 @@ async fn spawn(worker: &Arc<Worker>, mux: &Mux, p: ExecParams) -> Result<Value, 
     });
     let (worker2, mux2) = (Arc::clone(worker), mux.clone());
     tokio::spawn(async move {
-        // The hub's end of input closes the child; so do the stream's end and a stop.
-        let mut input = input;
-        tokio::select! {
-            _ = &mut input => {}
-            () = stop.notified() => input.abort(),
-            () = mux2.closed() => input.abort(),
+        // The hub's end of input closes the child; so do the end of its output (it exited or was
+        // killed), the stream's end and a stop.
+        let (mut input, mut output) = (input, output);
+        let output_ended = tokio::select! {
+            _ = &mut input => false,
+            _ = &mut output => true,
+            () = stop.notified() => false,
+            () = mux2.closed() => false,
+        };
+        input.abort();
+        let (exit, _) = child.close(CLOSE_WAIT, KILL_GRACE).await;
+        if !output_ended {
+            let _ = tokio::time::timeout(Duration::from_secs(2), output).await;
         }
-        child.close(CLOSE_WAIT, KILL_GRACE).await;
-        let _ = tokio::time::timeout(Duration::from_secs(2), output).await;
+        acknowledge(&worker2, &mux2, channel, &mut record, exit).await;
         worker2.children().remove(&channel);
     });
-    Ok(json!({ "channel": channel, "pid": pid, "stderr": stderr.display().to_string() }))
+    Ok(json!({
+        "channel": channel,
+        "pid": pid,
+        "attempt": p.attempt,
+        "stderr": stderr.display().to_string(),
+    }))
+}
+
+/// Records how the attempt's OMP ended, then acknowledges it as the channel's last frame. The lease
+/// is asked only while the hub can still hear the answer; on a closed stream the record alone
+/// answers `attempts` later.
+async fn acknowledge(
+    worker: &Worker,
+    mux: &Mux,
+    channel: u32,
+    record: &mut attempt::Attempt,
+    exit: command::Exit,
+) {
+    let lease = if mux.is_closed() {
+        Lease::Unknown
+    } else {
+        lease_of(worker, record.session()).await
+    };
+    let state = AttemptState::closed(exit, lease);
+    record_end(record, &state);
+    let report = Report {
+        attempt: record.token().to_string(),
+        state,
+    };
+    if let Ok(value) = serde_json::to_value(&report) {
+        let _ = mux.exit(channel, &value).await;
+    }
+}
+
+/// The `spawn` answer of an attempt that failed after it was recorded: the reason, and the state
+/// the worker recorded for it (never started, or how the started process ended).
+fn failed(record: &mut attempt::Attempt, state: &AttemptState, why: &str) -> Value {
+    record_end(record, state);
+    json!({ "attempt": record.token(), "failed": why, "state": state })
+}
+
+/// Records the attempt's end; a record that cannot be written is logged, and `attempts` then
+/// answers from the process identity alone.
+fn record_end(record: &mut attempt::Attempt, state: &AttemptState) {
+    if let Err(e) = record.ended(state) {
+        crate::log::warn(
+            "attempt end not recorded",
+            &[("attempt", &record.token()), ("error", &e)],
+        );
+    }
+}
+
+/// OMP's lease answer for `session` on this worker, `unknown` when none is named or OMP cannot say
+/// within [`LEASE_BOUND`].
+async fn lease_of(worker: &Worker, session: Option<&str>) -> Lease {
+    let Some(id) = session else {
+        return Lease::Unknown;
+    };
+    let argv = worker.program(&[
+        "omp".into(),
+        "session".into(),
+        "lease".into(),
+        "--json".into(),
+        "--".into(),
+        id.to_string(),
+    ]);
+    let env = worker.env(&HashMap::new());
+    let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
+    let done = command::run(&Spec {
+        argv: &argv,
+        cwd: Some(&worker.root),
+        env: &env,
+        timeout: LEASE_BOUND,
+        kill_grace: Duration::from_secs(1),
+        output_cap: 1024 * 1024,
+        output: Output::Capture,
+    })
+    .await;
+    match done {
+        Ok(d) if d.success() && !d.truncated => match crate::omp::usage::parse_lease(&d.stdout) {
+            Ok(l) if l.held.iter().any(|h| h == id) => Lease::Held,
+            Ok(l) if l.unknown.iter().any(|u| u == id) => Lease::Unknown,
+            Ok(_) => Lease::Free,
+            Err(_) => Lease::Unknown,
+        },
+        _ => Lease::Unknown,
+    }
+}
+
+/// The state of each named attempt token, within [`ATTEMPTS_BOUND`]: one this connection still
+/// runs, else what its record proves. An earlier attempt's process that still runs is reported as
+/// running; it is never killed or adopted.
+async fn attempts(worker: &Worker, p: AttemptsParams) -> Result<Value, String> {
+    if p.attempts.len() > attempt::QUERY_MAX {
+        return Err(format!(
+            "attempts takes at most {} tokens",
+            attempt::QUERY_MAX
+        ));
+    }
+    let deadline = tokio::time::Instant::now() + ATTEMPTS_BOUND;
+    let mut states = serde_json::Map::new();
+    for token in p.attempts {
+        let state = match worker.live(&token) {
+            Some(pid) => AttemptState::Running { pid },
+            None => tokio::time::timeout_at(deadline, worker.attempts.state(&token))
+                .await
+                .unwrap_or_else(|_| AttemptState::Unknown {
+                    reason: format!("not checked within {} s", ATTEMPTS_BOUND.as_secs()),
+                }),
+        };
+        let value = serde_json::to_value(&state).map_err(|e| e.to_string())?;
+        states.insert(token, value);
+    }
+    Ok(json!({ "attempts": states }))
 }
 
 /// TERM or KILL to one of this connection's own children.
@@ -600,7 +830,7 @@ fn signal(worker: &Worker, p: &SignalParams) -> Result<Value, String> {
     let pid = worker
         .children()
         .get(&p.channel)
-        .and_then(|(pid, _)| *pid)
+        .and_then(|c| c.pid)
         .ok_or("no child of this hub on that channel")?;
     let pid = i32::try_from(pid)
         .ok()
@@ -682,13 +912,13 @@ fn transcript(worker: &Worker, name: &str, params: &Value) -> Result<Value, Stri
     let text = |key: &str| params.get(key).and_then(Value::as_str).unwrap_or_default();
     let path = worker.confine(text("path"))?;
     if name == method::FIND {
-        let found = match find_marker(&path, text("marker")).map_err(|e| e.to_string())? {
-            Found::Yes => "yes",
-            Found::No => "no",
-            Found::Missing => "missing",
-            Found::OutOfTime => "out_of_time",
+        let (found, reason) = match find_marker(&path, text("marker")).map_err(|e| e.to_string())? {
+            Found::Yes => ("yes", None),
+            Found::Absent => ("absent", None),
+            Found::Missing => ("missing", None),
+            Found::Unknown(reason) => ("unknown", Some(reason)),
         };
-        return Ok(json!({ "found": found }));
+        return Ok(json!({ "found": found, "reason": reason }));
     }
     let root = worker.confine(text("root"))?;
     let folder = match (params.get("exactly"), params.get("recorded")) {

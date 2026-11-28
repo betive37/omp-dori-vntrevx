@@ -122,20 +122,32 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
 
 ### Handshake and identity (HOST-07, HOST-08)
 
-23. After spawn the daemon waits at most 15 s for the ready frame. A non-ready first frame, a protocol it does not
-    support, or a timeout ends the start: the child is closed (HOST-20) and the record marked failed with reason.
+23. From spawn the daemon gives the whole start one 60 s deadline: the ready frame, protocol negotiation and both
+    get_state answers (24) all spend it, and nothing restarts the clock. A non-ready first frame, a protocol it does
+    not support, or the deadline ends that attempt only: the child is closed (HOST-20), its exit verified, and the
+    record marked failed with the stage, the outcome and the cleanup evidence. The attempt never ends the
+    conversation it tried to resume, and it never supersedes the last proven binding (103).
 24. Then it sends get_state. The answer must carry a non-empty session id and an absolute transcript path. A
     second get_state must report the same pair. The pair is then bound to the session handle.
 25. The transcript file may be absent until OMP writes the first entry. If it is still absent at the first idle
     readback after a completed turn, the session is faulted.
 26. Every later get_state answer is compared with the bound pair. A different session id or path means OMP switched
     transcripts: the session becomes faulted (HOST-11) and receives no further input.
-27. The model OMP reports in get_state must equal the requested provider/id (provider exact, id case-insensitive),
-    and the reported thinking level must equal the requested one when one was requested. If not, the session
-    stays open but held with reason "model mismatch"; no input is delivered and no goal is set until the owner
-    closes it or explicitly accepts the observed model.
-28. Start returns only after steps 23-27 complete or fail. Total start budget: 30 s. Callers are notified by event,
-    not by polling.
+27. The requested model is a selector, never compared as text: within the deadline of 23 the session's bridge
+    answers the read-only `model.resolve` with the provider/id OMP itself resolves it to and the thinking level
+    it requests (a suffix `:<level>` of the documented levels, or the explicit thinking setting, which wins; an ID
+    with a colon part of its own stays whole). The model OMP reports in get_state must equal that provider/id
+    (provider exact, id case-insensitive), and the reported thinking level must equal the requested one when one
+    was requested; a clamped level is a mismatch. If not, the session stays open but held with reason
+    "model mismatch". A bridge whose hello lacks `model_resolution_version` 1 (older than the hub) cannot answer:
+    the model is unverified at once, without a query, a retry or waiting for the deadline. A session whose bridge
+    never says hello is not a failed start either: when the deadline has all but run out it binds, unverified.
+    Either way the session is held with reason "model unverified"; the owner hears it once, not on every start,
+    with the fix (`cataly update` or a restart of the session) and `cataly lead accept-model`. No input is
+    delivered and no goal is set until the owner closes it or explicitly accepts the observed model.
+28. Start returns only after steps 23-27 complete or fail: within the 60 s deadline of 23 plus at most 30 s of
+    owned cleanup (end of input, TERM, KILL and reap). At 15 s a still-starting attempt is reported as still
+    starting, not failed (108). Callers are notified by event, not by polling.
 
 ### Transport (HOST-10, HOST-11)
 
@@ -190,14 +202,16 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
     (default), only while working, or either.
 50. Checks, in this order, against a fresh readback: bound identity matches the expected id; not faulted, stopping
     or held; no pending dialog; goal not paused or blocked; text not blank; text at most 256 KiB; the timing rule
-    matches the current status. A failed check returns "not ready" with the current status and changes nothing.
+    matches the current status. A failed check returns "not ready" with the current status and the check that
+    failed (for example "the goal is paused" while the status reads idle), and changes nothing.
 51. Wake: if the session is idle the daemon sends prompt (with follow-up as the streaming behaviour, so a turn that
     starts in between queues the text instead of failing). This starts a turn. If working, it sends follow_up,
     which OMP runs after the current turn.
 52. A steer delivery (explicitly requested) sends steer and requires a running turn; with none it is refused.
 53. Text whose first non-space character is "/" is sent with a short fixed first line marking it as a message, so
     OMP does not run it as a command. Cataly never passes OMP commands through delivery.
-54. Results: delivered (and whether a new turn was started), not ready (status), refused (reason), or ambiguous.
+54. Results: delivered (and whether a new turn was started), not ready (status and failed check), refused (reason),
+    or ambiguous.
 55. Latency target: one readback plus one command round trip; no sleep or poll in the path. The daemon records the
     time from accepting a delivery to the next agent_start event and exposes it for measurement.
 
@@ -270,10 +284,15 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
 
 80. On daemon start the lead is started, then duty. Each must bind a session id distinct from every other live
     session; otherwise start stops and nothing already running is replaced.
-81. The lead resumes its last session only if that session's stop record is a clean close of exactly that id and
-    the transcript still exists; otherwise it starts fresh and says why. The owner may force fresh.
-82. A deployment may require a specific lead session id. Then the lead must resume exactly that one or the daemon
-    refuses to start the lead; a fresh lead is never substituted.
+81. The lead resumes its resume anchor (103): the last proven binding, whatever attempts failed since. It starts
+    fresh only the first time ever or on the owner's explicit fresh request. A missing, unsafe, oversized or
+    unverified transcript, an ambiguous history or an unproven exit of the earlier process holds the lead with the
+    precise check named; it never starts fresh by itself. A history is ambiguous only when the anchored session id
+    was bound to more than one transcript file; a changed working folder or runtime is not. The owner's plain start
+    lifts that hold by resuming the anchored transcript once it verifies.
+82. A deployment may require a specific lead session id. Then the lead must resume exactly that earlier binding, even
+    behind newer attempts or conversations, or the daemon holds the lead; a fresh lead is never substituted. A pin
+    and a fresh request together are refused.
 83. Stopping the roles refuses if a role is working or has a pending dialog. The lead is stopped before duty.
 
 ### Recovery (HOST-28)
@@ -332,6 +351,43 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
 102. Windows: no daemon release. Windows keeps working as it does today on its own path; nothing in this spec adds
      Windows behaviour (see questions).
 
+### Lossless resume (docs/design/lead-resume.md)
+
+103. Resume anchor: the lead's proven session id, canonical transcript, recorded cwd and runtime, written in the
+     same commit that binds a start (24-27) and never by a failed attempt. It is kept apart from the attempt log and
+     its retention. After a failed explicit fresh start the old conversation stays the anchor, held, until the
+     owner chooses `cataly lead start` (resume old) or `cataly lead start --fresh` (retry fresh).
+104. Retry: only a startup timeout whose child exit is verified may be retried, on the same exact identity, after a
+     fresh lease check, with 1, 2, 4, 8 and 16 s backoff, at most five retries, inside one 300 s recovery episode
+     that counts cleanup and waits and survives hub restarts without rolling its deadline forward. Anything else
+     (a rejection such as an early exit or a protocol or identity mismatch, an unknown cleanup or lease, the spent
+     episode) holds the lead.
+105. A hold stays across hub restarts and updates until the owner acts: a restart finds the hold, names its first
+     cause, and starts nothing. `cataly lead start` after fixing the cause resumes the anchor; stop, shutdown and
+     a target change cancel a planned retry and wait for owned cleanup.
+106. Input waits for binding: owner messages and quiet notes stay pending, untouched, while no session of the
+     anchor is bound; the first bound wake sends them once in one batch, and the resume note keeps its once-only
+     identity. A start attempt never creates a delivery or resends one.
+107. A written batch is settled from its transcript, which is read whole (up to 64 MiB, 10 s): the newest 8 MiB
+     first, then the rest. A user entry carrying its marker means delivered. It is written again, at most once and
+     with its original delivery id, only when every line of the file was read and parsed without the marker, the
+     process that took it is gone, and the same session id and transcript are bound again in a new process. A
+     partial last entry, an unparsable line, an entry over 8 MiB, a missing or unreadable file, or a spent search
+     budget proves nothing: the batch is in doubt, and the owner settles it. A batch on a worker whose connection
+     dropped is never written again automatically. No retry resets a batch's resend mark.
+108. The owner is told directly, in his `[hub] language`, through his home room and never only through the lead:
+     once per recovery episode when a start passes 15 s (not a failure yet; the conversation and queued input are
+     kept; the attempt and episode limits), and once per hold (the reason, that the conversation and work are kept,
+     `cataly lead start` after the fix and `cataly lead start --fresh` only for a different conversation, and that
+     an update or restart does not lift the hold). What was told survives a restart, so a hold found again is not
+     told again. Fresh is never offered as the repair.
+109. `cataly lead status` and `cataly health` show the anchor's id and transcript, the startup phase and its elapsed
+     time, the attempt count and next retry, the last attempt's stage, outcome and cleanup evidence, the last lease
+     answer and the pending, sent and in-doubt counts; while held, the same text the owner was told.
+110. After an update the hub's message says "recovering" for a lead or lane still in its recovery after the
+     one-minute wait, never a final word, and a second message gives the final result (resumed or held, with what
+     is kept) once it settles, at most one recovery episode later. `cataly update` says the same.
+
 ## Third-party interfaces used
 
 OMP public surfaces (installed 19.1.1 checked):
@@ -360,7 +416,9 @@ flag on turn end. The old tree also pinned OMP 19.0.1 built from source with a l
 - Per session: handle, role, runtime, cwd, name, group, requested model and thinking, start kind, bound session id
   and transcript path, lifecycle state (starting, live, stopped, lost, orphan-held, failed) and stop details.
 - Per session: the submission receipts and their states.
-- The last cleanly stopped lead session (id and transcript path) and any required lead session id.
+- The lead's resume anchor, the owner's fresh or resume intent, the recovery episode (attempt count, next retry,
+  deadline, state and first cause) and what the owner was last told about a slow start and a hold.
+- Any required lead session id.
 - Config: OMP executable, minimum version, allowed extra flags, capacity cap, default runtime.
 - Not kept: output ring, events, dialogs, view tokens (rebuilt from the live child).
 

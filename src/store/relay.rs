@@ -16,6 +16,14 @@ const KEEP_MS: i64 = 7 * 24 * 3600 * 1000;
 const OWED_KEEP: i64 = 200;
 /// Owed replies older than this are no longer reported (DISC-OUT req. 34).
 pub(crate) const OWED_WINDOW_MS: i64 = 30 * 60 * 1000;
+/// A request's done mark is recorded as a read mark under the request's message with this suffix,
+/// which no platform's message ID carries (MSG-04).
+const DONE_MARK: &str = ":done";
+
+/// The read-mark key of the done mark of the request `message`.
+pub(crate) fn done_mark(message: &str) -> String {
+    format!("{message}{DONE_MARK}")
+}
 
 /// A room's read position.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -61,6 +69,8 @@ pub(crate) struct PartRow {
     pub(crate) destination: Option<String>,
     pub(crate) state: String,
     pub(crate) uncertain: bool,
+    /// 0 for the answer; n for the n-th later turn OMP started by itself (DISC-OUT req. 21).
+    pub(crate) turn: i64,
 }
 
 /// One owed reply.
@@ -182,6 +192,17 @@ pub(crate) enum RelayWrite {
         relay: String,
         room: String,
         source: String,
+        parts: Vec<(String, String)>,
+    },
+    /// Stores the parts of the `turn`-th later turn at indexes from `start`, right after the parts
+    /// of the turns before it; nothing when that turn is stored already or the earlier ones are
+    /// not. Its hand-off is posting again until they are posted.
+    Continue {
+        relay: String,
+        room: String,
+        source: String,
+        turn: i64,
+        start: i64,
         parts: Vec<(String, String)>,
     },
     /// Pins a pending part's destination and whether an attempt may already have taken effect.
@@ -487,7 +508,9 @@ pub(super) fn write(
         | RelayWrite::Outbox { .. }
         | RelayWrite::PartState { .. }
         | RelayWrite::PartDone { .. } => write_replies(tx, change, now),
-        RelayWrite::Answer { .. } | RelayWrite::Question { .. } => write_marks(tx, change, now),
+        RelayWrite::Answer { .. } | RelayWrite::Question { .. } | RelayWrite::Continue { .. } => {
+            write_marks(tx, change, now)
+        }
         RelayWrite::State { .. } | RelayWrite::Recall { .. } => write_state(tx, change, now),
     }
 }
@@ -831,6 +854,47 @@ fn write_marks(tx: &Transaction<'_>, change: &RelayWrite, now: i64) -> rusqlite:
             }
             Ok(RelayDone::Done)
         }
+        RelayWrite::Continue {
+            relay,
+            room,
+            source,
+            turn,
+            start,
+            parts,
+        } => {
+            let (last_idx, last_turn, open): (Option<i64>, Option<i64>, bool) = tx.query_row(
+                "SELECT MAX(idx), MAX(turn), EXISTS (SELECT 1 FROM handoffs WHERE relay = ?1 \
+                 AND room = ?2 AND message = ?3 AND answer IN ('posting', 'posted')) \
+                 FROM outbox_parts WHERE relay = ?1 AND room = ?2 AND source = ?3",
+                params![relay, room, source],
+                |r| Ok((r.get(0)?, r.get(1)?, r.get(2)?)),
+            )?;
+            if !open || last_turn.is_none_or(|t| t >= *turn) || last_idx != Some(start - 1) {
+                return Ok(RelayDone::Done);
+            }
+            for (i, (nonce, text)) in parts.iter().enumerate() {
+                tx.execute(
+                    "INSERT INTO outbox_parts (relay, room, source, idx, text, nonce, state, turn, \
+                     created_ms, updated_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, 'pending', ?7, ?8, ?8)",
+                    params![
+                        relay,
+                        room,
+                        source,
+                        start.saturating_add(i64::try_from(i).unwrap_or(i64::MAX)),
+                        text,
+                        nonce,
+                        turn,
+                        now
+                    ],
+                )?;
+            }
+            tx.execute(
+                "UPDATE handoffs SET answer = 'posting', updated_ms = ?4 WHERE relay = ?1 AND room = ?2 \
+                 AND message = ?3 AND answer = 'posted'",
+                params![relay, room, source, now],
+            )?;
+            Ok(RelayDone::Done)
+        }
         _ => Ok(RelayDone::Done),
     }
 }
@@ -983,6 +1047,26 @@ impl Reads {
         stmt.query_map([relay], handoff_from_row)?.collect()
     }
 
+    /// The newest hand-off to `target` with an answer stored: only the last request's turns can
+    /// still go on, as the next input ends them.
+    pub(crate) fn answer_newest(
+        &self,
+        relay: &str,
+        target: &str,
+    ) -> rusqlite::Result<Option<HandoffRow>> {
+        self.0
+            .query_row(
+                &format!(
+                    "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE relay = ?1 AND target = ?2 \
+                     AND answer IN ('posting', 'posted') AND state IN ('handed', 'delivered') \
+                     ORDER BY created_ms DESC, seq DESC LIMIT 1"
+                ),
+                params![relay, target],
+                handoff_from_row,
+            )
+            .optional()
+    }
+
     pub(crate) fn parts(
         &self,
         relay: &str,
@@ -990,8 +1074,8 @@ impl Reads {
         source: &str,
     ) -> rusqlite::Result<Vec<PartRow>> {
         let mut stmt = self.0.prepare(
-            "SELECT idx, text, nonce, destination, state, uncertain FROM outbox_parts WHERE relay = ?1 AND room = ?2 \
-             AND source = ?3 ORDER BY idx",
+            "SELECT idx, text, nonce, destination, state, uncertain, turn FROM outbox_parts \
+             WHERE relay = ?1 AND room = ?2 AND source = ?3 ORDER BY idx",
         )?;
         stmt.query_map(params![relay, room, source], |r| {
             Ok(PartRow {
@@ -1001,6 +1085,7 @@ impl Reads {
                 destination: r.get(3)?,
                 state: r.get(4)?,
                 uncertain: r.get(5)?,
+                turn: r.get(6)?,
             })
         })?
         .collect()
@@ -1017,6 +1102,27 @@ impl Reads {
             params![relay, room, message],
             |r| r.get(0),
         )
+    }
+
+    /// Hand-offs whose answer was posted since `since_ms` and whose done mark is not recorded. The
+    /// answer is posted once its own parts are, whatever later turn still waits to follow it.
+    pub(crate) fn done_owed(
+        &self,
+        relay: &str,
+        since_ms: i64,
+    ) -> rusqlite::Result<Vec<HandoffRow>> {
+        let mut stmt = self.0.prepare(&format!(
+            "SELECT {HANDOFF_COLUMNS} FROM handoffs h WHERE relay = ?1 AND updated_ms >= ?2 \
+             AND (answer = 'posted' OR (answer = 'posting' \
+             AND EXISTS (SELECT 1 FROM outbox_parts o WHERE o.relay = h.relay AND o.room = h.room \
+             AND o.source = h.message AND o.turn = 0 AND o.state = 'confirmed') \
+             AND NOT EXISTS (SELECT 1 FROM outbox_parts o WHERE o.relay = h.relay AND o.room = h.room \
+             AND o.source = h.message AND o.turn = 0 AND o.state = 'pending'))) \
+             AND NOT EXISTS (SELECT 1 FROM read_marks m WHERE m.relay = h.relay \
+             AND m.room = h.room AND m.message = h.message || ?3) ORDER BY created_ms, seq"
+        ))?;
+        stmt.query_map(params![relay, since_ms, DONE_MARK], handoff_from_row)?
+            .collect()
     }
 
     /// Owed replies admitted since `since_ms`, newest first.
@@ -1225,6 +1331,92 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(h.answer, "posted");
+    }
+
+    #[tokio::test]
+    async fn later_turns_follow_the_answer_once() {
+        let (store, _w, _dir) = open_temp("relay-later");
+        let r = |w| store.relay(w);
+        r(arrive("c", 12)).await.unwrap();
+        r(RelayWrite::Handed {
+            relay: "discord".into(),
+            room: "c".into(),
+            message: "12".into(),
+            seq: 12,
+            target: "lead".into(),
+            request_id: "discord:c:12".into(),
+            digest: "d".into(),
+            owed: Some("hi".into()),
+        })
+        .await
+        .unwrap();
+        let later = |turn, start| RelayWrite::Continue {
+            relay: "discord".into(),
+            room: "c".into(),
+            source: "12".into(),
+            turn,
+            start,
+            parts: vec![(format!("n{start}"), format!("turn {turn}"))],
+        };
+        // Nothing before the answer is stored.
+        r(later(1, 0)).await.unwrap();
+        r(RelayWrite::Outbox {
+            relay: "discord".into(),
+            room: "c".into(),
+            source: "12".into(),
+            parts: vec![("n0".into(), "a".into())],
+        })
+        .await
+        .unwrap();
+        let owed = || async {
+            store
+                .read(|q| q.done_owed("discord", 0))
+                .await
+                .unwrap()
+                .into_iter()
+                .map(|h| h.message)
+                .collect::<Vec<_>>()
+        };
+        assert!(owed().await.is_empty(), "the answer is not posted yet");
+        r(RelayWrite::PartDone {
+            relay: "discord".into(),
+            room: "c".into(),
+            source: "12".into(),
+            idx: 0,
+            remote: "100".into(),
+            linked: true,
+        })
+        .await
+        .unwrap();
+        let answer = || async {
+            store
+                .read(|q| q.handoff("discord", "c", "12"))
+                .await
+                .unwrap()
+                .unwrap()
+                .answer
+        };
+        assert_eq!(answer().await, "posted");
+        r(later(1, 1)).await.unwrap();
+        // A repeat of the same turn, or one at the wrong index, stores nothing.
+        r(later(1, 2)).await.unwrap();
+        r(later(2, 3)).await.unwrap();
+        assert_eq!(
+            answer().await,
+            "posting",
+            "posting again for the later turn"
+        );
+        assert_eq!(
+            owed().await,
+            ["12"],
+            "a later turn still to post never holds up the answer's done mark"
+        );
+        let parts = store.read(|q| q.parts("discord", "c", "12")).await.unwrap();
+        let kept: Vec<(i64, i64, &str)> = parts
+            .iter()
+            .map(|p| (p.idx, p.turn, p.text.as_str()))
+            .collect();
+        assert_eq!(kept, [(0, 0, "a"), (1, 1, "turn 1")]);
     }
 
     #[tokio::test]

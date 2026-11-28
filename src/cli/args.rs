@@ -25,10 +25,10 @@ pub(crate) const COMMANDS: [Spec; 59] = [
     },
     Spec {
         path: &["lane"],
-        args: &["op"],
+        args: &["op", "key?"],
         flags: &["--json"],
         values: &["--params"],
-        summary: "one lane operation (open, list, board, pause, resume, park, abandon, claim, object, close, \
+        summary: "one lane operation (open, list, board, status [key], pause, resume, park, abandon, claim, object, close, \
                   reopen, send, release, read, interrupt, model, answer, grant, drift, spend); --params '<json>'",
     },
     Spec {
@@ -119,8 +119,8 @@ pub(crate) const COMMANDS: [Spec; 59] = [
         path: &["install"],
         args: &[],
         flags: &[],
-        values: &["--from", "--prefix"],
-        summary: "install from a folder of release assets (--from); install.sh runs this",
+        values: &["--from", "--prefix", "--preflight"],
+        summary: "install from a folder of release assets (--from); install.sh runs this; --preflight <binary> only checks that binary can read the store (install.sh runs it through the installed version first)",
     },
     Spec {
         path: &["update"],

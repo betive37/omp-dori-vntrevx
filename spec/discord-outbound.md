@@ -112,8 +112,15 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     job, not the model's.
 21. The answer is the final assistant message of the turn the request started: the turn ended
     normally (stop reason "stop"), the message contains no tool call, and it has non-empty visible
-    text. Text the provider marks as commentary is excluded. A turn that continues automatically
-    extends the wait; the answer is the last message of the final turn.
+    text. Text the provider marks as commentary is excluded. A turn that ends without such a message
+    and continues automatically extends the wait; the answer is the first such message after the
+    request. A turn OMP starts by itself after the answer, without a user input (a background job's
+    `async-result` or another message OMP injects), never replaces or removes it. Until the next
+    user input or request enters the transcript, the final message of each such later turn is
+    posted after the answer, in order, as its own message in the answer's destination (rule 25):
+    never as the reply, and it settles nothing (rule 33). Each is stored as further parts of the
+    same outbox entry under the same rules (24, 26-28) before it is posted, and a restart finds the
+    later turns not stored yet in the transcript again.
 22. If, before that turn ends, another user input or request enters the same transcript, the pending
     reply is abandoned (the answer would belong to mixed work) and the obligation stays open.
 23. The daemon reads the answer from OMP's public surfaces (rpc-ui events or the session file) and
@@ -125,7 +132,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     confirmation clears uncertainty, while a definite rejection clears it only if no earlier attempt
     was already uncertain. A crash-and-retry uses the saved destination and nonce.
 25. Parts are posted in order; the first is a reply to the source message (rule 15). Each confirmed
-    part is acknowledged in the outbox with its remote ID before the next is posted.
+    part is acknowledged in the outbox with its remote ID before the next is posted. The parts of a
+    later turn (rule 21) follow the answer's parts and go where the answer's last part went, as plain
+    posts that are never a reply, even after a move to the channel.
     When the source message is in a text or announcement channel, thread following is on (intake
     spec req. 6) and a thread was started from it outside a lane, the whole answer goes into that
     thread instead. The message's `thread` must name one under the same channel that is not locked.
@@ -165,7 +174,17 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 
 30. When the daemon admits an owner message as a request, it adds the eyes reaction (U+1F440) to that
     exact message and records the mark. Failure to react is logged and never causes the message to
-    be admitted again.
+    be admitted again. The eyes show while the request is worked on. Once its answer is posted
+    (every part of it confirmed, wherever it went, a thread included; the parts of a later turn,
+    rule 21, are not the answer and never hold the check mark up), the check mark (U+2705)
+    replaces them on that same message: the daemon adds the check mark, then removes its eyes
+    reaction, so the message never shows neither; a 404 on the removal counts as removed. This
+    comes after the answer and never holds it or the next answer up. An answer in doubt, abandoned
+    or dropped, a refused or failed post and a hold notice keep the eyes and add no check mark; an
+    answer posted later replaces them then. The replacement is recorded once done or tried, so it
+    happens once: a failed step is logged once per run and never retried (a failed check mark
+    leaves the eyes), and after a restart a replacement not recorded for an answer posted within
+    the last 30 minutes is made then, both steps (adding the check mark again changes nothing).
 31. Sessions may add or remove the bot's own reaction with any emoji on a message in an allowed
     channel; emoji are URL-encoded in the reaction route. Adding a reaction to an owner request
     counts as its read mark.
@@ -371,9 +390,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
 
 ## State that must survive a restart
 
-- Reply outbox per request: source channel and message, target session, ordered parts with text and
-  index, per-part remote ID once confirmed, completion time. Completed entries are the reply
-  receipts (keep at least 7 days).
+- Reply outbox per request: source channel and message, target session, ordered parts with text,
+  index and the turn each belongs to (the answer or a later turn), per-part remote ID once
+  confirmed, completion time. Completed entries are the reply receipts (keep at least 7 days).
 - Read marks: channel, message, time (at least as long as obligations are reported).
 - Obligations: channel, message, admission time, first 500 units of text, continuation count; the
   200 newest.
