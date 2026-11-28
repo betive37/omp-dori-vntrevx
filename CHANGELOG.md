@@ -4,8 +4,8 @@
 
 ### Upgrade notes
 
-- `cataly setup --service off` now writes `[setup] service = false`. A 0.2.7 hub (after a
-  rollback) refuses that key; remove it from the config before going back.
+- `cataly setup --service off` now writes `[setup] service = false`. A 0.2.8 or older hub (after
+  a rollback) refuses that key; remove it from the config before going back.
 
 ### Fixes
 
