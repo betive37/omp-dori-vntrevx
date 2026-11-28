@@ -311,6 +311,8 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
 ### Capacity (HOST-29)
 
 89. A configured cap (default 8, range 1-32) limits live OMP children, roles included. A start beyond it is refused.
+    The lead's slot is reserved while `[lead]` is configured: a lane start counts it whether or not the lead runs,
+    and the cap never refuses a lead start or wake.
 90. Before every spawn the daemon applies the memory admission rule of the lane-lifecycle spec. An unreadable
     memory reading refuses the start.
 
