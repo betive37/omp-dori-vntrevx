@@ -214,8 +214,8 @@ Totals: KEEP 36, SIMPLIFY 12, MERGE 3, DROP 11 (62 capabilities).
     (including a duplicate) or deliberately dropped. A full queue, failed admission write or admission
     timeout leaves the envelope unacknowledged so Slack can redeliver it within its retry window.
     A newer room position alone does not prove a redelivery was handled: dedupe by the message's
-    durable queue or hand-off record. A doubtful or failed hand-off given up by a room release still
-    counts as handled on redelivery. Reconnect backoff 1 s doubling to 60 s.
+    durable queue or hand-off record, in any state. A doubtful or failed hand-off given up by a room
+    release still counts as handled on redelivery. Reconnect backoff 1 s doubling to 60 s.
 39. SLACK-05 After start and every reconnect: for each remembered thread read replies newer than
     its seen position (at most 200, oldest first); for each DM with a position read newer history.
     Dedupe key is channel plus message timestamp, shared with live events.

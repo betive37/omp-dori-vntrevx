@@ -432,11 +432,13 @@ fn arrive(
 ) -> rusqlite::Result<Arrived> {
     let (relay, room, message, seq, parent, raw) = w;
     // A release removes doubtful or failed messages from the queue but retains their hand-offs.
-    // Those terminal records still prevent redelivery from reopening the released room.
+    // Those terminal records still prevent redelivery from reopening the released room. Without
+    // position dedupe, a hand-off in any state proves the message was admitted: Slack redelivers
+    // an admission that committed after its acknowledgement deadline.
     let handled: bool = tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM handoffs WHERE relay = ?1 AND room = ?2 AND message = ?3 \
-             AND state IN ('delivered', 'in_doubt', 'failed'))",
-        params![relay, room, message],
+             AND (state IN ('delivered', 'in_doubt', 'failed') OR NOT ?4))",
+        params![relay, room, message, position_dedupe],
         |r| r.get(0),
     )?;
     let position: Option<i64> = tx
@@ -1228,6 +1230,54 @@ mod tests {
         // Delivered once: a later copy is handled.
         assert_eq!(
             r(arrive("c", 12)).await.unwrap(),
+            RelayDone::Arrived(Arrived::Handled)
+        );
+    }
+
+    /// Slack keeps no position dedupe: a redelivery of a message whose admission committed after
+    /// its acknowledgement timed out, and was handed off since, is not admitted again.
+    #[tokio::test]
+    async fn a_redelivery_after_a_timed_out_admission_is_handled() {
+        let (store, _w, _dir) = open_temp("relay-redelivery");
+        let r = |w| store.relay(w);
+        let slack = || RelayWrite::Arrive {
+            relay: "slack".into(),
+            position_dedupe: false,
+            room: "c".into(),
+            message: "12".into(),
+            seq: 12,
+            parent: None,
+            raw: "{}".into(),
+        };
+        // The admission commits, but too late for its acknowledgement.
+        assert_eq!(
+            r(slack()).await.unwrap(),
+            RelayDone::Arrived(Arrived::Queued)
+        );
+        r(RelayWrite::Handed {
+            relay: "slack".into(),
+            room: "c".into(),
+            message: "12".into(),
+            seq: 12,
+            target: "lead".into(),
+            request_id: "slack:c:12".into(),
+            digest: "d".into(),
+            owed: Some("hi".into()),
+        })
+        .await
+        .unwrap();
+        r(RelayWrite::Finish {
+            relay: "slack".into(),
+            room: "c".into(),
+            message: "12".into(),
+            state: None,
+        })
+        .await
+        .unwrap();
+        assert_eq!(store.read(|q| q.queue("slack")).await.unwrap().len(), 0);
+        // Out of the queue and not yet delivered: Slack's redelivery is the same request.
+        assert_eq!(
+            r(slack()).await.unwrap(),
             RelayDone::Arrived(Arrived::Handled)
         );
     }
