@@ -313,12 +313,20 @@ async fn flapping_load_posts_nothing() {
 async fn pressure_alert_resolves_in_place() {
     let room = Room::new("ops-alert");
     let ko = Language::Korean;
-    let hot = || panel_with(172.0, HostState::Alert);
+    let hot = || {
+        panel_with(
+            172.0,
+            HostState::Alert(pressure::Causes {
+                load: true,
+                ..Default::default()
+            }),
+        )
+    };
     let alert = event(
         "pressure.alert",
         "host",
         START,
-        Some(r#"{"reasons":"load"}"#),
+        Some(r#"{"reasons":"load 172% above 150%","cause":"load"}"#),
     );
     room.at(START, hot(), vec![alert.clone()], &[], ko).await;
     let calls = room.fake.calls();
@@ -382,6 +390,116 @@ async fn pressure_alert_resolves_in_place() {
     let last = room.fake.calls().last().cloned().unwrap();
     assert!(last.0.starts_with("edit") && last.1.contains("🔕 알림 꺼짐"));
     assert!(last.1.contains("🔋 anthropic 사용량 85%"));
+}
+
+/// The report: 20 % load and 3 GB of disk free. The alert, the recent line, the host label and the
+/// summary all say disk, never overload; between the job's ticks a disk that has recovered shows as
+/// recovering, and the panel is green once the job has cleared the alert.
+#[tokio::test]
+async fn a_disk_alert_says_disk_and_clears() {
+    let room = Room::new("ops-disk");
+    let ko = Language::Korean;
+    let limits = crate::config::owner::Pressure::default();
+    let sample = |disk: f64| pressure::Sample {
+        load_percent: Some(20.0),
+        memory_free_percent: Some(75.0),
+        headroom: pressure::Headroom::NoLimit,
+        disk_free_gb: Some(disk),
+        sessions: Some(0),
+    };
+    let at = |s: &pressure::Sample, alert: bool, cause: Option<&str>| {
+        let mut p = panel_with(20.0, host_state(alert, true, cause, s, &limits));
+        p.host.memory_free = s.memory_free_percent;
+        p.host.disk_free_gb = s.disk_free_gb;
+        p
+    };
+    let low = sample(3.0);
+    let alert = event(
+        "pressure.alert",
+        "host",
+        START,
+        Some(r#"{"reasons":"free disk 3 GB below 50 GB","cause":"disk"}"#),
+    );
+    room.at(START, at(&low, true, Some("disk")), vec![alert], &[], ko)
+        .await;
+    let calls = room.fake.calls();
+    let post = calls
+        .iter()
+        .find(|(c, t)| c.starts_with("create") && !t.contains("Cataly 상황판"))
+        .unwrap();
+    let body: Value = serde_json::from_str(&post.1).unwrap();
+    assert_eq!(
+        body["embeds"][0]["title"],
+        "💾 디스크 여유가 5분 넘게 부족해요"
+    );
+    let panel = calls
+        .iter()
+        .rfind(|(_, t)| t.contains("Cataly 상황판"))
+        .unwrap();
+    let body: Value = serde_json::from_str(&panel.1).unwrap();
+    let embed = &body["embeds"][0];
+    assert!(
+        embed["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("🔴 확인이 필요해요: 디스크 여유 3 GB\n")
+    );
+    let host = embed["fields"][0]["value"].as_str().unwrap();
+    assert!(
+        host.contains("20% · 디스크 부족") && !host.contains("과부하"),
+        "{host}"
+    );
+    let recent = embed["fields"][4]["value"].as_str().unwrap();
+    assert!(
+        recent.contains("💾 디스크 여유가 5분 넘게 부족해요") && !recent.contains("서버 부하"),
+        "{recent}"
+    );
+    // Disk freed, the job not yet ticked: recovering, not a stale "disk".
+    let freed = sample(120.0);
+    let between = at(&freed, true, Some("disk"));
+    assert_eq!(between.host.state, HostState::Recovering);
+    assert_eq!(between.level(), Level::Watch);
+    // A cause that is still there stays named; one that has passed is dropped.
+    let mixed = pressure::Sample {
+        memory_free_percent: Some(5.0),
+        ..freed.clone()
+    };
+    assert_eq!(
+        host_state(true, true, Some("disk,memory"), &mixed, &limits),
+        HostState::Alert(pressure::Causes {
+            memory: true,
+            ..Default::default()
+        })
+    );
+    // The job's next tick clears the alert: green.
+    let clear = event("pressure.clear", "host", START + 2 * MIN, None);
+    room.at(
+        START + 2 * MIN,
+        at(&freed, false, None),
+        vec![clear],
+        &[],
+        ko,
+    )
+    .await;
+    let calls = room.fake.calls();
+    let panel = calls
+        .iter()
+        .rfind(|(_, t)| t.contains("Cataly 상황판"))
+        .unwrap();
+    let body: Value = serde_json::from_str(&panel.1).unwrap();
+    let embed = &body["embeds"][0];
+    assert_eq!(embed["color"], 0x002E_CC71, "green");
+    assert!(
+        embed["description"]
+            .as_str()
+            .unwrap()
+            .starts_with("🟢 모두 정상\n")
+    );
+    assert!(
+        calls
+            .iter()
+            .any(|(c, t)| c.starts_with("edit") && t.contains("✅ 해결됨 · 💾"))
+    );
 }
 
 /// A job routed here that fails twice opens one alert, resolved when it works again; the English

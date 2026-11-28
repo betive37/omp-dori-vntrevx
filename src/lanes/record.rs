@@ -69,6 +69,9 @@ pub(crate) struct Intent {
     pub(crate) step: String,
     pub(crate) receipt: Vec<String>,
     pub(crate) lesson: Option<String>,
+    /// Durable exit evidence; legacy close intents have no authority to discard work.
+    #[serde(default)]
+    pub(super) quiescence: crate::host::startup::Cleanup,
 }
 
 /// A one-attempt grant for one rule of one command (LANE req. 75).
@@ -96,6 +99,9 @@ pub(crate) struct Watch {
     /// A held lane started a turn and the lead heard it for this active stretch (LANE req. 47).
     pub(crate) active_noticed: bool,
     pub(crate) thread_post_ms: Option<i64>,
+    /// Why the owner's or the lead's messages wait undelivered, once the lead heard it.
+    #[serde(default)]
+    pub(crate) held_back: Option<String>,
 }
 
 /// The lane record, stored as JSON (LANE req. 28, "State that must survive a restart").
@@ -127,6 +133,12 @@ pub(crate) struct Record {
     pub(crate) pid: Option<u32>,
     /// `start held: model`, `unconfirmed`, or why the start did not finish.
     pub(crate) start_note: Option<String>,
+    /// Exit evidence for `handle`; absent only in records written before startup supervision.
+    #[serde(default)]
+    pub(super) startup_cleanup: Option<crate::host::startup::Cleanup>,
+    /// An accepted reopen's episode, new-run checkpoint and note; absent in older records.
+    #[serde(default)]
+    pub(super) pending_reopen: Option<super::reopen::Pending>,
     pub(crate) held_by: Option<String>,
     pub(crate) hold_reason: Option<String>,
     pub(crate) claim: Option<Claim>,

@@ -29,6 +29,17 @@ const STOP_WAIT: Duration = Duration::from_mins(1);
 const START_WAIT: Duration = Duration::from_secs(30);
 /// `omp --version`: 5 s (IR req. 25).
 const OMP_TIMEOUT: Duration = Duration::from_secs(5);
+/// Released binaries without `store_reader`, verified from their migration registries.
+/// No version-range inference: an unlisted report has unknown compatibility.
+const RELEASED_READERS: [(&str, i64); 7] = [
+    ("0.2.0", 9),
+    ("0.2.1", 9),
+    ("0.2.2", 9),
+    ("0.2.3", 9),
+    ("0.2.4", 9),
+    ("0.2.5", 9),
+    ("0.2.6", 10),
+];
 
 /// The four outcomes (IR req. 34).
 enum Outcome {
@@ -138,35 +149,54 @@ fn hub_version(paths: &Paths) -> Option<String> {
     hub_status(paths).map(|s| s.version)
 }
 
-/// The sessions the new hub brought back, once it settled (at most [`STOP_WAIT`]).
+/// The sessions the new hub brought back, once they settled; at [`STOP_WAIT`], what it said last,
+/// which may still be recovering.
 async fn resumed(paths: &Paths) -> Option<crate::proto::Resumed> {
     let deadline = Instant::now() + STOP_WAIT;
+    let mut last = None;
     loop {
         if let Some(r) = hub_status(paths).and_then(|s| s.resumed) {
-            return Some(r);
+            if r.settled() {
+                return Some(r);
+            }
+            last = Some(r);
         }
         if Instant::now() >= deadline {
-            return None;
+            return last;
         }
         tokio::time::sleep(Duration::from_millis(200)).await;
     }
 }
 
 /// The line `cataly update` and `cataly rollback` add about the sessions the new hub brought back:
-/// how the lead came back (or what holds it) and the lanes, or that the hub did not say in time.
+/// how the lead came back (or what holds it) and the lanes. Sessions still recovering are said so,
+/// never as final; the hub posts the final result to the owner's home room.
 async fn sessions_note(paths: &Paths) -> String {
+    let language = owner_language(paths);
+    let korean = language == Language::Korean;
     match resumed(paths).await {
         Some(r) => {
-            let text = crate::jobs::update::resumed_text(owner_language(paths), Some(r));
+            let settled = r.settled();
+            let text = crate::jobs::update::resumed_text(language, Some(r));
+            let watch = match (settled, korean) {
+                (true, _) => "",
+                (false, true) => " 진행 상황은 `cataly lead status`로 볼 수 있습니다.",
+                (false, false) => " `cataly lead status` shows the progress.",
+            };
             if text.is_empty() {
                 text
             } else {
-                format!("\n{text}")
+                format!("\n{text}{watch}")
             }
         }
+        None if korean => format!(
+            "\n새 허브의 세션은 {}초가 지나도록 아직 복구 중입니다(대화와 작업은 보존됨). \
+             최종 결과는 홈 방으로 알려드리며, `cataly lead status`로 lead를 볼 수 있습니다.",
+            STOP_WAIT.as_secs()
+        ),
         None => format!(
-            "\nthe new hub did not say within {} s which sessions it brought back; \
-             `cataly lead status` shows the lead",
+            "\nthe new hub's sessions are still recovering after {} s (conversations and work are kept); \
+             the final result goes to your home room, and `cataly lead status` shows the lead",
             STOP_WAIT.as_secs()
         ),
     }
@@ -232,6 +262,9 @@ fn path_note(l: &Layout) {
 /// `cataly install --from <folder>`: a first install, a reinstall (no change) or an update from a
 /// local folder of release assets (IR req. 19).
 async fn install(p: &Parsed, paths: &Paths) -> Outcome {
+    if let Some(candidate) = p.value("--preflight") {
+        return preflight(Path::new(candidate), paths).await;
+    }
     let Some(from) = p.value("--from").map(PathBuf::from) else {
         return Outcome::Held("--from <folder of release assets> is required".into());
     };
@@ -273,7 +306,7 @@ async fn from_folder(
         Err(e) => return Outcome::Held(format!("{e}; nothing changed")),
     };
     let Some(current) = l.current_version() else {
-        return first_install(l, staged).await;
+        return first_install(l, paths, staged).await;
     };
     let (new, old) = (
         Version::parse(&staged.record.version),
@@ -299,8 +332,30 @@ async fn from_folder(
     }
 }
 
-async fn first_install(l: &Layout, staged: Staged) -> Outcome {
-    let report = release::candidate_report(&staged.binary()).await;
+/// A first install here. State a removed install left behind is kept, so its store is checked too.
+async fn first_install(l: &Layout, paths: &Paths, staged: Staged) -> Outcome {
+    let report = match release::candidate_report(&staged.binary()).await {
+        Ok(report) => Some(report),
+        Err(error) => match layout_ops::store_floor(&paths.db_file()) {
+            Ok(None) => None,
+            Ok(Some(_)) => {
+                staged.discard();
+                return Outcome::Held(format!(
+                    "{error}; the retained store cannot be checked; nothing was installed"
+                ));
+            }
+            Err(error) => {
+                staged.discard();
+                return Outcome::Held(format!("{error}; nothing was installed"));
+            }
+        },
+    };
+    if let Some(r) = &report
+        && let Err(why) = store_preflight(paths, r, release::VERSION)
+    {
+        staged.discard();
+        return Outcome::Held(why);
+    }
     let minimum = report.map_or_default(|r| r.omp_minimum);
     let _ = omp_gate(&minimum, true).await;
     let version = staged.record.version.clone();
@@ -340,6 +395,10 @@ async fn switch_to(
     if let Err(o) = omp_gate(&report.omp_minimum, false).await {
         staged.discard();
         return o;
+    }
+    if let Err(why) = store_preflight(paths, &report, current) {
+        staged.discard();
+        return Outcome::Held(why);
     }
     let answering = hub_version(paths).is_some();
     let running = answering && restart;
@@ -404,6 +463,21 @@ async fn restart_switch(
         }
         Err(why) => {
             let _ = stop_hub(paths).await;
+            match layout_ops::store_floor(&paths.db_file()) {
+                Ok(None) => {}
+                Ok(Some(floor)) if floor <= crate::store::latest_schema() => {}
+                Ok(Some(floor)) => {
+                    return Outcome::NeedsAttention(format!(
+                        "{why}; the store now requires schema {floor}; {was} cannot read it. \
+                     The new version remains selected; restore a compatible store backup or repair the new hub."
+                    ));
+                }
+                Err(error) => {
+                    return Outcome::NeedsAttention(format!(
+                        "{why}; automatic switch-back to {was} was refused: {error}"
+                    ));
+                }
+            }
             let back = layout_ops::switch(l, was)
                 .and_then(|()| layout_ops::settle_records(l, Some(version)).map(drop));
             if let Err(e) = back {
@@ -532,6 +606,134 @@ fn busy_held(language: Language, busy: &str) -> String {
             "the update is waiting for a busy session ({busy}); busy sessions are never stopped. \
              Run it again once that work is done. Nothing changed."
         ),
+    }
+}
+
+/// A reported capability is authoritative; otherwise only an exact known release is admitted.
+fn reader(candidate: &release::Report) -> Option<i64> {
+    candidate.store_reader.or_else(|| {
+        RELEASED_READERS
+            .iter()
+            .find_map(|(version, reader)| (*version == candidate.version).then_some(*reader))
+    })
+}
+
+fn reads(candidate: &release::Report, floor: i64) -> bool {
+    reader(candidate).is_some_and(|reader| floor <= reader)
+}
+
+/// Refuses a switch from `current` to `candidate` when the candidate's hub could not open the store
+/// and would refuse to start. Reads the store's reader floor without writing; runs before anything
+/// is stopped or switched. A store that cannot be read refuses too.
+fn store_preflight(
+    paths: &Paths,
+    candidate: &release::Report,
+    current: &str,
+) -> Result<(), String> {
+    let floor = match layout_ops::store_floor(&paths.db_file()) {
+        Ok(None) => return Ok(()),
+        Ok(Some(floor)) => floor,
+        Err(e) => return Err(format!("{e}; nothing was stopped or switched")),
+    };
+    if reads(candidate, floor) {
+        return Ok(());
+    }
+    let copy = layout_ops::store_copies(&paths.backup_dir)
+        .into_iter()
+        .find(|(_, path)| {
+            layout_ops::store_floor(path).is_ok_and(|f| f.is_some_and(|f| reads(candidate, f)))
+        })
+        .map(|(_, path)| path);
+    Err(store_refusal(
+        owner_language(paths),
+        &Refusal {
+            candidate: &candidate.version,
+            reader: reader(candidate),
+            floor,
+            current,
+            store: &paths.db_file(),
+            copy: copy.as_deref(),
+        },
+    ))
+}
+
+/// What a store refusal names.
+struct Refusal<'a> {
+    candidate: &'a str,
+    reader: Option<i64>,
+    floor: i64,
+    current: &'a str,
+    store: &'a Path,
+    copy: Option<&'a Path>,
+}
+
+/// Why the switch is refused and the way out, in the owner's language.
+fn store_refusal(language: Language, r: &Refusal<'_>) -> String {
+    let (candidate, floor, current, store) = (r.candidate, r.floor, r.current, r.store.display());
+    match language {
+        Language::Korean => {
+            let why = r.reader.map_or_else(
+                || format!("{candidate} 버전은 어떤 저장소를 읽을 수 있는지 알려주지 않습니다"),
+                |reader| {
+                    format!("{candidate} 버전은 스키마 {reader}까지 읽고, 이 저장소는 {floor} 이상을 요구합니다")
+                },
+            );
+            let way = r.copy.map_or_else(
+                || {
+                    format!(
+                        "{current} 버전을 그대로 쓰세요. 업그레이드 전 저장소 사본이 없어 되돌릴 저장소가 없습니다."
+                    )
+                },
+                |copy| {
+                    format!(
+                        "{current} 버전을 그대로 쓰거나, 허브를 멈추고 업그레이드 전에 허브가 만든 저장소 사본 {}을(를) \
+                         {store} 자리에 복원한 뒤 다시 시도하세요. 사본 이후의 대화는 사본에 없습니다.",
+                        copy.display()
+                    )
+                },
+            );
+            format!(
+                "대화 보존을 위해 저장소를 업그레이드했습니다. {candidate} 버전은 이 저장소를 읽을 수 없습니다 ({why}). \
+                 아무것도 멈추거나 바꾸지 않았습니다. {way}"
+            )
+        }
+        Language::English => {
+            let why = r.reader.map_or_else(
+                || format!("{candidate} does not say which store it reads"),
+                |reader| format!("{candidate} reads schema {reader}; this store needs {floor}"),
+            );
+            let way = r.copy.map_or_else(
+                || {
+                    format!(
+                        "Stay on {current}; there is no store copy from before the upgrade to restore."
+                    )
+                },
+                |copy| {
+                    format!(
+                        "Stay on {current}, or stop the hub, restore the store copy the hub made before the \
+                         upgrade, {}, in place of {store}, and try again; conversation since that copy is not in it.",
+                        copy.display()
+                    )
+                },
+            );
+            format!(
+                "the store was upgraded for conversation safety; version {candidate} cannot read it ({why}). \
+                 Nothing was stopped or switched. {way}"
+            )
+        }
+    }
+}
+
+/// `cataly install --preflight <binary>`: whether that binary can read the store; changes nothing.
+/// `install.sh` runs it through the installed version before it replaces anything.
+async fn preflight(candidate: &Path, paths: &Paths) -> Outcome {
+    let report = match release::candidate_report(candidate).await {
+        Ok(r) => r,
+        Err(e) => return Outcome::Held(format!("{e}; nothing changed")),
+    };
+    match store_preflight(paths, &report, release::VERSION) {
+        Ok(()) => Outcome::Done(format!("cataly {} can read the store", report.version)),
+        Err(why) => Outcome::Held(why),
     }
 }
 
@@ -892,13 +1094,15 @@ async fn rollback(p: &Parsed, paths: &Paths) -> Outcome {
         return Outcome::Held(format!("{e}; nothing changed"));
     }
     let binary = l.version_dir(&previous.version).join(layout_ops::BINARY);
-    match release::candidate_report(&binary).await {
-        Ok(r) => {
-            if let Err(o) = omp_gate(&r.omp_minimum, false).await {
-                return o;
-            }
-        }
+    let report = match release::candidate_report(&binary).await {
+        Ok(r) => r,
         Err(e) => return Outcome::Held(e),
+    };
+    if let Err(o) = omp_gate(&report.omp_minimum, false).await {
+        return o;
+    }
+    if let Err(why) = store_preflight(paths, &report, &current) {
+        return Outcome::Held(why);
     }
     let answering = hub_version(paths).is_some();
     let running = answering && !p.flag("--no-restart");
@@ -1295,5 +1499,242 @@ mod tests {
             "the hub did not stop: control socket: the hub closed the connection; nothing changed"
         );
         assert!(hub.join().unwrap().contains(method::HUB_STOP));
+    }
+
+    /// A candidate's report: version 0.2.5, reading up to `reader` (none: a report from before the
+    /// capability).
+    fn candidate(reader: Option<i64>) -> release::Report {
+        release::Report {
+            version: "0.2.5".into(),
+            store_reader: reader,
+            ..release::report()
+        }
+    }
+
+    /// A store migrated as the hub migrates it, then its reader floor set to `floor` as a later
+    /// non-additive schema would set it.
+    fn store_at(paths: &Paths, floor: i64) {
+        let (store, writer) =
+            crate::store::Store::open(&paths.db_file(), &paths.backup_dir).unwrap();
+        drop(store);
+        writer.join().unwrap().unwrap();
+        raise_floor(&paths.db_file(), floor);
+    }
+
+    fn raise_floor(db: &Path, floor: i64) {
+        rusqlite::Connection::open(db)
+            .unwrap()
+            .execute(
+                "UPDATE meta SET value = ?1 WHERE key = 'min_reader'",
+                [floor.to_string()],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn a_candidate_that_reads_the_store_passes() {
+        let dir = scratch("preflight");
+        let paths = paths_in(&dir);
+        // No store yet: nothing to protect, and none is made.
+        store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
+        assert!(!paths.db_file().exists());
+        store_at(&paths, 1);
+        let before = std::fs::read(paths.db_file()).unwrap();
+        store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
+        store_preflight(&paths, &candidate(Some(9)), "0.2.7").unwrap();
+        assert_eq!(
+            std::fs::read(paths.db_file()).unwrap(),
+            before,
+            "the check changes nothing"
+        );
+        raise_floor(&paths.db_file(), 11);
+        store_preflight(&paths, &candidate(Some(11)), "0.2.7").unwrap();
+    }
+
+    #[test]
+    fn a_candidate_too_old_for_the_store_floor_is_refused() {
+        let dir = scratch("preflight");
+        let paths = paths_in(&dir);
+        store_at(&paths, 99);
+        let held = store_preflight(&paths, &candidate(Some(9)), "0.2.7").unwrap_err();
+        assert!(
+            held.contains("version 0.2.5 cannot read it")
+                || held.contains("0.2.5 버전은 이 저장소를 읽을 수 없습니다"),
+            "{held}"
+        );
+        let english = store_refusal(
+            Language::English,
+            &Refusal {
+                candidate: "0.2.5",
+                reader: Some(9),
+                floor: 99,
+                current: "0.2.7",
+                store: &paths.db_file(),
+                copy: None,
+            },
+        );
+        assert_eq!(
+            english,
+            "the store was upgraded for conversation safety; version 0.2.5 cannot read it (0.2.5 \
+             reads schema 9; this store needs 99). Nothing was stopped or switched. Stay on 0.2.7; \
+             there is no store copy from before the upgrade to restore."
+        );
+    }
+
+    #[test]
+    fn a_known_capability_less_release_is_refused_above_its_released_schema() {
+        let dir = scratch("preflight");
+        let paths = paths_in(&dir);
+        store_at(&paths, 9);
+        store_preflight(&paths, &candidate(None), "0.2.7").unwrap();
+        // The copy the hub made before a migration, readable by a capability-less release.
+        crate::sys::fs::ensure_private_dir(&paths.backup_dir).unwrap();
+        let copy = paths.backup_dir.join("cataly-v10.db");
+        rusqlite::Connection::open(paths.db_file())
+            .unwrap()
+            .execute("VACUUM INTO ?1", [copy.to_str().unwrap()])
+            .unwrap();
+        raise_floor(&paths.db_file(), 11);
+        let held = store_preflight(&paths, &candidate(None), "0.2.7").unwrap_err();
+        assert!(held.contains(&copy.display().to_string()), "{held}");
+        let refusal = |language| {
+            store_refusal(
+                language,
+                &Refusal {
+                    candidate: "0.2.5",
+                    reader: None,
+                    floor: 11,
+                    current: "0.2.7",
+                    store: &paths.db_file(),
+                    copy: Some(&copy),
+                },
+            )
+        };
+        let korean = refusal(Language::Korean);
+        assert!(
+            korean.starts_with(
+                "대화 보존을 위해 저장소를 업그레이드했습니다. 0.2.5 버전은 이 저장소를 읽을 수 \
+                 없습니다 (0.2.5 버전은 어떤 저장소를 읽을 수 있는지 알려주지 않습니다). 아무것도 \
+                 멈추거나 바꾸지 않았습니다. 0.2.7 버전을 그대로 쓰거나,"
+            ),
+            "{korean}"
+        );
+        let english = refusal(Language::English);
+        assert!(
+            english.contains("0.2.5 does not say which store it reads")
+                && english.contains(&format!("{}, in place of", copy.display())),
+            "{english}"
+        );
+        // A copy the candidate cannot read either is never offered.
+        raise_floor(&copy, 50);
+        raise_floor(&paths.db_file(), 40);
+        let held = store_preflight(&paths, &candidate(None), "0.2.7").unwrap_err();
+        assert!(!held.contains("cataly-v10.db"), "{held}");
+    }
+
+    #[tokio::test]
+    async fn first_install_protects_retained_state_without_blocking_an_empty_home() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let mut report = candidate(None);
+        report.omp_minimum.clear();
+        for retained in [true, false] {
+            for text in ["unreadable".into(), serde_json::to_string(&report).unwrap()] {
+                let dir = scratch("first-install-floor");
+                let paths = paths_in(&dir);
+                if retained {
+                    store_at(&paths, 11);
+                }
+                let layout = Layout {
+                    root: dir.join("program"),
+                    command: dir.join("bin/cataly"),
+                    extension: dir.join("extensions/cataly.ts"),
+                    package: None,
+                };
+                layout_ops::prepare_root(&layout).unwrap();
+                let staging = layout_ops::fresh_staging(&layout, "test").unwrap();
+                let binary = format!("#!/bin/sh\nprintf '%s\\n' '{text}'\n");
+                std::fs::write(staging.join("cataly"), &binary).unwrap();
+                std::fs::set_permissions(
+                    staging.join("cataly"),
+                    std::fs::Permissions::from_mode(0o500),
+                )
+                .unwrap();
+                std::fs::write(staging.join("cataly.ts"), "bridge").unwrap();
+                let staged = Staged {
+                    dir: staging,
+                    record: layout_ops::Record {
+                        version: report.version.clone(),
+                        commit: report.commit.clone(),
+                        target: report.target.clone(),
+                        binary_sha256: release::sha256(binary.as_bytes()),
+                        extension_sha256: release::sha256(b"bridge"),
+                        source: "test".into(),
+                        installed_ms: 0,
+                        role: "kept".into(),
+                    },
+                };
+                let before = std::fs::read(paths.db_file()).ok();
+                let outcome = first_install(&layout, &paths, staged).await;
+                if retained {
+                    let Outcome::Held(reason) = outcome else {
+                        panic!("unverified candidate installed over retained state: {text}");
+                    };
+                    assert!(
+                        reason.contains("unreadable")
+                            || reason.contains("cannot read")
+                            || reason.contains("읽을 수"),
+                        "{reason}"
+                    );
+                    assert!(!layout.version_dir(&report.version).exists());
+                    assert_eq!(layout.current_version(), None);
+                } else {
+                    let Outcome::Done(_) = outcome else {
+                        panic!("an empty home has no store compatibility constraint");
+                    };
+                    assert_eq!(layout.current_version(), Some(report.version.clone()));
+                }
+                assert_eq!(std::fs::read(paths.db_file()).ok(), before);
+            }
+        }
+    }
+
+    #[test]
+    fn released_reader_versions_are_known_but_unknown_versions_fail_closed() {
+        let dir = scratch("released-readers");
+        let paths = paths_in(&dir);
+        store_at(&paths, 10);
+        let mut old = candidate(None);
+        old.version = "0.2.6".into();
+        store_preflight(&paths, &old, "0.2.7").unwrap();
+        old.version = "0.2.5".into();
+        assert!(store_preflight(&paths, &old, "0.2.7").is_err());
+        raise_floor(&paths.db_file(), 1);
+        old.version = "0.1.99".into();
+        assert!(store_preflight(&paths, &old, "0.2.7").is_err());
+    }
+
+    #[tokio::test]
+    async fn failed_start_never_switches_back_across_a_migrated_store_floor() {
+        let dir = scratch("switch-back-floor");
+        let paths = paths_in(&dir);
+        store_at(&paths, crate::store::latest_schema() + 1);
+        let layout = Layout {
+            root: dir.join("program"),
+            command: dir.join("bin/cataly"),
+            extension: dir.join("extensions/cataly.ts"),
+            package: None,
+        };
+        layout_ops::prepare_root(&layout).unwrap();
+        // Missing binaries reproduce the two start errors without running another hub.
+        let outcome = restart_switch(&layout, &paths, "new", "old", Instant::now()).await;
+        let Outcome::NeedsAttention(reason) = outcome else {
+            panic!("an incompatible automatic rollback must need owner attention");
+        };
+        assert_eq!(layout.current_version().as_deref(), Some("new"), "{reason}");
+        assert!(
+            reason.contains("store") && reason.contains("old"),
+            "{reason}"
+        );
     }
 }

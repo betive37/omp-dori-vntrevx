@@ -6,6 +6,9 @@ use rusqlite::{OptionalExtension, Row, Transaction, params};
 
 use super::Reads;
 
+pub(crate) mod anchor;
+pub(crate) mod episode;
+
 /// Receipts kept per session (HOST req. 59; decision 20). A receipt belongs to the session its
 /// message was written into. Beyond the cap the oldest settled receipts of that session are evicted;
 /// an open one (pending, sent, in doubt, failed, or still read by a relay hand-off) never is, and
@@ -200,6 +203,10 @@ pub(crate) enum HostWrite {
     /// Inserts a new session record; an existing handle fails.
     Record(SessionRow),
     Session(SessionUpdate),
+    /// Validated lead binding and anchor advancement in one commit.
+    BindLead(SessionUpdate),
+    LeadIntent(anchor::Intent),
+    Episode(episode::Change),
     Admit(Admit),
     /// Records a delivery as sent and moves its inbox rows to `sent`, before the write to OMP.
     Send {
@@ -281,6 +288,13 @@ fn record(tx: &Transaction<'_>, row: &SessionRow) -> rusqlite::Result<HostDone> 
             row.fault
         ],
     )?;
+    if row.role == "lead" {
+        tx.execute(
+            "UPDATE lead_anchor SET ever_started = 1, \
+             intent = CASE WHEN ?1 = 'fresh' THEN 'fresh_failed' ELSE intent END WHERE singleton = 1",
+            [&row.mode],
+        )?;
+    }
     Ok(HostDone::Done)
 }
 
@@ -317,6 +331,9 @@ pub(super) fn write(
     match write {
         HostWrite::Record(row) => record(tx, row),
         HostWrite::Session(u) => update(tx, u, now),
+        HostWrite::BindLead(u) => anchor::bound(tx, u, now),
+        HostWrite::LeadIntent(i) => anchor::intent(tx, *i),
+        HostWrite::Episode(change) => episode::write(tx, change, now),
         HostWrite::Admit(a) => admit(tx, a, now).map(HostDone::Admitted),
         HostWrite::Send { delivery, inbox } => {
             send(tx, delivery, inbox, now)?;
@@ -559,8 +576,9 @@ fn resolve(
 }
 
 /// Retention (DESIGN 7.2): finished inbox rows, deliveries and receipts after 7 days; once-only
-/// identities after 30 days; stopped session records after 30 days except each role's newest.
+/// identities after 30 days; stopped attempts after 30 days, preserving current and pinnable bindings.
 pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
+    anchor::maintain(tx)?;
     let finished = now - FINISHED_KEEP_MS;
     tx.execute(
         "DELETE FROM inbox WHERE state IN ('delivered', 'failed') AND updated_ms < ?1",
@@ -581,7 +599,8 @@ pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
     )?;
     tx.execute(
         "DELETE FROM sessions AS s WHERE s.state IN ('stopped', 'failed') AND s.updated_ms < ?1 \
-         AND s.started_ms < (SELECT MAX(started_ms) FROM sessions WHERE role = s.role)",
+         AND s.started_ms < (SELECT MAX(started_ms) FROM sessions WHERE role = s.role) \
+         AND NOT EXISTS (SELECT 1 FROM lead_bindings b WHERE b.handle = s.handle)",
         [now - ONCE_KEEP_MS],
     )?;
     // Receipts go with their session record (HOST req. 60), unless still open.
@@ -596,24 +615,10 @@ pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
 }
 
 impl Reads {
-    /// The newest session record of a role.
-    pub(crate) fn latest_session(&self, role: &str) -> rusqlite::Result<Option<SessionRow>> {
-        self.0
-            .query_row(
-                &format!(
-                    "SELECT {SESSION_COLUMNS} FROM sessions WHERE role = ?1 \
-                     ORDER BY started_ms DESC, rowid DESC LIMIT 1"
-                ),
-                [role],
-                session_from_row,
-            )
-            .optional()
-    }
-
     /// Records left starting or live (recovery, HOST req. 85).
     pub(crate) fn open_sessions(&self) -> rusqlite::Result<Vec<SessionRow>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT {SESSION_COLUMNS} FROM sessions WHERE state IN ('starting', 'live') ORDER BY started_ms"
+            "SELECT {SESSION_COLUMNS} FROM sessions WHERE state IN ('starting', 'live') OR (session_id IS NULL AND state = 'held') ORDER BY started_ms"
         ))?;
         stmt.query_map([], session_from_row)?.collect()
     }

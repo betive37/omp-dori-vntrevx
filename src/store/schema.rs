@@ -14,7 +14,7 @@ struct Migration {
     additive: bool,
 }
 
-const MIGRATIONS: [Migration; 10] = [
+const MIGRATIONS: [Migration; 13] = [
     Migration {
         sql: include_str!("migrations/0001_init.sql"),
         additive: false,
@@ -55,6 +55,21 @@ const MIGRATIONS: [Migration; 10] = [
         sql: include_str!("migrations/0010_outbox_destinations.sql"),
         // Old readers do not honor destination pins or in-flight uncertainty.
         additive: false,
+    },
+    Migration {
+        sql: include_str!("migrations/0011_lead_anchor.sql"),
+        additive: false,
+    },
+    Migration {
+        sql: include_str!("migrations/0012_outbox_turns.sql"),
+        // An old reader posts a later turn's parts like answer parts after the answer; the reader
+        // floor stays at 11.
+        additive: true,
+    },
+    Migration {
+        sql: include_str!("migrations/0013_lead_anchor_history.sql"),
+        // Clears or rewords an 0011 ambiguity hold only; old readers see a plain anchor.
+        additive: true,
     },
 ];
 
@@ -145,6 +160,19 @@ mod tests {
         assert_eq!(v, latest());
         migrate(&mut conn, &dir.join("backup")).unwrap();
         assert!(!dir.join("backup").exists(), "no backup for a fresh store");
+    }
+
+    #[test]
+    fn the_additive_later_migrations_keep_the_reader_floor_at_the_lead_anchor() {
+        let dir = scratch("schema-floor");
+        let mut conn = Connection::open(dir.join("s.db")).unwrap();
+        migrate(&mut conn, &dir.join("backup")).unwrap();
+        let floor: String = conn
+            .query_row("SELECT value FROM meta WHERE key = 'min_reader'", [], |r| {
+                r.get(0)
+            })
+            .unwrap();
+        assert_eq!((latest(), floor.as_str()), (13, "11"));
     }
 
     #[test]

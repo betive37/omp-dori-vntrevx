@@ -123,28 +123,40 @@ impl Hub {
             lead,
             resumed: self.resumed(),
             workers: self.workers.list(),
+            tools: self.links.tool_reports(None),
         })
     }
 
-    /// The sessions brought back at start, once the lead and the lanes settled.
+    /// The sessions brought back at start, once the lead and the lanes settled, or while the lead
+    /// is still recovering, said as not final.
     fn resumed(&self) -> Option<crate::proto::Resumed> {
-        let how = self.lead.settled()?;
-        let lead_start = self.config().lead.is_some().then_some(how);
+        let configured = self.config().lead.is_some();
+        let recovering = configured && self.lead.recovering();
+        let how = match self.lead.settled() {
+            Some(how) => how,
+            None if recovering => crate::proto::LeadStart::NotRunning,
+            None => return None,
+        };
+        let lead_start = configured.then_some(how);
         let lane_names = self.lanes.resumed.get()?.clone();
         let not_running = lead_start == Some(crate::proto::LeadStart::NotRunning);
+        let lead_recovering = recovering && not_running;
         let lead_asleep_ms = self
             .lead
             .asleep()
             .filter(|_| not_running)
             .map(|a| a.since_ms);
         // An older CLI reads only the reason.
-        let lead_reason = self
-            .lead
-            .refusal()
-            .or_else(|| {
-                lead_asleep_ms.map(|_| "it is asleep and wakes when it is needed".to_string())
-            })
-            .filter(|_| not_running);
+        let lead_reason = if lead_recovering {
+            Some("it is still recovering its earlier conversation, which is kept".to_string())
+        } else {
+            self.lead
+                .refusal()
+                .or_else(|| {
+                    lead_asleep_ms.map(|_| "it is asleep and wakes when it is needed".to_string())
+                })
+                .filter(|_| not_running)
+        };
         Some(crate::proto::Resumed {
             lead: lead_start == Some(crate::proto::LeadStart::Resumed),
             lanes: lane_names.len(),
@@ -152,6 +164,9 @@ impl Hub {
             lane_names,
             lead_reason,
             lead_asleep_ms,
+            lead_recovering,
+            lead_held: not_running && !lead_recovering && self.lead.held(),
+            ..crate::proto::Resumed::default()
         })
     }
 
@@ -501,6 +516,9 @@ async fn serve(paths: &Paths, config: Config, store: Store, cleanup: Cleanup) ->
     hub.workers.shutdown().await;
     // Running job children get TERM, then KILL after the grace; their real end is recorded.
     jobs.drain(KILL_GRACE * 2 + Duration::from_secs(2)).await;
+    // A voice call, told to stop with the rest, finishes its accounting while the store is open.
+    #[cfg(feature = "voice")]
+    hub.voice.wound_down().await;
     let _ = std::fs::remove_file(&paths.socket);
     code
 }
@@ -792,6 +810,9 @@ fn ops_people(
                     Status::Error => LeadState::Error,
                     Status::Idle | Status::Unknown => LeadState::Idle,
                 },
+                (None, Phase::Starting | Phase::Stopped) if view.recovering => {
+                    LeadState::Recovering
+                }
                 (None, Phase::Starting) => LeadState::Starting,
                 (None, Phase::Stopped) => LeadState::Stopped,
                 (None, Phase::Held) => LeadState::Held,

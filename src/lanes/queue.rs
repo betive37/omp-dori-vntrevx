@@ -215,7 +215,10 @@ impl<R: Runtime> Lanes<R> {
             };
             if state == "ready"
                 && q.waits_for_worker()
-                && !self.stopping.load(std::sync::atomic::Ordering::Acquire)
+                && !self
+                    .starts
+                    .stopping
+                    .load(std::sync::atomic::Ordering::Acquire)
             {
                 let detail = match self.start_queued(&q.key).await {
                     Ok(v) => format!(
@@ -307,9 +310,15 @@ impl<R: Runtime> Lanes<R> {
             // The kickoff may have reached the agent: left for inspection, never retried.
             Ok(o) if o.starts_with("unconfirmed") => q.note = Some(o.clone()),
             Ok(_) => q.state = STARTED.into(),
-            // Nothing reached an agent: the entry is pending again.
+            // Only a proven unused rollback releases the key for another fresh attempt.
+            // A retained lane owns its allocation and must be inspected, not opened again.
             Err(e) => {
-                q.state = PENDING.into();
+                q.state = if self.row(key).await?.is_some() {
+                    STARTING
+                } else {
+                    PENDING
+                }
+                .into();
                 q.note = Some(e.clone());
             }
         }

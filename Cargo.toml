@@ -24,7 +24,7 @@ print_stdout = "deny"
 
 [package]
 name = "cataly"
-version = "0.2.6"
+version = "0.2.8"
 description = "Cataly hub, CLI and job engine"
 edition.workspace = true
 rust-version.workspace = true
@@ -67,6 +67,8 @@ unicode-width = { version = "0.2.2", default-features = false }
 webpki-roots = { version = "1.0.12", default-features = false }
 
 [dev-dependencies]
+# Dev-only paused time for startup-deadline tests; resolver 3 excludes it from product builds.
+tokio = { version = "1.54.1", default-features = false, features = ["test-util"] }
 hyper = { version = "1.12", default-features = false, features = ["server", "http1"] }
 # The fake realtime and Discord voice servers of the hub's voice tests (crates the voice build
 # already links; dev-only, never in the product).

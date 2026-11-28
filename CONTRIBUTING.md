@@ -51,8 +51,12 @@ Cargo cache per OS, CPU, target and `Cargo.lock`, and Bun with its cache per `ex
 - `build (<target>)`: the format check, clippy and the tests with and without voice, the Bun
   tests and type check of the extension, both release builds, binary size and idle memory.
 - `cargo deny`: advisories, bans, licences and sources.
-- `contract against OMP (<target>)`: every `contract*` test against stock OMP (the pinned
-  release; the latest release nightly and on a dispatch).
+- `contract against OMP (<target>)`: every `contract*` test against stock OMP 19.1.1, the
+  minimum supported release.
+- `contract against latest OMP (<target>)`: the same tests against the latest stock release,
+  resolved at run time. Both contract jobs run on PRs, pushes, nightly, manual dispatches and
+  release calls, and verify the executable against the release's `SHA256SUMS.txt` before running it.
+  The release workflow requires this CI workflow to succeed before building or publishing.
 - `release smoke (<target>)`, on pushes to `main` and dispatches only: the release binary built
   with a throwaway key, installed by `install.sh` from a signed local folder into an empty home,
   then `cataly version` and `cataly health`.
@@ -63,6 +67,21 @@ Cargo cache per OS, CPU, target and `Cargo.lock`, and Bun with its cache per `ex
 A newer push to a pull request cancels its running checks. On macOS the tests' waits for
 something to happen are three times as long (`CATALY_TEST_PATIENCE`, read by `tests/support`);
 what they check is the same on every target. Windows is not a target.
+
+## Hosted-tool safety
+
+Cataly's hosted-tool policy table controls availability and denial together. `eval` is hidden and
+denied, including its unavailable helper guidance; debug and LSP remain offered when enabled by the
+owner, with the owner's approvals intact. Owner-installed MCP servers and extensions are trusted
+code, not sandboxed plugins; the startup report identifies their live non-stock tools.
+
+The shell veto is an accidental-command guard, not a sandbox. It examines submitted commands, not
+arbitrary scripts, subprocesses, debug adapters or language servers. `NO_REDEEM` disables only OMP's
+automatic reset redemption; explicit CLI/API redemption, metered fallback, auxiliary model tools and
+already-enabled overage are separate paths. A hard no-spend guarantee needs credential isolation,
+an endpoint-restricted inference gateway with server-side budgets, and protection of owner state and
+hub controls. That isolation is not built. Do not describe tool denial or a cost ceiling as a billing
+firewall. See [`DESIGN.md` 9.2](DESIGN.md#92-accidental-spend-guards-fallback-allowed).
 
 ## Licence and CLA
 

@@ -142,7 +142,10 @@ fn discord_requests_against_stock_omp() {
     }
     let s = settled(&hub);
     assert_eq!(s["counts"]["owed_settled"], wakes, "{s}");
-    assert_eq!(fake.calls("PUT", "/reactions/").len(), wakes);
+    assert_eq!(fake.calls("PUT", "/reactions/%F0%9F%91%80/").len(), wakes);
+    fake.wait(WAIT, |f| {
+        (f.calls("PUT", "/reactions/%E2%9C%85/").len() == wakes).then_some(())
+    });
     // Check 2: a second message while the lead works is a follow-up answered after the first. The
     // lead works once the model has the slow request: the session status reads `unknown` during a
     // turn (no fresh readback, HOST req. 36), so it cannot tell.

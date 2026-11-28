@@ -1113,7 +1113,7 @@ impl<T: Runtime> Intake<T> {
             return self.refuse(&press, "This question is closed.").await;
         };
         if !press.by_owner(self.application, self.owner) || press.channel != card.channel {
-            return self.refuse(&press, "Only the owner can answer this.").await;
+            return self.refuse(&press, "Only Master can answer this.").await;
         }
         let Some(action) = press
             .custom_id
@@ -1143,11 +1143,7 @@ impl<T: Runtime> Intake<T> {
                 if index == 0 { approved } else { denied }
             )
         } else {
-            format!(
-                "{}\n\nAnswered by the owner: {}",
-                card.body,
-                neutral(&label)
-            )
+            format!("{}\n\nAnswered by Master: {}", card.body, neutral(&label))
         };
         let ack = if card.kind == Kind::Approval {
             json!({"type": 7, "data": {"content": done, "components": []}})
@@ -1597,7 +1593,7 @@ mod tests {
             ko.hint,
             "번호를 누르거나, 원하는 답을 채팅으로 보내 주세요."
         );
-        assert_eq!(ko.answered, "보스가 채팅으로 답했습니다.");
+        assert_eq!(ko.answered, "주인님이 채팅으로 답했습니다.");
         assert_eq!(
             ko.retry("x"),
             "그 답은 받을 수 없어요: x. 다시 보내 주세요."

@@ -475,7 +475,7 @@ impl<T: Runtime> Intake<T> {
                 if !self.reply(&press, json!({"type": 6})).await {
                     return self.cards.reopen(&card.dialog);
                 }
-                let done = format!("{}\n\nAnswered by the owner.", card.body);
+                let done = format!("{}\n\nAnswered by Master.", card.body);
                 self.submit_value(card, value, done).await;
             }
         }
