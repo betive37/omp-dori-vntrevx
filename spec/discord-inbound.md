@@ -153,7 +153,9 @@ operator who configures the daemon (in practice the same person).
 
 29. Every conversation in scope has a read position: the highest message ID fully handled. It
     never moves backwards. It moves past an owner message only after that message's hand-off is
-    confirmed (req. 48), and past non-owner messages freely.
+    confirmed (req. 48), and past non-owner messages freely once that conversation's catch-up
+    read has finished. While catch-up is owed or retrying, live non-owner and bot messages do not
+    advance the position past owner messages the history read has not reached yet.
 30. First run for a listed channel: the read position is set to its newest message ID (or "empty"
     if it has none), so history is never replayed. If queued messages already exist for a channel
     without a position, the position starts just below the oldest queued message.

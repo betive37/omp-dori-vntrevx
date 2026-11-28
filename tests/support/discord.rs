@@ -6,8 +6,8 @@
 //! every request, deduplicates creates by their enforced nonce as Discord does, keeps a history per
 //! channel, answers a reply with message type 19 and its reference, and lets a test script the next
 //! create statuses, fail every read of a path, start a thread from a message, hold the reply to a
-//! thread start, push dispatches, and send op 7, op 9 or a close code. With a token set, any other
-//! token gets 401.
+//! thread start or a history read, push dispatches, and send op 7, op 9 or a close code. With a token
+//! set, any other token gets 401.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -20,7 +20,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::CloseFrame;
 
@@ -66,6 +66,8 @@ struct State {
     created: usize,
     /// Channel -> messages, oldest first.
     history: HashMap<String, Vec<Value>>,
+    /// History path -> release of its next response, snapshotted when requested.
+    history_holds: HashMap<String, oneshot::Receiver<()>>,
     /// Channel -> its object.
     channels: HashMap<String, Value>,
     threads: Vec<Value>,
@@ -336,6 +338,18 @@ impl FakeDiscord {
             .unwrap()
             .failing_reads
             .insert(path.into(), (status, Some(times)));
+    }
+
+    /// Holds the next history response until the sender is sent or dropped. The response keeps
+    /// the snapshot from when the request arrived, even if more messages arrive while it waits.
+    pub fn hold_history(&self, channel: &str) -> oneshot::Sender<()> {
+        let (tx, rx) = oneshot::channel();
+        self.state
+            .lock()
+            .unwrap()
+            .history_holds
+            .insert(format!("/channels/{channel}/messages"), rx);
+        tx
     }
 
     /// A message object.
@@ -786,7 +800,15 @@ async fn answer(
     let content_type = req.headers().get("content-type").cloned();
     let bytes = req.into_body().collect().await.unwrap().to_bytes();
     let (body, files) = decode(content_type.as_ref().and_then(|v| v.to_str().ok()), &bytes);
+    let history_release = if method == "GET" {
+        state.lock().unwrap().history_holds.remove(&path)
+    } else {
+        None
+    };
     let (response, held) = respond(&state, &method, &path, &query, authorization, &body, files);
+    if let Some(release) = history_release {
+        let _ = release.await;
+    }
     while held && state.lock().unwrap().hold_thread_starts {
         tokio::time::sleep(Duration::from_millis(20)).await;
     }

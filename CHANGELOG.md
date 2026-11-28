@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Discord could skip an owner's message after a restart or reconnect when a newer message from
+  someone else or a bot arrived during catch-up. Live ignored messages now leave that room's read
+  position alone until its history has been read.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

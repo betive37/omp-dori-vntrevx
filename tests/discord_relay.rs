@@ -1292,6 +1292,88 @@ fn gateway_faults_resume_and_catch_up() {
     assert!(hub.stop().success());
 }
 
+/// DISC-IN req. 29: live ignored messages cannot move the cursor past an owner message the
+/// catch-up read has not returned yet, after either a fresh READY or a hub restart.
+#[test]
+fn live_passes_do_not_skip_owner_messages_during_catch_up() {
+    for restart in [false, true] {
+        let fake = FakeDiscord::start();
+        let mut hub = relay_hub(&fake, &[], "");
+        let baseline = 800_000_000_000_000_100;
+        fake.put(FakeDiscord::message(CH, baseline, OTHER, "already read"));
+        hub.start();
+        ready(&hub);
+        recap_delivered(&hub);
+        if restart {
+            assert!(hub.stop().success());
+        }
+        fake.put(FakeDiscord::message(
+            CH,
+            baseline + 1,
+            OWNER,
+            "missed while away",
+        ));
+        let path = format!("/channels/{CH}/messages");
+        let reads = fake.calls("GET", &path).len();
+        let release = fake.hold_history(CH);
+        if restart {
+            hub.start();
+        } else {
+            fake.gw(Gw::Op9(false));
+        }
+        fake.wait(WAIT, |f| {
+            (f.calls("GET", &path).len() > reads).then_some(())
+        });
+        assert_eq!(fake.connections(), ["identify", "identify"]);
+        fake.say(FakeDiscord::message(
+            CH,
+            baseline + 2,
+            OTHER,
+            "not the owner",
+        ));
+        let mut bot = FakeDiscord::message(CH, baseline + 3, BOT, "a bot notification");
+        bot["author"]["bot"] = json!(true);
+        fake.say(bot);
+        // Gateway dispatch is ordered: this queued owner message proves both passes finished
+        // while the earlier owner's history response was held. No timing sleep is needed.
+        fake.say(FakeDiscord::message(
+            CH,
+            baseline + 4,
+            OWNER,
+            "live after the passes",
+        ));
+        hub.until(WAIT, || (queued(&hub, baseline + 4) == 1).then_some(()));
+        let held_position = status(&hub)["rooms"][0]["position"].clone();
+        release.send(()).unwrap();
+        let live = (baseline + 4).to_string();
+        fake.wait(WAIT, |f| {
+            f.creates()
+                .iter()
+                .any(|c| reference(c).as_deref() == Some(live.as_str()))
+                .then_some(())
+        });
+        let asked = requests(&hub);
+        assert_eq!(
+            asked
+                .iter()
+                .filter(|t| t.contains("missed while away"))
+                .count(),
+            1,
+            "restart={restart}, cursor while REST waited={held_position}, requests={asked:?}"
+        );
+        assert_eq!(held_position, baseline.to_string());
+        assert_eq!(asked.len(), 2, "only the two owner messages reach the lead");
+        settled(&hub);
+        // Once this room is caught up, live passes advance normally again.
+        let after = 950_000_000_000_000_000;
+        fake.say(FakeDiscord::message(CH, after, OTHER, "after catch-up"));
+        hub.until(WAIT, || {
+            (status(&hub)["rooms"][0]["position"] == after.to_string()).then_some(())
+        });
+        assert!(hub.stop().success());
+    }
+}
+
 /// Check 5: a resume URL that is not the test Gateway's is refused and the session identifies again.
 #[test]
 fn bad_resume_url_identifies_again() {
