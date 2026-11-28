@@ -314,6 +314,53 @@ fn planner_limits_questions_and_merged_items() {
     assert!(hub.stop().success());
 }
 
+/// COORD req. 37: a done item's id added again starts under a fresh lane key, not as a refused
+/// open of its closed lane.
+#[test]
+fn planner_restarts_a_reused_item_id() {
+    let (mut hub, work) = coord_hub("[coord.planner]\nmax_open = 2\nmax_starts = 2\n");
+    let text = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&text.replace(
+        "[coord.planner]",
+        &format!(
+            "[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n[coord.planner]",
+            work.display()
+        ),
+    ));
+    start(&mut hub);
+    let add =
+        json!({ "id": "it-x", "brief": "b", "checks": [{ "kind": "command", "argv": ["true"] }] });
+    lane(&hub, "item-add", &add).unwrap();
+    let first = hub.until(WAIT, || {
+        let s = plan(&hub);
+        (!s.contains("no lead")).then_some(s)
+    });
+    assert!(first.contains("started: it-x"), "{first}");
+    lane(&hub, "close", &json!({ "key": "it-x", "note": "stop" })).unwrap();
+    hub.until(WAIT, || {
+        (record(&hub, "it-x")["state"] == "closed").then_some(())
+    });
+    let done = plan(&hub);
+    assert!(done.contains("it-x done (lane closed)"), "{done}");
+    lane(&hub, "item-add", &add).unwrap();
+    let again = plan(&hub);
+    assert!(again.contains("started: it-x"), "{again}");
+    let items = lane(&hub, "items", &json!({})).unwrap();
+    let x = items["items"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|i| i["id"] == "it-x")
+        .unwrap()
+        .clone();
+    assert_eq!(x["status"], "running", "{x}");
+    assert_eq!(x["start_failures"], 0, "{x}");
+    assert_eq!(x["question"], Value::Null, "{x}");
+    assert_eq!(x["lane"], "it-x-2", "{x}");
+    assert_eq!(record(&hub, "it-x-2")["state"], "running", "{x}");
+    assert!(hub.stop().success());
+}
+
 /// Check 4: the merge check refuses without an approving verdict at the current head, with no
 /// checks, or with a check neither passed nor skipped; a dry run stops before merging.
 #[test]

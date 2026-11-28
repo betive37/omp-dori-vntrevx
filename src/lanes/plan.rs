@@ -42,6 +42,10 @@ pub(crate) struct Item {
     pub(crate) reminded_ms: Option<i64>,
     pub(crate) failed_tries: u32,
     pub(crate) start_failures: u32,
+    /// The key of the lane its latest start opened; each attempt gets a fresh key, since a lane key is
+    /// never reused (LANE req. 3). Items stored without it reconcile by their id.
+    #[serde(default)]
+    pub(crate) lane: Option<String>,
     /// `owner/name#number` of an imported issue.
     pub(crate) source: Option<String>,
     pub(crate) created_ms: i64,
@@ -58,6 +62,11 @@ impl Item {
 
     fn active(&self) -> bool {
         self.status == "open" || self.status == "running"
+    }
+
+    /// The key of the lane it runs as (or last ran as).
+    fn lane_key(&self) -> &str {
+        self.lane.as_deref().unwrap_or(&self.id)
     }
 }
 
@@ -335,6 +344,7 @@ impl<R: Runtime> Lanes<R> {
             reminded_ms: None,
             failed_tries: 0,
             start_failures: 0,
+            lane: None,
             source: None,
             created_ms: now,
             updated_ms: now,
@@ -426,6 +436,7 @@ impl<R: Runtime> Lanes<R> {
                 reminded_ms: None,
                 failed_tries: 0,
                 start_failures: 0,
+                lane: None,
                 source: Some(source),
                 created_ms: now,
                 updated_ms: now,
@@ -528,7 +539,7 @@ impl<R: Runtime> Lanes<R> {
             .filter(|l| {
                 !items
                     .iter()
-                    .any(|(i, _)| i.id == l.key && i.status == "running")
+                    .any(|(i, _)| i.lane_key() == l.key && i.status == "running")
             })
             .count();
         self.plan_starts(&mut items, &lanes, &mut run).await;
@@ -597,7 +608,7 @@ impl<R: Runtime> Lanes<R> {
         for (mut item, v) in items {
             let before = item.clone();
             if item.status == "running" {
-                match self.load(&item.id).await.ok().map(|(r, _)| r) {
+                match self.load(item.lane_key()).await.ok().map(|(r, _)| r) {
                     Some(rec) if rec.state == State::Closed => {
                         item.status = "done".into();
                         item.note(now, "done: its lane closed");
@@ -721,7 +732,9 @@ impl<R: Runtime> Lanes<R> {
             .iter()
             .map(|(i, _)| i)
             .filter(|i| {
-                i.status == "open" && i.question.is_none() && !lanes.iter().any(|l| l.key == i.id)
+                i.status == "open"
+                    && i.question.is_none()
+                    && !lanes.iter().any(|l| l.key == i.lane_key())
             })
             .cloned()
             .collect();
@@ -766,9 +779,10 @@ impl<R: Runtime> Lanes<R> {
 
     /// One attempt of one item (COORD req. 31); returns the item as stored after it.
     async fn start_item(self: &Arc<Self>, item: &Item, run: &mut Run) -> Option<(Item, i64)> {
+        let key = self.fresh_key(&item.id).await;
         let open = json!({
             "op": "open",
-            "key": item.id,
+            "key": key,
             "title": item.title,
             "brief": item.brief,
             "cwd": item.cwd,
@@ -804,10 +818,12 @@ impl<R: Runtime> Lanes<R> {
                         "the start of {} is uncertain ({line}); inspect the lane before anything else",
                         fresh.id
                     ));
+                    fresh.lane = Some(key);
                     fresh.note(now, &format!("start uncertain: {line}"));
                     run.held.push(format!("{} start uncertain", fresh.id));
                 } else {
                     fresh.status = "running".into();
+                    fresh.lane = Some(key);
                     fresh.note(now, &format!("lane opened: {line}"));
                     run.started.push(format!("{} ({line})", fresh.id));
                 }
@@ -833,6 +849,21 @@ impl<R: Runtime> Lanes<R> {
                 None
             }
         }
+    }
+
+    /// A key no lane record holds (LANE req. 3): the item id, else `{id}-{n}` from n = 2, the id
+    /// shortened so the key stays within 61 characters. A store error ends the search; the open
+    /// then reports it.
+    async fn fresh_key(&self, id: &str) -> String {
+        let mut key = id.to_string();
+        let mut n: usize = 2;
+        while matches!(self.row(&key).await, Ok(Some(_))) {
+            let suffix = format!("-{n}");
+            let base: String = id.chars().take(61 - suffix.len()).collect();
+            key = format!("{base}{suffix}");
+            n += 1;
+        }
+        key
     }
 
     /// COORD req. 32: each question once, one reminder after 6 h.

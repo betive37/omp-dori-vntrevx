@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A done or dropped work item added again, or an item whose lane died, could never start again:
+  the planner reopened the old lane key, every open was refused, and after two tries the item
+  became a question. Each start now opens a lane under a fresh key (`<id>-2`, `<id>-3`, ...) and
+  the item remembers it.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes

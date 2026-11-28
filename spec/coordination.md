@@ -181,10 +181,12 @@ client) plus the lead's OMP session, and every record has one writer.
 29. Audit (read-only findings): a lane that claimed completion 2 hours or more ago and is still open; an active or
     waiting lane with no progress for 3 hours or more (a waiting lane names its full target and since when).
 30. Start: nothing starts without a lead. Free starts = min(max open lanes - open lanes, max starts per run),
-    never below 0; defaults 3 and 2. Candidates are open items with no open question whose key has no open lane,
+    never below 0; defaults 3 and 2. Candidates are open items with no open question whose lane is not open,
     ordered by priority, then creation time, then id. If the admission guard (LANE-08) refuses, no item starts and
     the reason is recorded.
-31. Each attempt uses one start. A failed open adds one start failure; at 2 the item gets an open question that
+31. Each attempt uses one start and opens its lane under a key no lane has used (LANE req. 3): the item id, else
+    the id with `-2`, `-3`, ... (shortened to keep the key within 61 characters); the item records that key as
+    its lane. A failed open adds one start failure; at 2 the item gets an open question that
     quotes the first 120 characters of the error and asks whether to fix the brief or directory or give it up. A
     start that the session host left in an uncertain state gets a question at once and is never retried
     automatically. A lane that opened but whose start notice did not reach the lead still counts as started. An item
@@ -206,7 +208,7 @@ client) plus the lead's OMP session, and every record has one writer.
 
 36. An item has id (lane key rules, LANE-01, not a reserved role name), title (default the id), brief (copied into
     the store when added), working directory (default the caller's), priority 1-9 (default 5), status (open,
-    running, done, dropped), optional open question, ask and reminder times, failed tries, start failures,
+    running, done, dropped), the key of its latest lane, optional open question, ask and reminder times, failed tries, start failures,
     optional GitHub source, creation and update times, and a log of what happened.
 37. Adding refuses an invalid id, a missing brief file, a priority outside 1-9, and an id whose item is open or
     running. A done or dropped id may be reused.
