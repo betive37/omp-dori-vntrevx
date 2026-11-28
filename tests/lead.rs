@@ -646,14 +646,27 @@ fn a_delivery_in_doubt_keeps_the_lead_awake() {
     assert!(hub.stop().success());
 }
 
-/// HOST req. 89: the lead cannot start when a live lane already fills the session cap.
+/// Opens a lane with one command check through the CLI.
+fn open_lane(hub: &TestHub, key: &str) -> std::process::Output {
+    let params = serde_json::json!({
+        "key": key,
+        "title": "Work",
+        "brief": "Do the work.",
+        "checks": [{ "kind": "command", "argv": ["true"] }],
+    })
+    .to_string();
+    hub.cli(&["lane", "open", "--json", "--params", &params])
+}
+
+/// HOST req. 89 with the lead's slot reserved: the session cap never refuses the lead, here with two
+/// live lanes filling a cap lowered under them.
 #[test]
-fn a_live_lane_at_the_session_cap_refuses_a_lead_start() {
+fn the_lead_starts_while_lanes_fill_the_session_cap() {
     let mut hub = sleepy_hub(
         &[],
         "0s",
         "autostart = false\n",
-        "[sessions]\ncap = 1\n[lanes]\nmodel = \"fake/primary\"\ncwd = \"/tmp\"\n",
+        "[sessions]\ncap = 3\n[lanes]\nmodel = \"fake/primary\"\ncwd = \"/tmp\"\n",
     );
     hub.start();
     hub.until(Duration::from_secs(20), || {
@@ -661,28 +674,56 @@ fn a_live_lane_at_the_session_cap_refuses_a_lead_start() {
             .is_object()
             .then_some(())
     });
-    let params = serde_json::json!({
-        "key": "at-cap",
-        "title": "Work",
-        "brief": "Do the work.",
-        "checks": [{ "kind": "command", "argv": ["true"] }],
-    })
-    .to_string();
-    let opened = hub.cli(&["lane", "open", "--json", "--params", &params]);
-    assert!(opened.status.success(), "{opened:?}");
+    for key in ["fill-1", "fill-2"] {
+        let opened = open_lane(&hub, key);
+        assert!(opened.status.success(), "{opened:?}");
+    }
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&config.replace("cap = 3", "cap = 2"));
+    assert!(hub.cli(&["config", "reload"]).status.success());
     let lanes = hub.json(&["lane", "list", "--json"]);
-    assert_eq!(lanes.as_array().unwrap().len(), 1, "{lanes}");
-    assert_eq!(lanes[0]["live"], true, "{lanes}");
-    assert!(lead_view(&hub)["session"].is_null());
-    // The fake logs probe processes too; refusing the lead must add no process at all.
-    let starts = omp_starts(&hub);
+    let running = lanes
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|l| l["live"] == true);
+    assert_eq!(running.count(), 2, "{lanes}");
 
     let started = hub.cli(&["lead", "start", "--fresh"]);
-    assert!(!started.status.success(), "{started:?}");
-    let error = String::from_utf8_lossy(&started.stderr);
-    assert!(error.contains("the session cap of 1 is reached"), "{error}");
+    assert!(started.status.success(), "{started:?}");
+    live(&hub, &Value::Null);
+    assert!(hub.stop().success());
+}
+
+/// HOST req. 89: lanes count the lead's reserved slot, running or not, so a lane is refused once
+/// the lead and the lanes reach the cap, before it spawns anything.
+#[test]
+fn a_lane_is_refused_when_the_lead_and_lanes_reach_the_session_cap() {
+    let mut hub = sleepy_hub(
+        &[],
+        "0s",
+        "autostart = false\n",
+        "[sessions]\ncap = 2\n[lanes]\nmodel = \"fake/primary\"\ncwd = \"/tmp\"\n",
+    );
+    hub.start();
+    hub.until(Duration::from_secs(20), || {
+        hub.json(&["status", "--json"])["omp"]
+            .is_object()
+            .then_some(())
+    });
     assert!(lead_view(&hub)["session"].is_null());
-    assert_eq!(omp_starts(&hub), starts, "the lead must not spawn");
+    let first = open_lane(&hub, "slot-1");
+    assert!(first.status.success(), "{first:?}");
+    // The fake logs probe processes too; refusing the lane must add no process at all.
+    let starts = omp_starts(&hub);
+
+    let second = open_lane(&hub, "slot-2");
+    assert!(!second.status.success(), "{second:?}");
+    let error = String::from_utf8_lossy(&second.stderr);
+    assert!(error.contains("the session cap of 2 is reached"), "{error}");
+    let lanes = hub.json(&["lane", "list", "--json"]);
+    assert_eq!(lanes.as_array().unwrap().len(), 1, "{lanes}");
+    assert_eq!(omp_starts(&hub), starts, "the lane must not spawn");
     assert!(hub.stop().success());
 }
 

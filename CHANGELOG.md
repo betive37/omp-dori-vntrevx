@@ -208,8 +208,9 @@
   reach the lead until one of its turns completes.
 - A lead held after too many crashes stays held across hub restarts and updates, even with
   autostart enabled. Only an explicit `lead start` clears the hold and resumes its conversation.
-- Starting the lead could exceed the session cap when live lanes already filled it. Lead starts
-  now count live local lanes too and refuse with the session-cap message when no place is free.
+- Lanes could fill the session cap while the lead slept or was stopped, so the lead then ran past
+  the cap. The lead's slot is now reserved while `[lead]` is configured: lanes count it and are
+  refused once they would take it, and the cap never refuses a lead start or wake.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
