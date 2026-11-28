@@ -1818,16 +1818,14 @@ fn a_stop_after_the_in_doubt_notice_never_hands_the_message_again() {
     hub.start();
     ready(&hub);
     assert_eq!(queued(&hub, 800_000_000_000_000_092), 0);
-    fake.say(FakeDiscord::message(
-        CH,
-        800_000_000_000_000_093,
-        OWNER,
-        "after",
-    ));
+    // Catch-up can advance past the bot's reply; the new owner message must be newer.
+    let after = now_id();
+    fake.say(FakeDiscord::message(CH, after, OWNER, "after"));
+    let after = after.to_string();
     fake.wait(WAIT, |f| {
         f.creates()
             .into_iter()
-            .find(|c| reference(c).as_deref() == Some("800000000000000093"))
+            .find(|c| reference(c).as_deref() == Some(after.as_str()))
     });
     // The lead got the notice; the message itself went nowhere else.
     let envelope = format!("[discord {CH}/{doubt}] request from the owner");
