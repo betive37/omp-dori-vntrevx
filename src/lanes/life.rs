@@ -781,19 +781,28 @@ impl<R: Runtime> Lanes<R> {
     pub(super) async fn watch(self: Arc<Self>, key: String, session: Arc<R::Session>) {
         let mut events = session.subscribe();
         // A batch behind a busy turn waits past its turn end (PATCH-01 rule 10) with no event to
-        // come; the beat finds its entry, or its doubt, in time.
-        let mut beat = tokio::time::interval(CONFIRM_BEAT);
-        beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        // come; the beat finds its entry, or its doubt, in time. It runs only while a batch is
+        // unconfirmed: a beat that finds none stops, and the session's next event arms it again
+        // (the first beat also covers a batch written before this watch began).
+        let mut beat = std::pin::pin!(tokio::time::sleep(CONFIRM_BEAT));
+        let mut armed = true;
         loop {
             let got = tokio::select! {
                 got = events.recv() => got,
-                _ = beat.tick() => {
-                    if self.mailbox(&key).unconfirmed().await {
+                () = &mut beat, if armed => {
+                    armed = self.mailbox(&key).unconfirmed().await;
+                    if armed {
                         self.flush_inbox(&key, &session, false).await;
+                        beat.as_mut().reset(tokio::time::Instant::now() + CONFIRM_BEAT);
                     }
                     continue;
                 }
             };
+            if !armed {
+                armed = true;
+                beat.as_mut()
+                    .reset(tokio::time::Instant::now() + CONFIRM_BEAT);
+            }
             let event = match got {
                 Ok((_, e)) => e,
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(_)) => continue,

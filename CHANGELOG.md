@@ -238,7 +238,11 @@
   delivery]", and held the owner's Discord room until `cataly discord release`. While the session
   works the delivery now waits; the 30 s run once it is idle, from the end of the turn it waited
   behind, and a session busy for 6 h without the entry still ends it in doubt. A lane now checks
-  an unconfirmed message every 5 s, as the lead does, instead of only when its turn ends.
+  an unconfirmed message every 5 s, as the lead does, instead of only when its turn ends; the
+  check runs only while a message is unconfirmed, so idle lanes are not polled.
+- Two flushes of a lane's inbox at once (a turn end and a new message from the lead, say) could
+  both write the same waiting messages, or both resend the same unconfirmed one, so the lane got
+  them twice. A lane's inbox now takes one flush or delivery at a time, as the lead's does.
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
   "300 s recovery episode has no startup and cleanup budget remaining", with nothing attempted:
