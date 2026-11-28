@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- An open Discord confirmation or choice-only question no longer consumes ordinary owner messages
+  as invalid answers. They reach the lead; only questions accepting free text take plain messages,
+  and explicit replies to question cards still work.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
