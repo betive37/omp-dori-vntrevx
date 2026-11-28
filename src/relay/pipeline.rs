@@ -10,7 +10,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -267,6 +267,8 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     marking: Mutex<HashSet<Key>>,
     /// The done marks owed from before this run were looked for.
     swept: AtomicBool,
+    /// When a read of answers last found the lead working (ms; 0 before any).
+    worked_ms: AtomicI64,
     /// Live messages not handed off yet.
     live: Mutex<LiveMessages>,
     /// Frame read time of a wake still waiting for its turn to start.
@@ -304,6 +306,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             done_failed: AtomicBool::new(false),
             marking: Mutex::default(),
             swept: AtomicBool::new(false),
+            worked_ms: AtomicI64::new(0),
             live: Mutex::default(),
             wake: Mutex::new(None),
             wake_latency,
@@ -1127,6 +1130,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             && let Some(file) = snap.session_file.clone()
         {
             let settled = turn_over || snap.status == Status::Idle;
+            if !settled {
+                self.worked_ms.store(now_ms(), Ordering::Release);
+            }
             let file = PathBuf::from(file);
             // The newest answered request's later turns: read again only when something changed.
             let length = std::fs::metadata(&file).map(|m| m.len()).ok();
@@ -1148,7 +1154,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                 let later_reply = later.as_ref().and_then(|_| replies.pop());
                 for (h, reply) in waiting.iter().zip(replies) {
-                    self.settle_reply(h, reply, settled).await?;
+                    self.settle_reply(h, reply).await?;
                 }
                 if let (Some(h), Some(reply)) = (later, later_reply) {
                     self.later_turns(&h, reply).await?;
@@ -1182,17 +1188,13 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
-    /// Stores what one read found for `h`. `settled` is true when the lead's turn is over (idle or
-    /// `turn_over`): only then does a request with no answer stop waiting once it is older than the
-    /// owed window. While the lead works, an unfinished turn (`Pending`) and a request still queued
-    /// behind it (`NotFound`) keep waiting however long the turn runs; the next input entering the
-    /// transcript ends the wait instead (DISC-OUT req. 21-22).
-    async fn settle_reply(
-        &self,
-        h: &HandoffRow,
-        reply: Reply,
-        settled: bool,
-    ) -> Result<(), String> {
+    /// Stores what one read found for `h`. A request with no answer stops waiting only once both
+    /// its hand-off and the lead's last work are older than the owed window: while the lead works,
+    /// an unfinished turn (`Pending`) and a request still queued behind it (`NotFound`) keep
+    /// waiting however long the turn runs, and a request queued behind it keeps the window after
+    /// the turn ends to reach the transcript. The next input entering the transcript ends the wait
+    /// sooner (DISC-OUT req. 21-22).
+    async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
         let answer = |answer: &str| RelayWrite::Answer {
             relay: R::NAME.into(),
             room: h.room.clone(),
@@ -1237,11 +1239,12 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     .await
                     .map_err(|e| e.to_string())?;
             }
-            // Once the lead is settled, `Pending` is a turn that ended without an answer and
+            // With the lead idle that long, `Pending` is a turn that ended without an answer and
             // `NotFound` a request that never reached this transcript (another session file, or
-            // outside the part read): past the owed window, neither waits on work still running.
+            // outside the part read): neither waits on work still running.
             Reply::NotFound | Reply::Pending => {
-                if settled && now_ms() - h.created_ms > OWED_WINDOW_MS {
+                let since = h.created_ms.max(self.worked_ms.load(Ordering::Acquire));
+                if now_ms() - since > OWED_WINDOW_MS {
                     self.store
                         .relay(answer("abandoned"))
                         .await
