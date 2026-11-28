@@ -45,6 +45,9 @@ const RUNNERS: [&str; 33] = [
     "stdbuf", "setsid", "xargs", "find", "watch", "flock", "parallel", "eval", "sh", "bash", "zsh",
     "dash", "ksh", "su", "then", "do", "else", "elif", "if", "while", "until", "!", "{",
 ];
+/// Runners that append arguments to the command they run, so a `cataly slot` under one has no
+/// known wrapped command.
+const APPENDERS: [&str; 3] = ["xargs", "find", "parallel"];
 /// Nesting depth for quoted commands and command substitutions.
 const NESTING: usize = 4;
 
@@ -192,8 +195,11 @@ fn segment_blocked(raw: &[String], words: &[Option<String>], depth: usize) -> bo
     };
     let any_position = RUNNERS.contains(&base(command)) || command.starts_with(['<', '>']);
     // `cataly slot` at `s` runs the command after the first literal `--` without a shell: that
-    // command is judged as its own segment. A word before `--` the hub cannot resolve, or one with
-    // spaces, may expand to `--` and a command, so it fails closed. Without `--` nothing runs.
+    // command is judged as its own segment. It fails closed whenever the line the CLI gets is not
+    // known from the text: a word before `--` that may expand to `--` and a command (unresolved,
+    // with spaces, or with `$`, braces or glob characters), no command after `--` (a runner may
+    // append one), a runner in front that appends arguments, or nesting deeper than `NESTING`.
+    // A help flag before `--` prints help and runs nothing.
     let slot_blocked = |s: usize| {
         let after = words.get(s + 1..).unwrap_or_default();
         let dash = after
@@ -201,16 +207,33 @@ fn segment_blocked(raw: &[String], words: &[Option<String>], depth: usize) -> bo
             .position(|w| w.as_deref() == Some("--"))
             .unwrap_or(after.len());
         let (head, tail) = after.split_at(dash);
+        let start = raw.len() - words.len() + s + 1;
+        let head_raw = raw.get(start..start + dash).unwrap_or_default();
         let wrapped = tail.get(1..).unwrap_or_default();
-        head.iter().any(|w| {
-            w.as_ref()
-                .is_none_or(|w| w.chars().any(char::is_whitespace))
-        }) || (!tail.is_empty()
-            && segment_blocked(
+        if depth >= NESTING
+            || head.iter().any(|w| {
+                w.as_ref()
+                    .is_none_or(|w| w.chars().any(char::is_whitespace))
+            })
+            || head_raw
+                .iter()
+                .any(|w| w.contains(['$', '{', '}', '*', '?', '[']))
+        {
+            return true;
+        }
+        if head.iter().flatten().any(|w| w == "--help" || w == "-h") {
+            return false;
+        }
+        wrapped.is_empty()
+            || words
+                .iter()
+                .take(s - 1)
+                .any(|w| w.as_deref().is_none_or(|w| APPENDERS.contains(&base(w))))
+            || segment_blocked(
                 raw.get(raw.len() - wrapped.len()..).unwrap_or_default(),
                 wrapped,
                 depth + 1,
-            ))
+            )
     };
     let blocked_here = |i: usize, word: &str| match base(word) {
         "cataly"
@@ -492,7 +515,9 @@ mod tests {
             "/usr/bin/cataly slot b -- true",
             "cataly slot b -- cataly status",
             "env cataly slot b -- make",
+            "cataly slot a -- cataly slot b -- make",
             "cataly slot --help",
+            "cataly slot b -h",
         ] {
             assert!(!rule_zero(cmd), "{cmd}");
             assert!(judge(cmd, &deny, &[], &mut grants).allowed, "{cmd}");
@@ -507,10 +532,29 @@ mod tests {
             "cataly slot $UNSET -- make",
             "x='-- cataly lane close x'; cataly slot b $x",
             "env cataly slot b -- cataly hub stop",
+            // No command after `--`: a runner may append one.
+            "cataly slot b",
+            "cataly slot b --",
+            // A runner that appends arguments decides the wrapped command at run time.
+            "printf '%s\\n' '-- omp usage reset' | xargs cataly slot b",
+            "xargs cataly slot b --",
+            "xargs -I{} cataly slot b -- {}",
+            "xargs cataly slot b -- make",
+            "find . -exec cataly slot b {} +",
+            "parallel cataly slot b -- ::: make",
+            "env $RUN cataly slot b -- make",
+            // A word before `--` that the shell may expand to `--` and a command.
+            "cataly slot b {--,} cataly lane close x -- true",
+            "IFS=,; X=--,cataly,lane,close,x; cataly slot b $X -- true",
+            "X=--; X=a true; cataly slot b $X cataly lane close x -- true",
+            "cataly slot b* -- make",
         ] {
             assert!(rule_zero(cmd), "{cmd}");
             assert_eq!(judge(cmd, &deny, &[], &mut grants).rules, [0], "{cmd}");
         }
+        // Nesting fails closed past its bound.
+        let deep = format!("{}make", "cataly slot a -- ".repeat(NESTING + 1));
+        assert!(rule_zero(&deep));
         // Configured deny rules still see the wrapped command.
         assert_eq!(
             judge("cataly slot b -- git push", &deny, &[], &mut grants).rules,
