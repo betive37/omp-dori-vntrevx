@@ -5,6 +5,9 @@
 - Stream jobs: output without line ends (a `\r` progress bar, binary data) no longer grows the hub's
   memory until the line ends. Past 64 KiB the line continues in its private file as it arrives;
   one event gives the path and size when it ends. The file keeps at most the line's first 4 MiB.
+  CRLF endings do not count toward either limit or appear in the saved bytes; a bare `\r` at EOF
+  remains data. The file and its directory are synced before the event reports it saved; a sync
+  failure is reported in the event instead.
 
 ## 0.2.8 (2026-11-28)
 
