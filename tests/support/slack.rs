@@ -291,9 +291,8 @@ fn history(query: &str, state: &mut State) -> Response<Full<Bytes>> {
         .flatten()
         .filter(|m| key(m["ts"].as_str().unwrap_or("0")) > key(&oldest))
         .filter(|m| {
-            root.as_deref().is_none_or(|r| {
-                m["thread_ts"].as_str() == Some(r) || m["ts"].as_str() == Some(r)
-            })
+            root.as_deref()
+                .is_none_or(|r| m["thread_ts"].as_str() == Some(r) || m["ts"].as_str() == Some(r))
         })
         .cloned()
         .collect();

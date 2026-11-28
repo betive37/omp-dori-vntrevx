@@ -126,7 +126,8 @@ pub(crate) struct ApiError {
 impl ApiError {
     /// Transport, server and rate-limit failures may pass without changing the room or credentials.
     fn retryable_read(&self) -> bool {
-        self.status.is_none_or(|s| matches!(s, 408 | 429 | 500..=599))
+        self.status
+            .is_none_or(|s| matches!(s, 408 | 429 | 500..=599))
             || UNCERTAIN_ERRORS.contains(&self.why.as_str())
             || self.why == "ratelimited"
     }

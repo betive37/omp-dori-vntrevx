@@ -702,8 +702,7 @@ fn permanent_slack_catch_up_failure(error: &str, thread: bool) {
         f.calls(method)
             .iter()
             .filter(|s| {
-                s.query.contains(&channel_query)
-                    && (!thread || s.query.contains(&thread_query))
+                s.query.contains(&channel_query) && (!thread || s.query.contains(&thread_query))
             })
             .count()
     };
@@ -728,9 +727,11 @@ fn permanent_slack_catch_up_failure(error: &str, thread: bool) {
         let s = status(&hub, "slack");
         assert_eq!(s["counts"]["held"], 1, "{s}");
         assert!(
-            s["held"].as_array().unwrap().iter().any(|p| {
-                p["room"] == room && p["reason"].as_str().unwrap().contains(error)
-            }),
+            s["held"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|p| { p["room"] == room && p["reason"].as_str().unwrap().contains(error) }),
             "{s}"
         );
         assert_eq!(position(&s), before, "the unread room keeps its position");
