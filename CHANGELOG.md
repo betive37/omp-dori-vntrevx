@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Large event bodies could make `events` fail with "bad reply". Event pages now fit within the
+  control-socket line limit; use `--after` with the last returned event ID to read the rest.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

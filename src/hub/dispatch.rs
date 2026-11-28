@@ -431,19 +431,7 @@ async fn handle(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
             .await
             .map_err(refused),
         method::STATS => ok(&hub.stats().await),
-        method::EVENTS_SINCE => {
-            let p: EventsParams = params(raw)?;
-            let limit = p.limit.unwrap_or(20).clamp(1, 1000);
-            let events = hub
-                .store
-                .read(move |r| match (p.after, p.since_ms) {
-                    (Some(after), _) => r.events_after(after, limit),
-                    (None, Some(since)) => r.events_since(since, limit),
-                    (None, None) => r.events_latest(limit),
-                })
-                .await?;
-            ok(&Events { events })
-        }
+        method::EVENTS_SINCE => events_since(&hub.store, params(raw)?).await,
         method::JOB_LIST => ok(&JobList {
             jobs: hub.jobs.list().await?,
         }),
@@ -506,6 +494,50 @@ async fn handle(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
             message: format!("unknown method '{name}'"),
         }),
     }
+}
+
+/// Count JSON bytes, including escaping, without allocating a second copy of each event.
+struct JsonSize(usize);
+
+impl std::io::Write for JsonSize {
+    fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+        self.0 += bytes.len();
+        Ok(bytes.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Leave room for the response envelope (including a full-width request ID) and newline.
+const EVENTS_BYTES: usize = proto::MAX_LINE - 1024;
+
+async fn events_since(store: &crate::store::Store, p: EventsParams) -> Result<Value, Failure> {
+    let limit = p.limit.unwrap_or(20).clamp(1, 1000);
+    let mut events = store
+        .read(move |r| match (p.after, p.since_ms) {
+            (Some(after), _) => r.events_after(after, limit),
+            (None, Some(since)) => r.events_since(since, limit),
+            (None, None) => r.events_latest(limit),
+        })
+        .await?;
+    let mut size = JsonSize(0);
+    let mut keep = 0;
+    for event in &events {
+        serde_json::to_writer(&mut size, event).map_err(|e| Failure {
+            code: code::INTERNAL,
+            message: e.to_string(),
+        })?;
+        size.0 += 1; // Array separator; the envelope's brackets are in the headroom.
+        if size.0 > EVENTS_BYTES {
+            break;
+        }
+        keep += 1;
+    }
+    // Keep an oldest-first prefix so the last ID resumes the next page without skipping events.
+    events.truncate(keep);
+    ok(&Events { events })
 }
 
 /// `worker.list`, `worker.doctor` (one worker, or all) and `worker.remove`.
@@ -901,4 +933,84 @@ fn snapshot_windows(snapshot: Option<&crate::omp::usage::Snapshot>, a: &LimitAcc
             .filter_map(|l| l.window_ms)
             .collect()
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::store::tests::{event, open_temp};
+
+    async fn assert_event_pages(tag: &str, body: &str) {
+        let (store, writer, _dir) = open_temp(tag);
+        let stored = store
+            .append_events(
+                (0..20)
+                    .map(|_| {
+                        let mut event = event("large", "run.done", &[]);
+                        event.body = Some(body.to_string());
+                        event
+                    })
+                    .collect(),
+            )
+            .await
+            .unwrap();
+        let expected: Vec<_> = stored.iter().map(|e| e.id).collect();
+        for mut params in [
+            EventsParams::default(),
+            EventsParams {
+                after: Some(0),
+                ..EventsParams::default()
+            },
+            EventsParams {
+                since_ms: Some(1),
+                ..EventsParams::default()
+            },
+            EventsParams {
+                after: Some(0),
+                limit: Some(1000),
+                ..EventsParams::default()
+            },
+        ] {
+            let mut seen = Vec::new();
+            let mut pages = 0;
+            loop {
+                let value = events_since(&store, params.clone())
+                    .await
+                    .unwrap_or_else(|f| panic!("{}", f.message));
+                let line = Response::ok(u64::MAX, value).to_line();
+                assert!(
+                    line.len() <= proto::MAX_LINE,
+                    "reply line is {} bytes (limit {})",
+                    line.len(),
+                    proto::MAX_LINE
+                );
+                let response: Response = serde_json::from_str(&line).unwrap();
+                let page: Events = serde_json::from_value(response.ok.unwrap()).unwrap();
+                let Some(last) = page.events.last() else {
+                    break;
+                };
+                params.after = Some(last.id);
+                pages += 1;
+                for event in page.events {
+                    assert_eq!(event.body.as_deref(), Some(body));
+                    seen.push(event.id);
+                }
+                assert!(seen.len() <= expected.len(), "pagination repeated events");
+            }
+            assert!(pages > 1, "large events must use more than one reply");
+            assert_eq!(seen, expected, "pagination lost or reordered events");
+        }
+        drop(store);
+        writer.join().unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn events_since_pages_large_bodies_below_line_limit() {
+        assert_event_pages("events-large", &"x".repeat(60 * 1024)).await;
+    }
+
+    #[tokio::test]
+    async fn events_since_pages_escaped_bodies_below_line_limit() {
+        assert_event_pages("events-escaped", &"\0".repeat(60 * 1024)).await;
+    }
 }

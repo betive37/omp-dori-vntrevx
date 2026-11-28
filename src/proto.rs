@@ -492,7 +492,8 @@ impl From<Summary> for LatencySummary {
 }
 
 /// `events.since` and `events.follow` parameters. With neither `after` nor `since_ms`, `since`
-/// returns the newest `limit` events and `follow` starts from now.
+/// selects the newest `limit` events and `follow` starts from now. `since` returns an oldest-first
+/// prefix that fits the reply byte limit; continue with `after` set to the last returned event ID.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct EventsParams {
     #[serde(default)]
