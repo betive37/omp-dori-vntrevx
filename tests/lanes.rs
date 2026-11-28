@@ -2283,6 +2283,99 @@ fn completed_close_removes_clean_worktree() {
     hub.stop();
 }
 
+fn close_published_symlink_worktree(legacy: bool, missing_link: bool) {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let link = hub.root.join("work-link");
+    std::os::unix::fs::symlink(&work, &link).unwrap();
+    let given = link.join("lane-tree");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}\n[[coord.publish]]\ndir = \"{}\"\n",
+        work.canonicalize().unwrap().display()
+    ));
+    start(&mut hub);
+    // Close runs signals after the unsent-work check but before the preservation boundary.
+    let argv = if missing_link {
+        json!(["rm", link])
+    } else {
+        json!(["true"])
+    };
+    open(
+        &hub,
+        "published-close",
+        &json!({
+            "cwd": repo, "worktree": {"path": given, "branch": "lane-work", "base": "HEAD"},
+            "checks": [{"kind":"command", "argv":argv}]
+        }),
+    );
+    let real = given.canonicalize().unwrap();
+    let before = record(&hub, "published-close");
+    let published = lane(
+        &hub,
+        "publish",
+        &json!({"key":"published-close", "path":real.join("a.txt")}),
+    )
+    .unwrap();
+    assert_eq!(published["path"], json!(real.join("a.txt")));
+    if legacy {
+        // Simulate ownership persisted by an older hub, without changing the canonical file path.
+        hub.stop();
+        assert_eq!(
+            recovery::db(&hub).execute(
+                "UPDATE lanes SET record = json_set(record, '$.worktrees', json_array(?1)) WHERE key = 'published-close'",
+                [given.to_str().unwrap()],
+            ).unwrap(),
+            1
+        );
+        start(&mut hub);
+        hub.until(WAIT, || {
+            (record(&hub, "published-close")["live"] == true).then_some(())
+        });
+    }
+    lane(
+        &hub,
+        "close",
+        &json!({"key":"published-close", "note":"done"}),
+    )
+    .unwrap();
+    if missing_link {
+        assert!(!link.exists(), "the close signal removed the symlink");
+    }
+    let rec = record(&hub, "published-close");
+    assert_eq!(rec["state"], "closed", "{rec}");
+    assert!(real.is_dir(), "the published worktree was removed: {rec}");
+    assert!(
+        rec["receipt"]
+            .to_string()
+            .contains("kept: it holds a published file"),
+        "{rec}"
+    );
+    assert_eq!(
+        std::fs::read_to_string(real.join("a.txt")).unwrap(),
+        "original"
+    );
+    if !legacy {
+        assert_eq!(before["worktrees"], json!([real]));
+    }
+    hub.stop();
+}
+
+#[test]
+fn completed_close_keeps_published_symlink_worktree() {
+    close_published_symlink_worktree(false, false);
+}
+
+#[test]
+fn completed_close_keeps_published_legacy_symlink_worktree() {
+    close_published_symlink_worktree(true, false);
+}
+
+#[test]
+fn completed_close_keeps_published_worktree_when_symlink_is_missing() {
+    close_published_symlink_worktree(true, true);
+}
+
 /// A pre-spawn failure proves no writer existed. Git locking is an actual removal refusal.
 #[test]
 fn failed_fresh_worktree_removal_keeps_record() {

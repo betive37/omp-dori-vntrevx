@@ -77,6 +77,9 @@
   req. 42 and DESIGN C17 say. The thread-finished hook already skipped it, but the status word
   set afterwards still renamed the thread `[done]` and, for a completed close, archived it while
   the other lane was working in it. The last lane on the thread marks it done.
+- A lane could remove a worktree containing a published file when the worktree was opened through
+  a symlink. Ownership now records the canonical path, and close resolves older paths too, keeping
+  the worktree when the path cannot be resolved.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
