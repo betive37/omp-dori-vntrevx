@@ -477,9 +477,6 @@ async fn policy(
     {
         return Err("moved while being checked".into());
     }
-    if files.len() > FILES_MAX {
-        return Err("more than 3000 files".into());
-    }
     for (name, rows, field) in [
         ("commits", &commits, "commits"),
         ("files", &files, "changed_files"),

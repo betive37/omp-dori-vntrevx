@@ -265,8 +265,9 @@ lane lifecycle area consumes the completion checker, the step records and the pu
     insensitive), except that a merge commit's committer may be GitHub's no-reply address; and if any fix-type commit
     changes source files, the pull request adds or changes a test file or its description gives an explicit no-test
     reason. All commit and file pages are read; their totals must match the pull request's commit and changed-file
-    counts, or the check fails as incomplete. The head, description and both counts are read before and after;
-    any change fails with "moved while being checked". More than 3000 files in a commit or the pull request fails.
+    counts, or the check fails as incomplete. Pull requests with more than 250 commits are refused because GitHub
+    lists at most 250 commits. The head, description and both counts are read before and after; any change fails
+    with "moved while being checked". More than 3000 files in a commit or the pull request fails.
     A repository without a configured identity fails.
 
 ### Message from the lead to a lane (EVR-33, EVR-34)
