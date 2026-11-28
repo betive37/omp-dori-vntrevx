@@ -1744,19 +1744,33 @@ impl<R: Runtime> Lanes<R> {
         )
     }
 
-    /// The thread title word from lane state (DESIGN 12.2 C17).
+    /// The thread title word from lane state (DESIGN 12.2 C17). A closed lane leaves the thread
+    /// alone while another lane on it is open: `done` and the archive would end that lane's thread
+    /// (LANE req. 42). That check and the change run under `closing`, like the thread-finished hook.
     async fn status_word(&self, rec: &Record) {
-        let Some(thread) = rec
-            .thread
-            .as_deref()
-            .and_then(|t| t.strip_prefix("discord:"))
-        else {
+        let Some(full) = rec.thread.as_deref() else {
             return;
         };
-        let (word, archive) = match rec.state {
-            State::Running | State::Rejected | State::Starting => ("working", false),
-            State::Held | State::Claimed | State::Closing => ("waiting", false),
-            State::Closed => ("done", rec.outcome.as_deref() == Some("completed")),
+        let Some(thread) = full.strip_prefix("discord:") else {
+            return;
+        };
+        let (_one, others) = if rec.state == State::Closed {
+            let one = self.closing.lock().await;
+            match self.others_open(rec, full).await {
+                Ok(n) => (Some(one), n),
+                Err(e) => {
+                    log::info(
+                        "thread status not set",
+                        &[("lane", &rec.key), ("error", &e)],
+                    );
+                    return;
+                }
+            }
+        } else {
+            (None, 0)
+        };
+        let Some((word, archive)) = thread_word(rec.state, rec.outcome.as_deref(), others) else {
+            return;
         };
         if let Err(e) = self.env.threads.status(thread, word, archive).await {
             log::info(
@@ -1816,6 +1830,18 @@ impl<R: Runtime> Lanes<R> {
     }
 }
 
+/// The thread title word for a lane in `state` and whether to archive the thread (DESIGN 12.2
+/// C17); `others` is how many other lanes on the thread are open. `None` for a closed lane that
+/// shares its thread with an open one: `done` is refused while a lane is open.
+fn thread_word(state: State, outcome: Option<&str>, others: usize) -> Option<(&'static str, bool)> {
+    match state {
+        State::Running | State::Rejected | State::Starting => Some(("working", false)),
+        State::Held | State::Claimed | State::Closing => Some(("waiting", false)),
+        State::Closed if others > 0 => None,
+        State::Closed => Some(("done", outcome == Some("completed"))),
+    }
+}
+
 /// The turn lock of `key`. Locks that nobody holds or waits for are dropped first (a new one is
 /// made when their key is used again), so the map holds only locks in use and the one returned.
 fn turn_lock(
@@ -1854,5 +1880,31 @@ mod tests {
         );
         drop(held);
         assert!(again.try_lock().is_ok());
+    }
+
+    /// A closed lane marks its thread done (and archives it when completed) only when no other
+    /// lane on the thread is open (DESIGN C17, LANE req. 42).
+    #[test]
+    fn a_closed_lane_leaves_a_shared_thread_open() {
+        assert_eq!(
+            thread_word(State::Closed, Some("completed"), 0),
+            Some(("done", true))
+        );
+        assert_eq!(
+            thread_word(State::Closed, Some("abandoned"), 0),
+            Some(("done", false))
+        );
+        for outcome in ["completed", "abandoned", "parked"] {
+            assert_eq!(
+                thread_word(State::Closed, Some(outcome), 1),
+                None,
+                "{outcome}"
+            );
+        }
+        assert_eq!(
+            thread_word(State::Running, None, 1),
+            Some(("working", false))
+        );
+        assert_eq!(thread_word(State::Held, None, 1), Some(("waiting", false)));
     }
 }

@@ -73,6 +73,10 @@
 - A lane step with new evidence now starts a new progress round, as a report with new evidence
   does: after one stall alert, a lane that moved on only through steps was never reminded or
   alerted again; now it is when it stalls again.
+- A lane that closes on a thread another open lane still uses leaves that thread alone, as LANE
+  req. 42 and DESIGN C17 say. The thread-finished hook already skipped it, but the status word
+  set afterwards still renamed the thread `[done]` and, for a completed close, archived it while
+  the other lane was working in it. The last lane on the thread marks it done.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

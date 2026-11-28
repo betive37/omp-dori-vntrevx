@@ -1701,6 +1701,70 @@ fn holds(file: &Value, text: &str) -> bool {
         .is_some_and(|t| t.contains(text))
 }
 
+/// Two lanes on one thread: the first completed close leaves the thread open for the other lane
+/// (no `[done]`, no archive); the last one marks it done and archives it (LANE req. 42, DESIGN C17).
+#[test]
+fn a_completed_lane_leaves_a_thread_another_lane_uses_open() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    fake.named_thread(THREAD, CH, "Shared work");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!("{config}{}", fake.config(&token, OWNER, &[CH])));
+    start(&mut hub);
+    for key in ["shared-a", "shared-b"] {
+        open(
+            &hub,
+            key,
+            &json!({ "thread": format!("discord:{THREAD}"), "cwd": work }),
+        );
+    }
+    let ending = |f: &FakeDiscord| {
+        f.calls("PATCH", &format!("/channels/{THREAD}"))
+            .into_iter()
+            .filter(|c| {
+                c.body["archived"] == true
+                    || c.body["name"]
+                        .as_str()
+                        .is_some_and(|n| n.starts_with("[done]"))
+            })
+            .collect::<Vec<_>>()
+    };
+    // Status words reach the thread.
+    fake.wait(WAIT, |f| {
+        f.calls("PATCH", &format!("/channels/{THREAD}"))
+            .into_iter()
+            .find(|c| c.body["name"] == "[working] Shared work")
+    });
+    lane(&hub, "close", &json!({ "key": "shared-a", "note": "done" })).unwrap();
+    let a = record(&hub, "shared-a");
+    assert_eq!(
+        (a["state"].as_str(), a["outcome"].as_str()),
+        (Some("closed"), Some("completed"))
+    );
+    assert!(
+        a["receipt"]
+            .to_string()
+            .contains("thread left open: 1 other"),
+        "{a}"
+    );
+    assert!(ending(&fake).is_empty(), "{:?}", ending(&fake));
+    // The last lane on the thread ends it.
+    lane(&hub, "close", &json!({ "key": "shared-b", "note": "done" })).unwrap();
+    let done = fake.wait(WAIT, |f| {
+        let e = ending(f);
+        (!e.is_empty()).then_some(e)
+    });
+    assert_eq!(
+        done[0].body["name"], "[done] Shared work",
+        "{:?}",
+        done[0].body
+    );
+    assert_eq!(done[0].body["archived"], true, "{:?}", done[0].body);
+    hub.stop();
+}
+
 /// The lead delegates: an owner message in a watched channel, the lead's `lane.open` with
 /// `thread_from` that message and a worktree, the kickoff first in the thread and the lead's pointer
 /// in the channel, the lane's session in its worktree, reports and later owner messages in its
