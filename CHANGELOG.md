@@ -184,6 +184,11 @@
   connections, frame reads and replayable catch-up reads still stop promptly.
 - Telegram could lose an owner message when its arrival queue was full or its store write failed.
   It now stops that batch, keeps the offset before the unsaved update and retries after a minute.
+- Slack no longer acknowledges messages when the arrival queue is full, a queue write fails, or
+  admission times out, leaving them eligible for Slack's bounded redelivery window. An older
+  redelivery is admitted even if a newer message has already advanced the room's position.
+  Redelivering a doubtful or failed hand-off given up by a room release no longer queues it again
+  or blocks the released room.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
