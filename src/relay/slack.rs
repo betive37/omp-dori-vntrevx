@@ -1011,35 +1011,40 @@ impl<T: Runtime> Socket<T> {
         }
     }
 
-    async fn connect(&self, shutdown: &mut watch::Receiver<bool>) -> Down {
+    /// Opens one Socket Mode connection; a halt wins over each step.
+    async fn open(&self, shutdown: &mut watch::Receiver<bool>) -> Result<http::WebSocket, Down> {
         if *shutdown.borrow() {
-            return Down::Shutdown;
+            return Err(Down::Shutdown);
         }
         let args = json!({});
         let opened = tokio::select! {
             biased;
-            _ = shutdown.changed() => return Down::Shutdown,
+            _ = shutdown.changed() => return Err(Down::Shutdown),
             opened = self.api.call("apps.connections.open", &args, Kind::Once, true) => match opened {
                 Ok(v) => v,
                 Err(e) if e.why == "invalid_auth" || e.why == "not_authed" => {
-                    return Down::Fatal("the app-level token was refused".into());
+                    return Err(Down::Fatal("the app-level token was refused".into()));
                 }
-                Err(e) => return Down::Again(format!("opening the socket: {e}")),
+                Err(e) => return Err(Down::Again(format!("opening the socket: {e}"))),
             },
         };
         let Some(url) = opened.get("url").and_then(Value::as_str) else {
-            return Down::Again("no socket URL".into());
+            return Err(Down::Again("no socket URL".into()));
         };
         let Some((tls, host, port)) = socket_url(url, self.loopback) else {
-            return Down::Fatal("the socket URL is not Slack's".into());
+            return Err(Down::Fatal("the socket URL is not Slack's".into()));
         };
-        let mut ws = tokio::select! {
+        tokio::select! {
             biased;
-            _ = shutdown.changed() => return Down::Shutdown,
-            connected = http::websocket(tls, &host, port, url, FRAME_MAX) => match connected {
-                Ok(ws) => ws,
-                Err(e) => return Down::Again(e),
-            },
+            _ = shutdown.changed() => Err(Down::Shutdown),
+            connected = http::websocket(tls, &host, port, url, FRAME_MAX) => connected.map_err(Down::Again),
+        }
+    }
+
+    async fn connect(&self, shutdown: &mut watch::Receiver<bool>) -> Down {
+        let mut ws = match self.open(shutdown).await {
+            Ok(ws) => ws,
+            Err(down) => return down,
         };
         let established = Instant::now();
         let mut caught_up = false;
