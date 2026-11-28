@@ -36,7 +36,10 @@ Tailscale claims cite their public documentation (Sources at the end). Estimates
 
 - Hub side: one `ssh` client child per worker in use, closed after 5 minutes with no remote lane and no
   pending operation; its memory is measured in phase 1. Worker side: one `cataly worker serve` per hub
-  connection, plus the OMP children of its lanes. Nothing else.
+  connection, plus the OMP children of its lanes. Nothing else. Cancelling a request releases its
+  pending-operation count. A cancelled spawn drops its unclaimed channel, even if it arrives later,
+  ending the child's input; cancellation is not a reap acknowledgement, so attempt reconciliation
+  still applies (2.4).
 - Remote lanes are **headless** only. Tern lanes need a terminal on the hub's screen; a remote tern lane
   is refused by name.
 - The `Headless` runtime stays one implementation. What changes is where its child lives: `command::attach`

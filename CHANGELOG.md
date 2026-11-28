@@ -60,6 +60,8 @@
   without adding a duplicate table and failing validation. The header and its comment are kept.
 - Voice setup no longer rejects a channel whose overwrites grant Connect or Speak when the bot's
   server roles lack them. It checks effective channel permissions before asking for role changes.
+- Cancelling a worker request no longer keeps its SSH connection busy forever. A cancelled lane
+  start closes its unclaimed OMP channel, including one that arrives after cancellation.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
