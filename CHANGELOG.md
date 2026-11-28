@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Adding a worker at an IPv6 address no longer fails when saving its config. The saved destination
+  keeps the IPv6 brackets so config validation and later SSH connections can read it.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
