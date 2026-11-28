@@ -206,6 +206,8 @@
   restarted, hub notes and other automatic input reached the model again without your decision.
   The block is now kept in the store and the next lead session starts with it; only your messages
   reach the lead until one of its turns completes.
+- A lead held after too many crashes stays held across hub restarts and updates, even with
+  autostart enabled. Only an explicit `lead start` clears the hold and resumes its conversation.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
