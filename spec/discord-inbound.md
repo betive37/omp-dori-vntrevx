@@ -233,8 +233,9 @@ operator who configures the daemon (in practice the same person).
     49). Not found and the recorded OMP process is gone: the file is final, so the message was
     not delivered; send it again.
     Not found and the process is alive: ask it over RPC to finish writing, then search again once.
-    Still in doubt: hold that conversation only, and tell the owner which message is in doubt and
-    how to release it.
+    Still in doubt: the message counts as handled and is never sent again. The conversation is not
+    held: nothing is posted in it and its later messages go on. The lead is told once which message
+    is in doubt, before its queue item is removed.
 51. An entry with the same channel and message ID but a different envelope hash is a conflict:
     the conversation is held and reported, never silently resent.
 52. Delivered records are kept for 7 days or until the read position has passed the message and

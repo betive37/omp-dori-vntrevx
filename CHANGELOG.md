@@ -1,5 +1,16 @@
 # Changelog
 
+## Unreleased
+
+- An owner message that may or may not have reached the lead or a lane (in doubt) no longer
+  holds its Discord, Telegram or Slack room. It is still never sent again, but nothing is posted
+  in the room, the room's next messages go on to the lead or the thread's lane, and the lead is
+  told once which message it was (with its text when the lead's transcript could not be
+  searched). Before, every later message from that room waited until you ran
+  `cataly discord release <room>`. Rooms held that way are released when the hub starts. A
+  hand-off that definitely failed (two lanes claim the thread, the lane is closing, the message
+  changed) still holds the room, and `release` now gives up only such failed hand-offs.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a
