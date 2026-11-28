@@ -194,6 +194,9 @@
   queued durably while history loads, and each room waits for its older messages before hand-off.
   Temporary read failures reconnect; a permanently unreadable room is held without delaying
   catch-up or live messages in other rooms.
+- Owner messages from Telegram and Slack that had no answer got no reminder and did not keep the
+  lead from stopping or sleeping; only Discord did. Owed messages on every relay now do, and the
+  reminder names the message's own relay.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
