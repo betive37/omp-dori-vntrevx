@@ -8,6 +8,7 @@ use std::fmt::Write as _;
 use super::neutral;
 use crate::config::Language;
 use crate::host::Dialog;
+use crate::sys::secrets;
 
 /// The longest command shown, in characters, and its most lines.
 const COMMAND_MAX: usize = 900;
@@ -144,7 +145,8 @@ fn text(prompt: &str, language: Language) -> String {
         out.push_str(&short(&neutral(&others), DETAIL_MAX));
     }
     if let Some(command) = command {
-        let (shown, was_cut) = cut_command(&command);
+        // Masked before the cut, like the lines above; the dialog's own command is unchanged.
+        let (shown, was_cut) = cut_command(&secrets::mask(&command));
         let _ = write!(out, "\n**{}:**\n{}", w.command, fenced(&shown));
         if was_cut {
             out.push('\n');
@@ -221,6 +223,15 @@ mod tests {
             card,
             format!("**Permission asked**\n{padding} \\[masked\\]")
         );
+    }
+
+    #[test]
+    fn the_command_block_masks_a_credential() {
+        let token = format!("ghp_{}", "a".repeat(36));
+        let prompt = format!("Allow tool: bash\nCommand: curl -H 'Authorization: token {token}'");
+        let card = text(&prompt, Language::English);
+        assert!(!card.contains("ghp_"), "{card}");
+        assert!(card.contains("token [masked]'"), "{card}");
     }
 
     #[test]
