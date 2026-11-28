@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Cron and one-shot jobs could run 60 s or more late after waiting for a command slot. They now
+  recheck the start time after the wait and count the occurrence as skipped; a skipped one-shot
+  stays consumed and on hold, without starting a command.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

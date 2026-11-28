@@ -19,7 +19,7 @@ use super::event::{Emit, EventKind, Severity, build};
 use super::{Command, Ctx, JobsError, duration_ms, log_failure};
 
 /// An occurrence this late or later is skipped, never replayed.
-const LATE_MS: i64 = 60_000;
+pub(super) const LATE_MS: i64 = 60_000;
 /// Most skipped occurrences counted per evaluation.
 const SKIP_COUNT_MAX: u64 = 1000;
 /// Longest single sleep.

@@ -239,10 +239,12 @@ lead's OMP session. The new model: **one Rust daemon, one job table, one typed e
 55. A preview option validates and shows the next five trigger instants (UTC and the job's zone) without saving or
     running anything.
 56. Cron due handling: an occurrence starting less than 60 s late runs; 60 s or more late is counted as skipped (at
-    most 1,000 counted per evaluation) and never replayed. An occurrence due while the previous run or its delivery
-    is unfinished is counted as skipped: runs never overlap.
+    most 1,000 counted per evaluation) and never replayed. Lateness includes waiting for a command slot and is
+    checked again after acquiring it, before recording a run. An occurrence due while the previous run or its
+    delivery is unfinished is counted as skipped: runs never overlap.
 57. One-shot due handling: the job is consumed (put on hold) atomically before running or skipping; 60 s or more
-    late is skipped. A consumed one-shot cannot be resumed; a new job is needed.
+    late, including time waiting for a command slot, is skipped. A consumed one-shot cannot be resumed; a new job
+    is needed.
 58. Condition due handling: next probe at the later of finish time and scheduled time, plus the interval. A
     backwards clock step never probes early.
 59. Run: before spawning, durably record a run ID, scheduled instant and start time; spawn with stdin closed and
