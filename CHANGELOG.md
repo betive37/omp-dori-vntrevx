@@ -7,7 +7,7 @@
   had no way to queue for a slot. The command after `--` is now judged by rule 0 as its own line:
   `cataly slot b -- cargo test` runs, `cataly slot b -- omp usage reset` is still refused, and a
   slot whose command is not known from the text (nothing after `--`, a word before it that the
-  shell may expand, `xargs` or `find` in front) is refused as before.
+  shell may expand, including `~`, or `xargs` or `find` in front) is refused as before.
 
 ## 0.2.8 (2026-11-28)
 

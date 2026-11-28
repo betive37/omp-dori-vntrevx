@@ -197,7 +197,7 @@ fn segment_blocked(raw: &[String], words: &[Option<String>], depth: usize) -> bo
     // `cataly slot` at `s` runs the command after the first literal `--` without a shell: that
     // command is judged as its own segment. It fails closed whenever the line the CLI gets is not
     // known from the text: a word before `--` that may expand to `--` and a command (unresolved,
-    // with spaces, or with `$`, braces or glob characters), no command after `--` (a runner may
+    // with spaces, or with `$`, `~`, braces or glob characters), no command after `--` (a runner may
     // append one), a runner in front that appends arguments, or nesting deeper than `NESTING`.
     // A help flag before `--` prints help and runs nothing.
     let slot_blocked = |s: usize| {
@@ -217,7 +217,7 @@ fn segment_blocked(raw: &[String], words: &[Option<String>], depth: usize) -> bo
             })
             || head_raw
                 .iter()
-                .any(|w| w.contains(['$', '{', '}', '*', '?', '[']))
+                .any(|w| w.contains(['$', '~', '{', '}', '*', '?', '[']))
         {
             return true;
         }
@@ -560,6 +560,24 @@ mod tests {
             judge("cataly slot b -- git push", &deny, &[], &mut grants).rules,
             [1]
         );
+    }
+
+    #[test]
+    fn a_slot_with_tilde_in_its_head_fails_closed() {
+        for cmd in [
+            "cataly slot ~ -- make",
+            "cataly slot ~root -- make",
+            "cataly slot b~ -- make",
+            "cataly slot b --lane ~/lane -- make",
+            "cataly slot a -- cataly slot ~ -- make",
+            // HOME may expand `~` into a delimiter before the one visible in the text.
+            "HOME=--; cataly slot b ~ omp usage reset -- true",
+            "HOME=--; cataly slot b ~ omp usage reset --help",
+        ] {
+            assert!(rule_zero(cmd), "{cmd}");
+        }
+        // A tilde argument after `--` does not make the slot's head unknown.
+        assert!(!rule_zero("cataly slot b -- echo ~"));
     }
 
     #[test]
