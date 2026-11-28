@@ -4,8 +4,9 @@
 
 - Slack reconnects and retries transient catch-up failures before taking live messages, so a
   newer message cannot move the saved position past requests missed while disconnected. A
-  permanently unreadable room is held with its position preserved until released, without
-  stopping messages in other rooms.
+  room-specific permanent read refusal holds that room with its position preserved until released,
+  without stopping messages in other rooms. Token-wide errors and responses without a success
+  field reconnect instead of leaving rooms held.
 
 ## 0.2.8 (2026-11-28)
 

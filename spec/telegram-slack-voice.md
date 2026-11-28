@@ -217,8 +217,10 @@ Totals: KEEP 36, SIMPLIFY 12, MERGE 3, DROP 11 (62 capabilities).
     Dedupe key is channel plus message timestamp, shared with live events. If a catch-up read fails
     transiently (transport, server error or rate limit), reconnect and retry before admitting or
     acknowledging live events, so they cannot advance a position past messages not yet fetched.
-    A permanent read refusal (such as a missing room or missing permission) holds only that room
-    until the owner releases it: its position is preserved and other rooms keep receiving messages.
+    Token-wide authentication failures and responses without a success field also reconnect without
+    holding rooms. A room-specific permanent refusal (such as a missing room or missing permission)
+    holds only that room until the owner releases it: its position is preserved and other rooms
+    keep receiving messages.
 40. SLACK-06 Every post records its thread (channel, root timestamp) with seen position = the post's
     timestamp, keyed by workspace and account. An already recorded thread keeps its older position.
 41. SLACK-06 Replies in remembered threads are admitted without a mention. Seen positions only move

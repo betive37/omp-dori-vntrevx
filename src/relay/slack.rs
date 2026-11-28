@@ -12,7 +12,8 @@
 //!   position is the seen timestamp). Every envelope is acknowledged within 3 s, after the event was
 //!   admitted or dropped. After start and every reconnect, remembered threads and DMs are read from
 //!   their positions (200 at most, oldest first). A transient catch-up failure reconnects before
-//!   taking live events, so their hand-off cannot skip unread messages. A permanent read failure
+//!   taking live events, so their hand-off cannot skip unread messages. Token failures and responses
+//!   without a success field also reconnect without holding rooms. A room-specific permanent refusal
 //!   holds only that room until released, preserving its position while other rooms continue.
 //!   Own and bot messages are dropped; a reply whose channel or root disagrees with where it was read
 //!   stops that read. Only allowlisted senders are admitted (owner decision 10: the owner alone by
@@ -124,12 +125,20 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
-    /// Transport, server and rate-limit failures may pass without changing the room or credentials.
-    fn retryable_read(&self) -> bool {
+    /// Connection, response and token failures must not leave individual rooms permanently held.
+    fn reconnect_read(&self) -> bool {
         self.status
-            .is_none_or(|s| matches!(s, 408 | 429 | 500..=599))
+            .is_none_or(|s| matches!(s, 401 | 408 | 429 | 500..=599))
             || UNCERTAIN_ERRORS.contains(&self.why.as_str())
-            || self.why == "ratelimited"
+            || matches!(
+                self.why.as_str(),
+                "ratelimited"
+                    | "no success field"
+                    | "invalid_auth"
+                    | "token_revoked"
+                    | "account_inactive"
+                    | "not_authed"
+            )
     }
 }
 
@@ -1191,7 +1200,7 @@ impl<T: Runtime> Socket<T> {
             };
             let v = match self.api.call(method, &args, Kind::Read, false).await {
                 Ok(v) => v,
-                Err(e) if e.retryable_read() => return Err(e.to_string()),
+                Err(e) if e.reconnect_read() => return Err(e.to_string()),
                 Err(e) => {
                     let reason = format!("catch-up read: {e}");
                     log::warn(
@@ -1271,32 +1280,43 @@ mod tests {
     }
 
     #[test]
-    fn catch_up_errors_retry_only_when_transient() {
-        let retryable = |status, why: &str| {
+    fn catch_up_errors_distinguish_room_and_connection_failures() {
+        let reconnects = |status, why: &str| {
             ApiError {
                 status,
                 why: why.into(),
                 uncertain: false,
             }
-            .retryable_read()
+            .reconnect_read()
         };
         for status in [None, Some(408), Some(429), Some(500), Some(503)] {
-            assert!(retryable(status, "transport failure"));
+            assert!(reconnects(status, "transport failure"));
         }
-        for why in UNCERTAIN_ERRORS.into_iter().chain(["ratelimited"]) {
-            assert!(retryable(Some(200), why), "{why}");
+        for why in UNCERTAIN_ERRORS
+            .into_iter()
+            .chain(["ratelimited", "no success field"])
+        {
+            assert!(reconnects(Some(200), why), "{why}");
+        }
+        assert!(reconnects(Some(401), "refused"));
+        for why in [
+            "invalid_auth",
+            "token_revoked",
+            "account_inactive",
+            "not_authed",
+        ] {
+            assert!(reconnects(Some(200), why), "{why}");
         }
         for why in [
             "thread_not_found",
             "channel_not_found",
             "not_in_channel",
             "missing_scope",
-            "invalid_auth",
         ] {
-            assert!(!retryable(Some(200), why), "{why}");
+            assert!(!reconnects(Some(200), why), "{why}");
         }
-        for status in [400, 401, 403, 404] {
-            assert!(!retryable(Some(status), "refused"));
+        for status in [400, 403, 404] {
+            assert!(!reconnects(Some(status), "refused"));
         }
     }
 
