@@ -367,7 +367,7 @@ fn start_run(ctx: &Arc<Ctx>, job: &Arc<Job>, scheduled_ms: i64, consume: bool) {
     tokio::spawn(async move {
         let dry = job.dry_run;
         let probe = job.trigger.every().is_some();
-        if let Err(e) = super::perform(&ctx, &job, scheduled_ms, dry, consume).await {
+        if let Err(e) = super::perform(&ctx, &job, Some(scheduled_ms), dry, consume).await {
             log_failure("job run failed", &job.name, &e);
         }
         ctx.release(&job.name);

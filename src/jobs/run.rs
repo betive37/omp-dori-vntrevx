@@ -23,7 +23,8 @@ const OUTPUT_CAP: u64 = 1024 * 1024;
 /// One run to perform.
 pub(super) struct Request {
     pub(super) job: Arc<Job>,
-    pub(super) scheduled_ms: i64,
+    /// A scheduler occurrence; `None` for a manual run, which has no lateness limit.
+    pub(super) scheduled_ms: Option<i64>,
     pub(super) dry: bool,
     /// One-shot: consume the job in the same transaction that records the run.
     pub(super) consume: bool,
@@ -114,17 +115,19 @@ pub(super) async fn execute(ctx: &Ctx, req: Request) -> Result<Vec<EventRecord>,
 async fn execute_with_clock(
     ctx: &Ctx,
     req: Request,
-    clock: impl FnOnce() -> i64,
+    mut clock: impl FnMut() -> i64,
 ) -> Result<Vec<EventRecord>, JobsError> {
     static SEQ: AtomicU64 = AtomicU64::new(0);
+    let scheduled_ms = req.scheduled_ms.unwrap_or_else(&mut clock);
     let _slot = ctx
         .command_slots
         .acquire()
         .await
         .map_err(|_| JobsError::Stopped)?;
     let started_ms = clock();
-    if matches!(req.job.trigger, Trigger::Cron { .. } | Trigger::Once { .. })
-        && started_ms.saturating_sub(req.scheduled_ms) >= super::schedule::LATE_MS
+    if req.scheduled_ms.is_some()
+        && matches!(req.job.trigger, Trigger::Cron { .. } | Trigger::Once { .. })
+        && started_ms.saturating_sub(scheduled_ms) >= super::schedule::LATE_MS
     {
         return skip_late(ctx, &req, started_ms).await;
     }
@@ -146,7 +149,7 @@ async fn execute_with_clock(
         .run_started(RunStart {
             job: job.name.clone(),
             dry: req.dry,
-            scheduled_ms: req.scheduled_ms,
+            scheduled_ms,
             started_ms,
             stdout_path: stdout_path.display().to_string(),
             stderr_path: stderr_path.as_ref().map(|p| p.display().to_string()),
@@ -172,7 +175,7 @@ async fn execute_with_clock(
     let mut facts = Facts {
         run,
         dry: req.dry,
-        scheduled_ms: req.scheduled_ms,
+        scheduled_ms,
         started_ms,
         exit_code: None,
         signal: None,
@@ -728,7 +731,7 @@ mod tests {
                     &ctx,
                     Request {
                         job,
-                        scheduled_ms: due,
+                        scheduled_ms: Some(due),
                         dry,
                         consume,
                     },
@@ -773,6 +776,76 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn manual_timed_runs_wait_for_a_slot_without_being_skipped() {
+        for trigger in [
+            "kind = \"once\"\nat = \"2030-01-01T00:00:00Z\"",
+            "kind = \"cron\"\ncron = \"* * * * *\"\nzone = \"UTC\"",
+        ] {
+            let cfg = format!("[jobs.t]\n{trigger}\nargv = [\"echo\", \"ran\"]\ncwd = \"/\"\n");
+            let (ctx, _stop, _dir) = ctx_with(&cfg, "run-manual-slot");
+            let job = ctx.config().jobs.get("t").cloned().unwrap();
+            let before = ctx
+                .store
+                .register_job(crate::store::JobRegistration {
+                    name: job.name.clone(),
+                    kind: job.kind(),
+                    trigger: job.trigger.canonical(),
+                    next_due_ms: Some(now_ms() + 120_000),
+                    now_ms: now_ms(),
+                })
+                .await
+                .unwrap();
+            let slots = ctx.command_slots.acquire_many(4).await.unwrap();
+            tokio::time::pause();
+            let queued = tokio::time::Instant::now();
+            let began = now_ms();
+            let run = execute_with_clock(
+                &ctx,
+                Request {
+                    job,
+                    // Jobs::run_once passes no scheduled occurrence for a manual dry tick.
+                    scheduled_ms: None,
+                    dry: true,
+                    consume: false,
+                },
+                || began + crate::jobs::duration_ms(queued.elapsed()),
+            );
+            tokio::pin!(run);
+            assert!(
+                poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+            assert!(
+                poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            // Only the slot wait uses simulated time; let the real child finish normally.
+            tokio::time::resume();
+            drop(slots);
+            let events = run.await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "run.done");
+            assert!(events[0].dry);
+            assert_eq!(events[0].body.as_deref(), Some("ran\n"));
+            let runs = ctx.store.read(Reads::last_runs).await.unwrap();
+            assert_eq!(runs.len(), 1);
+            assert!(runs[0].dry);
+            assert_eq!(runs[0].exit_code, Some(0));
+            assert_eq!(runs[0].scheduled_ms, began);
+            assert!(runs[0].started_ms >= began + 61_000);
+            let after = ctx.store.read(|r| r.job("t")).await.unwrap().unwrap();
+            assert_eq!(after.skipped, 0);
+            assert_eq!(
+                after, before,
+                "manual runs leave scheduling state untouched"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn timed_run_reports_output_and_failure() {
         let cfg = "[jobs.t]\nkind = \"once\"\nat = \"2030-01-01T00:00:00Z\"\nargv = [\"sh\", \"-c\", \"echo hello; exit 3\"]\ncwd = \"/\"\n";
         let (ctx, _stop, _dir) = ctx_with(cfg, "run-timed");
@@ -781,7 +854,7 @@ mod tests {
             &ctx,
             Request {
                 job,
-                scheduled_ms: now_ms(),
+                scheduled_ms: Some(now_ms()),
                 dry: false,
                 consume: false,
             },
@@ -812,7 +885,7 @@ mod tests {
         let job = ctx.config().jobs.get("p").cloned().unwrap();
         let req = |job: &Arc<Job>| Request {
             job: Arc::clone(job),
-            scheduled_ms: 1,
+            scheduled_ms: Some(1),
             dry: false,
             consume: false,
         };
@@ -858,7 +931,7 @@ mod tests {
                 &ctx,
                 Request {
                     job,
-                    scheduled_ms: 1,
+                    scheduled_ms: Some(1),
                     dry: false,
                     consume: false,
                 },

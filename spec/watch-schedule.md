@@ -240,8 +240,9 @@ lead's OMP session. The new model: **one Rust daemon, one job table, one typed e
     running anything.
 56. Cron due handling: an occurrence starting less than 60 s late runs; 60 s or more late is counted as skipped (at
     most 1,000 counted per evaluation) and never replayed. Lateness includes waiting for a command slot and is
-    checked again after acquiring it, before recording a run. An occurrence due while the previous run or its
-    delivery is unfinished is counted as skipped: runs never overlap.
+    checked again after acquiring it, before recording a run. This lateness limit applies only to scheduled
+    occurrences, not manual dry runs. An occurrence due while the previous run or its delivery is unfinished is
+    counted as skipped: runs never overlap.
 57. One-shot due handling: the job is consumed (put on hold) atomically before running or skipping; 60 s or more
     late, including time waiting for a command slot, is skipped. A consumed one-shot cannot be resumed; a new job
     is needed.

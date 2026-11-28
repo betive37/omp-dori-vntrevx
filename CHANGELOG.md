@@ -4,7 +4,8 @@
 
 - Cron and one-shot jobs could run 60 s or more late after waiting for a command slot. They now
   recheck the start time after the wait and count the occurrence as skipped; a skipped one-shot
-  stays consumed and on hold, without starting a command.
+  stays consumed and on hold, without starting a command. Manual dry runs still wait for a slot
+  and run fully, without changing the scheduled job's skipped count.
 
 ## 0.2.8 (2026-11-28)
 
