@@ -197,6 +197,8 @@
 - Owner messages from Telegram and Slack that had no answer got no reminder and did not keep the
   lead from stopping or sleeping; only Discord did. Owed messages on every relay now do, and the
   reminder names the message's own relay.
+- Request notes that would exceed 16 KiB are refused instead of silently truncated while reporting
+  success. Automatic question notes are skipped when the request's notes are full.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
