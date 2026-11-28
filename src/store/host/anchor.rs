@@ -100,7 +100,28 @@ pub(super) fn continued(
         params![update.handle, id, file],
     )?;
     if changed != 1 {
-        return Err(rusqlite::Error::InvalidQuery);
+        // A verified move keeps the ID. Relocate its earlier bindings too, so a later pin does
+        // not mistake launch history for multiple transcripts. Never touch another identity.
+        let previous: String = tx.query_row(
+            "SELECT session_file FROM lead_bindings WHERE handle = ?1 AND session_id = ?2 \
+             AND EXISTS(SELECT 1 FROM lead_anchor WHERE handle = ?1)",
+            params![update.handle, id],
+            |row| row.get(0),
+        )?;
+        let changed = tx.execute(
+            "UPDATE lead_bindings SET session_file = ?2 WHERE session_id = ?1 AND session_file = ?3 \
+             AND NOT EXISTS(SELECT 1 FROM lead_bindings WHERE session_id = ?1 \
+                 AND session_file NOT IN (?2, ?3))",
+            params![id, file, previous],
+        )?;
+        if changed == 0 {
+            return Err(rusqlite::Error::InvalidQuery);
+        }
+        tx.execute(
+            "UPDATE sessions SET session_file = ?2 WHERE session_id = ?1 AND session_file = ?3 \
+             AND handle IN (SELECT handle FROM lead_bindings WHERE session_id = ?1 AND session_file = ?2)",
+            params![id, file, previous],
+        )?;
     }
     super::update(tx, update, now)
 }

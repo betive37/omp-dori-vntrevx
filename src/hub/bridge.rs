@@ -136,56 +136,83 @@ async fn decide(
 /// A resume or tree move carries no authority from the previous conversation (EXT req. 8).
 /// Match both the ID and transcript before forwarding the transition to the terminal port.
 async fn switched(hub: &Hub, params: &Value, worker: Option<&str>) -> Option<(String, Role)> {
-    let session = params.get("session")?.as_str()?.to_string();
-    let file = params.get("file")?.as_str()?;
-    if session.is_empty() || file.is_empty() {
+    let id = params.get("session")?.as_str()?;
+    let raw_file = params.get("file")?.as_str()?;
+    if id.is_empty() || raw_file.is_empty() {
         return None;
     }
+    let session = id.to_string();
+    let from = worker.map(str::to_owned);
     let local = worker.is_none();
     let file = if local {
-        crate::sys::fs::canonical_file(std::path::Path::new(file))
+        crate::sys::fs::canonical_file(std::path::Path::new(raw_file))
             .ok()?
             .into_os_string()
             .into_string()
             .ok()?
     } else {
-        file.to_string()
+        raw_file.to_string()
     };
-    hub.store
+    let (exact, moves) = hub
+        .store
         .read(move |r| {
-            let same_file = |stored: Option<&str>| {
-                stored.is_some_and(|stored| {
-                    if local {
-                        crate::sys::fs::canonical_file(std::path::Path::new(stored))
-                            .is_ok_and(|path| path.to_str() == Some(file.as_str()))
-                    } else {
-                        stored == file
-                    }
-                })
+            let same_file = |stored: &str| {
+                if local {
+                    crate::sys::fs::canonical_file(std::path::Path::new(stored))
+                        .is_ok_and(|path| path.to_str() == Some(file.as_str()))
+                } else {
+                    stored == file
+                }
             };
-            if let Some(row) = r.lead_target(None)?.row
+            let mut moves = Vec::new();
+            if local
+                && let Some(row) = r.lead_target(None)?.row
                 && row.session_id.as_deref() == Some(session.as_str())
-                && same_file(row.session_file.as_deref())
+                && let Some(previous) = row.session_file
             {
-                return Ok(Some((row.handle, Role::Lead)));
+                let known = (row.handle, Role::Lead);
+                if same_file(&previous) {
+                    return Ok((Some(known), Vec::new()));
+                }
+                moves.push((known, previous));
             }
             for row in r.lanes(true)? {
                 let Ok(rec) = serde_json::from_str::<crate::lanes::record::Record>(&row.record)
                 else {
                     continue;
                 };
-                if rec.session_id.as_deref() == Some(session.as_str())
-                    && same_file(rec.session_file.as_deref())
-                    && let Some(handle) = rec.handle
+                if rec.worker.as_deref() == from.as_deref()
+                    && rec.session_id.as_deref() == Some(session.as_str())
+                    && let (Some(handle), Some(previous)) = (rec.handle, rec.session_file)
                 {
-                    return Ok(Some((handle, Role::Lane)));
+                    let known = (handle, Role::Lane);
+                    if same_file(&previous) {
+                        return Ok((Some(known), Vec::new()));
+                    }
+                    moves.push((known, previous));
                 }
             }
-            Ok(None)
+            Ok((None, moves))
         })
         .await
-        .ok()
-        .flatten()
+        .ok()?;
+    if exact.is_some() {
+        return exact;
+    }
+    // Read headers only after exact matching failed, and only on the session's own machine.
+    for ((handle, role), previous) in moves {
+        let path = worker.map_or_else(
+            || raw_file.into(),
+            |w| crate::worker::remote_path(w, raw_file).into(),
+        );
+        if let Ok(Some(file)) =
+            crate::omp::transcript::verify_move(path, id.into(), previous.into()).await
+            && continue_session(hub, &handle, role, &json!({"session":id, "file":file})).await
+        {
+            return Some((handle, role));
+        }
+    }
+    None
 }
 
 /// A continuation is acknowledged only once its identity survives reconnects and restarts.

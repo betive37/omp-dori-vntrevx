@@ -210,6 +210,51 @@ fn bridge_role_identity_matches_canonical_transcript_aliases() {
 }
 
 #[test]
+fn bridge_transcript_moves_keep_roles_and_persist_the_new_path() {
+    let (mut hub, lead) = lead_hub();
+    let lane = open_lane(&hub);
+    for (role, original) in [("lead", lead), ("lane", lane)] {
+        let old = std::path::Path::new(original["session_file"].as_str().unwrap());
+        let alias = hub.root.join(format!("old-{role}"));
+        std::os::unix::fs::symlink(old.parent().unwrap(), &alias).unwrap();
+        let mut header =
+            json!({"type":"session", "id":original["session_id"], "cwd":hub.root.join("work")});
+        std::fs::write(old, format!("{header}\n")).unwrap();
+        let mut bridge = Bridge::connect(&hub, &original, role);
+        let dir = hub.root.join(format!("moved-{role}"));
+        std::fs::create_dir(&dir).unwrap();
+        let file = dir.join(old.file_name().unwrap());
+        std::fs::rename(old, &file).unwrap();
+        // OMP moveTo rewrites the header with its old path, which may use a directory alias.
+        header["previousSessionFiles"] = json!([alias.join(old.file_name().unwrap())]);
+        std::fs::write(&file, format!("{header}\n")).unwrap();
+        let moved = json!({"session_id":original["session_id"], "session_file":file});
+        let answer = bridge.switch(&moved, "session_current");
+        assert_eq!(answer["role"], role, "{answer}");
+        assert_eq!(answer["tools"][0]["name"], format!("cataly_{role}"));
+        let recorded = if role == "lead" {
+            hub.json(&["lead", "status", "--json"])["anchor"].clone()
+        } else {
+            hub.json(&["lane", "list", "--json"])[0].clone()
+        };
+        assert_eq!(recorded["session_id"], original["session_id"]);
+        assert_eq!(
+            recorded["session_file"],
+            json!(std::fs::canonicalize(&file).unwrap())
+        );
+        drop(bridge);
+        let mut returned = Bridge::connect(&hub, &recorded, role);
+        // Copying even a previously moved transcript does not link it to the current stored path.
+        let copied_file = dir.join("copy.jsonl");
+        std::fs::copy(&file, &copied_file).unwrap();
+        let copy = json!({"session_id":original["session_id"], "session_file":copied_file});
+        assert_eq!(returned.switch(&copy, "resume")["role"], "none");
+        drop(returned);
+    }
+    hub.stop();
+}
+
+#[test]
 fn bridge_continuations_store_canonical_transcript_paths() {
     let (mut hub, lead) = lead_hub();
     let lane = open_lane(&hub);

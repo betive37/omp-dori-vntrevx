@@ -86,6 +86,36 @@ fn a_continued_identity_moves_the_anchor_and_its_pin_together() {
 }
 
 #[test]
+fn a_moved_identity_keeps_binding_history_unambiguous() {
+    let mut db = database();
+    attempt(&mut db, "old", "fresh", 1);
+    bind(&mut db, "old", "original", 2);
+    attempt(&mut db, "current", "resume", 3);
+    bind(&mut db, "current", "original", 4);
+    let tx = db.transaction().unwrap();
+    continued(
+        &tx,
+        &SessionUpdate {
+            handle: "current".into(),
+            session_id: Some("original".into()),
+            session_file: Some("/moved/original.jsonl".into()),
+            ..SessionUpdate::default()
+        },
+        5,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    // The moved identity must remain selectable after a later fresh launch, not look like two files.
+    attempt(&mut db, "fresh", "fresh", 6);
+    bind(&mut db, "fresh", "other", 7);
+    let selected = Reads(db).lead_target(Some("original")).unwrap();
+    assert!(selected.hold.is_none(), "{selected:?}");
+    let row = selected.row.unwrap();
+    assert_eq!(row.handle, "current");
+    assert_eq!(row.session_file.as_deref(), Some("/moved/original.jsonl"));
+}
+
+#[test]
 fn a_continuation_preserves_launch_ownership_evidence() {
     let mut db = database();
     attempt(&mut db, "lead", "fresh", 1);
