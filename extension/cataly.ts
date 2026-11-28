@@ -9,6 +9,7 @@ import { dirname } from "node:path";
 import type {
 	AgentToolResult, BeforeAgentStartEvent, BeforeAgentStartEventResult, ExtensionAPI, ExtensionAskDialogQuestion, ExtensionContext,
 	MessageEndEvent, SessionStopEventResult, ToolCallEvent, ToolCallEventResult, ToolDefinition, ToolExecutionEndEvent, ToolExecutionStartEvent,
+	ToolExecutionUpdateEvent,
 } from "@oh-my-pi/pi-coding-agent";
 
 const PROTOCOL = 1;
@@ -399,6 +400,7 @@ export class Bridge {
 		pi.on("message_end", (e, ctx) => this.message(e, ctx));
 		pi.on("tool_execution_start", (e, ctx) => this.toolStart(e, ctx));
 		pi.on("tool_execution_end", (e, ctx) => this.toolEnd(e, ctx));
+		pi.on("tool_execution_update", (e, ctx) => this.toolUpdate(e, ctx));
 		// The main agent's events the hub follows, each with the fields it reads; payloads differ across OMP versions.
 		const dialog = (e: Json) => ({ call: e.toolCallId ?? e.reviewId, tool: e.toolName, choice: e.choice });
 		const goal = (e: Json) => ({ status: (e.goal as Json)?.status ?? e.status, objective: (e.goal as Json)?.objective ?? e.objective });
@@ -597,8 +599,22 @@ export class Bridge {
 		const running = async?.state === "running";
 		if (call) [call.error, call.running] = [Boolean(e.isError), running];
 		if (call) call.fingerprint = running ? undefined : fingerprint(call.tool, result);
-		const job = async?.jobId;
-		this.event("tool_execution_end", { call: id, tool: e.toolName, error: Boolean(e.isError), job });
+		const [job, state] = [async?.jobId, async?.state];
+		this.event("tool_execution_end", { call: id, tool: e.toolName, error: Boolean(e.isError), job, state });
+	}
+
+	/** A backgrounded call's job settles in a later update for the same call (EXT req. 23): completed gives the final
+	 * result's fingerprint; failed or cancelled marks the call as an error. Earlier frames and other calls change nothing. */
+	toolUpdate(e: ToolExecutionUpdateEvent, ctx: Ctx): void {
+		if (!this.main(ctx)) return;
+		const id = String(e.toolCallId ?? "");
+		const call = this.calls.get(id);
+		const result = e.partialResult as Json | undefined;
+		const async = (result?.details as Json | undefined)?.async as Json | undefined;
+		if (!call?.running || !async || async.state === "running") return;
+		[call.running, call.error] = [false, async.state !== "completed"];
+		call.fingerprint = call.error ? undefined : fingerprint(call.tool, result);
+		this.event("tool_job_end", { call: id, tool: e.toolName, job: async.jobId, state: async.state });
 	}
 
 	/** Forwards one tool call with its recorded call facts (EXT req. 18, 21-22); the hub judges them. */

@@ -277,6 +277,22 @@ mod tests {
     }
 
     #[test]
+    fn a_running_background_call_is_refused() {
+        let facts = json!([
+            { "call": "b1", "seen": true, "tool": "bash", "running": true },
+            { "call": "b2", "seen": true, "tool": "bash", "running": false, "fingerprint": "f2" }
+        ]);
+        assert_eq!(
+            tool_items(&["b1".into()], Some(&facts)).unwrap_err(),
+            "call b1: its background job has not completed"
+        );
+        assert_eq!(
+            tool_items(&["b2".into()], Some(&facts)).unwrap(),
+            [("tool:f2".to_string(), "f2".to_string())]
+        );
+    }
+
+    #[test]
     fn display_and_thread_text_clean() {
         assert_eq!(display("a\u{1b}[31mb\n\nc\u{7}"), "ab c");
         assert_eq!(

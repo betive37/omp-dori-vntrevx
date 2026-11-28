@@ -441,7 +441,7 @@ test("a session without Tern answers model.resolve and still takes no other comm
 	expect(calls).toEqual([]);
 });
 
-test("a call OMP moved to the background is reported running, with no fingerprint (EVR req. 11)", async () => {
+test("a call OMP moved to the background is refused while running and bound to its job's outcome (EVR req. 11, EXT req. 23)", async () => {
 	const pi = fakePi();
 	const sent: any[] = [];
 	bridge(pi, { env: { CATALY_LAUNCH: "tok", CATALY_SOCKET: "/x.sock" }, connect: fakeHub("lead", sent, { n: 0 }), uid: () => 1 });
@@ -450,9 +450,34 @@ test("a call OMP moved to the background is reported running, with no fingerprin
 	await pi.emit("tool_execution_start", { toolCallId: "b1", toolName: "bash", args: { command: "cargo test" } }, ctx);
 	const details = { async: { state: "running", jobId: "j1", type: "bash" } };
 	await pi.emit("tool_execution_end", { toolCallId: "b1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "started" }], details } }, ctx);
-	expect(sent.find(m => m.params?.kind === "tool_execution_end").params).toMatchObject({ call: "b1", job: "j1" });
-	await pi.tools[0].execute("t1", { op: "done", calls: ["b1"] }, undefined, undefined, ctx);
-	const fact = sent.find(m => m.method === "bridge.tool").params.facts[0];
-	expect(fact).toMatchObject({ call: "b1", seen: true, running: true });
-	expect(fact.fingerprint).toBeUndefined();
+	expect(sent.find(m => m.params?.kind === "tool_execution_end").params).toMatchObject({ call: "b1", job: "j1", state: "running" });
+	const facts = async (call: string) => {
+		await pi.tools[0].execute("t1", { op: "done", calls: [call] }, undefined, undefined, ctx);
+		return sent.filter(m => m.method === "bridge.tool").at(-1).params.facts[0];
+	};
+	const running = await facts("b1");
+	expect(running).toMatchObject({ call: "b1", seen: true, running: true });
+	expect(running.fingerprint).toBeUndefined();
+	// OMP reports the settled job as a later update for the same call (19.1.1 tools/bash.ts, onDetachedToolUpdate).
+	const update = (call: string, state: string, text: string) =>
+		pi.emit("tool_execution_update", { toolCallId: call, toolName: "bash", partialResult: { content: [{ type: "text", text }], details: { async: { state, jobId: `j-${call}`, type: "bash" } } } }, ctx);
+	await update("b1", "running", "compiling");
+	expect((await facts("b1")).running).toBe(true);
+	await update("b1", "completed", "test result: ok");
+	const done = await facts("b1");
+	expect(done).toMatchObject({ running: false, error: false });
+	expect(done.fingerprint).toBe(fingerprint("bash", { content: [{ type: "text", text: "test result: ok" }], details: { async: { state: "completed", jobId: "j-b1", type: "bash" } } }));
+	expect(sent.find(m => m.params?.kind === "tool_job_end").params).toMatchObject({ call: "b1", job: "j-b1", state: "completed" });
+	// A failed job stays refused; an update for a call that never ran in the background changes nothing.
+	await pi.emit("tool_execution_start", { toolCallId: "b2", toolName: "bash", args: { command: "cargo build" } }, ctx);
+	await pi.emit("tool_execution_end", { toolCallId: "b2", toolName: "bash", isError: false, result: { content: [], details: { async: { state: "running", jobId: "j-b2" } } } }, ctx);
+	await update("b2", "failed", "error[E0308]");
+	const failed = await facts("b2");
+	expect(failed).toMatchObject({ running: false, error: true });
+	expect(failed.fingerprint).toBeUndefined();
+	await pi.emit("tool_execution_start", { toolCallId: "b3", toolName: "bash", args: { command: "ls" } }, ctx);
+	await pi.emit("tool_execution_end", { toolCallId: "b3", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "a" }] } }, ctx);
+	const before = (await facts("b3")).fingerprint;
+	await update("b3", "completed", "other");
+	expect((await facts("b3")).fingerprint).toBe(before);
 });
