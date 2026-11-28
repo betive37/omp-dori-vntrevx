@@ -231,6 +231,8 @@ relative to the worktree, and the hash or JSON field is checked on the hub. `pr_
 worker can lie about its own `command` and `file` results (2.9); merges still need the owner's
 authorisation and `pr_merged` is read on the hub. File evidence in a report or step is read the same
 way: `stat`, `read` (8 MiB at most) and `stat` again on the worker, hashed on the hub.
+The path must stay within the worker root without `..`; a symlink loop or an unreadable directory
+there reads as missing, as `stat` does not tell the reason.
 
 ### 2.8 Version skew and updates
 

@@ -98,7 +98,8 @@ lane lifecycle area consumes the completion checker, the step records and the pu
    unreadable file are each refused with their own reason. A worker lane's working directory is on its worker:
    there the file is resolved, sized and read through the worker's `stat` and `read`, at most 8 MiB (larger files
    are refused), and a changed resolved path or size between the `stat` before and after the read refuses the report
-   the same way.
+   the same way. On a worker the path must stay within the worker's root without `..`, and a symlink loop or an
+   unreadable directory reads as missing (the worker's `stat` does not tell the reason).
 10. Tool evidence: each ID must name a tool call on the session's current branch whose result is present, not an
     error, and not pruned, and whose result belongs to the same tool. The extension, not the lane, reads the branch.
 11. When a tool call only launched background work, it counts only if the extension saw OMP report that work as completed
