@@ -117,8 +117,9 @@ pub(crate) struct View {
 
 impl View {
     /// The target's ID and path, the startup phase with its elapsed time, the attempt count and
-    /// next retry, how the last attempt ended with its cleanup, and the last lease answer.
-    fn startup_lines(&self, now: i64) -> Vec<String> {
+    /// next retry, how the last attempt ended in plain words in the owner's `language`, and the
+    /// last lease answer.
+    fn startup_lines(&self, now: i64, language: crate::config::Language) -> Vec<String> {
         let ago = |ms: i64| (now - ms).max(0) / 1000;
         let until = |ms: i64| ((ms - now).max(0) + 999) / 1000;
         let attempts = 1 + super::startup::RETRY_DELAYS.len();
@@ -169,22 +170,16 @@ impl View {
                 .unwrap_or_default()
         };
         if let Some(f) = &self.attempt.failed {
-            let how = match (f.stage, f.outcome) {
-                (Some(stage), Some(outcome)) => format!(
-                    "{} {}",
-                    name(serde_json::to_value(stage)),
-                    name(serde_json::to_value(outcome))
-                ),
-                _ => "failed".into(),
-            };
-            let cleanup = f.cleanup.map_or_else(String::new, |c| {
-                format!("; cleanup {}", name(serde_json::to_value(c)))
+            // What happened, in plain words; its stage, outcome, cleanup and raw detail are in
+            // `cataly lead status --json`.
+            let (what, _) = f.cause.text(language);
+            let ago = ago(f.at_ms);
+            lines.push(match language {
+                crate::config::Language::Korean => format!("마지막 시도 ({ago}초 전): {what}"),
+                crate::config::Language::English => {
+                    format!("last attempt ({ago} s ago): {what}")
+                }
             });
-            lines.push(format!(
-                "last     {how} {} s ago{cleanup}: {}",
-                ago(f.at_ms),
-                f.detail
-            ));
         }
         if let Some(l) = &self.attempt.lease {
             lines.push(format!(
@@ -217,6 +212,9 @@ pub(crate) struct Failed {
     /// The process-ownership evidence of the attempt's cleanup.
     pub(crate) cleanup: Option<super::startup::Cleanup>,
     pub(crate) detail: String,
+    /// What the failure is about, as the owner reads it.
+    #[serde(skip)]
+    pub(crate) cause: notice::Cause,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -1249,6 +1247,7 @@ impl<R: Runtime> Lead<R> {
         resume: Option<(String, PathBuf)>,
     ) -> String {
         let detail = e.to_string();
+        let cause = notice::Cause::of(&detail);
         self.attempt().failed = Some(match e {
             StartError::Startup {
                 stage,
@@ -1261,6 +1260,7 @@ impl<R: Runtime> Lead<R> {
                 outcome: Some(*outcome),
                 cleanup: Some(*cleanup),
                 detail: detail.clone(),
+                cause,
             },
             StartError::Refused(why) => Failed {
                 at_ms: now_ms(),
@@ -1268,6 +1268,7 @@ impl<R: Runtime> Lead<R> {
                 outcome: None,
                 cleanup: None,
                 detail: why.clone(),
+                cause,
             },
         });
         self.update(SessionUpdate {
@@ -2006,7 +2007,7 @@ impl<R: Runtime> Lead<R> {
             notice,
             startup: Vec::new(),
         };
-        view.startup = view.startup_lines(now_ms());
+        view.startup = view.startup_lines(now_ms(), language);
         view
     }
 
@@ -2174,6 +2175,53 @@ impl<R: Runtime> Lead<R> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Plain `cataly lead status` says how the last attempt ended in the owner's language, with
+    /// the same plain cause as the hold texts; the raw detail stays in `--json`.
+    #[test]
+    fn the_last_attempt_line_is_plain_in_the_owner_language() {
+        let detail = "startup Ready Rejected: bad protocol (cleanup: LocalReaped)".to_string();
+        let view = View {
+            phase: Phase::Held,
+            reason: None,
+            session: None,
+            waiting: 0,
+            notes: 0,
+            sent: 0,
+            in_doubt: 0,
+            asleep: None,
+            anchor: None,
+            recovery: None,
+            attempt: Attempt {
+                started_ms: None,
+                failed: Some(Failed {
+                    at_ms: 1_000,
+                    stage: Some(crate::host::startup::StartupStage::Ready),
+                    outcome: Some(crate::host::startup::StartupOutcome::Rejected),
+                    cleanup: Some(crate::host::startup::Cleanup::LocalReaped),
+                    cause: notice::Cause::of(&detail),
+                    detail,
+                }),
+                lease: None,
+            },
+            recovering: false,
+            notice: None,
+            startup: Vec::new(),
+        };
+        assert_eq!(
+            view.startup_lines(31_000, crate::config::Language::Korean),
+            ["마지막 시도 (30초 전): lead를 시작했지만 준비되기 전에 멈췄어요."]
+        );
+        assert_eq!(
+            view.startup_lines(31_000, crate::config::Language::English),
+            ["last attempt (30 s ago): The lead was started but stopped before it was ready."]
+        );
+        let json = serde_json::to_value(&view).unwrap();
+        assert_eq!(
+            json["attempt"]["failed"]["detail"],
+            "startup Ready Rejected: bad protocol (cleanup: LocalReaped)"
+        );
+    }
 
     fn row(state: &str, how: Option<&str>, file: Option<&Path>) -> SessionRow {
         SessionRow {

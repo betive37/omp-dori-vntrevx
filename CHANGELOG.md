@@ -23,6 +23,9 @@
   and hold with the busy session named by the hub in that language, and every refusal the owner acts
   on. Errors meant for developers (a file, network or store failure) stay as they were said, inside
   those sentences. `--help` stays English, as it is for every command.
+  The last-attempt line of plain `cataly lead status` and the model-unverified notice no longer
+  quote raw internal text either: they say what happened in plain words in `[hub] language`, the
+  last attempt with the same causes as the hold texts; the raw detail stays in `--json`.
 - `cataly update` and `cataly rollback` during a voice call: a hub stop waits for the call to wind
   down (up to 90 s), but the update waited only 60 s and then failed with "the hub accepted the stop
   but did not end in time". The hub's stop answer now names the call's wind-down bound, and the
