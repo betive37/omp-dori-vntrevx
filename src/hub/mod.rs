@@ -231,6 +231,17 @@ impl Hub {
         }
     }
 
+    /// What an accepted stop tells its caller: how long a running voice call may take to wind
+    /// down before the hub ends (`serve` waits for it), so `cataly update` waits that long too.
+    #[cfg_attr(not(feature = "voice"), allow(clippy::unused_self))]
+    fn stopping(&self) -> crate::proto::Stopping {
+        #[cfg(feature = "voice")]
+        let voice_wind_down_s = self.voice.wind_down().map(|d| d.as_secs());
+        #[cfg(not(feature = "voice"))]
+        let voice_wind_down_s = None;
+        crate::proto::Stopping { voice_wind_down_s }
+    }
+
     /// Begins the orderly stop `hub.stop` accepted. The control connection calls it only once the
     /// acceptance is written: the hub may end at once, and the caller must still read it.
     fn stop(&self) {

@@ -497,8 +497,12 @@ async fn handle(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
         {
             relay_method(hub, relay, raw).await
         }
-        // The stop begins once this acceptance is written (`socket::connection`).
-        method::HUB_STOP => hub.may_stop().map(|()| Value::Null).map_err(refused),
+        // The stop begins once this acceptance is written (`socket::connection`); the answer says
+        // how long a voice call may keep the hub winding down.
+        method::HUB_STOP => hub
+            .may_stop()
+            .map_err(refused)
+            .and_then(|()| ok(&hub.stopping())),
         voice if voice.starts_with("voice.") => voice_method(hub, voice, raw).await,
         worker if worker.starts_with("worker.") => worker_method(hub, worker, raw).await,
         _ => Err(Failure {

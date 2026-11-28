@@ -28,6 +28,8 @@ use say::Say;
 const HUB_ANSWER: Duration = Duration::from_secs(1);
 /// The orderly stop: asked until accepted, at most this long (IR req. 33).
 const STOP_WAIT: Duration = Duration::from_mins(1);
+/// After a voice call's wind-down, the hub's own end (its socket and lock go) takes at most this.
+const END_MARGIN: Duration = Duration::from_secs(15);
 /// The new hub must answer with its version within this time.
 const START_WAIT: Duration = Duration::from_secs(30);
 /// `omp --version`: 5 s (IR req. 25).
@@ -498,20 +500,40 @@ async fn restart_switch(
 /// Asks the hub to stop until it accepts, then waits for it to end. A busy session (the lead or a
 /// lane working or waiting on a dialog) refuses; it is never stopped, and after 60 s the owner is
 /// told, in his language, which session the switch waits for. Sessions the owner started with OMP
-/// himself are not the hub's and are never asked.
+/// himself are not the hub's and are never asked. A hub that accepts while a voice call runs ends
+/// only once the call has wound down, within the bound its answer names: that bound is waited for,
+/// and the owner told so.
 async fn stop_hub(paths: &Paths, say: Say) -> Result<(), String> {
-    stop_hub_within(paths, STOP_WAIT, say).await
+    stop_hub_within(paths, STOP_WAIT, END_MARGIN, say).await
 }
 
-/// [`stop_hub`], given up after `wait`.
-async fn stop_hub_within(paths: &Paths, wait: Duration, say: Say) -> Result<(), String> {
-    let deadline = Instant::now() + wait;
+/// [`stop_hub`], given up after `wait`, or after the voice wind-down the accepting hub names plus
+/// `margin` when that is later.
+async fn stop_hub_within(
+    paths: &Paths,
+    wait: Duration,
+    margin: Duration,
+    say: Say,
+) -> Result<(), String> {
+    let mut deadline = Instant::now() + wait;
     let mut said = String::new();
+    let mut voice = None;
     loop {
         let answer = Client::connect(&paths.socket)
             .and_then(|mut c| c.call(method::HUB_STOP, json!({}), Duration::from_secs(5)));
         match answer {
-            Ok(_) | Err(ClientError::NoHub) => break,
+            Ok(reply) => {
+                // An older hub answers `null`: no bound beyond `wait`.
+                let stopping: crate::proto::Stopping =
+                    serde_json::from_value(reply).unwrap_or_default();
+                if let Some(seconds) = stopping.voice_wind_down_s {
+                    out::line(&say.voice_winding_down(seconds));
+                    deadline = deadline.max(Instant::now() + Duration::from_secs(seconds) + margin);
+                    voice = Some(seconds);
+                }
+                break;
+            }
+            Err(ClientError::NoHub) => break,
             // No answer: the hub may have accepted and ended before its answer was read. Only its
             // end, seen in time, shows that it stopped.
             Err(e @ (ClientError::Closed | ClientError::Io(_))) => {
@@ -536,10 +558,12 @@ async fn stop_hub_within(paths: &Paths, wait: Duration, say: Say) -> Result<(), 
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
     if ended_by(paths, deadline).await {
-        Ok(())
-    } else {
-        Err(say.hub_did_not_end())
+        return Ok(());
     }
+    Err(match voice {
+        Some(seconds) => say.voice_did_not_end(seconds),
+        None => say.hub_did_not_end(),
+    })
 }
 
 /// Waits until the hub has ended or `deadline` has passed; whether it ended.
@@ -1424,9 +1448,14 @@ mod tests {
             drop(held);
             request
         });
-        stop_hub_within(&paths, Duration::from_secs(10), Say(Language::English))
-            .await
-            .unwrap();
+        stop_hub_within(
+            &paths,
+            Duration::from_secs(10),
+            END_MARGIN,
+            Say(Language::English),
+        )
+        .await
+        .unwrap();
         assert!(hub.join().unwrap().contains(method::HUB_STOP));
     }
 
@@ -1438,7 +1467,8 @@ mod tests {
         let (listener, _held) = fake_hub(&paths);
         let hub = std::thread::spawn(move || close_unanswered(&listener));
         let started = Instant::now();
-        let held = stop_hub_within(&paths, Duration::from_millis(500), Say(Language::English))
+        let english = Say(Language::English);
+        let held = stop_hub_within(&paths, Duration::from_millis(500), END_MARGIN, english)
             .await
             .unwrap_err();
         assert!(started.elapsed() >= Duration::from_millis(500));
@@ -1447,6 +1477,87 @@ mod tests {
             "the hub did not stop: control socket: the hub closed the connection; nothing changed"
         );
         assert!(hub.join().unwrap().contains(method::HUB_STOP));
+    }
+
+    /// Accepts the stop as a hub does while a voice call runs: its answer names the call's
+    /// wind-down bound. Returns the request.
+    fn accept_with_voice(listener: &UnixListener, seconds: u64) -> String {
+        use std::io::Write as _;
+        let (mut stream, _) = listener.accept().unwrap();
+        let mut request = String::new();
+        std::io::BufReader::new(&stream)
+            .read_line(&mut request)
+            .unwrap();
+        let reply = json!({
+            "v": crate::proto::VERSION,
+            "id": 1,
+            "ok": crate::proto::Stopping { voice_wind_down_s: Some(seconds) },
+        });
+        writeln!(stream, "{reply}").unwrap();
+        request
+    }
+
+    /// A hub stopped during a voice call ends only once the call has wound down. The update waits
+    /// for the bound the hub named, not its own shorter wait: an end 1.2 s after the stop, within
+    /// a 1 s wind-down and its margin, completes the stop.
+    #[tokio::test]
+    async fn a_voice_wind_down_within_its_bound_completes_the_stop() {
+        let dir = scratch("stop-voice");
+        let paths = paths_in(&dir);
+        let (listener, held) = fake_hub(&paths);
+        let socket = paths.socket.clone();
+        let hub = std::thread::spawn(move || {
+            let request = accept_with_voice(&listener, 1);
+            std::thread::sleep(Duration::from_millis(1200));
+            std::fs::remove_file(&socket).unwrap();
+            drop(held);
+            request
+        });
+        let wait = Duration::from_millis(100);
+        stop_hub_within(&paths, wait, Duration::from_secs(1), Say(Language::Korean))
+            .await
+            .unwrap();
+        assert!(hub.join().unwrap().contains(method::HUB_STOP));
+    }
+
+    /// A wind-down beyond the hub's bound holds the update with nothing changed, saying why.
+    #[tokio::test]
+    async fn a_voice_wind_down_beyond_its_bound_holds_the_update() {
+        let dir = scratch("stop-voice");
+        let paths = paths_in(&dir);
+        let (listener, _held) = fake_hub(&paths);
+        let hub = std::thread::spawn(move || accept_with_voice(&listener, 1));
+        let started = Instant::now();
+        let margin = Duration::from_millis(300);
+        let held = stop_hub_within(
+            &paths,
+            Duration::from_millis(100),
+            margin,
+            Say(Language::Korean),
+        )
+        .await
+        .unwrap_err();
+        assert!(started.elapsed() >= Duration::from_millis(1300));
+        assert_eq!(
+            held,
+            "허브가 멈추기로 했지만 음성 통화 정리 시간(1초)이 지나도 끝나지 않았습니다. 아무것도 \
+             바뀌지 않았습니다. 허브가 멈춘 뒤 다시 실행하세요."
+        );
+        assert!(hub.join().unwrap().contains(method::HUB_STOP));
+        let english = Say(Language::English);
+        assert_eq!(
+            english.voice_did_not_end(90),
+            "the hub accepted the stop but had not ended after its voice call's 90 s wind-down; \
+             nothing changed. Run it again once the hub has stopped."
+        );
+        assert_eq!(
+            Say(Language::Korean).voice_winding_down(90),
+            "음성 통화를 정리하는 중이에요 (최대 90초)"
+        );
+        assert_eq!(
+            english.voice_winding_down(90),
+            "winding down the voice call (up to 90 s)"
+        );
     }
 
     /// A candidate's report: version 0.2.5, reading up to `reader` (none: a report from before the

@@ -7,6 +7,11 @@
   and hold with the busy session named by the hub in that language, and every refusal the owner acts
   on. Errors meant for developers (a file, network or store failure) stay as they were said, inside
   those sentences. `--help` stays English, as it is for every command.
+- `cataly update` and `cataly rollback` during a voice call: a hub stop waits for the call to wind
+  down (up to 90 s), but the update waited only 60 s and then failed with "the hub accepted the stop
+  but did not end in time". The hub's stop answer now names the call's wind-down bound, and the
+  update waits that long plus a margin, saying so once ("음성 통화를 정리하는 중이에요 (최대
+  90초)"); a wind-down beyond the bound holds the update with nothing changed and says why.
 
 ## 0.2.8 (2026-11-28)
 

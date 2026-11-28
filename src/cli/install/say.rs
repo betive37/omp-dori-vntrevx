@@ -290,6 +290,28 @@ impl Say {
         }
     }
 
+    /// Said once when the hub accepted the stop and a voice call winds down first.
+    pub(super) fn voice_winding_down(self, seconds: u64) -> String {
+        match self.0 {
+            Language::Korean => format!("음성 통화를 정리하는 중이에요 (최대 {seconds}초)"),
+            Language::English => format!("winding down the voice call (up to {seconds} s)"),
+        }
+    }
+
+    /// The hub accepted the stop but had not ended once its voice call's bound had passed.
+    pub(super) fn voice_did_not_end(self, seconds: u64) -> String {
+        match self.0 {
+            Language::Korean => format!(
+                "허브가 멈추기로 했지만 음성 통화 정리 시간({seconds}초)이 지나도 끝나지 않았습니다. \
+                 아무것도 바뀌지 않았습니다. 허브가 멈춘 뒤 다시 실행하세요."
+            ),
+            Language::English => format!(
+                "the hub accepted the stop but had not ended after its voice call's {seconds} s \
+                 wind-down; nothing changed. Run it again once the hub has stopped."
+            ),
+        }
+    }
+
     /// Said once per distinct reason while a busy session holds the switch.
     pub(super) fn busy_waiting(self, busy: &str) -> String {
         match self.0 {
