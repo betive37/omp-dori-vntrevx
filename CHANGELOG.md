@@ -2,9 +2,16 @@
 
 ## Unreleased
 
-- After `cataly setup --service off` or `cataly service disable`, a plain `cataly setup` enabled
-  and started the service again. The off is now remembered as `[setup] service = false`; setup
-  leaves the service off until `--service on` or `cataly service enable`.
+### Upgrade notes
+
+- `cataly setup --service off` now writes `[setup] service = false`. A 0.2.7 hub (after a
+  rollback) refuses that key; remove it from the config before going back.
+
+### Fixes
+
+- After `cataly setup --service off`, a plain `cataly setup` enabled and started the service
+  again. The off is now remembered as `[setup] service = false`; setup leaves the service off
+  until `--service on` or `cataly service enable`.
 
 ## 0.2.7 (2026-11-28)
 

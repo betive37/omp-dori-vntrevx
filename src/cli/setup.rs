@@ -993,7 +993,7 @@ pub(super) fn write_one(
     .map(drop)
 }
 
-/// [`write_one`] for a boolean setting (`cataly service disable` records `[setup] service`).
+/// [`write_one`] for a boolean setting (`cataly service enable` sets `[setup] service` back to `true`).
 pub(super) fn write_flag(paths: &Paths, section: &str, key: &str, on: bool) -> Result<(), String> {
     file::edit(&paths.config_file, NEW_FILE, |text| {
         Ok(set_rendered(text, section, key, &on.to_string()))

@@ -174,7 +174,7 @@ What `cataly setup` remembers between runs. You rarely edit it by hand.
 | Key | Type | Default | Allowed | What it does | Setup |
 |---|---|---|---|---|---|
 | `backup` | boolean | `true` | | `false` once you turned the [home backup](#home-backup) off before it existed; a plain re-run then leaves it off instead of offering it again. | `--backup off` writes `false`; `--backup on` (or `--backup-repo`) sets it back to `true` and plans the backup |
-| `service` | boolean | `true` | | `false` once you turned the user service off; a plain re-run then leaves it off instead of enabling it again. | `--service off` (or `cataly service disable`) writes `false`; `--service on` (or `cataly service enable`) sets it back to `true` |
+| `service` | boolean | `true` | | `false` once you turned the user service off with setup; a plain re-run then leaves it off instead of enabling it again. `cataly service disable` does not change it. | `--service off` writes `false`; `--service on` sets it back to `true`, and so does `cataly service enable` |
 
 ```toml
 [setup]

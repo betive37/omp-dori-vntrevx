@@ -337,7 +337,7 @@ fn a_service_turned_off_stays_off() {
     );
     assert_eq!(service(&hub), (String::new(), String::new()));
 
-    // `--service on` turns it on again; `service disable` turns it off and remembers that too.
+    // `--service on` turns it on again; `service disable` removes it without recording an off.
     let (ok, _, stderr) = json_run(&hub, &["--yes", "--service", "on"]);
     assert!(ok, "{stderr}");
     assert!(service(&hub).0.contains("cataly"));
@@ -345,11 +345,7 @@ fn a_service_turned_off_stays_off() {
     let off = hub.cli(&["service", "disable"]);
     assert!(off.status.success(), "{off:?}");
     assert_eq!(service(&hub).0, "");
-    assert!(read(&hub.config_path()).contains("service = false"));
-    let (ok, again, stderr) = json_run(&hub, &["--yes"]);
-    assert!(ok, "{stderr}");
-    assert_eq!(item(&again, "service")["change"], false, "{again}");
-    assert_eq!(service(&hub).0, "");
+    assert!(read(&hub.config_path()).contains("service = true"));
 }
 
 #[test]

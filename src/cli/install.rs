@@ -1171,18 +1171,12 @@ async fn service(enable: bool, paths: &Paths) -> Outcome {
         Err(e) => return Outcome::Held(e),
     };
     if !enable {
-        let done = match crate::sys::service::disable(&l).await {
-            Ok(Some(path)) => format!("service stopped and {} removed", path.display()),
-            Ok(None) => "no service created by Cataly".into(),
-            Err(e) => return Outcome::Held(e),
-        };
-        // Remembered as `[setup] service = false`, so a plain `cataly setup` leaves it off.
-        if crate::config::load(&paths.config_file).is_ok_and(|c| !c.setup.service) {
-            return Outcome::Done(done);
-        }
-        return match super::setup::write_flag(paths, "setup", "service", false) {
-            Ok(()) => Outcome::Done(format!("{done}; setup leaves it off")),
-            Err(e) => Outcome::NeedsAttention(format!("{done}; recording it as off: {e}")),
+        return match crate::sys::service::disable(&l).await {
+            Ok(Some(path)) => {
+                Outcome::Done(format!("service stopped and {} removed", path.display()))
+            }
+            Ok(None) => Outcome::Done("no service created by Cataly; nothing changed".into()),
+            Err(e) => Outcome::Held(e),
         };
     }
     if !l.installed() {
