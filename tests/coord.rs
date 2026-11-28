@@ -379,6 +379,108 @@ fn planner_restarts_a_reused_item_id() {
     assert!(hub.stop().success());
 }
 
+/// A reused item's next allocation fails before spawn. When requested, a database refusal keeps
+/// the failed lane; otherwise the unused allocation rolls back. Arm the trigger with the hub stopped.
+fn planner_failed_start(retain_lane: bool) -> TestHub {
+    let (mut hub, work) = coord_hub("[coord.planner]\nmax_open = 2\nmax_starts = 2\n");
+    let text = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&text.replace(
+        "[coord.planner]",
+        &format!(
+            "[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n[coord.planner]",
+            work.display()
+        ),
+    ));
+    start(&mut hub);
+    let add =
+        json!({ "id": "it-fail", "brief": "b", "checks": [{ "kind": "command", "argv": ["true"] }] });
+    lane(&hub, "item-add", &add).unwrap();
+    let first = hub.until(WAIT, || {
+        let s = plan(&hub);
+        (!s.contains("no lead")).then_some(s)
+    });
+    assert!(first.contains("started: it-fail"), "{first}");
+    lane(&hub, "close", &json!({ "key": "it-fail", "note": "stop" })).unwrap();
+    hub.until(WAIT, || {
+        (record(&hub, "it-fail")["state"] == "closed").then_some(())
+    });
+    let done = plan(&hub);
+    assert!(done.contains("it-fail done (lane closed)"), "{done}");
+    lane(&hub, "item-add", &add).unwrap();
+    assert!(hub.stop().success());
+    if retain_lane {
+        let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER keep_failed_planner_lane BEFORE DELETE ON lanes
+             WHEN OLD.key = 'it-fail-2'
+             BEGIN SELECT RAISE(FAIL, 'keep failed planner lane'); END;",
+        )
+        .unwrap();
+    }
+    let blocked = hub.state().join("sessions/lanes/it-fail-2");
+    std::fs::write(&blocked, "not a directory").unwrap();
+    start(&mut hub);
+    let failed = hub.until(WAIT, || {
+        let s = plan(&hub);
+        (!s.contains("no lead")).then_some(s)
+    });
+    assert!(failed.contains("it-fail start failed:"), "{failed}");
+    assert!(
+        failed.contains(if retain_lane {
+            "conversation and work retained"
+        } else {
+            "unused allocation rolled back"
+        }),
+        "{failed}"
+    );
+    let items = lane(&hub, "items", &json!({})).unwrap();
+    let item = &items["items"][0];
+    assert_eq!(item["status"], "open", "{item}");
+    assert_eq!(item["start_failures"], 1, "{item}");
+    assert_eq!(item["question"], Value::Null, "{item}");
+    assert_eq!(item["lane"], "it-fail-2", "{item}");
+    std::fs::remove_file(blocked).unwrap();
+    hub
+}
+
+#[test]
+fn planner_failed_start_retains_its_lane_key() {
+    let mut hub = planner_failed_start(true);
+    let failed = record(&hub, "it-fail-2");
+    assert_eq!(failed["state"], "held", "{failed}");
+    assert!(
+        failed["receipt"].to_string().contains("record retained:"),
+        "{failed}"
+    );
+    let next = plan(&hub);
+    assert!(!next.contains("started:"), "{next}");
+    assert_eq!(record(&hub, "it-fail-3"), Value::Null, "{next}");
+    let items = lane(&hub, "items", &json!({})).unwrap();
+    let item = &items["items"][0];
+    assert_eq!(item["status"], "open", "{item}");
+    assert_eq!(item["start_failures"], 1, "{item}");
+    assert_eq!(item["question"], Value::Null, "{item}");
+    assert_eq!(item["lane"], "it-fail-2", "{item}");
+    assert!(hub.stop().success());
+}
+
+#[test]
+fn planner_failed_start_reuses_rolled_back_key() {
+    let mut hub = planner_failed_start(false);
+    assert_eq!(record(&hub, "it-fail-2"), Value::Null);
+    let next = plan(&hub);
+    assert!(next.contains("started: it-fail"), "{next}");
+    assert_eq!(record(&hub, "it-fail-2")["state"], "running", "{next}");
+    assert_eq!(record(&hub, "it-fail-3"), Value::Null, "{next}");
+    let items = lane(&hub, "items", &json!({})).unwrap();
+    let item = &items["items"][0];
+    assert_eq!(item["status"], "running", "{item}");
+    assert_eq!(item["start_failures"], 1, "{item}");
+    assert_eq!(item["question"], Value::Null, "{item}");
+    assert_eq!(item["lane"], "it-fail-2", "{item}");
+    assert!(hub.stop().success());
+}
+
 /// Check 4: the merge check refuses without an approving verdict at the current head, with no
 /// checks, or with a check neither passed nor skipped; a dry run stops before merging.
 #[test]

@@ -5,7 +5,8 @@
 - A work item that had run once and was added again never started: the planner opened the old
   lane key, every open was refused, and after two tries the item became a question. Each start
   now opens a lane under a fresh key (`<id>-2`, `<id>-3`, ...) and the item remembers it; an item
-  added again waits while its earlier lane is still open.
+  added again waits while its earlier lane is still open. Failed starts also remember the attempted
+  key, so a retained lane blocks another start; a rolled-back allocation frees its key for a retry.
 
 ## 0.2.8 (2026-11-28)
 

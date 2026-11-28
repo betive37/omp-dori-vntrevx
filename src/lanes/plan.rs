@@ -42,8 +42,8 @@ pub(crate) struct Item {
     pub(crate) reminded_ms: Option<i64>,
     pub(crate) failed_tries: u32,
     pub(crate) start_failures: u32,
-    /// The key of the lane its latest start opened; each attempt gets a fresh key, since a lane key is
-    /// never reused (LANE req. 3). Items stored without it reconcile by their id.
+    /// The key its latest start attempted, including failures. A retained lane keeps that key
+    /// reserved (LANE req. 3); a rolled-back allocation frees it. Older items reconcile by their id.
     #[serde(default)]
     pub(crate) lane: Option<String>,
     /// `owner/name#number` of an imported issue.
@@ -822,13 +822,11 @@ impl<R: Runtime> Lanes<R> {
                     fresh.note(now, &format!("start of lane {key} uncertain: {line}"));
                     run.held
                         .push(format!("{} start uncertain (lane {key})", fresh.id));
-                    fresh.lane = Some(key);
                 } else {
                     fresh.status = "running".into();
                     fresh.note(now, &format!("lane {key} opened: {line}"));
                     run.started
                         .push(format!("{} (lane {key}: {line})", fresh.id));
-                    fresh.lane = Some(key);
                 }
             }
             Err(e) => {
@@ -845,6 +843,7 @@ impl<R: Runtime> Lanes<R> {
                 }
             }
         }
+        fresh.lane = Some(key);
         match docs::put(&self.env.store, ITEM, &fresh.id, &fresh, Some(fv)).await {
             Ok(nv) => Some((fresh, nv)),
             Err(e) => {

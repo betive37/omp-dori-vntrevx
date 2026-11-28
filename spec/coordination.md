@@ -186,9 +186,11 @@ client) plus the lead's OMP session, and every record has one writer.
     the reason is recorded.
 31. Each attempt uses one start and opens its lane under a key no lane or queued launch holds (LANE req. 3): the
     item id, else the id with `-2`, `-3`, ... (shortened to keep the key within 61 characters); the item records
-    that key as its lane. A failed open adds one start failure; at 2 the item gets an open question that quotes the
-    first 120 characters of the error and asks whether to fix the brief or directory or give it up. A start that
-    the session host left in an uncertain state gets a question at once and is never retried automatically. A lane
+    that key as its lane for every outcome, including a failed open. A retained failed lane prevents another
+    start; an allocation rolled back without a lane record leaves its key free for the next attempt. A failed
+    open adds one start failure; at 2 the item gets an open question that quotes the first 120 characters of the
+    error and asks whether to fix the brief or directory or give it up. A start that the session host left in an
+    uncertain state gets a question at once and is never retried automatically. A lane
     that opened but whose start notice did not reach the lead still counts as started. An item becomes running only
     if it is still the same item (same creation time), open and without a question. Leftover candidates are
     summarised with their count, the free lane places against the maximum, and the per-run limit.
