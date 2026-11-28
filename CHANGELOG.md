@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Open request and owner-question lists no longer stop at 200 items. Recovery summaries count
+  every omitted item in "and N more", including when a next step or question spans several lines.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
