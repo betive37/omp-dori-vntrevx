@@ -604,7 +604,7 @@ path. The values come from the specs; the main ones:
 | `gh` / git local / git push | 60 s (GitHub reads in done checks 120 s) / 60 s / 300 s |
 | Job commands / event commands | per job (default 30 s, max 1 day) / 30 s, 4 at a time |
 | Bridge: connect / report tool / job tool / shell veto / stop gate | 1 s / 10 s / 5 s / 2 s / 1 s |
-| Session file reads | header 64 KiB (1 MiB for reopen), in-doubt search last 8 MiB and 2 s, file ≤ 64 MiB |
+| Session file reads | header 64 KiB (1 MiB for reopen); replies start at retained request offsets or the last 8 MiB, searching the rest for missing tags within 2 s; delivery-marker search whole file within 10 s; file ≤ 64 MiB |
 | Release check / install downloads | 15 s, 1 MiB / connect 10 s, 120 s per asset, binary ≤ 128 MiB |
 
 ### 9.5 No panics

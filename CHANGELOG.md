@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Relay answers are no longer lost when more than 8 MiB of transcript follows their request.
+  The reader searches beyond the tail when needed and remembers each pending request's position.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

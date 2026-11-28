@@ -1,9 +1,10 @@
 //! OMP session-file reader (DESIGN 3.3, 7.1; PATCH-01 rules 8-10, HOST req. 9-10): whether a saved
 //! session file may be resumed exactly and which model OMP will restore from it, and the search for
 //! a delivery marker in a user entry. Session files belong to OMP; the hub only reads them, with
-//! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), the last 8 MiB
-//! and 2 s for a reply read, the whole file within 10 s for a marker search, and nothing over
-//! 64 MiB. Every read here blocks; callers use the async wrappers, which run on the blocking pool.
+//! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), and 2 s for a
+//! reply read from retained request offsets or the last 8 MiB, searching the rest for missing tags.
+//! Marker searches read the whole file within 10 s. Nothing over 64 MiB is read. Every read here
+//! blocks; callers use the async wrappers, which run on the blocking pool.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -11,6 +12,7 @@ use std::fs::{self, File};
 use std::io::{BufRead as _, BufReader, Read as _, Seek as _, SeekFrom};
 use std::os::unix::fs::MetadataExt as _;
 use std::path::{Component, Path, PathBuf};
+use std::sync::{Arc, Mutex, PoisonError};
 use std::time::{Duration, Instant};
 
 use serde_json::Value;
@@ -21,10 +23,9 @@ const HEADER_BYTES: u64 = 64 * 1024;
 const REOPEN_HEADER_BYTES: u64 = 1024 * 1024;
 /// Largest session file read at all.
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
-/// A reply read covers at most this much from the end of the file; it is also the longest entry a
-/// marker search parses.
+/// The initial reply-search window and the longest entry a reply or marker search parses.
 const SEARCH_TAIL: u64 = 8 * 1024 * 1024;
-/// And takes at most this long.
+/// The total reply-read budget, including a search outside the tail.
 const SEARCH_BUDGET: Duration = Duration::from_secs(2);
 /// A marker search reads the whole file within this time, or proves nothing.
 pub(crate) const MARKER_BUDGET: Duration = Duration::from_secs(10);
@@ -647,6 +648,7 @@ pub(crate) enum Reply {
 
 /// One message entry: role, visible text, whether it calls a tool, and the stop reason.
 struct Said {
+    offset: u64,
     user: bool,
     text: String,
     tool_call: bool,
@@ -658,7 +660,7 @@ const DELIVERY_TYPE: &str = "cataly-delivery";
 
 /// A message entry, or a delivery of the terminal runtime's bridge, which is an input like a user
 /// message.
-fn said(entry: &Value) -> Option<Said> {
+fn said(entry: &Value, offset: u64) -> Option<Said> {
     let (user, content, stop) = match entry.get("type").and_then(Value::as_str)? {
         "custom_message"
             if entry.get("customType").and_then(Value::as_str) == Some(DELIVERY_TYPE) =>
@@ -702,6 +704,7 @@ fn said(entry: &Value) -> Option<Said> {
         _ => {}
     }
     Some(Said {
+        offset,
         user,
         text,
         tool_call,
@@ -709,13 +712,30 @@ fn said(entry: &Value) -> Option<Said> {
     })
 }
 
-/// Reads the message entries of the last 8 MiB of `path` (2 s budget). `None` when the file is
-/// missing or the budget ran out.
-fn message_entries(path: &Path) -> Result<Option<Vec<Said>>> {
+/// Request positions for one relay's current session file. Only tags still being read are kept;
+/// a replaced or shortened file discards all positions. No transcript text is cached.
+#[derive(Debug, Default)]
+pub(crate) struct ReplyOffsets {
+    identity: Option<(u64, u64)>,
+    length: u64,
+    tags: HashMap<String, u64>,
+}
+
+/// Reads from retained request positions or the newest 8 MiB, then searches the unread head once
+/// if a tag is missing. Both parts share the 2 s budget and the file's bounded length. `None` means
+/// the file is missing or the budget ran out, not that the tag is absent.
+fn message_entries(
+    path: &Path,
+    tags: &[String],
+    offsets: &mut ReplyOffsets,
+) -> Result<Option<Vec<Said>>> {
     let started = Instant::now();
-    let mut file = match read_only(path) {
+    let file = match read_only(path) {
         Ok(f) => f,
-        Err(TranscriptError::Io(_)) if !path.exists() => return Ok(None),
+        Err(TranscriptError::Io(_)) if !path.exists() => {
+            *offsets = ReplyOffsets::default();
+            return Ok(None);
+        }
         Err(e) => return Err(e),
     };
     let info = file.metadata()?;
@@ -725,35 +745,85 @@ fn message_entries(path: &Path) -> Result<Option<Vec<Said>>> {
     if info.len() > FILE_LIMIT {
         return Err(TranscriptError::TooLarge);
     }
-    let start = info.len().saturating_sub(SEARCH_TAIL);
-    file.seek(SeekFrom::Start(start))?;
+    let identity = (info.dev(), info.ino());
+    if offsets.identity != Some(identity) || info.len() < offsets.length {
+        offsets.tags.clear();
+        offsets.identity = Some(identity);
+    }
+    offsets.length = info.len();
+    offsets.tags.retain(|tag, _| tags.contains(tag));
+    let tail = info.len().saturating_sub(SEARCH_TAIL);
+    let cached = offsets.tags.values().min().copied();
+    let mut start = if tags.iter().all(|tag| offsets.tags.contains_key(tag)) {
+        cached.unwrap_or(tail)
+    } else {
+        cached.map_or(tail, |at| at.min(tail))
+    };
     let mut reader = BufReader::new(file);
+    if start > 0 {
+        // Include a line beginning exactly at the offset, even at the tail boundary. If a cached
+        // offset moved inside a line, the head search below still covers that entire line.
+        reader.seek(SeekFrom::Start(start - 1))?;
+        start = start - 1
+            + reader
+                .by_ref()
+                .take(info.len() - start + 1)
+                .skip_until(b'\n')? as u64;
+    }
+    let Some(mut entries) = message_lines(
+        &mut reader.by_ref().take(info.len() - start),
+        start,
+        started,
+    )?
+    else {
+        return Ok(None);
+    };
+    if start > 0
+        && tags.iter().any(|tag| {
+            !entries
+                .iter()
+                .any(|entry| entry.user && entry.text.contains(tag.as_str()))
+        })
+    {
+        reader.seek(SeekFrom::Start(0))?;
+        let Some(mut head) = message_lines(&mut reader.take(start), 0, started)? else {
+            return Ok(None);
+        };
+        head.append(&mut entries);
+        entries = head;
+    }
+    Ok(Some(entries))
+}
+
+fn message_lines(
+    reader: &mut impl std::io::BufRead,
+    mut offset: u64,
+    started: Instant,
+) -> Result<Option<Vec<Said>>> {
     let mut line = Vec::new();
-    let mut first = start > 0;
     let mut out = Vec::new();
     loop {
         if started.elapsed() > SEARCH_BUDGET {
             return Ok(None);
         }
         line.clear();
-        if reader
+        let n = reader
             .by_ref()
             .take(SEARCH_TAIL + 1)
-            .read_until(b'\n', &mut line)?
-            == 0
-        {
+            .read_until(b'\n', &mut line)? as u64;
+        if n == 0 {
             return Ok(Some(out));
         }
-        if std::mem::take(&mut first) {
-            continue;
-        }
-        // An unfinished last line is skipped; it is read again next time.
+        let at = offset;
+        offset += n;
+        // An unfinished last line is read again next time; an oversized entry is skipped whole.
         if line.last() != Some(&b'\n') {
+            offset += reader.skip_until(b'\n')? as u64;
             continue;
         }
         trim_newline(&mut line);
         if let Ok(entry) = serde_json::from_slice::<Value>(&line)
-            && let Some(s) = said(&entry)
+            && let Some(s) = said(&entry, at)
         {
             out.push(s);
         }
@@ -772,30 +842,45 @@ pub(crate) fn replies(
     tags: &[String],
     prefix: &str,
     settled: bool,
+    offsets: &mut ReplyOffsets,
 ) -> Result<Vec<Reply>> {
-    let Some(entries) = message_entries(path)? else {
+    if tags.is_empty() {
+        offsets.tags.clear();
+        return Ok(Vec::new());
+    }
+    let Some(entries) = message_entries(path, tags, offsets)? else {
         return Ok(vec![Reply::Pending; tags.len()]);
     };
     Ok(tags
         .iter()
         .map(|tag| {
-            let Some(at) = entries
+            let Some((at, request)) = entries
                 .iter()
-                .rposition(|e| e.user && e.text.contains(tag.as_str()))
+                .enumerate()
+                .rev()
+                .find(|(_, e)| e.user && e.text.contains(tag.as_str()))
             else {
+                offsets.tags.remove(tag);
                 return Reply::NotFound;
             };
-            let later_request = entries.get(at).is_some_and(|e| {
-                e.text
-                    .find(tag.as_str())
-                    .and_then(|i| e.text.get(i + tag.len()..))
-                    .is_some_and(|rest| rest.contains(prefix))
-            });
+            let later_request = request
+                .text
+                .find(tag.as_str())
+                .and_then(|i| request.text.get(i + tag.len()..))
+                .is_some_and(|rest| rest.contains(prefix));
             if later_request {
+                offsets.tags.remove(tag);
                 return Reply::Abandoned;
             }
             let span = entries.get(at + 1..).unwrap_or_default();
             let end = span.iter().position(|e| e.user);
+            if end.is_some() {
+                offsets.tags.remove(tag);
+            } else if let Some(offset) = offsets.tags.get_mut(tag) {
+                *offset = request.offset;
+            } else {
+                offsets.tags.insert(tag.clone(), request.offset);
+            }
             let turns = span.get(..end.unwrap_or(span.len())).unwrap_or_default();
             // A final message counts once anything follows it or the session is idle.
             let mut finals: Vec<String> = turns
@@ -832,10 +917,19 @@ pub(crate) async fn read_replies(
     tags: Vec<String>,
     prefix: String,
     settled: bool,
+    offsets: Arc<Mutex<ReplyOffsets>>,
 ) -> Result<Vec<Reply>> {
-    tokio::task::spawn_blocking(move || replies(&path, &tags, &prefix, settled))
-        .await
-        .map_err(|e| TranscriptError::Io(format!("reply task: {e}")))?
+    tokio::task::spawn_blocking(move || {
+        replies(
+            &path,
+            &tags,
+            &prefix,
+            settled,
+            &mut offsets.lock().unwrap_or_else(PoisonError::into_inner),
+        )
+    })
+    .await
+    .map_err(|e| TranscriptError::Io(format!("reply task: {e}")))?
 }
 
 /// [`find_marker`] on the blocking pool; a worker's session file is searched on the worker.
@@ -1171,7 +1265,8 @@ mod tests {
             more: Vec::new(),
             open,
         };
-        let got = replies(&path, &tags, "[d ", false).unwrap();
+        let mut offsets = ReplyOffsets::default();
+        let got = replies(&path, &tags, "[d ", false, &mut offsets).unwrap();
         assert_eq!(got[0], answer("first answer", false));
         assert_eq!(got[1], Reply::Abandoned, "steered before an answer");
         assert_eq!(
@@ -1181,8 +1276,159 @@ mod tests {
         );
         assert_eq!(got[3], Reply::Pending, "the session still works");
         assert_eq!(got[4], Reply::NotFound);
-        let got = replies(&path, &tags, "[d ", true).unwrap();
+        let got = replies(&path, &tags, "[d ", true, &mut offsets).unwrap();
         assert_eq!(got[3], answer("done", true));
+    }
+
+    #[test]
+    fn a_reply_tag_outside_the_newest_8_mib_keeps_its_answer() {
+        use std::io::{Seek as _, Write as _};
+
+        let dir = crate::sys::fs::tests::scratch("reply-old-tag");
+        let path = dir.join("s.jsonl");
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        writeln!(file, r#"{{"type":"session","id":"x"}}"#).unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"user","content":"earlier input"}}}}"#
+        )
+        .unwrap();
+        let request_at = file.stream_position().unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"user","content":"[d old] request"}}}}"#
+        )
+        .unwrap();
+        let filler = serde_json::json!({
+            "type": "message",
+            "message": {"role": "toolResult", "content": "x".repeat(64 * 1024)}
+        })
+        .to_string();
+        for _ in 0..144 {
+            writeln!(file, "{filler}").unwrap();
+        }
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"assistant","content":"the answer","stopReason":"stop"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let tags = ["[d old]".into()];
+        let mut offsets = ReplyOffsets::default();
+        assert_eq!(
+            replies(&path, &tags, "[d ", true, &mut offsets).unwrap(),
+            vec![Reply::Answer {
+                text: "the answer".into(),
+                more: Vec::new(),
+                open: true,
+            }]
+        );
+        assert_eq!(offsets.tags.get("[d old]"), Some(&request_at));
+        let entries = message_entries(&path, &tags, &mut offsets)
+            .unwrap()
+            .unwrap();
+        assert_eq!(entries[0].offset, request_at, "the head is not read again");
+        assert_eq!(entries[0].text, "[d old] request");
+
+        writeln!(
+            file,
+            r#"{{"type":"custom_message","customType":"cataly-delivery","content":"[d new] next"}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let mut cold = ReplyOffsets::default();
+        assert_eq!(
+            replies(
+                &path,
+                &["[d old]".into(), "[d new]".into()],
+                "[d ",
+                false,
+                &mut cold,
+            )
+            .unwrap(),
+            vec![
+                Reply::Answer {
+                    text: "the answer".into(),
+                    more: Vec::new(),
+                    open: false,
+                },
+                Reply::Pending,
+            ],
+            "head and tail entries keep their order"
+        );
+        assert_eq!(cold.tags.len(), 1, "a closed request leaves the cache");
+        assert!(cold.tags.contains_key("[d new]"));
+    }
+
+    #[test]
+    fn reply_offsets_reset_when_the_file_changes_or_requests_leave() {
+        let dir = crate::sys::fs::tests::scratch("reply-offsets");
+        let path = dir.join("s.jsonl");
+        let user = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d a] request\"}}\n";
+        let header = "{\"type\":\"session\",\"id\":\"x\"}\n";
+        let tags = ["[d a]".into()];
+        let mut offsets = ReplyOffsets::default();
+        fs::write(&path, format!("{header}{user}")).unwrap();
+        assert_eq!(
+            replies(&path, &tags, "[d ", false, &mut offsets).unwrap(),
+            vec![Reply::Pending]
+        );
+        assert_eq!(offsets.tags.get("[d a]"), Some(&(header.len() as u64)));
+
+        fs::write(&path, user).unwrap();
+        let entries = message_entries(&path, &tags, &mut offsets)
+            .unwrap()
+            .unwrap();
+        assert!(
+            offsets.tags.is_empty(),
+            "truncation invalidates the offsets"
+        );
+        assert_eq!(entries[0].offset, 0);
+        replies(&path, &tags, "[d ", false, &mut offsets).unwrap();
+        let identity = offsets.identity;
+
+        let replacement = dir.join("replacement.jsonl");
+        fs::write(&replacement, format!("{header}{user}")).unwrap();
+        fs::rename(&replacement, &path).unwrap();
+        let entries = message_entries(&path, &tags, &mut offsets)
+            .unwrap()
+            .unwrap();
+        assert_ne!(offsets.identity, identity);
+        assert!(
+            offsets.tags.is_empty(),
+            "replacement invalidates the offsets"
+        );
+        assert_eq!(entries[0].offset, header.len() as u64);
+        replies(&path, &tags, "[d ", false, &mut offsets).unwrap();
+        assert_eq!(offsets.tags.len(), 1);
+        assert_eq!(
+            replies(&path, &[], "[d ", false, &mut offsets).unwrap(),
+            Vec::<Reply>::new()
+        );
+        assert!(offsets.tags.is_empty(), "unrequested tags are not retained");
+    }
+
+    #[test]
+    fn reply_reads_keep_the_file_and_time_bounds() {
+        let dir = crate::sys::fs::tests::scratch("reply-bounds");
+        let path = dir.join("s.jsonl");
+        File::create(&path)
+            .unwrap()
+            .set_len(FILE_LIMIT + 1)
+            .unwrap();
+        assert_eq!(
+            replies(
+                &path,
+                &["[d a]".into()],
+                "[d ",
+                true,
+                &mut ReplyOffsets::default(),
+            ),
+            Err(TranscriptError::TooLarge)
+        );
+        let mut input = std::io::Cursor::new(b"{}\n");
+        let started = Instant::now().checked_sub(SEARCH_BUDGET).unwrap();
+        assert!(message_lines(&mut input, 0, started).unwrap().is_none());
     }
 
     #[test]
@@ -1210,9 +1456,10 @@ mod tests {
             result.to_string(),
             said("cleaned up", "stop", false),
         ];
-        let read = |lines: &[String], settled| {
+        let mut offsets = ReplyOffsets::default();
+        let mut read = |lines: &[String], settled| {
             std::fs::write(&path, lines.join("\n") + "\n").unwrap();
-            replies(&path, &["[d a]".to_string()], "[d ", settled)
+            replies(&path, &["[d a]".to_string()], "[d ", settled, &mut offsets)
                 .unwrap()
                 .remove(0)
         };
