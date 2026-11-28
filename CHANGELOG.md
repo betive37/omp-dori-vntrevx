@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Relay answers and later turns could post credential-shaped strings unchanged. They are now
+  masked before the reply parts are stored, so retries keep them masked too.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
