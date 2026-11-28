@@ -1,6 +1,7 @@
 //! Routing (WS req. 7, OJ req. 7): every event goes to the rotating owner-readable event log; events
-//! with destinations get one attempt per destination. An attempt is marked durably before it starts,
-//! so a hub that stops mid-attempt leaves it "uncertain" and it is never repeated (DESIGN 9.3).
+//! with destinations get one attempt per destination. An attempt is marked durably once a destination
+//! slot is held, before it starts. A hub that stops mid-attempt leaves it "uncertain" and it is never
+//! repeated (DESIGN 9.3); deliveries still waiting for a slot remain queued across a restart.
 //! Destinations: local commands and Discord channels. Full delivery pages wake the router again so
 //! queued destinations drain without another event, under the same concurrency limit.
 
@@ -143,6 +144,7 @@ async fn deliver_waiting(ctx: &Arc<Ctx>) -> Result<(), JobsError> {
     }
     let full_page = waiting.len() == PAGE as usize;
     let config = ctx.config();
+    let mut shutdown = ctx.shutdown.clone();
     for (event_id, destination) in waiting {
         let Some(dest) = config.destination(&destination) else {
             let detail = Some("destination no longer configured".to_string());
@@ -154,15 +156,20 @@ async fn deliver_waiting(ctx: &Arc<Ctx>) -> Result<(), JobsError> {
         let Some(event) = ctx.store.read(move |r| r.event(event_id)).await? else {
             continue;
         };
+        let slot = tokio::select! {
+            biased;
+            _ = shutdown.wait_for(|stopped| *stopped) => return Ok(()),
+            slot = Arc::clone(&ctx.destination_slots).acquire_owned() => slot,
+        };
+        let Ok(slot) = slot else {
+            return Ok(());
+        };
         ctx.store
             .delivery(event_id, destination.clone(), Delivery::Attempting, None)
             .await?;
         let task_ctx = Arc::clone(ctx);
-        let slots = Arc::clone(&ctx.destination_slots);
         tokio::spawn(async move {
-            let Ok(_slot) = slots.acquire_owned().await else {
-                return;
-            };
+            let _slot = slot;
             let (state, detail) = attempt(&task_ctx, &destination, &dest, &event).await;
             if let Err(e) = task_ctx
                 .store
@@ -445,6 +452,26 @@ mod tests {
             assert_eq!(deliveries.len(), 3);
             assert!(deliveries.iter().all(|(_, state, _)| state == "failed"));
         }
+    }
+
+    #[tokio::test]
+    async fn deliveries_without_a_slot_stay_waiting_after_recovery() {
+        let (ctx, _stop, _dir) = ctx_with(
+            "[destinations.sink]\nkind = \"command\"\nargv = [\"true\"]\n",
+            "route-waiting-recovery",
+        );
+        let events = (0..300)
+            .map(|_| event("j", "run.done", &["sink"]))
+            .collect();
+        ctx.stream.append(events).await.unwrap();
+        // Make acquiring a slot fail deterministically, without launching any commands.
+        ctx.destination_slots.close();
+        deliver_waiting(&ctx).await.unwrap();
+
+        let recovered = ctx.store.recover(0).await.unwrap();
+        assert_eq!(recovered.uncertain_deliveries, 0);
+        let waiting = ctx.store.read(|r| r.waiting_deliveries(300)).await.unwrap();
+        assert_eq!(waiting.len(), 300, "unstarted deliveries must remain queued");
     }
 
     #[tokio::test]

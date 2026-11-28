@@ -4,6 +4,7 @@
 
 - A batch of more than 256 job-event destinations could leave the rest waiting until another event
   arrived. The router now drains every page without a new event, keeping its delivery concurrency limit.
+  Deliveries wait for a slot before being marked started, so a restart keeps those still queued.
 
 ## 0.2.8 (2026-11-28)
 
