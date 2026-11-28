@@ -437,14 +437,21 @@ fn not_running(korean: bool, resumed: &Resumed) -> String {
         };
     }
     if resumed.lead_held {
-        let reason = resumed.lead_reason.as_deref().unwrap_or("-");
+        // The raw reason stays in `lead status --json`; the owner reads what happened in plain words.
+        let cause =
+            crate::host::lead::notice::Cause::of(resumed.lead_reason.as_deref().unwrap_or("-"));
+        let (what, todo) = cause.text(if korean {
+            Language::Korean
+        } else {
+            Language::English
+        });
         return if korean {
             format!(
-                "lead가 보류되었습니다: {reason}. 대화와 작업은 보존되어 있습니다. 원인을 해결한 뒤 `cataly lead start`로 이어서 시작하세요. 업데이트만으로는 보류가 풀리지 않습니다."
+                "lead가 보류되었습니다. {what} 대화와 작업은 보존되어 있습니다. {todo} 업데이트만으로는 보류가 풀리지 않습니다."
             )
         } else {
             format!(
-                "The lead is held: {reason}. Its conversation and work are kept; after fixing the cause, run `cataly lead start` to resume it. An update does not lift the hold by itself."
+                "The lead is held. {what} Its conversation and work are kept. {todo} An update does not lift the hold by itself."
             )
         };
     }
@@ -861,7 +868,7 @@ mod tests {
         for part in [
             "최종 결과",
             "보류",
-            "startup Ready Rejected: bad protocol",
+            "lead를 시작했지만 준비되기 전에 멈췄어요.",
             "보존",
             "`cataly lead start`",
             "업데이트만으로는",
@@ -869,6 +876,11 @@ mod tests {
             assert!(last.text.contains(part), "{part}: {}", last.text);
         }
         assert!(!last.text.contains("확정되면 따로"), "{}", last.text);
+        assert!(
+            !last.text.contains("Rejected"),
+            "no raw reason: {}",
+            last.text
+        );
         assert!(polls.load(Ordering::SeqCst) > 200);
     }
 
@@ -889,11 +901,18 @@ mod tests {
         let held = english(Resumed {
             lead_start: Some(LeadStart::NotRunning),
             lead_held: true,
-            lead_reason: Some("r".into()),
+            lead_reason: Some("recovery is held (300 s recovery episode has no startup and cleanup budget remaining); explicit owner retry required".into()),
             lanes_held: vec!["docs".into()],
             ..Resumed::default()
         });
-        assert!(held.starts_with("The lead is held: r. Its conversation and work are kept"));
+        assert!(
+            held.starts_with(
+                "The lead is held. Cataly tried to restart the lead, but it did not come up within the set time (5 minutes). \
+                 Its conversation and work are kept. Run `cataly lead start` to try again."
+            ),
+            "{held}"
+        );
+        assert!(!held.contains("recovery is held"), "{held}");
         assert!(held.contains("An update does not lift the hold by itself."));
         assert!(
             held.ends_with(
