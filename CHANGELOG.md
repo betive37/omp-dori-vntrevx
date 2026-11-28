@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.2.8 (Unreleased)
+## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
   directory had changed at some point, leaving only `lead start --fresh`, which abandons the
