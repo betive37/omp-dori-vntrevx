@@ -4,7 +4,8 @@
 
 - Slow Slack catch-up reads no longer delay Socket Mode acknowledgements. Live messages are
   queued durably while history loads, and each room waits for its older messages before hand-off.
-  A failed read keeps unread rooms waiting until the next connection retries catch-up.
+  Temporary read failures reconnect; a permanently unreadable room is held without delaying
+  catch-up or live messages in other rooms.
 
 ## 0.2.8 (2026-11-28)
 

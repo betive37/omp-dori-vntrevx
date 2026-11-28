@@ -39,6 +39,8 @@ struct State {
     next_ts: u64,
     hang: bool,
     history_hold: Option<watch::Receiver<bool>>,
+    /// Channel -> (Slack error, remaining failures); None keeps failing until changed.
+    read_errors: HashMap<String, (String, Option<usize>)>,
     upload_url: String,
     connections: usize,
     socket: Option<mpsc::UnboundedSender<Value>>,
@@ -145,6 +147,15 @@ impl FakeSlack {
         let (release, held) = watch::channel(false);
         self.state.lock().unwrap().history_hold = Some(held);
         release
+    }
+
+    /// Fails reads of a channel with a Slack error; None persists, Some(n) fails n attempts.
+    pub fn fail_reads(&self, channel: &str, error: &str, count: Option<usize>) {
+        self.state
+            .lock()
+            .unwrap()
+            .read_errors
+            .insert(channel.into(), (error.into(), count));
     }
 
     pub fn set_upload_url(&self, url: &str) {
@@ -261,6 +272,35 @@ async fn wait_for_history(state: &Mutex<State>) {
     }
 }
 
+fn history_reply(state: &Mutex<State>, query: &str) -> Response<Full<Bytes>> {
+    let channel = arg(query, "channel").unwrap_or_default();
+    let root = arg(query, "ts");
+    let oldest = arg(query, "oldest").unwrap_or_default();
+    let mut state = state.lock().unwrap();
+    if let Some((error, count)) = state.read_errors.get_mut(&channel)
+        && count.is_none_or(|left| left > 0)
+    {
+        if let Some(left) = count {
+            *left -= 1;
+        }
+        return reply(200, &json!({"ok": false, "error": error}));
+    }
+    let key = |t: &str| t.replace('.', "").parse::<u64>().unwrap_or(0);
+    let messages: Vec<Value> = state
+        .history
+        .get(&channel)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|m| key(m["ts"].as_str().unwrap_or("0")) > key(&oldest))
+        .filter(|m| {
+            root.as_deref()
+                .is_none_or(|r| m["thread_ts"].as_str() == Some(r) || m["ts"].as_str() == Some(r))
+        })
+        .collect();
+    ok(json!({"messages": messages}))
+}
+
 async fn answer(
     req: Request<Incoming>,
     state: Arc<Mutex<State>>,
@@ -333,28 +373,7 @@ async fn answer(
             json!({"channel": {"id": arg(&query, "channel"), "name": "general",
             "topic": {"value": "the release room"}, "is_im": false}}),
         ),
-        "conversations.replies" | "conversations.history" => {
-            let channel = arg(&query, "channel").unwrap_or_default();
-            let root = arg(&query, "ts");
-            let oldest = arg(&query, "oldest").unwrap_or_default();
-            let key = |t: &str| t.replace('.', "").parse::<u64>().unwrap_or(0);
-            let messages: Vec<Value> = state
-                .lock()
-                .unwrap()
-                .history
-                .get(&channel)
-                .cloned()
-                .unwrap_or_default()
-                .into_iter()
-                .filter(|m| key(m["ts"].as_str().unwrap_or("0")) > key(&oldest))
-                .filter(|m| {
-                    root.as_deref().is_none_or(|r| {
-                        m["thread_ts"].as_str() == Some(r) || m["ts"].as_str() == Some(r)
-                    })
-                })
-                .collect();
-            ok(json!({"messages": messages}))
-        }
+        "conversations.replies" | "conversations.history" => history_reply(&state, &query),
         "files.getUploadURLExternal" => {
             let url = state.lock().unwrap().upload_url.clone();
             ok(json!({"upload_url": url, "file_id": "F0FILE1"}))
