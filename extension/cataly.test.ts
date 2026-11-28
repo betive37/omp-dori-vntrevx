@@ -440,3 +440,19 @@ test("a session without Tern answers model.resolve and still takes no other comm
 	expect(await ask({ op: "model", model: "fake/second" })).toBeUndefined();
 	expect(calls).toEqual([]);
 });
+
+test("a call OMP moved to the background is reported running, with no fingerprint (EVR req. 11)", async () => {
+	const pi = fakePi();
+	const sent: any[] = [];
+	bridge(pi, { env: { CATALY_LAUNCH: "tok", CATALY_SOCKET: "/x.sock" }, connect: fakeHub("lead", sent, { n: 0 }), uid: () => 1 });
+	const ctx = ctxOf(pi);
+	await pi.emit("session_start", {}, ctx);
+	await pi.emit("tool_execution_start", { toolCallId: "b1", toolName: "bash", args: { command: "cargo test" } }, ctx);
+	const details = { async: { state: "running", jobId: "j1", type: "bash" } };
+	await pi.emit("tool_execution_end", { toolCallId: "b1", toolName: "bash", isError: false, result: { content: [{ type: "text", text: "started" }], details } }, ctx);
+	expect(sent.find(m => m.params?.kind === "tool_execution_end").params).toMatchObject({ call: "b1", job: "j1" });
+	await pi.tools[0].execute("t1", { op: "done", calls: ["b1"] }, undefined, undefined, ctx);
+	const fact = sent.find(m => m.method === "bridge.tool").params.facts[0];
+	expect(fact).toMatchObject({ call: "b1", seen: true, running: true });
+	expect(fact.fingerprint).toBeUndefined();
+});

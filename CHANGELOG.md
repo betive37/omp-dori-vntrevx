@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A lane could cite a build or test that OMP had moved to the background after 60 s, and the
+  still-running call counted as evidence. The extension now reports such a call as running with
+  no result, so the hub refuses it until it is rerun to completion.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes

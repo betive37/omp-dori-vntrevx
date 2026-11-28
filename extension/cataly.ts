@@ -105,7 +105,7 @@ export function fingerprint(tool: string, result: Json | undefined): string {
 	return hasher.digest("hex");
 }
 
-interface Call { tool: string; cwd: string; starts: number; command?: string; fingerprint?: string; error?: boolean }
+interface Call { tool: string; cwd: string; starts: number; command?: string; fingerprint?: string; error?: boolean; running?: boolean }
 
 /** The model OMP runs for this context, `provider/id`, or "" when unknown. */
 function modelOf(ctx: Ctx): string {
@@ -592,8 +592,12 @@ export class Bridge {
 		const id = String(e.toolCallId ?? "");
 		const call = this.calls.get(id);
 		const result = e.result as Json | undefined;
-		if (call) [call.error, call.fingerprint] = [Boolean(e.isError), fingerprint(call.tool, result)];
-		const job = (result?.details as Json | undefined)?.jobId;
+		// OMP backgrounds a long call and ends it at once with `details.async.state: "running"`: no result yet (EVR req. 11).
+		const async = (result?.details as Json | undefined)?.async as Json | undefined;
+		const running = async?.state === "running";
+		if (call) [call.error, call.running] = [Boolean(e.isError), running];
+		if (call) call.fingerprint = running ? undefined : fingerprint(call.tool, result);
+		const job = async?.jobId;
 		this.event("tool_execution_end", { call: id, tool: e.toolName, error: Boolean(e.isError), job });
 	}
 
