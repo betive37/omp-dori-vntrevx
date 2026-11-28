@@ -16,9 +16,9 @@ use tokio::sync::{mpsc, oneshot, watch};
 use super::attempt::{AttemptState, QUERY_MAX, Report};
 use super::enrol::{self, Destination};
 use super::mux::{Accepted, Mux, Timing};
-use super::{Hello, LINE_MAX, method};
-use crate::config::Config;
+use super::{Hello, LINE_MAX, PROTOCOL, method};
 use crate::config::workers::WorkerSettings;
+use crate::config::{Config, Language};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::proto::{Line, Request, Response};
@@ -84,8 +84,8 @@ pub(crate) enum ConnectError {
     NoForcedCommand,
     /// The worker refused the hub's key.
     Denied,
-    /// Speaks another protocol (design 2.8).
-    Incompatible(String),
+    /// Speaks another protocol (design 2.8); the worker's `hello`, which says what it runs.
+    Incompatible(String, Box<Hello>),
     /// Anything else: the network, the worker's sshd, a timeout.
     Unreachable(String),
 }
@@ -113,7 +113,7 @@ impl std::fmt::Display for ConnectError {
                 "refused: the worker did not accept this hub's key; run the `cataly worker init` \
                  line `worker add` printed on the worker",
             ),
-            Self::Incompatible(why) | Self::Unreachable(why) => f.write_str(why),
+            Self::Incompatible(why, _) | Self::Unreachable(why) => f.write_str(why),
         }
     }
 }
@@ -526,7 +526,7 @@ impl Link {
             child
                 .close(Duration::from_secs(2), Duration::from_secs(1))
                 .await;
-            return Err(ConnectError::Incompatible(why));
+            return Err(ConnectError::Incompatible(why, Box::new(hello)));
         }
         Ok((
             Self::assemble(&target.name, hello, mux, client, Some(child)),
@@ -894,6 +894,9 @@ pub(crate) struct View {
     pub(crate) reason: Option<String>,
     #[serde(default)]
     pub(crate) version: Option<String>,
+    /// The worker protocol its last `hello` spoke.
+    #[serde(default)]
+    pub(crate) protocol: Option<u32>,
     #[serde(default)]
     pub(crate) os: Option<String>,
     #[serde(default)]
@@ -907,6 +910,65 @@ pub(crate) struct View {
     #[serde(default)]
     pub(crate) repos: Vec<String>,
     pub(crate) tailscale: bool,
+}
+
+/// A worker PC's Cataly against this hub's, as far as the hub knows it: the last `hello` it got,
+/// also one it refused. Nothing is asked of the worker for it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum Standing {
+    /// As new as the hub, or newer.
+    Current,
+    /// Older; `held` when it speaks an older worker protocol, whose lanes are held.
+    Behind { held: bool },
+    /// Unreachable, or never reached: its version is not known.
+    Unknown,
+}
+
+impl View {
+    /// This worker against the hub running `hub` (its version).
+    pub(crate) fn standing(&self, hub: &str) -> Standing {
+        if matches!(self.state, State::Offline | State::Refused) {
+            return Standing::Unknown;
+        }
+        let Some(version) = &self.version else {
+            return Standing::Unknown;
+        };
+        let held = self.protocol.is_some_and(|p| p < PROTOCOL);
+        let parse = crate::sys::release::Version::parse;
+        let older = parse(version).zip(parse(hub)).is_some_and(|(w, h)| w < h);
+        if held || older {
+            Standing::Behind { held }
+        } else {
+            Standing::Current
+        }
+    }
+
+    /// What the owner is told about this worker PC against the hub running `hub`, in his
+    /// language; `None` when it is current.
+    pub(crate) fn standing_note(
+        &self,
+        hub: &str,
+        language: Language,
+    ) -> Option<(Standing, String)> {
+        let standing = self.standing(hub);
+        let (name, version) = (&self.display, self.version.as_deref().unwrap_or_default());
+        let note = match (standing, language) {
+            (Standing::Current, _) => return None,
+            (Standing::Behind { .. }, Language::Korean) => format!(
+                "다른 PC {name}는 아직 {version}이에요. 그 PC에서 `cataly update`를 실행하세요."
+            ),
+            (Standing::Behind { .. }, Language::English) => format!(
+                "The other PC {name} is still on {version}. Run `cataly update` on that PC."
+            ),
+            (Standing::Unknown, Language::Korean) => {
+                format!("다른 PC {name}에 연결되지 않아 버전을 알 수 없어요.")
+            }
+            (Standing::Unknown, Language::English) => {
+                format!("The other PC {name} is not connected, so its version is unknown.")
+            }
+        };
+        Some((standing, note))
+    }
 }
 
 /// What a bridge channel a worker opens is handed to: the hub's bridge.
@@ -1198,17 +1260,19 @@ impl Workers {
                 Ok(link)
             }
             Err(e) => {
-                let state = match &e {
-                    ConnectError::Incompatible(_) => State::Incompatible,
-                    e if e.refused() => State::Refused,
-                    _ => State::Offline,
+                let (state, hello) = match &e {
+                    ConnectError::Incompatible(_, hello) => {
+                        (State::Incompatible, Some(Hello::clone(hello)))
+                    }
+                    e if e.refused() => (State::Refused, None),
+                    _ => (State::Offline, None),
                 };
                 let text = e.to_string();
                 log::warn(
                     "worker connection failed",
                     &[("worker", &name), ("reason", &text)],
                 );
-                self.set(name, state, Some(text.clone()), None).await;
+                self.set(name, state, Some(text.clone()), hello).await;
                 Err(format!("{name}: {text}"))
             }
         }
@@ -1292,6 +1356,7 @@ impl Workers {
                     },
                     reason: if link.is_some() { None } else { record.reason },
                     version: hello.as_ref().map(|h| h.version.clone()),
+                    protocol: hello.as_ref().map(|h| h.protocol),
                     os: hello.as_ref().map(|h| h.os.clone()),
                     arch: hello.as_ref().map(|h| h.arch.clone()),
                     omp: hello.as_ref().and_then(|h| h.omp.version.clone()),
@@ -1713,6 +1778,63 @@ pub(crate) mod tests {
         let ok = finished_of(&json!({"exit": {"code": 0}, "stdout": "", "stderr": ""})).unwrap();
         assert!(ok.success());
         assert!(finished_of(&json!({"exit": {"code": 0}})).is_err());
+    }
+
+    /// A worker PC is named when it speaks an older protocol or runs an older version than the
+    /// hub; a current or newer one is not; an unreachable or never-reached one is unknown, not
+    /// outdated, even with an old `hello` on record.
+    #[test]
+    fn older_worker_pcs_are_named_and_unreachable_ones_unknown() {
+        let view = |state: State, version: Option<&str>, protocol: Option<u32>| View {
+            name: "box".into(),
+            display: "box".into(),
+            destination: "dev@box".into(),
+            port: 22,
+            state,
+            reason: None,
+            version: version.map(str::to_string),
+            protocol,
+            os: None,
+            arch: None,
+            omp: None,
+            lanes: 0,
+            lanes_max: 1,
+            seen_ms: None,
+            repos: Vec::new(),
+            tailscale: false,
+        };
+        let ko = Language::Korean;
+        let old = view(State::Incompatible, Some("0.2.6"), Some(1));
+        assert_eq!(old.standing("0.2.8"), Standing::Behind { held: true });
+        assert_eq!(
+            old.standing_note("0.2.8", ko).unwrap().1,
+            "다른 PC box는 아직 0.2.6이에요. 그 PC에서 `cataly update`를 실행하세요."
+        );
+        assert_eq!(
+            old.standing_note("0.2.8", Language::English).unwrap().1,
+            "The other PC box is still on 0.2.6. Run `cataly update` on that PC."
+        );
+        let behind = view(State::Idle, Some("0.2.7"), Some(PROTOCOL));
+        assert_eq!(behind.standing("0.2.8"), Standing::Behind { held: false });
+        for current in [
+            view(State::Online, Some("0.2.8"), Some(PROTOCOL)),
+            view(State::Online, Some("0.2.9"), Some(PROTOCOL)),
+        ] {
+            assert_eq!(current.standing_note("0.2.8", ko), None);
+        }
+        for unknown in [
+            view(State::Offline, Some("0.2.6"), Some(1)),
+            view(State::Refused, None, None),
+            view(State::Idle, None, None),
+        ] {
+            assert_eq!(
+                unknown.standing_note("0.2.8", ko).unwrap(),
+                (
+                    Standing::Unknown,
+                    "다른 PC box에 연결되지 않아 버전을 알 수 없어요.".to_string()
+                )
+            );
+        }
     }
 
     #[test]
