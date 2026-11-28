@@ -6,7 +6,8 @@
   req. 21 and COORD req. 5 allow. Built-in shell rule 0 refused every `cataly slot` line, so a lane
   had no way to queue for a slot. The command after `--` is now judged by rule 0 as its own line:
   `cataly slot b -- cargo test` runs, `cataly slot b -- omp usage reset` is still refused, and a
-  word before `--` the hub cannot resolve fails closed.
+  slot whose command is not known from the text (nothing after `--`, a word before it that the
+  shell may expand, `xargs` or `find` in front) is refused as before.
 
 ## 0.2.7 (2026-11-28)
 
