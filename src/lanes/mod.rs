@@ -42,14 +42,14 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, Notify, OwnedMutexGuard, watch};
 
 use crate::config::Config;
-use crate::host::inbox::{HUB_SENDER, LEAD, Mailbox, Message, Note, ReceiptState};
+use crate::host::inbox::{HUB_SENDER, LEAD, Mailbox, Message, Note, Receipt, ReceiptState};
 use crate::host::lead::{Events, Factory};
 use crate::host::{Control, Runtime, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::omp::Omp;
 use crate::params as p;
-use crate::store::Store;
+use crate::store::{Store, StoreError};
 use crate::store::lanes::{LaneDone, LaneRow, LaneWrite, Revision};
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
@@ -126,6 +126,7 @@ pub(crate) struct Lanes<R: Runtime> {
     env: Env<R>,
     live: Mutex<HashMap<String, Arc<R::Session>>>,
     turns: Mutex<HashMap<String, Arc<AsyncMutex<()>>>>,
+    inboxes: Inboxes,
     opening: Mutex<Vec<String>>,
     /// Closes on threads are serialised so two last lanes cannot both skip the hook (LANE req. 42).
     closing: AsyncMutex<()>,
@@ -174,6 +175,7 @@ impl<R: Runtime> Lanes<R> {
             env,
             live: Mutex::new(HashMap::new()),
             turns: Mutex::new(HashMap::new()),
+            inboxes: Inboxes::default(),
             opening: Mutex::new(Vec::new()),
             closing: AsyncMutex::new(()),
             overlay: OnceLock::new(),
@@ -340,8 +342,8 @@ impl<R: Runtime> Lanes<R> {
     async fn flush_inbox(&self, key: &str, session: &R::Session, locked: bool) {
         self.resume_for_answer(key, session, false, locked).await;
         let notes = self
-            .mailbox(key)
-            .flush(Some(session), false)
+            .inboxes
+            .flush(&self.mailbox(key), Some(session))
             .await
             .unwrap_or_default();
         self.noted(key, notes, locked).await;
@@ -1347,7 +1349,10 @@ impl<R: Runtime> Lanes<R> {
             identity: Some(identity.to_string()),
             request_id: Some(identity.to_string()),
         };
-        let (receipt, id, _) = mailbox.deliver(&message, Some(&**session), false).await?;
+        let (receipt, id, _) = self
+            .inboxes
+            .deliver(&mailbox, &message, Some(&**session))
+            .await?;
         let Some(id) = id else {
             return Ok(receipt.state);
         };
@@ -1359,7 +1364,7 @@ impl<R: Runtime> Lanes<R> {
                 return Ok(state);
             }
             tokio::time::sleep(Duration::from_millis(100)).await;
-            let _ = mailbox.flush(Some(&**session), false).await;
+            let _ = self.inboxes.flush(&mailbox, Some(&**session)).await;
         }
     }
 
@@ -1388,7 +1393,11 @@ impl<R: Runtime> Lanes<R> {
         {
             self.resume_for_answer(key, s, true, locked).await;
         }
-        match mailbox.deliver(&message, session.as_deref(), false).await {
+        match self
+            .inboxes
+            .deliver(&mailbox, &message, session.as_deref())
+            .await
+        {
             Ok((_, _, notes)) => self.noted(key, notes, locked).await,
             Err(e) => log::warn("lane notice not stored", &[("lane", &key), ("error", &e)]),
         }
@@ -1460,7 +1469,10 @@ impl<R: Runtime> Lanes<R> {
             return Ok(format!("{out:?}"));
         }
         self.resume_for_answer(key, &session, true, true).await;
-        let (receipt, _, notes) = mailbox.deliver(&message, Some(&*session), false).await?;
+        let (receipt, _, notes) = self
+            .inboxes
+            .deliver(&mailbox, &message, Some(&*session))
+            .await?;
         drop(turn);
         self.noted(key, notes, false).await;
         let state = match receipt.inbox_id {
@@ -1716,7 +1728,10 @@ impl<R: Runtime> Lanes<R> {
             self.resume_for_answer(key, s, true, false).await;
         }
         let mailbox = self.mailbox(key);
-        let (receipt, _, notes) = mailbox.deliver(&message, session.as_deref(), false).await?;
+        let (receipt, _, notes) = self
+            .inboxes
+            .deliver(&mailbox, &message, session.as_deref())
+            .await?;
         self.noted(key, notes, false).await;
         Ok(receipt)
     }
@@ -1825,6 +1840,35 @@ fn turn_lock(
     Arc::clone(map.entry(key.to_string()).or_default())
 }
 
+/// One flush or delivery of a lane's inbox at a time, as the lead's inbox has one: two at once
+/// read the same pending rows, or the same batch to resend, and both write them to the lane
+/// (PATCH-01 rules 4 and 11). A lock is held only around the store and session calls of one flush
+/// or delivery, never while its notes are acted on ([`Lanes::noted`]), so the lock order is always
+/// the lane's turn, then its inbox.
+#[derive(Default)]
+struct Inboxes(Mutex<HashMap<String, Arc<AsyncMutex<()>>>>);
+
+impl Inboxes {
+    async fn flush<S: Control>(
+        &self,
+        mailbox: &Mailbox,
+        session: Option<&S>,
+    ) -> Result<Vec<Note>, StoreError> {
+        let _one = turn_lock(&self.0, &mailbox.target).lock_owned().await;
+        mailbox.flush(session, false).await
+    }
+
+    async fn deliver<S: Control>(
+        &self,
+        mailbox: &Mailbox,
+        message: &Message,
+        session: Option<&S>,
+    ) -> Result<(Receipt, Option<i64>, Vec<Note>), String> {
+        let _one = turn_lock(&self.0, &mailbox.target).lock_owned().await;
+        mailbox.deliver(message, session, false).await
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1852,5 +1896,70 @@ mod tests {
         );
         drop(held);
         assert!(again.try_lock().is_ok());
+    }
+
+    /// Two flushes of one lane's inbox at once (a turn end and the confirmation beat, a lead's
+    /// message and `deliver_wait`'s poll) read the same pending rows, or the same batch to resend:
+    /// the lane must get them once, not once per flush.
+    #[tokio::test]
+    async fn concurrent_lane_flushes_write_a_batch_once() {
+        use crate::host::testing::{Fake, spec};
+        use crate::store::tests::open_temp;
+
+        let writes = |fake: &Fake| fake.seen("prompt").len() + fake.seen("follow_up").len();
+        let message = Message {
+            sender: LEAD.into(),
+            text: "one".into(),
+            urgent: true,
+            owner: false,
+            identity: None,
+            request_id: None,
+        };
+        let inboxes = Inboxes::default();
+
+        // Pending rows: one batch carries them.
+        let (store, _writer, _dir) = open_temp("lane-inbox-pending");
+        let mailbox = Mailbox {
+            target: "lane-1".into(),
+            store,
+        };
+        let fake = Fake::start();
+        let (session, _) = fake.bind(spec("h1", None)).await.unwrap();
+        mailbox.admit(&message).await.unwrap();
+        let (a, b) = tokio::join!(
+            inboxes.flush(&mailbox, Some(&*session)),
+            inboxes.flush(&mailbox, Some(&*session))
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(writes(&fake), 1, "the pending row was written twice");
+
+        // A batch to resend: its process gone, the same session bound again without its entry.
+        let (store, _writer, _dir) = open_temp("lane-inbox-resend");
+        let mailbox = Mailbox {
+            target: "lane-2".into(),
+            store,
+        };
+        let fake = Fake::start();
+        fake.set(|s| s.write_entries = false);
+        std::fs::write(fake.file(), "{\"type\":\"session\"}\n").unwrap();
+        let (session, _) = fake.bind(spec("h1", None)).await.unwrap();
+        mailbox.admit(&message).await.unwrap();
+        inboxes.flush(&mailbox, Some(&*session)).await.unwrap();
+        assert_eq!(writes(&fake), 1);
+        session.close(false).await.unwrap();
+        let next = Fake::start();
+        next.set(|s| {
+            s.file = fake.file();
+            s.write_entries = false;
+        });
+        let (resumed, _) = next.bind(spec("h2", None)).await.unwrap();
+        let (a, b) = tokio::join!(
+            inboxes.flush(&mailbox, Some(&*resumed)),
+            inboxes.flush(&mailbox, Some(&*resumed))
+        );
+        a.unwrap();
+        b.unwrap();
+        assert_eq!(writes(&next), 1, "the batch was resent twice");
     }
 }
