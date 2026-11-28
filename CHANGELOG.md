@@ -2,8 +2,9 @@
 
 ## Unreleased
 
-- Removing a worker keeps the SSH host-key pin while another worker uses the same host and port,
-  so other users on that host can still connect. The last worker's removal drops the pin.
+- Removing a worker keeps the SSH host-key pin while another worker uses the same host and port
+  (ignoring host-name letter case), so other users on that host can still connect. The last worker's
+  removal drops the pin.
 
 ## 0.2.8 (2026-11-28)
 

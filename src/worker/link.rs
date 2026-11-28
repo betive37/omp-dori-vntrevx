@@ -1479,7 +1479,8 @@ pub(crate) fn remove_files(
     if config.workers.iter().any(|(other_name, other)| {
         other_name != name
             && other.port == dest.port
-            && Destination::parse(&other.destination).is_ok_and(|other| other.host == dest.host)
+            && Destination::parse(&other.destination)
+                .is_ok_and(|other| other.host.eq_ignore_ascii_case(&dest.host))
     }) {
         return Ok(());
     }
@@ -1596,6 +1597,27 @@ pub(crate) mod tests {
             let key = enrol::key_path(&dir, "bob");
             assert!(!key.exists() && !key.with_extension("pub").exists());
             assert_eq!(std::fs::read_to_string(&pins).unwrap(), unrelated);
+        }
+    }
+
+    #[test]
+    fn removing_workers_keeps_a_shared_host_pin_with_mixed_case_hosts() {
+        for port in [22, 2222] {
+            let config = crate::config::parse(&format!(
+                "[workers.alice]\ndestination = \"alice@BoX\"\nport = {port}\n\
+                 [workers.bob]\ndestination = \"bob@bOx\"\nport = {port}\n"
+            ))
+            .unwrap();
+            for (name, destination) in [("alice", "alice@BoX"), ("bob", "bob@bOx")] {
+                let dir = crate::sys::fs::tests::scratch("worker-shared-pin-case");
+                let dest = Destination::parse(&format!("{destination}:{port}")).unwrap();
+                let pins = enrol::known_hosts(&dir);
+                let all_pins = enrol::set_pin("", &dest.pin_name(), "SHARED");
+                crate::sys::fs::write_atomic(&pins, all_pins.as_bytes()).unwrap();
+
+                remove_files(&dir, name, &dest, &config).unwrap();
+                assert_eq!(std::fs::read_to_string(&pins).unwrap(), all_pins);
+            }
         }
     }
 
