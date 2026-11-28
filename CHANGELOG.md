@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Starting the lead could exceed the session cap when live lanes already filled it. Lead starts
+  now count live local lanes too and refuse with the session-cap message when no place is free.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
