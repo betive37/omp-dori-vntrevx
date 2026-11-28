@@ -85,11 +85,7 @@ fn child_env_with(lookup: impl Fn(&str) -> Option<String>) -> Vec<(&'static str,
             env.push((key, value));
         }
     }
-    for key in ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"] {
-        if let Some(value) = lookup(key).filter(|value| Path::new(value).is_absolute()) {
-            env.push((key, value));
-        }
-    }
+    env.extend(crate::sys::xdg_homes(&lookup));
     env
 }
 

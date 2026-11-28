@@ -135,17 +135,12 @@ fn definition_with_env(
     macos: bool,
     lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Result<String, String> {
-    let xdg = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"]
-        .into_iter()
-        .filter_map(|name| {
-            lookup(name)
-                .filter(|value| Path::new(value).is_absolute())
-                .map(|value| {
-                    value.into_string().map(|value| (name, value)).map_err(|_| {
-                        format!("{name} is not valid UTF-8; user service paths must be UTF-8")
-                    })
-                })
-        });
+    let xdg = super::xdg_homes(lookup).map(|(name, value)| {
+        value
+            .into_string()
+            .map(|value| (name, value))
+            .map_err(|_| format!("{name} is not valid UTF-8; user service paths must be UTF-8"))
+    });
     if macos {
         let exe = xml_escape(&unit.command.display().to_string());
         let env_file = xml_escape(&unit.env_file.display().to_string());
