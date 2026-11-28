@@ -3,8 +3,8 @@
 ## Unreleased
 
 - Questions could expose credential-shaped strings in their text and choice labels on Discord.
-  Mask them before formatting or shortening, including when a question closes, while keeping
-  the original option values for answers.
+  Mask them before formatting or shortening, including local-only waiting notices, approval
+  reasons and details, and closing edits, while keeping the original option values for answers.
 
 ## 0.2.8 (2026-11-28)
 

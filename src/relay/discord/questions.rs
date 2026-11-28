@@ -308,14 +308,15 @@ fn local_notice(dialog: &Dialog, remote_approvals: bool) -> String {
         .flatten()
         .map(String::as_str)
         .collect();
-    let raw = raw.join(" ");
+    // Mask the full detail before a cut can hide a credential's shape.
+    let raw = neutral(&raw.join(" "));
     let mut detail: String = raw.chars().take(NOTICE_DETAIL).collect();
     if detail.len() < raw.len() {
         detail.push('…');
     }
     let mut text = format!("**Waiting on the machine:** {what}");
     if !detail.is_empty() {
-        let _ = write!(text, ": {}", neutral(&detail));
+        let _ = write!(text, ": {detail}");
     }
     let _ = write!(text, " ({why}). Answer it there: ");
     let id = &dialog.id;
@@ -1803,6 +1804,24 @@ mod tests {
             long.ends_with(" (추천)") && long.chars().count() == 100,
             "{long}"
         );
+    }
+
+    #[test]
+    fn local_notices_mask_secrets_before_shortening() {
+        // A raw cut would leave fewer than the 30 characters needed to recognise this token.
+        let padding = "界".repeat(NOTICE_DETAIL - 20);
+        let token = format!("ghp_{}", "a".repeat(36));
+        let dialog = dialog_of(&json!({
+            "id": "a-1", "method": "select", "title": padding, "message": token,
+            "options": ["Approve Once", "Deny"]
+        }))
+        .unwrap();
+        let text = local_notice(&dialog, false);
+        assert!(
+            text.contains(&format!(r": {padding} \[masked\] (remote approvals are off).")),
+            "{text}"
+        );
+        assert_eq!(dialog.message.as_deref(), Some(token.as_str()));
     }
 
     #[test]

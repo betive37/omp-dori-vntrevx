@@ -125,7 +125,7 @@ fn text(prompt: &str, language: Language) -> String {
             let tool: String = tool.chars().filter(|c| *c != '`').collect();
             let _ = write!(out, "\n**{}:** `{}`", w.tool, short(&tool, 80));
         } else if let Some(reason) = line.strip_prefix("Reason: ") {
-            let reason = neutral(&short(reason, DETAIL_MAX));
+            let reason = short(&neutral(reason), DETAIL_MAX);
             let _ = write!(out, "\n**{}:** {reason}", w.reason);
         } else if let Some(first) = line.strip_prefix("Command:") {
             // The command runs to the end of the prompt; OMP puts it last.
@@ -141,7 +141,7 @@ fn text(prompt: &str, language: Language) -> String {
         }
     }
     if !others.is_empty() {
-        out.push_str(&neutral(&short(&others, DETAIL_MAX)));
+        out.push_str(&short(&neutral(&others), DETAIL_MAX));
     }
     if let Some(command) = command {
         let (shown, was_cut) = cut_command(&command);
@@ -197,6 +197,27 @@ mod tests {
         assert!(!card.contains("@everyone"), "{card}");
         let odd = text("Run bash: rm -rf @everyone *now*", Language::English);
         assert!(odd.contains("@\u{200b}everyone \\*now\\*"), "{odd}");
+    }
+
+    #[test]
+    fn approval_reasons_mask_secrets_before_shortening() {
+        let padding = "界".repeat(DETAIL_MAX - 20);
+        let token = format!("ghp_{}", "a".repeat(36));
+        let prompt = format!("Reason: {padding} {token}");
+        let card = text(&prompt, Language::English);
+        assert_eq!(
+            card,
+            format!("**Permission asked**\n**Reason:** {padding} \\[masked\\]")
+        );
+    }
+
+    #[test]
+    fn approval_other_lines_mask_secrets_before_shortening() {
+        let padding = "界".repeat(DETAIL_MAX - 20);
+        let token = format!("ghp_{}", "a".repeat(36));
+        let prompt = format!("{padding} {token}");
+        let card = text(&prompt, Language::English);
+        assert_eq!(card, format!("**Permission asked**\n{padding} \\[masked\\]"));
     }
 
     #[test]
