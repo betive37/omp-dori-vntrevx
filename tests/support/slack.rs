@@ -290,6 +290,9 @@ async fn answer(
             body: body.clone(),
             bytes: bytes.len(),
         });
+        if method == "conversations.history" && std::mem::take(&mut s.fail_history_once) {
+            return Ok(reply(200, &json!({"ok": false, "error": "internal_error"})));
+        }
         s.hang
     };
     if hang {
@@ -332,11 +335,6 @@ async fn answer(
             "topic": {"value": "the release room"}, "is_im": false}}),
         ),
         "conversations.replies" | "conversations.history" => {
-            if method == "conversations.history"
-                && std::mem::take(&mut state.lock().unwrap().fail_history_once)
-            {
-                return Ok(reply(200, &json!({"ok": false, "error": "internal_error"})));
-            }
             let channel = arg(&query, "channel").unwrap_or_default();
             let root = arg(&query, "ts");
             let oldest = arg(&query, "oldest").unwrap_or_default();
