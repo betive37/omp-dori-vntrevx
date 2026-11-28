@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A lane that closes on a thread another open lane still uses leaves that thread alone, as LANE
+  req. 42 and DESIGN C17 say. The thread-finished hook already skipped it, but the status word
+  set afterwards still renamed the thread `[done]` and, for a completed close, archived it while
+  the other lane was working in it. The last lane on the thread marks it done.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
