@@ -267,7 +267,8 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     marking: Mutex<HashSet<Key>>,
     /// The done marks owed from before this run were looked for.
     swept: AtomicBool,
-    /// When a read of answers last found the lead working (ms; 0 before any).
+    /// When a read of answers last found the lead working, seeded from the session file's mtime
+    /// after an intake or hub restart (ms; 0 before either is known).
     worked_ms: AtomicI64,
     /// Live messages not handed off yet.
     live: Mutex<LiveMessages>,
@@ -1130,12 +1131,23 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             && let Some(file) = snap.session_file.clone()
         {
             let settled = turn_over || snap.status == Status::Idle;
+            let file = PathBuf::from(file);
+            let metadata = std::fs::metadata(&file).ok();
             if !settled {
                 self.worked_ms.store(now_ms(), Ordering::Release);
+            } else if self.worked_ms.load(Ordering::Acquire) == 0
+                && let Some(modified) = metadata
+                    .as_ref()
+                    .and_then(|m| m.modified().ok())
+                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                    .and_then(|t| i64::try_from(t.as_millis()).ok())
+            {
+                // A rebuilt intake may first see an idle lead. Recover its earlier work without
+                // giving an old, untouched transcript a fresh window at every restart.
+                self.worked_ms.fetch_max(modified, Ordering::AcqRel);
             }
-            let file = PathBuf::from(file);
             // The newest answered request's later turns: read again only when something changed.
-            let length = std::fs::metadata(&file).map(|m| m.len()).ok();
+            let length = metadata.map(|m| m.len());
             let later = newest.filter(|h| {
                 let seen = &self.later().read;
                 !matches!((seen, length), (Some((m, f, l, s)), Some(length))

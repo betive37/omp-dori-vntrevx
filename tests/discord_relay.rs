@@ -344,6 +344,104 @@ fn answers_wait_for_a_turn_longer_than_the_owed_window() {
     assert!(hub.stop().success());
 }
 
+/// An intake rebuild must recover recent lead work even when its first snapshot is idle, but
+/// must not give an old, untouched transcript a fresh window just because intake restarted.
+#[test]
+fn intake_restart_recovers_only_recent_lead_work() {
+    for recent in [true, false] {
+        let fake = FakeDiscord::start();
+        let mut hub = relay_hub(&fake, &[], "");
+        hub.start();
+        ready(&hub);
+        recap_delivered(&hub);
+        assert!(hub.stop().success());
+        // Install the aging rule with the hub stopped: only its own writer changes the hand-off
+        // while it runs. Confirmation means the held turn has reached the transcript already.
+        {
+            let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+            db.execute_batch(
+                "CREATE TRIGGER age_confirmed_request AFTER UPDATE OF state ON handoffs
+                 WHEN NEW.relay = 'discord' AND NEW.message = '800000000000000023'
+                   AND OLD.state = 'handed' AND NEW.state = 'delivered'
+                 BEGIN
+                   UPDATE handoffs SET created_ms = created_ms - 31 * 60 * 1000
+                   WHERE relay = NEW.relay AND room = NEW.room AND message = NEW.message;
+                 END;",
+            )
+            .unwrap();
+        }
+        hub.fixture("omp", "hold", Some("the interrupted wait"));
+        hub.fixture("omp", "hold-busy", Some(""));
+        hub.start();
+        ready(&hub);
+        recap_delivered(&hub);
+        hub.fixture("omp", "answer.json", Some(r#""the late answer""#));
+        fake.say(FakeDiscord::message(
+            CH,
+            800_000_000_000_000_023,
+            OWNER,
+            "the interrupted wait",
+        ));
+        hub.until(WAIT, || {
+            (handoffs(&hub) == 1 && queued(&hub, 800_000_000_000_000_023) == 0)
+                .then_some(())
+        });
+        // A renewal after confirmation proves an answer round observed the busy lead.
+        let typing = format!("/channels/{CH}/typing");
+        let typed = fake.calls("POST", &typing).len();
+        fake.wait(WAIT, |f| {
+            (f.calls("POST", &typing).len() > typed).then_some(())
+        });
+        let source = "800000000000000023";
+        assert_eq!(answer_state(&hub, source), "waiting");
+        // Let readback show idle without releasing the delayed final answer. The old pipeline
+        // still remembers the busy read; the new one has only the transcript's modification time.
+        hub.fixture("omp", "busy", None);
+        hub.until(WAIT, || {
+            (hub.json(&["lead", "status", "--json"])["session"]["status"] == "idle")
+                .then_some(())
+        });
+        let file = session_file(&hub);
+        let age = Duration::from_secs(if recent { 60 } else { 31 * 60 });
+        std::fs::File::options()
+            .write(true)
+            .open(&file)
+            .unwrap()
+            .set_times(std::fs::FileTimes::new().set_modified(std::time::SystemTime::now() - age))
+            .unwrap();
+        let connections = fake.connections().len();
+        assert!(hub.cli(&["discord", "release", CH]).status.success());
+        fake.wait_connections(connections + 1, WAIT);
+        ready(&hub);
+        if recent {
+            // Allow two 3 s handling ticks after the rebuild before making the answer available.
+            std::thread::sleep(support::patience(Duration::from_secs(6)));
+            assert_eq!(answer_state(&hub, source), "waiting");
+        } else {
+            hub.until(WAIT, || {
+                (answer_state(&hub, source) == "abandoned").then_some(())
+            });
+        }
+        hub.fixture("omp", "release", Some(""));
+        if recent {
+            let creates = fake.wait_creates(1, WAIT);
+            assert_eq!(reference(&creates[0]).as_deref(), Some(source));
+            hub.until(WAIT, || {
+                (answer_state(&hub, source) == "posted").then_some(())
+            });
+        }
+        // End the held turn before stopping the hub, including the expired-answer case.
+        hub.until(WAIT, || {
+            (std::fs::read_to_string(&file)
+                .unwrap()
+                .contains("the late answer")
+                && hub.json(&["lead", "status", "--json"])["session"]["status"] == "idle")
+                .then_some(())
+        });
+        assert!(hub.stop().success());
+    }
+}
+
 /// Sends an owner message from which the owner has already started a thread (the thread takes the
 /// message's ID); `THREAD_CREATE` goes first, so intake follows the thread before the request.
 fn ask_with_thread(fake: &FakeDiscord, message: u64, text: &str) -> String {

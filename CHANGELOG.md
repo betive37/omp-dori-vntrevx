@@ -7,12 +7,13 @@
   minutes after it arrived, and the answer that came later was never posted. While the lead works,
   a message to the lead now keeps waiting for its answer; the next message that reaches the lead
   still ends the wait, and a message with no answer is given up only once the lead has also been
-  idle for 30 minutes. Messages handed to a lane keep the 30-minute limit. Limits: a message whose
-  line in the lead's session file is pushed out of the last 8 MiB read, or whose session file
-  changed, waits until the lead has been idle for 30 minutes and is then given up; after a hub
-  restart the lead's earlier work is not remembered, so an old message is given up as before. A
-  message queued behind a long turn can still go in doubt when its delivery is not confirmed
-  within 30 seconds (a separate cause, fixed by
+  idle for 30 minutes. Intake and hub restarts recover the last-work time from the lead's session
+  file's modification time instead of immediately giving up an old message. Messages handed to a
+  lane keep the 30-minute limit. Limits: a message whose line in the lead's session file is pushed
+  out of the last 8 MiB read, or whose session file changed, waits until the lead has been idle for
+  30 minutes and is then given up; work not reflected in the file's modification time cannot be
+  recovered after a restart. A message queued behind a long turn can still go in doubt when its
+  delivery is not confirmed within 30 seconds (a separate cause, fixed by
   [PR #314](https://github.com/vntrevx/Cataly/pull/314)); the full effect for such messages needs
   both. Discord, Telegram and Slack alike.
 
