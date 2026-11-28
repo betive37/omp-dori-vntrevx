@@ -727,7 +727,10 @@ enum ReplyPosition {
     Request(u64),
     /// No complete entry through this offset carries the tag; `complete` means the rest of the
     /// current file was checked too, apart from an unfinished last line.
-    Searched { through: u64, complete: bool },
+    Searched {
+        through: u64,
+        complete: bool,
+    },
 }
 
 impl ReplyPosition {
@@ -860,7 +863,12 @@ fn finish_messages(
         .min(start);
     let mut head = if from < start {
         reader.seek(SeekFrom::Start(from))?;
-        message_lines(&mut reader.take(start - from), from, started, Some(&missing))?
+        message_lines(
+            &mut reader.take(start - from),
+            from,
+            started,
+            Some(&missing),
+        )?
     } else {
         MessageScan {
             entries: Vec::new(),
@@ -967,7 +975,9 @@ pub(crate) fn replies(
     let Some(entries) = message_entries(path, tags, offsets)? else {
         return Ok(vec![Reply::Pending; tags.len()]);
     };
-    Ok(replies_from_entries(&entries, tags, prefix, settled, offsets))
+    Ok(replies_from_entries(
+        &entries, tags, prefix, settled, offsets,
+    ))
 }
 
 fn replies_from_entries(
@@ -1527,8 +1537,10 @@ mod tests {
                 .is_empty(),
             "an unchanged transcript is not searched again for an absent tag"
         );
-        file.write_all(b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d que")
-            .unwrap();
+        file.write_all(
+            b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d que",
+        )
+        .unwrap();
         file.flush().unwrap();
         assert_eq!(
             replies(&path, &tags, "[d ", true, &mut offsets).unwrap(),
@@ -1554,7 +1566,8 @@ mod tests {
 
     #[test]
     fn reply_search_keeps_tail_answers_when_head_budget_expires() {
-        let head = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d old]\"}}\n";
+        let head =
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d old]\"}}\n";
         let tail = concat!(
             "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d ready]\"}}\n",
             "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"ready answer\",\"stopReason\":\"stop\"}}\n"
@@ -1577,8 +1590,8 @@ mod tests {
         let expired = Instant::now()
             .checked_sub(SEARCH_BUDGET + Duration::from_millis(1))
             .unwrap();
-        let entries = finish_messages(&mut reader, start, tail, &tags, &mut offsets, expired)
-            .unwrap();
+        let entries =
+            finish_messages(&mut reader, start, tail, &tags, &mut offsets, expired).unwrap();
         assert_eq!(
             replies_from_entries(&entries, &tags, "[d ", true, &mut offsets),
             vec![
@@ -1610,8 +1623,7 @@ mod tests {
             "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"wanted answer\"}}\n"
         );
         let mut reader = std::io::Cursor::new(text);
-        let scan = message_lines(&mut reader, 0, Instant::now(), Some(&["[d wanted]"]))
-            .unwrap();
+        let scan = message_lines(&mut reader, 0, Instant::now(), Some(&["[d wanted]"])).unwrap();
         assert!(scan.complete);
         assert_eq!(scan.through, text.len() as u64);
         assert_eq!(scan.entries.len(), 2);
@@ -1692,7 +1704,11 @@ mod tests {
         let started = Instant::now()
             .checked_sub(SEARCH_BUDGET + Duration::from_millis(1))
             .unwrap();
-        assert!(!message_lines(&mut input, 0, started, None).unwrap().complete);
+        assert!(
+            !message_lines(&mut input, 0, started, None)
+                .unwrap()
+                .complete
+        );
     }
 
     #[test]
