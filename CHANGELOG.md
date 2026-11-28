@@ -122,6 +122,12 @@
   an explicit refusal still leaves it inert. An accepted session whose reconnect the hub refuses
   (for one, a session it no longer knows) now goes inert too, instead of retrying for the life of
   the process; a reconnect that times out or loses its connection still retries.
+- Cron jobs with a step in a day field, like `0 0 */2 * *` or `0 0 * * */2`, ran every day; they now
+  run only on the stepped days, combining the two day fields the way standard cron does: when either
+  day field starts with `*`, both must match. So `0 0 */2 * mon` now fires only on odd-day Mondays,
+  fewer days than before. A next run already saved for a day the new rule excludes moves to the next
+  valid day instead of firing. The search covers 40-year gaps between rare date-and-weekday matches,
+  such as leap-day Sundays from 2088 to 2128 across the non-leap year 2100.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
