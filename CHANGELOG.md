@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Slack reconnects and retries failed catch-up reads before taking live messages, so a newer
+  message cannot move the saved position past requests missed while disconnected.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

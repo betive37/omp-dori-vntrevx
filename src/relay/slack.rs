@@ -11,9 +11,10 @@
 //!   threads the account posted in (thread memory: one room per thread, `<channel>:<root ts>`, whose
 //!   position is the seen timestamp). Every envelope is acknowledged within 3 s, after the event was
 //!   admitted or dropped. After start and every reconnect, remembered threads and DMs are read from
-//!   their positions (200 at most, oldest first). Own and bot messages are dropped; a reply whose
-//!   channel or root disagrees with where it was read stops that read. Only allowlisted senders are
-//!   admitted (owner decision 10: the owner alone by default).
+//!   their positions (200 at most, oldest first). A failed catch-up read reconnects before taking
+//!   live events, so their hand-off cannot skip unread messages. Own and bot messages are dropped;
+//!   a reply whose channel or root disagrees with where it was read stops that read. Only allowlisted
+//!   senders are admitted (owner decision 10: the owner alone by default).
 //! - Posts (SLACK req. 45-47): a post answers in the request's thread and records that thread; the
 //!   answer must carry the channel and a `digits.digits` timestamp, else it is uncertain. Uploads
 //!   allocate a ticket whose URL must be https on exactly `files.slack.com` under Slack's upload path
@@ -1045,11 +1046,7 @@ impl<T: Runtime> Socket<T> {
                                 self.shared.catch_up_latency.record(established.elapsed());
                                 self.shared.set(|h| h.caught_up = true);
                             }
-                            Err(e) => {
-                                log::warn("Slack catch-up read failed", &[("error", &e)]);
-                                self.shared
-                                    .set(|h| h.last_error = Some(format!("catch-up read: {e}")));
-                            }
+                            Err(e) => return Down::Again(format!("catch-up read: {e}")),
                         }
                     }
                 }
