@@ -2352,12 +2352,12 @@ fn close_published_symlink_worktree(legacy: bool, missing_link: bool) {
     let rec = record(&hub, "published-close");
     assert_eq!(rec["state"], "closed", "{rec}");
     assert!(real.is_dir(), "the published worktree was removed: {rec}");
-    assert!(
-        rec["receipt"]
-            .to_string()
-            .contains("kept: it holds a published file"),
-        "{rec}"
-    );
+    let kept = if missing_link {
+        "kept: its path cannot be resolved"
+    } else {
+        "kept: it holds a published file"
+    };
+    assert!(rec["receipt"].to_string().contains(kept), "{rec}");
     assert_eq!(
         std::fs::read_to_string(real.join("a.txt")).unwrap(),
         "original"

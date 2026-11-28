@@ -64,7 +64,11 @@ impl<R: Runtime> Lanes<R> {
             return Err("input is pending or uncertain".into());
         }
         let place = saved.place();
-        if self.holds_published(&place, path).await {
+        // One resolution where the worktree lives serves both preservation checks below.
+        let Ok(tree) = canonical_path(&place, path).await else {
+            return Err("its path cannot be resolved".into());
+        };
+        if self.holds_published(path, &tree).await {
             return Err("it holds a published file".into());
         }
         if let Some(id) = &saved.session_id
@@ -72,7 +76,7 @@ impl<R: Runtime> Lanes<R> {
         {
             return Err("session lease is held or unknown".into());
         }
-        self.worktree_unused(&saved, &place, path).await?;
+        self.worktree_unused(&saved, &place, &tree).await?;
         let dir = Path::new(path);
         let limit = Duration::from_secs(60);
         let (ok, status) = git::git(
@@ -111,8 +115,12 @@ impl<R: Runtime> Lanes<R> {
     }
 
     /// Caller holds `worktree_use` until removal finishes, fencing new path reservations.
-    async fn worktree_unused(&self, rec: &Record, place: &Place, path: &str) -> Result<(), String> {
-        let tree = canonical_path(place, path).await?;
+    async fn worktree_unused(
+        &self,
+        rec: &Record,
+        place: &Place,
+        tree: &Path,
+    ) -> Result<(), String> {
         let rows = self
             .env
             .store
@@ -138,7 +146,7 @@ impl<R: Runtime> Lanes<R> {
                 let real = canonical_path(place, used)
                     .await
                     .map_err(|e| format!("lane {key} path unreadable: {e}"))?;
-                if real.starts_with(&tree) {
+                if real.starts_with(tree) {
                     return Err(format!("in use by lane {key}"));
                 }
             }
