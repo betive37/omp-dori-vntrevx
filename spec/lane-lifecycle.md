@@ -277,9 +277,12 @@ in their own areas; this spec only states what lifecycle needs from them.
     gone (on a worker, the worker's acknowledgement; a dropped connection is not one), and a fresh preservation check
     at removal time. Tracked changes, untracked files, ignored files (build caches included), commits on no remote,
     uncertain input, a worktree the artifacts area marks as needed, and any check that cannot be read all keep the
-    worktree. Removal is the non-forced git removal; a failure keeps the record and the worktree and is named in
-    the receipt. Disposing of kept ignored files or caches is a separate, explicit owner action, never part of a
-    close or of a recovery.
+    worktree. Another open lane on the same machine (the hub or the same worker) whose working directory or
+    registered worktree is at or inside it also keeps it; paths are resolved on that machine before comparison,
+    and the receipt names the lane using it. Open, reopen and worktree registration cannot reserve a path between
+    that check and removal. Removal is the non-forced git removal; a failure keeps the record and the worktree and
+    is named in the receipt. Disposing of kept ignored files or caches is a separate, explicit owner action,
+    never part of a close or of a recovery.
 62. Crash during close: on restart, a lane with a recorded close intent resumes the close from the step it reached,
     using the recorded intent; it never starts over or re-runs checks with a different result.
 

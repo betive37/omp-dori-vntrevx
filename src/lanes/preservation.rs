@@ -1,16 +1,40 @@
 //! The only worktree removal boundary. Durable authority is necessary, never sufficient.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use super::record::Record;
 use super::{Lanes, git};
 use crate::host::Runtime;
+use crate::worker::Place;
+
+/// Resolve paths where they are used, never against the hub's filesystem for a worker lane.
+pub(super) async fn canonical_path(place: &Place, path: &str) -> Result<PathBuf, String> {
+    match place {
+        Place::Local => std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}")),
+        Place::Worker(worker) => {
+            let answer: serde_json::Value = crate::worker::link::connect(worker)
+                .await?
+                .call(
+                    crate::worker::method::STAT,
+                    serde_json::json!({ "path": path }),
+                    Duration::from_secs(10),
+                )
+                .await?;
+            answer
+                .get("real")
+                .and_then(serde_json::Value::as_str)
+                .map(PathBuf::from)
+                .ok_or_else(|| format!("cannot resolve {path} on worker {worker}"))
+        }
+    }
+}
 
 impl<R: Runtime> Lanes<R> {
     /// Re-read authority and preservation immediately before non-forced Git removal, locally
     /// or on the worker. Every unknown is a keep, including ignored files and stale ownership.
     pub(super) async fn remove_worktree(&self, rec: &Record, path: &str) -> Result<(), String> {
+        let _worktree_use = self.worktree_use.lock().await;
         let (saved, _) = self.load(&rec.key).await?;
         if saved.run_id != rec.run_id || !saved.worktrees.iter().any(|p| p == path) {
             return Err("worktree ownership changed".into());
@@ -48,6 +72,7 @@ impl<R: Runtime> Lanes<R> {
             return Err("session lease is held or unknown".into());
         }
         let place = saved.place();
+        self.worktree_unused(&saved, &place, path).await?;
         let dir = Path::new(path);
         let limit = Duration::from_secs(60);
         let (ok, status) = git::git(
@@ -83,6 +108,42 @@ impl<R: Runtime> Lanes<R> {
         } else {
             Err("git worktree remove refused; retained".into())
         }
+    }
+
+    /// Caller holds `worktree_use` until removal finishes, fencing new path reservations.
+    async fn worktree_unused(&self, rec: &Record, place: &Place, path: &str) -> Result<(), String> {
+        let tree = canonical_path(place, path).await?;
+        let rows = self
+            .env
+            .store
+            .read(|r| r.lanes(true))
+            .await
+            .map_err(|e| format!("open lanes unreadable: {e}"))?;
+        for row in rows {
+            if row.key == rec.key {
+                continue;
+            }
+            let Record {
+                key,
+                cwd,
+                worktrees,
+                worker,
+                ..
+            } = serde_json::from_str(&row.record)
+                .map_err(|e| format!("lane {} unreadable: {e}", row.key))?;
+            if worker != rec.worker {
+                continue;
+            }
+            for used in std::iter::once(&cwd).chain(worktrees.iter().filter(|p| *p != &cwd)) {
+                let real = canonical_path(place, used)
+                    .await
+                    .map_err(|e| format!("lane {key} path unreadable: {e}"))?;
+                if real.starts_with(&tree) {
+                    return Err(format!("in use by lane {key}"));
+                }
+            }
+        }
+        Ok(())
     }
 
     pub(super) async fn delivery_doubt(&self, rec: &Record) -> Option<String> {

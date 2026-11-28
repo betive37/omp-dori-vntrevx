@@ -2100,12 +2100,115 @@ fn completed_close_removes_clean_worktree() {
             "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
         }),
     );
+    let sibling = work.join("lane-tree-sibling");
+    std::fs::create_dir(&sibling).unwrap();
+    open(
+        &hub,
+        "sibling-reader",
+        &json!({"cwd": sibling, "look_only": true}),
+    );
     lane(&hub, "close", &json!({"key":"clean-close", "note":"done"})).unwrap();
     assert!(!tree.exists());
     let rec = record(&hub, "clean-close");
     assert_eq!(rec["state"], "closed");
     assert!(rec["receipt"].to_string().contains("removed"), "{rec}");
     hub.stop();
+}
+
+fn close_shared_worktree(usage: &str) {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    std::fs::create_dir(repo.join("nested")).unwrap();
+    std::fs::write(repo.join("nested/review.txt"), "reviewed").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "review directory"]);
+    git(&repo, &["push", "-q", "origin", "HEAD:main"]);
+    let alias = work.join("alias");
+    std::os::unix::fs::symlink(&work, &alias).unwrap();
+    let tree = work.join("lane-tree");
+    let owned = alias.join("lane-tree");
+    let nested = tree.join("nested");
+    start(&mut hub);
+    open(
+        &hub,
+        "shared-owner",
+        &json!({
+            "cwd": repo, "worktree": {"path": owned, "branch": "shared", "base": "HEAD"}
+        }),
+    );
+    open(
+        &hub,
+        "shared-reader",
+        &json!({"cwd": if usage == "registered" { &repo } else { &nested }, "look_only": true}),
+    );
+    let reader = record(&hub, "shared-reader");
+    if usage == "registered" {
+        let (mut bridge, hello) = hello(&hub, &reader);
+        assert_eq!(hello["role"], "lane", "{hello}");
+        let registered = bridge.lane_tool(
+            "shared-tree",
+            &reader["session_id"],
+            json!({"op": "worktree", "path": nested}),
+        );
+        assert!(
+            registered["text"].as_str().unwrap().contains("registered"),
+            "{registered}"
+        );
+    } else if usage == "closed" {
+        lane(
+            &hub,
+            "park",
+            &json!({"key": "shared-reader", "reason": "review finished"}),
+        )
+        .unwrap();
+        assert_eq!(record(&hub, "shared-reader")["state"], "closed");
+    }
+    lane(
+        &hub,
+        "close",
+        &json!({"key": "shared-owner", "note": "done"}),
+    )
+    .unwrap();
+    let rec = record(&hub, "shared-owner");
+    assert_eq!(rec["state"], "closed");
+    if usage == "closed" {
+        assert!(!tree.exists(), "a closed lane no longer reserves its cwd");
+        assert!(rec["receipt"].to_string().contains("removed"), "{rec}");
+    } else {
+        assert!(
+            nested.is_dir(),
+            "another open lane lost its directory: {rec}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(nested.join("review.txt")).unwrap(),
+            "reviewed"
+        );
+        assert!(
+            rec["receipt"]
+                .to_string()
+                .contains("kept: in use by lane shared-reader"),
+            "{rec}"
+        );
+        let after = record(&hub, "shared-reader");
+        assert_eq!(after["state"], "running", "{after}");
+        assert_eq!(after["session_id"], reader["session_id"]);
+    }
+    hub.stop();
+}
+
+#[test]
+fn completed_close_keeps_another_lanes_cwd() {
+    close_shared_worktree("cwd");
+}
+
+#[test]
+fn completed_close_keeps_another_lanes_registered_worktree() {
+    close_shared_worktree("registered");
+}
+
+#[test]
+fn completed_close_ignores_a_closed_lanes_cwd() {
+    close_shared_worktree("closed");
 }
 
 /// A pre-spawn failure proves no writer existed. Git locking is an actual removal refusal.

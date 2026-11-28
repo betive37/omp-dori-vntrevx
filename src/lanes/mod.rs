@@ -129,6 +129,8 @@ pub(crate) struct Lanes<R: Runtime> {
     opening: Mutex<Vec<String>>,
     /// Closes on threads are serialised so two last lanes cannot both skip the hook (LANE req. 42).
     closing: AsyncMutex<()>,
+    /// Path reservations (open, reopen, registration) and worktree removal are serialised.
+    worktree_use: AsyncMutex<()>,
     overlay: OnceLock<()>,
     spend: Mutex<HashMap<String, crate::omp::transcript::SpendTree>>,
     /// Wakes oversight early (a report, a state change, a claim).
@@ -176,6 +178,7 @@ impl<R: Runtime> Lanes<R> {
             turns: Mutex::new(HashMap::new()),
             opening: Mutex::new(Vec::new()),
             closing: AsyncMutex::new(()),
+            worktree_use: AsyncMutex::new(()),
             overlay: OnceLock::new(),
             spend: Mutex::new(HashMap::new()),
             nudge: Notify::new(),
@@ -713,6 +716,7 @@ impl<R: Runtime> Lanes<R> {
                     return Err(crate::store::lanes::MOVED_ON.into());
                 }
                 let path = p::PATH.some(input)?.to_string();
+                let _worktree_use = self.worktree_use.lock().await;
                 let real = std::fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
                 let real = real.display().to_string();
                 self.keep(&key, |r| {
@@ -1122,6 +1126,11 @@ impl<R: Runtime> Lanes<R> {
             rec.thread = Some(self.thread_for(&rec.key, &rec.title, &source).await?);
         }
         let mut note = None;
+        let worktree_use = self.worktree_use.lock().await;
+        // Validation preceded the lock; a close may have removed this directory since then.
+        if valid.worker.is_none() && !valid.cwd.is_dir() {
+            return Err(format!("{} is not a directory", valid.cwd.display()));
+        }
         if let Some(worker) = &valid.worker {
             let prepared = self.prepare(&valid, worker).await?;
             rec.cwd.clone_from(&prepared.cwd);
@@ -1146,6 +1155,7 @@ impl<R: Runtime> Lanes<R> {
                 ));
             }
         };
+        drop(worktree_use);
         if let Some(rid) = &request_id {
             let _ = self
                 .env
