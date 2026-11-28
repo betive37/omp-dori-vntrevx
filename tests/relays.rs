@@ -674,7 +674,7 @@ fn permanent_slack_catch_up_failure(error: &str, thread: bool) {
         let s = status(&hub, "slack");
         (s["counts"]["owed_settled"] == 1 && s["counts"]["queued"] == 0).then_some(())
     });
-    let room = if thread {
+    let target = if thread {
         format!("{channel}:{root}")
     } else {
         channel.into()
@@ -684,13 +684,13 @@ fn permanent_slack_catch_up_failure(error: &str, thread: bool) {
             .as_array()
             .unwrap()
             .iter()
-            .find(|p| p["room"] == room)
+            .find(|p| p["room"] == target)
             .unwrap()["position"]
             .clone()
     };
     let before = position(&status(&hub, "slack"));
     assert!(hub.stop().success());
-    slack.fail_reads(&room, error);
+    slack.fail_reads(&target, error);
     let method = if thread {
         "conversations.replies"
     } else {
@@ -731,11 +731,14 @@ fn permanent_slack_catch_up_failure(error: &str, thread: bool) {
                 .as_array()
                 .unwrap()
                 .iter()
-                .any(|p| { p["room"] == room && p["reason"].as_str().unwrap().contains(error) }),
+                .any(|p| { p["room"] == target && p["reason"].as_str().unwrap().contains(error) }),
             "{s}"
         );
         assert_eq!(position(&s), before, "the unread room keeps its position");
-        assert!(requests(&hub, &format!("[slack {room}/{blocked}]")).is_empty());
+        assert_eq!(
+            requests(&hub, &format!("[slack {target}/{blocked}]")),
+            Vec::<String>::new()
+        );
         assert_eq!(requests(&hub, &format!("[slack {DM}/{live}]")).len(), 1);
         assert_eq!(reads(&slack), 1, "held rooms are not retried on reconnect");
         assert_eq!(slack.connections(), connections + round + 1);

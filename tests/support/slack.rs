@@ -275,8 +275,8 @@ fn arg(query: &str, key: &str) -> Option<String> {
 fn history(query: &str, state: &mut State) -> Response<Full<Bytes>> {
     let channel = arg(query, "channel").unwrap_or_default();
     let root = arg(query, "ts");
-    let room = root.as_ref().map(|r| format!("{channel}:{r}"));
-    if let Some(error) = state.read_errors.get(room.as_deref().unwrap_or(&channel)) {
+    let target = root.as_ref().map(|r| format!("{channel}:{r}"));
+    if let Some(error) = state.read_errors.get(target.as_deref().unwrap_or(&channel)) {
         return reply(200, &json!({"ok": false, "error": error}));
     }
     if root.is_none() && std::mem::take(&mut state.fail_history_once) {
