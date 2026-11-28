@@ -91,29 +91,28 @@ pub(crate) fn path_line<'a>(dirs: impl IntoIterator<Item = &'a Path>) -> String 
     parts.join(":")
 }
 
-/// A value for a systemd unit line: `%` doubled so no specifier is expanded.
-fn systemd_escape(text: &str) -> String {
-    text.replace('%', "%%")
-}
-
-/// One quoted systemd environment assignment, without specifier or escape expansion.
-fn systemd_environment(text: &mut String, name: &str, value: &str) {
-    let _ = write!(text, "Environment=\"{name}=");
-    for c in value.chars() {
+/// A value for a systemd unit line: `%` doubled so no specifier is expanded. A `quoted` value sits
+/// in double quotes, where systemd also expands C escapes, so its quotes, backslashes and control
+/// characters are escaped too.
+fn systemd_escape(text: &str, quoted: bool) -> String {
+    let mut out = String::with_capacity(text.len());
+    for c in text.chars() {
         match c {
-            '%' => text.push_str("%%"),
-            '"' => text.push_str("\\\""),
-            '\\' => text.push_str("\\\\"),
-            '\n' => text.push_str("\\n"),
-            '\r' => text.push_str("\\r"),
-            '\t' => text.push_str("\\t"),
-            c if c.is_control() => {
-                let _ = write!(text, "\\u{:04x}", u32::from(c));
+            '%' => out.push_str("%%"),
+            '"' | '\\' if quoted => {
+                out.push('\\');
+                out.push(c);
             }
-            c => text.push(c),
+            '\n' if quoted => out.push_str("\\n"),
+            '\r' if quoted => out.push_str("\\r"),
+            '\t' if quoted => out.push_str("\\t"),
+            c if quoted && c.is_control() => {
+                let _ = write!(out, "\\u{:04x}", u32::from(c));
+            }
+            c => out.push(c),
         }
     }
-    text.push_str("\"\n");
+    out
 }
 
 /// Text for a property list string.
@@ -141,17 +140,12 @@ fn definition_with_env(
     macos: bool,
     lookup: impl Fn(&str) -> Option<OsString>,
 ) -> Result<String, String> {
-    let xdg = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"]
-        .into_iter()
-        .filter_map(|name| {
-            lookup(name)
-                .filter(|value| Path::new(value).is_absolute())
-                .map(|value| {
-                    value.into_string().map(|value| (name, value)).map_err(|_| {
-                        format!("{name} is not valid UTF-8; user service paths must be UTF-8")
-                    })
-                })
-        });
+    let xdg = super::xdg_homes(lookup).map(|(name, value)| {
+        value
+            .into_string()
+            .map(|value| (name, value))
+            .map_err(|_| format!("{name} is not valid UTF-8; user service paths must be UTF-8"))
+    });
     if macos {
         let exe = xml_escape(&unit.command.display().to_string());
         let env_file = xml_escape(&unit.env_file.display().to_string());
@@ -184,16 +178,20 @@ fn definition_with_env(
         );
         Ok(text)
     } else {
-        let exe = systemd_escape(&unit.command.display().to_string());
-        let env_file = systemd_escape(&unit.env_file.display().to_string());
-        let path = systemd_escape(unit.path);
+        let exe = systemd_escape(&unit.command.display().to_string(), false);
+        let env_file = systemd_escape(&unit.env_file.display().to_string(), false);
+        let path = systemd_escape(unit.path, true);
         let mut text = format!(
             "[Unit]\nDescription=Cataly hub\n\n[Service]\nType=notify\nNotifyAccess=main\n\
 Environment=\"PATH={path}\"\nEnvironment=\"MALLOC_ARENA_MAX=1\"\n"
         );
         for entry in xdg {
             let (name, value) = entry?;
-            systemd_environment(&mut text, name, &value);
+            let _ = writeln!(
+                text,
+                "Environment=\"{name}={}\"",
+                systemd_escape(&value, true)
+            );
         }
         let _ = write!(
             text,
