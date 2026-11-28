@@ -492,8 +492,9 @@ impl From<Summary> for LatencySummary {
 }
 
 /// `events.since` and `events.follow` parameters. With neither `after` nor `since_ms`, `since`
-/// selects the newest `limit` events and `follow` starts from now. `since` returns an oldest-first
-/// prefix that fits the reply byte limit; continue with `after` set to the last returned event ID.
+/// selects the newest `limit` events and `follow` starts from now. Byte-limited `since` pages keep
+/// the newest events in latest mode, or an oldest-first prefix with either cursor. `Events::more`
+/// provides an `after` cursor for reading omitted events.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub(crate) struct EventsParams {
     #[serde(default)]
@@ -508,6 +509,10 @@ pub(crate) struct EventsParams {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct Events {
     pub(crate) events: Vec<EventRecord>,
+    /// When byte-limited, an `after` cursor for the omitted events. For a latest page this starts
+    /// before the selected range; replaying it oldest-first can overlap the latest events shown.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub(crate) more: Option<i64>,
 }
 
 /// Parameters naming one job; `request_id` deduplicates a repeated mutating call.

@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Large event bodies could make `events` fail with "bad reply". Event pages now fit within the
-  control-socket line limit; use `--after` with the last returned event ID to read the rest.
+  control-socket line limit, keeping the newest events in the default view. The CLI reports a
+  byte-limited list and prints an `--after` cursor for reading the omitted events.
 
 ## 0.2.8 (2026-11-28)
 

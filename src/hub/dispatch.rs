@@ -439,6 +439,7 @@ async fn handle(hub: &Hub, name: &str, raw: Value) -> Result<Value, Failure> {
             let p: JobParams = params(raw)?;
             ok(&Events {
                 events: hub.jobs.run_once(&p.name).await?,
+                more: None,
             })
         }
         method::JOB_ENABLE => {
@@ -514,6 +515,7 @@ impl std::io::Write for JsonSize {
 const EVENTS_BYTES: usize = proto::MAX_LINE - 1024;
 
 async fn events_since(store: &crate::store::Store, p: EventsParams) -> Result<Value, Failure> {
+    let latest = p.after.is_none() && p.since_ms.is_none();
     let limit = p.limit.unwrap_or(20).clamp(1, 1000);
     let mut events = store
         .read(move |r| match (p.after, p.since_ms) {
@@ -524,7 +526,12 @@ async fn events_since(store: &crate::store::Store, p: EventsParams) -> Result<Va
         .await?;
     let mut size = JsonSize(0);
     let mut keep = 0;
-    for event in &events {
+    let mut candidates = events.iter();
+    while let Some(event) = if latest {
+        candidates.next_back()
+    } else {
+        candidates.next()
+    } {
         serde_json::to_writer(&mut size, event).map_err(|e| Failure {
             code: code::INTERNAL,
             message: e.to_string(),
@@ -535,9 +542,18 @@ async fn events_since(store: &crate::store::Store, p: EventsParams) -> Result<Va
         }
         keep += 1;
     }
-    // Keep an oldest-first prefix so the last ID resumes the next page without skipping events.
-    events.truncate(keep);
-    ok(&Events { events })
+    let more = if keep == events.len() {
+        None
+    } else if latest {
+        // Preserve the newest events; the cursor replays the selected range from its old end.
+        let after = events.first().map(|e| e.id - 1);
+        events.drain(..events.len() - keep);
+        after
+    } else {
+        events.truncate(keep);
+        events.last().map(|e| e.id)
+    };
+    ok(&Events { events, more })
 }
 
 /// `worker.list`, `worker.doctor` (one worker, or all) and `worker.remove`.
@@ -940,6 +956,76 @@ mod tests {
     use super::*;
     use crate::store::tests::{event, open_temp};
 
+    async fn event_page(store: &crate::store::Store, params: EventsParams) -> Events {
+        let value = events_since(store, params)
+            .await
+            .unwrap_or_else(|f| panic!("{}", f.message));
+        let line = Response::ok(u64::MAX, value).to_line();
+        assert!(
+            line.len() <= proto::MAX_LINE,
+            "reply line is {} bytes (limit {})",
+            line.len(),
+            proto::MAX_LINE
+        );
+        let response: Response = serde_json::from_str(&line).unwrap();
+        serde_json::from_value(response.ok.unwrap()).unwrap()
+    }
+
+    async fn assert_latest_pages(
+        store: &crate::store::Store,
+        stored: &[crate::store::EventRecord],
+    ) {
+        for limit in [None, Some(19)] {
+            let latest = event_page(
+                store,
+                EventsParams {
+                    limit,
+                    ..EventsParams::default()
+                },
+            )
+            .await;
+            assert!(latest.events.len() < stored.len());
+            assert_eq!(
+                latest.events.last().map(|e| e.id),
+                stored.last().map(|e| e.id),
+                "latest event was omitted"
+            );
+            assert!(
+                latest
+                    .events
+                    .iter()
+                    .eq(stored.iter().skip(stored.len() - latest.events.len())),
+                "latest page must keep a newest suffix in ID order"
+            );
+            let selected = usize::from(limit.is_some());
+            let after = stored.get(selected).unwrap().id - 1;
+            assert_eq!(latest.more, Some(after));
+            let omitted = event_page(
+                store,
+                EventsParams {
+                    after: latest.more,
+                    ..EventsParams::default()
+                },
+            )
+            .await;
+            assert_eq!(omitted.events.first(), stored.get(selected));
+        }
+        let one = event_page(
+            store,
+            EventsParams {
+                limit: Some(1),
+                ..EventsParams::default()
+            },
+        )
+        .await;
+        assert_eq!(one.events.len(), 1);
+        assert_eq!(one.events.last(), stored.last());
+        assert!(
+            one.more.is_none(),
+            "an uncut page must not advertise a byte cut"
+        );
+    }
+
     async fn assert_event_pages(tag: &str, body: &str) {
         let (store, writer, _dir) = open_temp(tag);
         let stored = store
@@ -955,8 +1041,8 @@ mod tests {
             .await
             .unwrap();
         let expected: Vec<_> = stored.iter().map(|e| e.id).collect();
+        assert_latest_pages(&store, &stored).await;
         for mut params in [
-            EventsParams::default(),
             EventsParams {
                 after: Some(0),
                 ..EventsParams::default()
@@ -974,21 +1060,16 @@ mod tests {
             let mut seen = Vec::new();
             let mut pages = 0;
             loop {
-                let value = events_since(&store, params.clone())
-                    .await
-                    .unwrap_or_else(|f| panic!("{}", f.message));
-                let line = Response::ok(u64::MAX, value).to_line();
-                assert!(
-                    line.len() <= proto::MAX_LINE,
-                    "reply line is {} bytes (limit {})",
-                    line.len(),
-                    proto::MAX_LINE
-                );
-                let response: Response = serde_json::from_str(&line).unwrap();
-                let page: Events = serde_json::from_value(response.ok.unwrap()).unwrap();
+                let page = event_page(&store, params.clone()).await;
                 let Some(last) = page.events.last() else {
+                    assert!(page.more.is_none());
                     break;
                 };
+                assert_eq!(
+                    page.more,
+                    (seen.len() + page.events.len() < expected.len()).then_some(last.id),
+                    "a cut forward page must name its last ID as the continuation"
+                );
                 params.after = Some(last.id);
                 pages += 1;
                 for event in page.events {
