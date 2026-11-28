@@ -42,18 +42,19 @@ pub(crate) fn titled(current: &str, word: &str) -> Option<String> {
 }
 
 /// Where a lane thread from a message in `room` goes: `None` for a thread on the message itself in a
-/// listed channel, else the listed parent beside the source thread and whether it is a forum.
+/// listed channel, else the listed parent beside the source thread with the sibling thread type
+/// (`None` for a forum or media post).
 async fn beside(
     rest: &Rest,
     config: &Config,
     room: Snowflake,
-) -> Result<Option<(Snowflake, bool)>, (bool, String)> {
+) -> Result<Option<(Snowflake, Option<u64>)>, (bool, String)> {
     // The source channel's type is always looked up, listed or not (DISC-OUT req. 49). A
     // message inside a thread under a listed channel: Discord nests no threads, so the new
     // thread starts beside it in that listed channel without a starter message; a forum or
     // media parent takes a post with a starter message instead.
     let channel = rest.channel(room).await.map_err(|e| (false, e.why))?;
-    let thread = matches!(channel.get("type").and_then(Value::as_u64), Some(11 | 12));
+    let thread = matches!(channel.get("type").and_then(Value::as_u64), Some(10..=12));
     if thread {
         let parent = channel
             .get("parent_id")
@@ -65,7 +66,8 @@ async fn beside(
                 "the source message's channel is not in scope".to_string(),
             ))?;
         let home = rest.channel(parent).await.map_err(|e| (false, e.why))?;
-        let forum = matches!(home.get("type").and_then(Value::as_u64), Some(15 | 16));
+        let kind = home.get("type").and_then(Value::as_u64);
+        let forum = matches!(kind, Some(15 | 16));
         // REQUIRE_TAG (1 << 4): the product never picks a tag itself.
         if forum && home.get("flags").and_then(Value::as_u64).unwrap_or(0) & (1 << 4) != 0 {
             return Err((
@@ -73,7 +75,9 @@ async fn beside(
                 "the forum requires a tag on every post; no lane thread was made".into(),
             ));
         }
-        Ok(Some((parent, forum)))
+        // An announcement channel takes announcement threads (10), others public threads (11).
+        let sibling = (!forum).then_some(if kind == Some(5) { 10 } else { 11 });
+        Ok(Some((parent, sibling)))
     } else if config.discord.channels.contains(&room) {
         Ok(None)
     } else {
@@ -181,18 +185,19 @@ impl DiscordThreads {
                 format!("/channels/{room}/messages/{message}/threads"),
                 json!({ "name": title, "auto_archive_duration": 10080 }),
             ),
-            Some((p, true)) => (
+            Some((p, None)) => (
                 p,
                 "POST channels/threads",
                 format!("/channels/{p}/threads"),
                 json!({ "name": title, "auto_archive_duration": 10080,
-                    "message": { "content": title } }),
+                    "message": { "content": title,
+                    "allowed_mentions": { "parse": [], "replied_user": false } } }),
             ),
-            Some((p, false)) => (
+            Some((p, Some(sibling))) => (
                 p,
                 "POST channels/threads",
                 format!("/channels/{p}/threads"),
-                json!({ "name": title, "auto_archive_duration": 10080, "type": 11 }),
+                json!({ "name": title, "auto_archive_duration": 10080, "type": sibling }),
             ),
         };
         let created = rest
@@ -440,6 +445,7 @@ mod tests {
         let seen = seen.lock().unwrap();
         let post = seen.iter().find(|(m, _, _)| m == "POST").unwrap();
         assert_eq!(post.2["message"]["content"], "T");
+        assert_eq!(post.2["message"]["allowed_mentions"]["parse"], json!([]));
         assert!(post.2.get("type").is_none());
     }
 

@@ -6,7 +6,7 @@
   nested thread, and a lane under a forum or media channel was sent without its starter message;
   both failed. The source channel's type is now always looked up: the new thread sits beside the
   source in its listed parent, a forum gets a post with a starter message, and a forum that
-  requires tags is refused before any request.
+  requires tags is refused before any write.
 
 ## 0.2.7 (2026-11-28)
 
