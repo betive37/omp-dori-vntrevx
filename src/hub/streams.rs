@@ -485,8 +485,7 @@ impl Line {
                 .sync_all()
                 .map_err(|e| format!("sync file: {e}"))
                 .and_then(|()| {
-                    crate::sys::fs::sync_dir(&self.dir)
-                        .map_err(|e| format!("sync directory: {e}"))
+                    crate::sys::fs::sync_dir(&self.dir).map_err(|e| format!("sync directory: {e}"))
                 });
             if let Err(e) = synced {
                 let _ = std::fs::remove_file(&path);
@@ -635,7 +634,15 @@ mod tests {
         let mut line = Line::new(dir.to_path_buf(), "sync");
         let len = LINE_MAX + 1;
         line.push(&vec![b'x'; len]);
-        let path = line.spill.as_ref().unwrap().file.as_ref().unwrap().1.clone();
+        let path = line
+            .spill
+            .as_ref()
+            .unwrap()
+            .file
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
         // The file can be synced, but opening this path for the directory sync fails.
         line.dir = dir.join("missing");
         let Ended::Saved(note) = line.finish() else {
