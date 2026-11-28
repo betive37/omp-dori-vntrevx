@@ -201,6 +201,11 @@
   success. Automatic question notes are skipped when the request's notes are full.
 - Open request and owner-question lists no longer stop at 200 items. Recovery summaries count
   every omitted item in "and N more", including when a next step or question spans several lines.
+- **A quota-blocked lead stays blocked after its sleep or a restart.** The block a usage-limit
+  error sets was kept only in the running session, so once the lead slept, restarted or the hub
+  restarted, hub notes and other automatic input reached the model again without your decision.
+  The block is now kept in the store and the next lead session starts with it; only your messages
+  reach the lead until one of its turns completes.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
