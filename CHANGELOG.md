@@ -44,6 +44,8 @@
   counted the slot as held, until some other slot request, release or grant on the hub woke it, or
   until it timed out or was cancelled when none came. A request for a free slot is granted right
   away and could hit this.
+- `cataly setup` no longer resets a `[destinations.cataly-ops]` you pointed elsewhere to the
+  `#cataly-ops` channel, and no longer creates that channel when the destination is already set.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
