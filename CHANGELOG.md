@@ -92,6 +92,9 @@
   hub refuses it until OMP reports its job finished; a completed job then counts with its final
   result and the same evidence identity as the equivalent foreground result, without job
   bookkeeping. A failed or cancelled one stays refused.
+- A `lane.review` call from the lead no longer times out after 5 s while the review still runs,
+  telling the model that nothing was recorded and a retry is safe (a retry ran a second paid
+  review). The hub now serves a per-operation wait, and the bridge waits about 40 minutes for a review.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
