@@ -118,6 +118,21 @@ fn events_of(hub: &TestHub, kind: &str) -> Vec<Value> {
         .collect()
 }
 
+/// Discord hand-offs to `target` in the hub's store.
+fn handed_to(hub: &TestHub, target: &str) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT COUNT(*) FROM handoffs WHERE relay = 'discord' AND target = ?1",
+        [target],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 fn goal(hub: &TestHub, session: &Value) -> String {
     std::fs::read_to_string(data(hub).join(format!("goal-{}", session.as_str().unwrap())))
         .unwrap_or_default()
@@ -831,9 +846,12 @@ fn pause_resume_and_a_held_lane_that_turns() {
         OWNER,
         "how is it going?",
     ));
-    hub.until(WAIT, || {
-        (hub.json(&["discord", "status", "--json"])["counts"]["answers_waiting"] == 1).then_some(())
-    });
+    // Handed to the lane: its answer is the lane's, so the relay counts no answer waiting for it.
+    hub.until(WAIT, || (handed_to(&hub, "p-1") == 1).then_some(()));
+    assert_eq!(
+        hub.json(&["discord", "status", "--json"])["counts"]["answers_waiting"],
+        0
+    );
     // The held lane turns by itself: it stays held, the lead hears it once for the stretch.
     let held_alerts = || {
         events_of(&hub, "lane.alert")
