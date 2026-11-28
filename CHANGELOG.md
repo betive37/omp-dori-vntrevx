@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Discord form options with an explicit empty value keep that value instead of returning their
+  label to OMP. Only options without a value attribute use their label as the value.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
