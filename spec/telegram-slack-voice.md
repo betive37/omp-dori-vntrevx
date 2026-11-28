@@ -217,7 +217,8 @@ Totals: KEEP 36, SIMPLIFY 12, MERGE 3, DROP 11 (62 capabilities).
     Dedupe key is channel plus message timestamp, shared with live events. Catch-up HTTP reads do
     not stop socket reads or acknowledgements: live events enter the durable queue immediately,
     while hand-off waits only for that room's catch-up read. A restart repeats catch-up before
-    draining an existing queue.
+    draining an existing queue. A failed read leaves unread rooms blocked until the next connection
+    retries catch-up.
 40. SLACK-06 Every post records its thread (channel, root timestamp) with seen position = the post's
     timestamp, keyed by workspace and account. An already recorded thread keeps its older position.
 41. SLACK-06 Replies in remembered threads are admitted without a mention. Seen positions only move

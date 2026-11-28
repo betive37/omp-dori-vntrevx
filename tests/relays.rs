@@ -363,7 +363,7 @@ fn slack_threads_allowlist_acks_and_uploads() {
     assert!(hub.stop().success());
 }
 
-/// A five-second history read must not occupy the socket's three-second ack window. Live
+/// A held history response must not occupy the socket's three-second ack window. Live
 /// messages commit immediately, but only rooms still catching up wait to reach the lead.
 #[test]
 fn slack_acks_during_catch_up_without_overtaking_history() {
@@ -379,7 +379,7 @@ fn slack_acks_during_catch_up_without_overtaking_history() {
     // This message exists only in history when the next connection opens.
     let missed = slack.say(DM, fake_slack::OWNER, "catch-up older", None);
     let reads = slack.calls("conversations.history").len();
-    slack.set_history_delay(Duration::from_secs(5));
+    let release_history = slack.hold_history();
     hub.start();
     slack.wait(WAIT, |f| {
         (f.calls("conversations.history").len() > reads).then_some(())
@@ -409,6 +409,7 @@ fn slack_acks_during_catch_up_without_overtaking_history() {
         Vec::<String>::new()
     );
 
+    release_history.send(true).unwrap();
     hub.until(WAIT, || {
         (requests(&hub, &format!("[slack {DM}/{live}]")).len() == 1).then_some(())
     });

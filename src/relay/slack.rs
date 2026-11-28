@@ -22,7 +22,6 @@
 //!   before any byte is sent. The seen mark is the `eyes` reaction, replaced by `white_check_mark`
 //!   once the answer is posted (SLACK req. 48).
 
-use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -1023,11 +1022,9 @@ impl<T: Runtime> Socket<T> {
         let established = Instant::now();
         let mut greeted = false;
         let mut catching_up = false;
-        let catch_up = async {
-            let result = self.catch_up().await;
-            self.round.recovering(Some(HashSet::new())).await;
-            result
-        };
+        // Each completed room releases itself; an error leaves unread rooms fenced until
+        // the next connection resets the catch-up scope.
+        let catch_up = self.catch_up();
         tokio::pin!(catch_up);
         loop {
             let frame = tokio::select! {

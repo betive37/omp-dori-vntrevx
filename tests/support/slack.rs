@@ -14,7 +14,7 @@ use hyper::service::service_fn;
 use hyper::{Request, Response};
 use hyper_util::rt::TokioIo;
 use serde_json::{Value, json};
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 use tokio_tungstenite::tungstenite::Message;
 
 pub const TEAM: &str = "T0TEAM";
@@ -38,7 +38,7 @@ struct State {
     history: HashMap<String, Vec<Value>>,
     next_ts: u64,
     hang: bool,
-    history_delay: Duration,
+    history_hold: Option<watch::Receiver<bool>>,
     upload_url: String,
     connections: usize,
     socket: Option<mpsc::UnboundedSender<Value>>,
@@ -139,9 +139,12 @@ impl FakeSlack {
         self.state.lock().unwrap().hang = on;
     }
 
-    /// Delays only DM history responses, leaving the socket and other Web API calls live.
-    pub fn set_history_delay(&self, delay: Duration) {
-        self.state.lock().unwrap().history_delay = delay;
+    /// Holds `conversations.history` responses, including retries, until explicitly released.
+    /// The socket and other Web API methods remain live; send `true` to release history.
+    pub fn hold_history(&self) -> watch::Sender<bool> {
+        let (release, held) = watch::channel(false);
+        self.state.lock().unwrap().history_hold = Some(held);
+        release
     }
 
     pub fn set_upload_url(&self, url: &str) {
@@ -285,8 +288,10 @@ async fn answer(
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
     if method == "conversations.history" {
-        let delay = state.lock().unwrap().history_delay;
-        tokio::time::sleep(delay).await;
+        let hold = state.lock().unwrap().history_hold.clone();
+        if let Some(mut hold) = hold {
+            let _ = hold.wait_for(|released| *released).await;
+        }
     }
     if auth.as_deref().is_none_or(|a| !a.starts_with("Bearer x")) && !method.starts_with("upload/")
     {
