@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.2.9 (Unreleased)
+
+- The lead's answer to your message no longer lands in the lane thread made from it, ahead of the
+  kickoff, when the lane's record is saved at the moment the answer is placed. The check that keeps
+  the answer in the channel looked at the open lanes before the thread's creation record and could
+  miss a record saved between the two; it now reads them in the order `lane.open` writes them, so
+  the answer stays in the channel as the lead's pointer.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
