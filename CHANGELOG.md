@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Discord: disabled select options could be offered as buttons or recommended defaults, then refused
+  by OMP. They are now left out of form choices, defaults and answers.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
