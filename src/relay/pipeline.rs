@@ -1135,16 +1135,8 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             let metadata = std::fs::metadata(&file).ok();
             if !settled {
                 self.worked_ms.store(now_ms(), Ordering::Release);
-            } else if self.worked_ms.load(Ordering::Acquire) == 0
-                && let Some(modified) = metadata
-                    .as_ref()
-                    .and_then(|m| m.modified().ok())
-                    .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                    .and_then(|t| i64::try_from(t.as_millis()).ok())
-            {
-                // A rebuilt intake may first see an idle lead. Recover its earlier work without
-                // giving an old, untouched transcript a fresh window at every restart.
-                self.worked_ms.fetch_max(modified, Ordering::AcqRel);
+            } else {
+                self.recover_work(metadata.as_ref());
             }
             // The newest answered request's later turns: read again only when something changed.
             let length = metadata.map(|m| m.len());
@@ -1198,6 +1190,19 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             }
         }
         Ok(())
+    }
+
+    /// A rebuilt intake may first see an idle lead. Recover its earlier work without giving an
+    /// old, untouched transcript a fresh window at every restart.
+    fn recover_work(&self, metadata: Option<&std::fs::Metadata>) {
+        if self.worked_ms.load(Ordering::Acquire) == 0
+            && let Some(modified) = metadata
+                .and_then(|m| m.modified().ok())
+                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                .and_then(|t| i64::try_from(t.as_millis()).ok())
+        {
+            self.worked_ms.fetch_max(modified, Ordering::AcqRel);
+        }
     }
 
     /// Stores what one read found for `h`. A request to the lead with no answer stops waiting only
