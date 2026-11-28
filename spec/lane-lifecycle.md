@@ -281,8 +281,8 @@ in their own areas; this spec only states what lifecycle needs from them.
     gone (on a worker, the worker's acknowledgement; a dropped connection is not one), and a fresh preservation check
     at removal time. Tracked changes, untracked files, ignored files (build caches included), commits on no remote,
     uncertain input, a worktree the artifacts area marks as needed, and any check that cannot be read all keep the
-    worktree. Local ownership paths are stored in canonical form when resolvable; the published-file
-    preservation check also resolves older paths, and a resolution failure keeps the worktree. Worker
+    worktree. Ownership keeps worktree paths as given; the published-file preservation check resolves them
+    where the worktree lives, and a resolution failure keeps the worktree. Worker
     paths are not resolved on the hub. Another open lane on the same machine (the hub or the same worker) whose
     working directory or registered worktree is at or inside it also keeps it; paths are resolved on that machine
     before comparison, and the receipt names the lane using it. Open, reopen and worktree registration cannot

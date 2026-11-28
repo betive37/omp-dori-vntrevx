@@ -78,8 +78,9 @@
   set afterwards still renamed the thread `[done]` and, for a completed close, archived it while
   the other lane was working in it. The last lane on the thread marks it done.
 - A lane could remove a worktree containing a published file when the worktree was opened through
-  a symlink. Ownership now records the canonical path, and close resolves older paths too, keeping
-  the worktree when the path cannot be resolved.
+  a symlink. Close now resolves the worktree path where it lives before comparing it with
+  published files, keeping the worktree when the path cannot be resolved; ownership records still
+  keep the path as given.
 - Closing a lane could remove a worktree another open lane was using. Keep it when another lane
   on the same machine works inside it or has registered a path inside it, resolving symlinks, and
   name that lane in the close receipt. Concurrent worktree registration takes the lane's turn before

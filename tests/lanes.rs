@@ -2579,7 +2579,8 @@ fn close_published_symlink_worktree(legacy: bool, missing_link: bool) {
         "original"
     );
     if !legacy {
-        assert_eq!(before["worktrees"], json!([real]));
+        // Ownership keeps the path as given; the close resolved it.
+        assert_eq!(before["worktrees"], json!([given]));
     }
     hub.stop();
 }

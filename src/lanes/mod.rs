@@ -1155,14 +1155,11 @@ impl<R: Runtime> Lanes<R> {
             note = Some(prepared.note());
         } else if let Some(w) = &valid.worktree {
             git::add_worktree(&valid.cwd, &w.path, &w.branch, &w.base).await?;
-            // Store ownership and the working directory in the same canonical form.
-            match std::fs::canonicalize(&w.path) {
-                Ok(real) => {
-                    rec.cwd = real.display().to_string();
-                    rec.worktrees.push(rec.cwd.clone());
-                }
-                // Keep authority over the allocation; an unreadable path cannot be removed.
-                Err(_) => rec.worktrees.push(w.path.clone()),
+            // Ownership keeps the path as given; checks resolve it where it is used. The lane works
+            // in its own worktree, stored canonical like any working directory.
+            rec.worktrees.push(w.path.clone());
+            if let Ok(real) = std::fs::canonicalize(&w.path) {
+                rec.cwd = real.display().to_string();
             }
         }
         // Record first, then spawn (LANE req. 15c).

@@ -11,6 +11,7 @@ use serde_json::{Value, json};
 
 use super::Lanes;
 use super::docs::{self, FILE, RULE};
+use super::preservation::canonical_path;
 use super::record::Record;
 use crate::config::coord::PublishRoot;
 use crate::host::Runtime;
@@ -251,7 +252,8 @@ impl<R: Runtime> Lanes<R> {
         )
     }
 
-    /// Refuses a file inside a worktree of another open lane (EVR req. 26).
+    /// Refuses a file inside a worktree of another open lane (EVR req. 26). Ownership keeps paths
+    /// as given, so a hub lane's worktree is also compared resolved.
     async fn outside_other_worktrees(&self, key: &str, real: &Path) -> Result<(), String> {
         let rows = self
             .env
@@ -263,8 +265,19 @@ impl<R: Runtime> Lanes<R> {
             let Ok(o) = serde_json::from_str::<Record>(&other.record) else {
                 continue;
             };
-            if o.key != key && o.worktrees.iter().any(|w| real.starts_with(w)) {
-                return Err(format!("the file lies in a worktree of lane {}", o.key));
+            if o.key == key {
+                continue;
+            }
+            let place = o.place();
+            for w in &o.worktrees {
+                // A worker lane's paths are on its worker, never resolved on the hub.
+                let resolved = match place {
+                    crate::worker::Place::Local => canonical_path(&place, w).await.ok(),
+                    crate::worker::Place::Worker(_) => None,
+                };
+                if real.starts_with(w) || resolved.is_some_and(|r| real.starts_with(r)) {
+                    return Err(format!("the file lies in a worktree of lane {}", o.key));
+                }
             }
         }
         Ok(())
