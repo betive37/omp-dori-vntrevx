@@ -1,6 +1,6 @@
 # Changelog
 
-## Unreleased
+## 0.2.9 (Unreleased)
 
 - The user service now keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME`
   values from the shell when enabled or refreshed, instead of using the default config, store or
@@ -8,6 +8,22 @@
   remains unsupported: the shell and systemd user manager must agree on the config home to find
   the unit. OMP child processes now also follow the shell's XDG homes.
   Explicit service commands refuse absolute non-UTF-8 XDG homes rather than silently using defaults.
+- A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
+  "ambiguous lead binding history" does) could be held again by the first message that woke it,
+  "300 s recovery episode has no startup and cleanup budget remaining", with nothing attempted:
+  the wake reused the recovery episode an earlier start had left open. An automatic start, wake or
+  restart now continues an episode only while its 300 s window is open; one that ended or expired
+  begins a fresh episode, so the lead resumes its conversation and the message is delivered. A held
+  or cancelled episode still holds until the owner acts, and the cap within a live episode is
+  unchanged. Lanes follow the same rule; a reopen that comes up fenced for its model now ends its
+  episode, so a later exit gets a fresh retry window. No migration: a store with such an open or
+  ended episode recovers on its next wake; a lead already held by this message needs one
+  `cataly lead start`, as the hold says.
+- The lead's hold texts (the hold notice, the update result, `cataly lead status`, `cataly health`)
+  no longer quote internal reasons such as "recovery is held (300 s recovery episode has no
+  startup and cleanup budget remaining); explicit owner retry required". Each hold reason is told
+  as a short sentence in `[hub] language`, Korean or English, saying what happened and what to do;
+  the raw reason stays in the log and `cataly lead status --json`.
 
 ## 0.2.8 (2026-11-28)
 
