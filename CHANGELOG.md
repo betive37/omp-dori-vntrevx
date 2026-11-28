@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- Lane threads on Discord: a lane split from a message in a listed thread asked Discord for a
+  nested thread, and a lane under a forum or media channel was sent without its starter message;
+  both failed. The source channel's type is now always looked up: the new thread sits beside the
+  source in its listed parent, a forum gets a post with a starter message, and a forum that
+  requires tags is refused before any request.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
