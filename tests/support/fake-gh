@@ -24,19 +24,22 @@ repo)
     ;;
 api)
     for last in "$@"; do :; done
-    case "$last" in
-    *"&page="*) page=${last#*&page=} ;;
-    *"?page="*) page=${last#*\?page=} ;;
-    *) page=1 ;;
-    esac
-    page=${page%%&*}
     path=${last%%\?*}
     path=${path#/}
     file="$dir/$(printf '%s' "$path" | tr '/' '_').json"
-    if [ "$page" != 1 ]; then
-        file="${file%.json}.page-$page.json"
-        [ -f "$file" ] || { echo '[]'; exit 0; }
-    fi
+    case "$last" in
+    *"?page="* | *"&page="*)
+        page=${last##*[?&]page=}
+        page=${page%%&*}
+        if [ "$page" != 1 ]; then
+            file="${file%.json}.page-$page.json"
+            if [ ! -f "$file" ]; then
+                echo '[]'
+                exit 0
+            fi
+        fi
+        ;;
+    esac
     ;;
 *)
     echo "fake gh: unsupported command $1" >&2

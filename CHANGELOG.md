@@ -110,6 +110,8 @@
   Pull requests with over 250 commits are refused because GitHub lists only the first 250.
   Both PR snapshots and all pages share one 120-second deadline, so slow pages cannot each
   restart the timeout and hold the lane for many minutes.
+- The merge check now reads every page of GitHub check runs, so a failing check after the first
+  page cannot be missed. Missing or inconsistent counts and incomplete results refuse the merge.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
