@@ -2,6 +2,10 @@
 
 ## 0.2.9 (Unreleased)
 
+- An approval the lead raised while an owner message was being handed to a lane in its thread
+  could reply to that lane message instead of the lead's request; typing and the lead's answer
+  bookkeeping also counted lane messages. Only messages handed to the lead are now treated as
+  waiting for the lead's answer.
 - The lead's answer is no longer lost when its turn runs past 30 minutes. A turn that ran longer
   (subagents, long tool calls), or a message of yours waiting behind such a turn, was given up 30
   minutes after it arrived, and the answer that came later was never posted. While the lead works,
