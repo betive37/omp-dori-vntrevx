@@ -20,6 +20,7 @@ use tokio::sync::Semaphore;
 use super::Lanes;
 use super::docs::{self, VERDICT};
 use crate::host::Runtime;
+use crate::jobs::owner::gh_list;
 use crate::log;
 use crate::omp::launch::write_overlay;
 use crate::omp::tools::{self, Role as ToolRole};
@@ -45,9 +46,6 @@ const DIAG_LINES: usize = 200;
 const REVIEW_MAX_COST: f64 = 2.0;
 /// One page of the PR's changed files goes into the review text.
 const REVIEW_FILES: usize = 100;
-/// Match the owner jobs' bounded GitHub paging, but require the reported check count as well.
-const CHECKS_PAGE: usize = 100;
-const CHECKS_PAGES_MAX: usize = 30;
 /// Event commands: four at once, 30 s each (COORD req. 58).
 const EVENT_SLOTS: usize = 4;
 const EVENT_LIMIT: Duration = Duration::from_secs(30);
@@ -420,58 +418,36 @@ impl<R: Runtime> Lanes<R> {
         if !v.approve {
             return Err(format!("refused: the verdict at {head} rejects"));
         }
-        let mut total = None;
-        let mut received = 0;
+        let incomplete = |why: String| format!("refused: incomplete checks from GitHub: {why}");
+        let dir = cwd.as_path();
+        let (runs, total) = gh_list(
+            &format!("repos/{repo}/commits/{head}/check-runs"),
+            Some("check_runs"),
+            None,
+            |p| async move { super::checks::gh(&p, dir).await },
+        )
+        .await
+        .map_err(incomplete)?;
+        let total = total.ok_or_else(|| incomplete("missing total_count".into()))?;
+        if runs.len() != total {
+            return Err(incomplete(format!("received {} of {total}", runs.len())));
+        }
+        if runs.is_empty() {
+            return Err("refused: GitHub reports no checks".into());
+        }
         let mut bad = Vec::new();
         let mut passed = 0;
-        for page in 1..=CHECKS_PAGES_MAX {
-            let answer = super::checks::gh(
-                &format!(
-                    "repos/{repo}/commits/{head}/check-runs?per_page={CHECKS_PAGE}&page={page}"
-                ),
-                &cwd,
-            )
-            .await?;
-            let count = answer
-                .get("total_count")
-                .and_then(Value::as_u64)
-                .ok_or("refused: incomplete checks from GitHub: missing total_count")?;
-            if total.replace(count).is_some_and(|before| before != count) {
-                return Err("refused: incomplete checks from GitHub: total_count changed".into());
+        for r in &runs {
+            let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+            let conclusion = r
+                .get("conclusion")
+                .and_then(Value::as_str)
+                .unwrap_or("pending");
+            match conclusion {
+                "success" | "neutral" => passed += 1,
+                "skipped" => {}
+                other => bad.push(format!("{name} ({other})")),
             }
-            let runs = answer
-                .get("check_runs")
-                .and_then(Value::as_array)
-                .ok_or("refused: incomplete checks from GitHub: missing check_runs")?;
-            received += runs.len() as u64;
-            if received > count || (runs.len() < CHECKS_PAGE && received < count) {
-                return Err(format!(
-                    "refused: incomplete checks from GitHub: received {received} of {count}"
-                ));
-            }
-            for r in runs {
-                let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
-                let conclusion = r
-                    .get("conclusion")
-                    .and_then(Value::as_str)
-                    .unwrap_or("pending");
-                match conclusion {
-                    "success" | "neutral" => passed += 1,
-                    "skipped" => {}
-                    other => bad.push(format!("{name} ({other})")),
-                }
-            }
-            if received == count {
-                break;
-            }
-        }
-        if total != Some(received) {
-            return Err(format!(
-                "refused: incomplete checks from GitHub: exceeded {CHECKS_PAGES_MAX} pages"
-            ));
-        }
-        if received == 0 {
-            return Err("refused: GitHub reports no checks".into());
         }
         if !bad.is_empty() {
             return Err(format!(

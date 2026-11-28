@@ -105,6 +105,7 @@
   so a crash before the result is recorded also blocks further messages until released. A definite
   refusal allows retry; release never resends the original. Settled steering receipts obey the same
   per-session cap as queued messages.
+
 - A lane's pull-request policy check could pass after reading only the first 100 commits or files.
   It now reads every page, refuses incomplete lists, and rejects pull requests with over 3000 files.
   Pull requests with over 250 commits are refused because GitHub lists only the first 250.
@@ -112,6 +113,8 @@
   restart the timeout and hold the lane for many minutes.
 - The merge check now reads every page of GitHub check runs, so a failing check after the first
   page cannot be missed. Missing or inconsistent counts and incomplete results refuse the merge.
+  page cannot be missed. Missing counts and incomplete results refuse the merge; a count that
+  changes while the pages are read (CI adding runs) has the list read once more.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

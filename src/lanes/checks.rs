@@ -493,8 +493,8 @@ async fn policy(
     }
     // Bounded by the PR's counts; a short page (GitHub lists at most 250 commits) is checked below.
     let read = |p: String| async move { gh.read(&p).await };
-    let commits = gh_list(&format!("{path}/commits"), None, Some(commit_count), read).await?;
-    let files = gh_list(&format!("{path}/files"), None, Some(file_count), read).await?;
+    let (commits, _) = gh_list(&format!("{path}/commits"), None, Some(commit_count), read).await?;
+    let (files, _) = gh_list(&format!("{path}/files"), None, Some(file_count), read).await?;
     let after = gh.read(&path).await?;
     if before.pointer("/head/sha") != after.pointer("/head/sha")
         || ["body", "commits", "changed_files"]

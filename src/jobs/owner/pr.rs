@@ -104,7 +104,8 @@ impl Gh<'_, '_> {
 
     /// Every row of a list endpoint (WS req. 46); `key` names the array inside an object answer.
     async fn list(&self, path: &str, key: Option<&str>) -> Result<Vec<Value>, String> {
-        super::gh_list(path, key, None, |page| async move { self.api(&page).await }).await
+        let read = |page: String| async move { self.api(&page).await };
+        Ok(super::gh_list(path, key, None, read).await?.0)
     }
 }
 
