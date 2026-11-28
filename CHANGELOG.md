@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Request notes that would exceed 16 KiB are refused instead of silently truncated while reporting
+  success. A full request log does not block recording an owner question's answer.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
