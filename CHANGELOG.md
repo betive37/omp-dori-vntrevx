@@ -62,6 +62,12 @@
   server roles lack them. It checks effective channel permissions before asking for role changes.
 - Cancelling a worker request no longer keeps its SSH connection busy forever. A cancelled lane
   start closes its unclaimed OMP channel, including one that arrives after cancellation.
+- The user service now keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME`
+  values from the shell when enabled or refreshed, instead of using the default config, store or
+  program folder. The Linux unit also carries `XDG_CONFIG_HOME`, but a shell-only custom value
+  remains unsupported: the shell and systemd user manager must agree on the config home to find
+  the unit. OMP child processes now also follow the shell's XDG homes.
+  Explicit service commands refuse absolute non-UTF-8 XDG homes rather than silently using defaults.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
