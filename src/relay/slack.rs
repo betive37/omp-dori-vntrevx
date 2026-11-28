@@ -124,11 +124,21 @@ pub(crate) struct ApiError {
 }
 
 impl ApiError {
+    /// Connection, response and token failures reconnect; they must not hold individual rooms.
     fn retry_catch_up(&self) -> bool {
         self.status
-            .is_none_or(|status| matches!(status, 408 | 429 | 500..=599))
-            || self.why == "ratelimited"
+            .is_none_or(|status| matches!(status, 401 | 408 | 429 | 500..=599))
             || UNCERTAIN_ERRORS.contains(&self.why.as_str())
+            || matches!(
+                self.why.as_str(),
+                "ratelimited"
+                    | "no success field"
+                    | "invalid_auth"
+                    | "token_expired"
+                    | "token_revoked"
+                    | "account_inactive"
+                    | "not_authed"
+            )
     }
 }
 
@@ -1289,12 +1299,19 @@ mod tests {
     fn catch_up_errors_retry_only_when_transient() {
         for (status, why) in [
             (None, "send failed"),
+            (Some(401), "refused"),
             (Some(408), "refused"),
             (Some(429), "rate limited"),
             (Some(500), "refused"),
             (Some(503), "refused"),
             (Some(599), "refused"),
             (Some(200), "ratelimited"),
+            (Some(200), "no success field"),
+            (Some(200), "invalid_auth"),
+            (Some(200), "token_expired"),
+            (Some(200), "token_revoked"),
+            (Some(200), "account_inactive"),
+            (Some(200), "not_authed"),
         ]
         .into_iter()
         .chain(UNCERTAIN_ERRORS.map(|why| (Some(200), why)))
