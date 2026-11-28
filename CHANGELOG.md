@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A lead held after too many crashes stays held across hub restarts and updates, even with
+  autostart enabled. Only an explicit `lead start` clears the hold and resumes its conversation.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

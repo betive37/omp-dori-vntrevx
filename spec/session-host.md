@@ -363,8 +363,10 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
      (a rejection such as an early exit or a protocol or identity mismatch, an unknown cleanup or lease, the spent
      episode) holds the lead.
 105. A hold stays across hub restarts and updates until the owner acts: a restart finds the hold, names its first
-     cause, and starts nothing. `cataly lead start` after fixing the cause resumes the anchor; stop, shutdown and
-     a target change cancel a planned retry and wait for owned cleanup.
+     cause, and starts nothing. This includes the hold after more than five child restarts within ten minutes,
+     even with autostart enabled; only an explicit `cataly lead start` clears that hold. `cataly lead start` after
+     fixing the cause resumes the anchor; stop, shutdown and a target change cancel a planned retry and wait
+     for owned cleanup.
 106. Input waits for binding: owner messages and quiet notes stay pending, untouched, while no session of the
      anchor is bound; the first bound wake sends them once in one batch, and the resume note keeps its once-only
      identity. A start attempt never creates a delivery or resends one.
@@ -417,7 +419,8 @@ flag on turn end. The old tree also pinned OMP 19.0.1 built from source with a l
   and transcript path, lifecycle state (starting, live, stopped, lost, orphan-held, failed) and stop details.
 - Per session: the submission receipts and their states.
 - The lead's resume anchor, the owner's fresh or resume intent, the recovery episode (attempt count, next retry,
-  deadline, state and first cause) and what the owner was last told about a slow start and a hold.
+  deadline, state and first cause), the crash restart-limit hold and its reason, and what the owner was last
+  told about a slow start and a hold.
 - Any required lead session id.
 - Config: OMP executable, minimum version, allowed extra flags, capacity cap, default runtime.
 - Not kept: output ring, events, dialogs, view tokens (rebuilt from the live child).
