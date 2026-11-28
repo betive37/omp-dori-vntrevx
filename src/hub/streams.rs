@@ -606,6 +606,7 @@ mod tests {
         }
     }
 
+    #[cfg(target_os = "linux")]
     #[test]
     fn a_spill_file_sync_failure_is_reported() {
         let dir = crate::sys::fs::tests::scratch("streams-file-sync");
