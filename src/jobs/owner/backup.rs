@@ -217,7 +217,8 @@ async fn run(t: &Tick<'_>, b: &Backup, git: &Git<'_, '_>) -> Result<Found, Strin
     );
     if staged.is_empty() && own.is_empty() {
         // A stopped tick can leave a commit without recording its pending push.
-        let push = if t.dry || (t.memory.get(PUSHED, "pending").is_none() && !ahead(git).await?) {
+        let push = if t.dry || (t.memory.get(PUSHED, "pending").is_none() && !ahead(git, b).await?)
+        {
             None
         } else {
             Some(push(git, b).await)
@@ -332,16 +333,26 @@ async fn own_files_not_ignored(
     Ok(found)
 }
 
-/// A commit left local by an interrupted tick. No upstream means there is nothing to compare.
-async fn ahead(git: &Git<'_, '_>) -> Result<bool, String> {
+/// Commits absent from the backup target. A missing remote-tracking ref also needs a push.
+async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
+    let target = format!("refs/remotes/{}/{}", b.remote, b.branch);
     let done = git
-        .run(&["rev-list", "--count", "@{u}..HEAD"], LOCAL)
+        .run(&["rev-list", "--count", "HEAD", "--not", &target], LOCAL)
         .await?;
-    Ok(done.success()
-        && String::from_utf8_lossy(&done.stdout)
+    if done.success() {
+        return Ok(String::from_utf8_lossy(&done.stdout)
             .trim()
             .parse::<u64>()
-            .is_ok_and(|count| count > 0))
+            .is_ok_and(|count| count > 0));
+    }
+    let found = git
+        .run(&["show-ref", "--verify", "--quiet", &target], LOCAL)
+        .await?;
+    if matches!(found.exit, crate::sys::command::Exit::Code(1)) {
+        Ok(true)
+    } else {
+        Err(format!("git rev-list failed: {}", super::said(&done)))
+    }
 }
 
 /// Pushes HEAD to the configured branch. Never forced.
@@ -555,6 +566,23 @@ mod tests {
         (remote, work)
     }
 
+    fn commit(dir: &Path, message: &str) {
+        git(dir, &["add", "-A"]);
+        git(
+            dir,
+            &[
+                "-c",
+                "user.name=Backup",
+                "-c",
+                "user.email=b@example.org",
+                "commit",
+                "-q",
+                "-m",
+                message,
+            ],
+        );
+    }
+
     /// Moves the remote on with a commit made in a separate clone.
     fn push_from_another_clone(root: &Path, remote: &Path) {
         let other = root.join("other");
@@ -569,7 +597,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn unchanged_tick_pushes_without_pending_memory() {
+    async fn unchanged_tick_pushes_without_upstream_or_pending_memory() {
         let root = crate::sys::fs::tests::scratch("backup-unpushed");
         let (remote, work) = repos(&root);
         let cfg = format!(
@@ -583,20 +611,7 @@ mod tests {
 
         // The next tick committed, but stopped before pushing or saving its memory.
         std::fs::write(work.join("notes.md"), "next backup\n").unwrap();
-        git(&work, &["add", "-A"]);
-        git(
-            &work,
-            &[
-                "-c",
-                "user.name=Backup",
-                "-c",
-                "user.email=b@example.org",
-                "commit",
-                "-q",
-                "-m",
-                "interrupted backup",
-            ],
-        );
+        commit(&work, "interrupted backup");
         let head = git(&work, &["rev-parse", "HEAD"]);
         assert_ne!(head, pushed);
         assert_eq!(git(&work, &["status", "--porcelain"]), "");
@@ -607,10 +622,14 @@ mod tests {
                 .any(|(s, c, _)| s == super::PUSHED && c == "pending")
         );
 
-        // Without an upstream and pending memory, an unchanged tick still does nothing.
-        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
-        assert_eq!(git(&remote, &["rev-parse", "main"]), pushed);
-        git(&work, &["branch", "--set-upstream-to=origin/main"]);
+        assert_eq!(
+            git(
+                &work,
+                &["for-each-ref", "--format=%(upstream)", "refs/heads/main"]
+            ),
+            "\n",
+            "backup pushes do not set an upstream"
+        );
 
         // A dry tick must not recover the missing push either.
         let config = ctx.config();
@@ -628,6 +647,11 @@ mod tests {
         assert_eq!(git(&remote, &["rev-parse", "main"]), head);
         assert_eq!(git(&work, &["rev-parse", "HEAD"]), head, "no extra commit");
 
+        // A missing tracking ref must also trigger a push, even with a clean tree.
+        git(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
+
         // Once caught up, a clean tick must not attempt another push.
         git(
             &work,
@@ -635,6 +659,52 @@ mod tests {
                 "remote",
                 "set-url",
                 "origin",
+                root.join("missing.git").to_str().unwrap(),
+            ],
+        );
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_uses_configured_backup_target_not_upstream() {
+        let root = crate::sys::fs::tests::scratch("backup-target");
+        let (upstream, work) = repos(&root);
+        let remote = root.join("backup.git");
+        git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(&work, &["remote", "add", "vault", remote.to_str().unwrap()]);
+        std::fs::write(work.join("notes.md"), "first backup\n").unwrap();
+        commit(&work, "first backup");
+        git(&work, &["push", "-q", "-u", "origin", "main"]);
+        git(&work, &["push", "-q", "vault", "HEAD:refs/heads/backup"]);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\nremote = \"vault\"\nbranch = \"backup\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-target-ctx");
+
+        // Upstream already has this commit, but the configured backup does not.
+        std::fs::write(work.join("notes.md"), "next backup\n").unwrap();
+        commit(&work, "interrupted backup");
+        git(&work, &["push", "-q", "origin", "main"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&work, &["rev-parse", "@{u}"]), head);
+        assert_ne!(git(&remote, &["rev-parse", "backup"]), head);
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "backup"]), head);
+
+        // Once backed up, being ahead of the unrelated upstream must not cause another push.
+        std::fs::write(work.join("notes.md"), "latest backup\n").unwrap();
+        commit(&work, "another interrupted backup");
+        let latest = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "backup"]), latest);
+        assert_eq!(git(&upstream, &["rev-parse", "main"]), head);
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "vault",
                 root.join("missing.git").to_str().unwrap(),
             ],
         );

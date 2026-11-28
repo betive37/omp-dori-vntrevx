@@ -996,9 +996,10 @@ Stages every change in a git working tree, scans it for secrets (built-in token 
 patterns) and for files over the size limit, and only then commits and pushes. Never force-pushes,
 rewrites history or pulls. A refusal commits nothing and names files and rule, never the matched
 text. The config file and `secrets/` inside the tree are refused unless git ignores them.
-An unchanged tick retries a pending push and also pushes a branch ahead of its upstream, recovering
-commits left by an interrupted tick even when no pending push was recorded. With no upstream and no
-pending push, an unchanged tick does nothing.
+An unchanged tick retries a pending push and also pushes commits missing from the configured backup
+remote and branch, recovering interrupted ticks even when no pending push was recorded. It compares
+HEAD with `refs/remotes/<remote>/<branch>`; if that ref is missing, it attempts the push. The working
+branch's upstream is not used and need not be configured.
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|

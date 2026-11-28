@@ -3,8 +3,9 @@
 ## Unreleased
 
 - A backup interrupted after committing could leave that commit local forever when nothing else
-  changed. An unchanged tick now pushes a branch ahead of its upstream even if no pending push
-  was recorded.
+  changed. An unchanged tick now pushes commits missing from the configured backup remote and
+  branch, even without pending-push memory or a branch upstream. A missing remote-tracking ref
+  also triggers a push.
 
 ## 0.2.8 (2026-11-28)
 
