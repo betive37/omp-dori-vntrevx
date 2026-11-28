@@ -1346,8 +1346,9 @@ mod tests {
         let mut args = [0; 2];
         stream.read_exact(&mut args).await.unwrap();
         assert_eq!(&args, b"{}");
-        let response = json!({"ok": true, "url": format!("ws://{}/link", listener.local_addr().unwrap())})
-            .to_string();
+        let response =
+            json!({"ok": true, "url": format!("ws://{}/link", listener.local_addr().unwrap())})
+                .to_string();
         stream
             .write_all(
                 format!(
@@ -1384,10 +1385,16 @@ mod tests {
             let posting = POSTING.read().await;
             tokio::time::pause();
             for (id, event) in [
-                ("read", json!({"type": "message", "channel": "C1", "user": "U0OWNER",
-                    "ts": "2.000001", "thread_ts": "1.000001", "text": "reply"})),
-                ("next", json!({"type": "message", "channel": "D1", "user": "U0OWNER",
-                    "ts": "3.000001", "text": "must wait for the next intake"})),
+                (
+                    "read",
+                    json!({"type": "message", "channel": "C1", "user": "U0OWNER",
+                    "ts": "2.000001", "thread_ts": "1.000001", "text": "reply"}),
+                ),
+                (
+                    "next",
+                    json!({"type": "message", "channel": "D1", "user": "U0OWNER",
+                    "ts": "3.000001", "text": "must wait for the next intake"}),
+                ),
             ] {
                 let envelope = json!({"type": "events_api", "envelope_id": id,
                     "payload": {"event": event}});
@@ -1414,7 +1421,9 @@ mod tests {
                 "halt cancelled an envelope before its admission and acknowledgement"
             );
             tokio::time::resume();
-            remember(&store, "C1", "1.000001", "1.000001").await.unwrap();
+            remember(&store, "C1", "1.000001", "1.000001")
+                .await
+                .unwrap();
             drop(posting);
             assert!(matches!(
                 tokio::time::timeout(Duration::from_secs(5), &mut run)
