@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Cron jobs with a step in a day field, like `0 0 */2 * *` or `0 0 * * */2`, ran every day; they now
+  run only on the stepped days, combining the two day fields the way standard cron does.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
