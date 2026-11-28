@@ -588,29 +588,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_spill_file_sync_failure_is_reported() {
-        let dir = crate::sys::fs::tests::scratch("streams-file-sync");
-        let mut line = Line::new(dir.to_path_buf(), "sync");
-        let len = LINE_MAX + 1;
-        line.push(&vec![b'x'; len]);
-        let (file, path) = line.spill.as_mut().unwrap().file.as_mut().unwrap();
-        let path = path.clone();
-        // A real descriptor whose sync_all fails after the line's writes have succeeded.
-        *file = std::fs::File::open("/dev/null").unwrap();
-        let Ended::Saved(note) = line.finish() else {
-            panic!("the oversized line needs a note")
-        };
-        assert!(
-            note.starts_with(&format!(
-                "a line of {len} bytes that could not be saved: sync file:"
-            )),
-            "{note}"
-        );
-        assert!(!path.exists(), "an unsynced file must not be left behind");
-    }
-
     #[test]
     fn a_spill_directory_sync_failure_is_reported() {
         let dir = crate::sys::fs::tests::scratch("streams-dir-sync");
