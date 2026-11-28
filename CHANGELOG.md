@@ -80,6 +80,10 @@
 - A lane could remove a worktree containing a published file when the worktree was opened through
   a symlink. Ownership now records the canonical path, and close resolves older paths too, keeping
   the worktree when the path cannot be resolved.
+- Closing a lane could remove a worktree another open lane was using. Keep it when another lane
+  on the same machine works inside it or has registered a path inside it, resolving symlinks, and
+  name that lane in the close receipt. Concurrent worktree registration takes the lane's turn before
+  reserving paths, rechecks the run, and reports success only when the registration is stored.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

@@ -129,6 +129,9 @@ pub(crate) struct Lanes<R: Runtime> {
     opening: Mutex<Vec<String>>,
     /// Closes on threads are serialised so two last lanes cannot both skip the hook (LANE req. 42).
     closing: AsyncMutex<()>,
+    /// Path reservations (open, reopen, registration) and worktree removal are serialised.
+    /// When both locks are needed, acquire the lane's turn before this lock.
+    worktree_use: AsyncMutex<()>,
     overlay: OnceLock<()>,
     spend: Mutex<HashMap<String, crate::omp::transcript::SpendTree>>,
     /// Wakes oversight early (a report, a state change, a claim).
@@ -176,6 +179,7 @@ impl<R: Runtime> Lanes<R> {
             turns: Mutex::new(HashMap::new()),
             opening: Mutex::new(Vec::new()),
             closing: AsyncMutex::new(()),
+            worktree_use: AsyncMutex::new(()),
             overlay: OnceLock::new(),
             spend: Mutex::new(HashMap::new()),
             nudge: Notify::new(),
@@ -712,16 +716,27 @@ impl<R: Runtime> Lanes<R> {
                 if !current {
                     return Err(crate::store::lanes::MOVED_ON.into());
                 }
-                let path = p::PATH.some(input)?.to_string();
-                let real = std::fs::canonicalize(&path).map_err(|e| format!("{path}: {e}"))?;
+                let path = p::PATH.some(input)?;
+                drop(rec);
+                let _turn = self.turn(&key).await?;
+                let (mut rec, rev) = self.load(&key).await?;
+                if !rec.open()
+                    || rec.intent.is_some()
+                    || run.as_deref() != Some(rec.run_id.as_str())
+                    || rec.handle.as_deref() != Some(handle)
+                    || rec.session_id.as_deref() != Some(session)
+                {
+                    return Err(crate::store::lanes::MOVED_ON.into());
+                }
+                let _worktree_use = self.worktree_use.lock().await;
+                let real = std::fs::canonicalize(path).map_err(|e| format!("{path}: {e}"))?;
                 let real = real.display().to_string();
-                self.keep(&key, |r| {
-                    if !r.worktrees.contains(&real) {
-                        r.worktrees.push(real.clone());
-                    }
-                })
-                .await;
-                Ok(json!(format!("worktree {real} registered for lane {key}")))
+                let receipt = format!("worktree {real} registered for lane {key}");
+                if !rec.worktrees.contains(&real) {
+                    rec.worktrees.push(real);
+                    self.save(&rec, Some(rev), None).await?;
+                }
+                Ok(json!(receipt))
             }
             "publish" => {
                 if !current {
@@ -1122,6 +1137,11 @@ impl<R: Runtime> Lanes<R> {
             rec.thread = Some(self.thread_for(&rec.key, &rec.title, &source).await?);
         }
         let mut note = None;
+        let worktree_use = self.worktree_use.lock().await;
+        // Validation preceded the lock; a close may have removed this directory since then.
+        if valid.worker.is_none() && !valid.cwd.is_dir() {
+            return Err(format!("{} is not a directory", valid.cwd.display()));
+        }
         if let Some(worker) = &valid.worker {
             let prepared = self.prepare(&valid, worker).await?;
             rec.cwd.clone_from(&prepared.cwd);
@@ -1150,6 +1170,7 @@ impl<R: Runtime> Lanes<R> {
                 ));
             }
         };
+        drop(worktree_use);
         if let Some(rid) = &request_id {
             let _ = self
                 .env
@@ -1860,6 +1881,110 @@ fn turn_lock(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    async fn registration_lane(
+        store: Store,
+        dir: &Path,
+    ) -> (Arc<Lanes<crate::host::headless::Headless>>, Record) {
+        let config = Config::default();
+        let input = OpenInput {
+            key: "registration".into(),
+            title: "Register work".into(),
+            brief: Some("Keep this worktree".into()),
+            model: Some("fake/primary".into()),
+            cwd: Some(dir.display().to_string()),
+            checks: json!([{ "kind": "command", "argv": ["true"] }]),
+            ..OpenInput::default()
+        };
+        let valid = record::validate(&input, &config.lanes).unwrap();
+        let mut rec =
+            Lanes::<crate::host::headless::Headless>::build(&valid, &config, "run".into());
+        rec.state = State::Running;
+        rec.handle = Some("handle".into());
+        rec.session_id = Some("session".into());
+        let (_, config) = watch::channel(Arc::new(config));
+        let threads = Arc::new(crate::relay::discord::threads::DiscordThreads {
+            config: config.clone(),
+            rest: Arc::new(|_| panic!("registration does not contact Discord")),
+        });
+        let lanes = Lanes::new(Env {
+            config,
+            omp: Omp::new(),
+            store,
+            state_dir: dir.to_path_buf(),
+            events: Arc::new(|_| panic!("registration does not emit lifecycle events")),
+            make: Box::new(|_, _, _| panic!("registration does not start sessions")),
+            bridge_link: Arc::new(|| panic!("registration does not start a bridge")),
+            lead_live: Arc::new(|| false),
+            threads: threads.clone(),
+            boards: threads,
+        });
+        lanes.save(&rec, None, Some("opened".into())).await.unwrap();
+        (lanes, rec)
+    }
+
+    #[tokio::test]
+    async fn worktree_registration_waits_for_the_turn_before_reserving_paths() {
+        let (store, _writer, dir) = crate::store::tests::open_temp("registration-order");
+        let (lanes, mut rec) = registration_lane(store, &dir).await;
+        let lock = turn_lock(&lanes.turns, &rec.key);
+        let held = lock.clone().lock_owned().await;
+        let input = json!({ "op": "worktree", "path": dir.display().to_string() });
+        let mut registration = std::pin::pin!(lanes.lane_call("handle", "session", &input));
+        std::future::poll_fn(|cx| {
+            assert!(registration.as_mut().poll(cx).is_pending());
+            // Map, this handle, held turn, and the registration waiting for that turn.
+            if Arc::strong_count(&lock) == 4 {
+                std::task::Poll::Ready(())
+            } else {
+                std::task::Poll::Pending
+            }
+        })
+        .await;
+        let paths = lanes
+            .worktree_use
+            .try_lock()
+            .expect("a registration waiting for its turn must not reserve paths");
+        let (_, rev) = lanes.load(&rec.key).await.unwrap();
+        rec.state = State::Closed;
+        rec.closed_ms = Some(now_ms());
+        rec.outcome = Some("completed".into());
+        lanes.save(&rec, Some(rev), None).await.unwrap();
+        drop(paths);
+        drop(held);
+        assert_eq!(
+            registration.await.unwrap_err(),
+            crate::store::lanes::MOVED_ON
+        );
+        assert_eq!(
+            lanes.load(&rec.key).await.unwrap().0.worktrees,
+            Vec::<String>::new()
+        );
+    }
+
+    #[tokio::test]
+    async fn worktree_registration_reports_store_refusal() {
+        let (store, _writer, dir) = crate::store::tests::open_temp("registration-store");
+        let (lanes, rec) = registration_lane(store, &dir).await;
+        let db = rusqlite::Connection::open(dir.join("cataly.db")).unwrap();
+        db.execute_batch(
+            "CREATE TRIGGER refuse_registration BEFORE UPDATE ON lanes
+             BEGIN SELECT RAISE(FAIL, 'registration denied'); END;",
+        )
+        .unwrap();
+        let result = lanes
+            .lane_call(
+                "handle",
+                "session",
+                &json!({ "op": "worktree", "path": dir.display().to_string() }),
+            )
+            .await;
+        assert!(result.unwrap_err().contains("registration denied"));
+        assert_eq!(
+            lanes.load(&rec.key).await.unwrap().0.worktrees,
+            Vec::<String>::new()
+        );
+    }
 
     /// Closed lanes leave no turn lock behind, and a lock in use is never replaced.
     #[tokio::test]
