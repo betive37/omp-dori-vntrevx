@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- With a Discord interactions endpoint URL set, remote approvals could post without buttons and
+  wait forever. Such approvals are now denied before posting because their buttons cannot reach
+  the daemon; ordinary questions still accept text replies.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
