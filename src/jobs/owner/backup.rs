@@ -392,9 +392,11 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
 
 /// All expanded push URLs, or the remote itself when it is a direct URL rather than a name.
 async fn push_url(git: &Git<'_, '_>, b: &Backup) -> Result<String, String> {
-    Ok(git_value(git, &["remote", "get-url", "--push", "--all", &b.remote])
-        .await?
-        .unwrap_or_else(|| b.remote.clone()))
+    Ok(
+        git_value(git, &["remote", "get-url", "--push", "--all", &b.remote])
+            .await?
+            .unwrap_or_else(|| b.remote.clone()),
+    )
 }
 
 /// Pushes the resolved HEAD to the configured branch and returns its receipt. Never forced.
@@ -869,7 +871,10 @@ mod tests {
                 first.to_str().unwrap(),
             ],
         );
-        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/archive"]), head);
+        assert_eq!(
+            git(&work, &["rev-parse", "refs/remotes/origin/archive"]),
+            head
+        );
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
         assert_eq!(git(&first, &["rev-parse", "archive"]), head);
         assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
