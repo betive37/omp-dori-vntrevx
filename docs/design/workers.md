@@ -76,21 +76,36 @@ one audited server, and `known_hosts`, keys and forced commands are standard, do
   `[host]:port`, OpenSSH's own form [sshd(8), SSH_KNOWN_HOSTS FILE FORMAT]. A changed key is refused by
   `StrictHostKeyChecking=yes` and never accepted automatically.
 - **Stream.** One SSH session per worker carries frames: `u32 length | u32 channel | u8 kind | payload`,
-  at most 1 MiB + 9 bytes. Kinds: `open`, `data`, `credit`, `eof`, `close`, `ping`. Each channel has
-  1 MiB of credit per direction, so one slow lane cannot stall the others or grow memory. Both ends ping
-  every 15 s; 45 s without a frame closes the stream (the bridge's own heartbeat rule). Binary framing
-  because the payloads are already JSON lines up to 1 MiB; re-escaping them would double the work.
-- **Channel 0: worker protocol v1.** Requests and replies in the control protocol's JSON shape
-  (`{v, id, method, params}`), reusing `proto`. Methods:
+  at most 1 MiB + 9 bytes. Kinds: `open`, `data`, `credit`, `eof`, `close`, `ping`, `exit`. Each channel
+  has 1 MiB of credit per direction, so one slow lane cannot stall the others or grow memory. Both ends
+  ping every 15 s; 45 s without a frame closes the stream (the bridge's own heartbeat rule). Binary
+  framing because the payloads are already JSON lines up to 1 MiB; re-escaping them would double the
+  work. `exit` (protocol 2) is the last frame of a spawned OMP's channel: the worker's acknowledgement
+  that it reaped that OMP (2.4). It spends no credit and may follow the channel's `close`.
+- **Channel 0: worker protocol v2.** Requests and replies in the control protocol's JSON shape
+  (`{v, id, method, params}`), reusing `proto`. Version 2 added the attempt token, the `exit` frame and
+  `attempts`; a worker on version 1 is refused as incompatible (2.8). Methods:
 
 | Method | Does | Bound |
 | --- | --- | --- |
 | `hello` | Protocols (worker, bridge), version, OS, arch, root path, `omp` and `git` versions, bridge-link check | 10 s |
 | `status` | Load, free memory and disk, through the same `sys::host` readers | 5 s |
 | `exec` | One bounded subprocess (argv, cwd, env names, timeout, cap), as `sys::command` | per call |
-| `spawn` / `signal` | Start the worker's own OMP (argv[0] must be `omp`, replaced by the configured path) on a new channel; TERM or KILL only its own children | start budget |
+| `spawn` / `signal` | Start the worker's own OMP (argv[0] must be `omp`, replaced by the configured path) on a new channel for the hub's `attempt` token (required; `session` optional, for the lease check), recorded before the process exists; TERM or KILL only its own children | start budget |
+| `attempts` | The state of up to 64 attempt tokens: `running` (with PID), `reaped` (with exit and lease) or `unknown` (with reason) | 10 s |
 | `read` / `stat` / `write` | Bounded file access, confined to the worker root | 8 MiB, 10 s |
+| `find` / `verify` | The hub's delivery-marker search and resume check of a session file, run where the file is | 10 s |
 | `forget` | Remove this hub's line from `authorized_keys` | 5 s |
+
+- **Attempt messages.** `spawn` params add `{"attempt": "<handle>", "session": "<id>" | null}`. Its
+  answer is `{channel, pid, attempt, stderr}`. A failure after the attempt was recorded answers
+  `{attempt, failed: "<reason>", state: <state>}` instead, so the hub knows whether a process existed.
+  A refusal (an error reply) starts nothing. The `exit` payload is `{"attempt": "<handle>", ...state}`.
+  `attempts` takes `{"attempts": ["<handle>", ...]}` and answers `{"attempts": {"<handle>": state}}`. A
+  state is one of
+  `{"state":"running","pid":N}`, `{"state":"reaped","exit":{"code":N}|{"signal":N}|"gone"|"not_spawned","lease":"free"|"held"|"unknown"}`
+  or `{"state":"unknown","reason":"..."}`. `gone` means the recorded process identity no longer exists,
+  but the `serve` that started it died before reaping it, so there is no status.
 
 ### 2.3 Network: Tailscale
 
@@ -141,11 +156,29 @@ every lane comes back from its session file. SSH keepalives and the 45 s heartbe
 than that does not drop at all. Over a tailnet, a roaming laptop keeps its tailnet IP, so its connections
 should survive a network change inside that window [inf.].
 
-On the worker, a closed stream (EOF, write error or 45 s silence) makes `serve` close every OMP child by
-the HOST-20 rule (end input, 15 s, TERM, 5 s, KILL) and exit. A new `serve` for the same hub first takes
-`serve.lock`; if an older one still holds it (half-open TCP), it sends that process TERM and waits up to
-30 s. On the hub, the reattach waits for `omp session lease` on the worker to show the lease free, then
-resumes. A resume that binds another session stays held for inspection, as now.
+On the worker, a closed stream (EOF, write error or 45 s silence) or TERM from a newer `serve` makes
+`serve` close every OMP child by the HOST-20 rule (end input, 15 s, TERM, 5 s, KILL), record each exit,
+and exit. A new `serve` for the same hub first takes `serve.lock`. If an older one still holds it
+(half-open TCP), the new one sends that process TERM and waits up to 30 s. On the hub, the reattach
+waits for `omp session lease` on the worker to show the lease free, then resumes. A resume that binds
+another session stays held for inspection, as now.
+
+**Attempt identity (protocol 2).** Remote EOF is not a reap receipt. Every remote OMP start carries the
+hub's attempt token (the start spec's handle). Before spawning, the worker records the token under
+`<root>/attempts/<token>.json`; once the process exists it adds the process identity (PID plus boot ID
+and start time), so a reused PID is never mistaken for it. A token is used once. When the OMP ends (its
+input ends, its output ends, it is killed, or the stream or `serve` ends), the worker reaps it. While
+the hub can still hear, it asks OMP for the lease of the named session. It records the exit code or
+signal with that lease, then sends one `exit` frame with this state on the attempt's channel.
+The hub counts a remote attempt as terminated only on that acknowledgement (`Cleanup::WorkerReaped`).
+A stop or failed start waits for it within the stop budget (15 s + 5 s + 5 s), then KILL and 5 s
+more. A disconnect, an EOF, or no acknowledgement in time leaves ownership `Unknown`, and the attempt
+holds: no retry, no removal. After a reconnect, `ownership::reconcile_attempt(state, handle, worker)`
+asks `attempts`. `reaped` is a confirmed exit; `running` means an earlier attempt's process still lives
+(after a `serve` crash) and is reported, never killed or adopted; `unknown` (no record, an unreadable
+record, no process identity, or no answer within 10 s) holds. Records are kept: the worker cannot
+know which attempts the hub's recovery still refers to, and nothing removes them until an explicit
+release exists.
 
 ### 2.5 Bridge path and extension file
 

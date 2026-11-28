@@ -154,4 +154,19 @@ done
 
 echo "Cataly $version for $target; release key $RELEASE_KEY"
 chmod 700 "$tmp/cataly-$version-$target"
+
+# Over an existing install, its own binary first checks that this version can read the store: a
+# hub that cannot read it refuses to start. It exits 6 when it refuses; nothing has changed then.
+# A binary from before this check does not know --preflight (a usage error), and one that cannot
+# run leaves the repair to this install, so only its refusal stops here.
+case "${XDG_DATA_HOME:-}" in
+/*) installed="$XDG_DATA_HOME/cataly/current/cataly" ;;
+*) installed="${HOME:-}/.local/share/cataly/current/cataly" ;;
+esac
+if [ -x "$installed" ]; then
+	checked=0
+	"$installed" install --preflight "$tmp/cataly-$version-$target" || checked=$?
+	[ "$checked" != 6 ] || fail "the installed Cataly refused $version; nothing was installed"
+fi
+
 "$tmp/cataly-$version-$target" install --from "$tmp"

@@ -638,6 +638,71 @@ pub(crate) fn inspect(layout: &Layout) -> (Vec<String>, Vec<Problem>) {
     (repaired, problems)
 }
 
+/// The lowest store schema a binary must know to open the store at `db`, read as the hub reads it
+/// (`meta.min_reader`, else the schema version) through a read-only connection that changes
+/// nothing; `None` when there is no store.
+pub(crate) fn store_floor(db: &Path) -> Result<Option<i64>, String> {
+    use rusqlite::{Connection, OpenFlags, OptionalExtension};
+    match fs::symlink_metadata(db) {
+        Ok(_) => {}
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(format!("{}: {e}", db.display())),
+    }
+    let fail = |e: rusqlite::Error| format!("the store {} could not be read: {e}", db.display());
+    let conn = Connection::open_with_flags(
+        db,
+        OpenFlags::SQLITE_OPEN_READ_ONLY | OpenFlags::SQLITE_OPEN_NO_MUTEX,
+    )
+    .map_err(fail)?;
+    conn.busy_timeout(std::time::Duration::from_millis(250))
+        .map_err(fail)?;
+    conn.execute_batch("PRAGMA query_only=ON;").map_err(fail)?;
+    let version: i64 = conn
+        .query_row("PRAGMA user_version", [], |r| r.get(0))
+        .map_err(fail)?;
+    let has_meta: i64 = conn
+        .query_row(
+            "SELECT count(*) FROM sqlite_master WHERE type = 'table' AND name = 'meta'",
+            [],
+            |r| r.get(0),
+        )
+        .map_err(fail)?;
+    if has_meta == 0 {
+        return Ok(Some(version));
+    }
+    let min_reader = conn
+        .query_row("SELECT value FROM meta WHERE key = 'min_reader'", [], |r| {
+            r.get::<_, String>(0)
+        })
+        .optional()
+        .map_err(fail)?;
+    Ok(Some(
+        min_reader.and_then(|v| v.parse().ok()).unwrap_or(version),
+    ))
+}
+
+/// The store copies the hub made before migrating (`<backup>/cataly-v<N>.db`), newest schema first.
+pub(crate) fn store_copies(backup_dir: &Path) -> Vec<(i64, PathBuf)> {
+    let Ok(dir) = fs::read_dir(backup_dir) else {
+        return Vec::new();
+    };
+    let mut copies: Vec<(i64, PathBuf)> = dir
+        .filter_map(Result::ok)
+        .filter_map(|e| {
+            let name = e.file_name();
+            let schema = name
+                .to_str()?
+                .strip_prefix("cataly-v")?
+                .strip_suffix(".db")?
+                .parse()
+                .ok()?;
+            Some((schema, e.path()))
+        })
+        .collect();
+    copies.sort_by_key(|c| std::cmp::Reverse(c.0));
+    copies
+}
+
 /// Removes the command link and the extension link when they are Cataly's, then the program folder
 /// (IR req. 35). Configuration, state, sessions and OMP are never touched.
 pub(crate) fn remove_all(layout: &Layout) -> Result<(), String> {
@@ -673,6 +738,10 @@ fn make_writable_and_remove(path: &Path) -> Result<(), String> {
         Err(e) => Err(format!("{}: {e}", path.display())),
     }
 }
+
+#[cfg(test)]
+#[path = "install_floor_tests.rs"]
+mod floor_tests;
 
 #[cfg(test)]
 mod tests {

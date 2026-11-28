@@ -1,9 +1,9 @@
 //! OMP session-file reader (DESIGN 3.3, 7.1; PATCH-01 rules 8-10, HOST req. 9-10): whether a saved
-//! session file may be resumed exactly and which model OMP will restore from it, and the bounded search
-//! for a delivery marker in a user entry. Session files belong to OMP; the hub only reads them, with
-//! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), the last 8 MiB and
-//! 2 s for a search, and nothing over 64 MiB. Every read here blocks; callers use the async wrappers,
-//! which run on the blocking pool.
+//! session file may be resumed exactly and which model OMP will restore from it, and the search for
+//! a delivery marker in a user entry. Session files belong to OMP; the hub only reads them, with
+//! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), the last 8 MiB
+//! and 2 s for a reply read, the whole file within 10 s for a marker search, and nothing over
+//! 64 MiB. Every read here blocks; callers use the async wrappers, which run on the blocking pool.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -21,10 +21,13 @@ const HEADER_BYTES: u64 = 64 * 1024;
 const REOPEN_HEADER_BYTES: u64 = 1024 * 1024;
 /// Largest session file read at all.
 const FILE_LIMIT: u64 = 64 * 1024 * 1024;
-/// A delivery search reads at most this much from the end of the file.
+/// A reply read covers at most this much from the end of the file; it is also the longest entry a
+/// marker search parses.
 const SEARCH_TAIL: u64 = 8 * 1024 * 1024;
 /// And takes at most this long.
 const SEARCH_BUDGET: Duration = Duration::from_secs(2);
+/// A marker search reads the whole file within this time, or proves nothing.
+pub(crate) const MARKER_BUDGET: Duration = Duration::from_secs(10);
 
 /// A session file could not be read safely.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -34,6 +37,23 @@ pub(crate) enum TranscriptError {
     TooLarge,
     /// Not valid JSON lines.
     Malformed,
+    Verification(VerificationCheck),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum VerificationCheck {
+    Path,
+    FileNameIdentity,
+    CanonicalLocation,
+    DirectorySafety,
+    FileSafety,
+    Header,
+    WorkingDirectory,
+    HeaderIdentity,
+    SiblingSafety,
+    Continuation,
+    Departed,
+    RemoteUnverified,
 }
 
 impl fmt::Display for TranscriptError {
@@ -42,6 +62,7 @@ impl fmt::Display for TranscriptError {
             Self::Io(e) => write!(f, "session file: {e}"),
             Self::TooLarge => f.write_str("session file exceeds 64 MiB"),
             Self::Malformed => f.write_str("session file is not valid JSON lines"),
+            Self::Verification(check) => write!(f, "exact resume check failed: {check:?}"),
         }
     }
 }
@@ -256,20 +277,32 @@ pub(crate) fn exact(
     session: &str,
     folder: &Folder,
 ) -> Result<Option<Transcript>> {
+    match exact_checked(path, root, session, folder) {
+        Ok(transcript) => Ok(Some(transcript)),
+        Err(TranscriptError::Verification(_)) => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn exact_checked(path: &Path, root: &Path, session: &str, folder: &Folder) -> Result<Transcript> {
     let name = path
         .file_name()
         .and_then(std::ffi::OsStr::to_str)
         .unwrap_or_default();
-    if !path.is_absolute()
-        || path.to_string_lossy().chars().any(char::is_control)
-        || session_file_id(name) != Some(session)
-    {
-        return Ok(None);
+    if !path.is_absolute() || path.to_string_lossy().chars().any(char::is_control) {
+        return Err(TranscriptError::Verification(VerificationCheck::Path));
+    }
+    if session_file_id(name) != Some(session) {
+        return Err(TranscriptError::Verification(
+            VerificationCheck::FileNameIdentity,
+        ));
     }
     let file = real(path)?;
     let root = real(root)?;
     if file != path || !strictly_inside(&root, &file) {
-        return Ok(None);
+        return Err(TranscriptError::Verification(
+            VerificationCheck::CanonicalLocation,
+        ));
     }
     let uid = rustix::process::getuid().as_raw();
     let parent = root.parent().map(fs::metadata).transpose()?;
@@ -284,7 +317,9 @@ pub(crate) fn exact(
     while let Some(at) = dir {
         let info = fs::metadata(&at)?;
         if !info.is_dir() || info.uid() != uid || info.mode() & write_mask != 0 {
-            return Ok(None);
+            return Err(TranscriptError::Verification(
+                VerificationCheck::DirectorySafety,
+            ));
         }
         if at == root {
             break;
@@ -294,17 +329,19 @@ pub(crate) fn exact(
     let mut handle = read_only(&file)?;
     let info = handle.metadata()?;
     if !info.is_file() || info.uid() != uid || info.nlink() != 1 || info.mode() & write_mask != 0 {
-        return Ok(None);
+        return Err(TranscriptError::Verification(VerificationCheck::FileSafety));
     }
     if info.len() > FILE_LIMIT {
         return Err(TranscriptError::TooLarge);
     }
     let Some(head) = header(&mut handle, REOPEN_HEADER_BYTES)? else {
-        return Ok(None);
+        return Err(TranscriptError::Verification(VerificationCheck::Header));
     };
     let header_cwd = head.get("cwd").and_then(Value::as_str).map(Path::new);
     let Some(recorded) = header_cwd.filter(|c| c.is_absolute()) else {
-        return Ok(None);
+        return Err(TranscriptError::Verification(
+            VerificationCheck::WorkingDirectory,
+        ));
     };
     let recorded = real(recorded)?;
     let allowed = match folder {
@@ -314,38 +351,56 @@ pub(crate) fn exact(
                 || fs::metadata(&recorded).is_ok_and(|m| m.is_dir() && m.uid() == uid)
         }
     };
-    if head.get("id").and_then(Value::as_str) != Some(session) || !allowed {
-        return Ok(None);
+    if head.get("id").and_then(Value::as_str) != Some(session) {
+        return Err(TranscriptError::Verification(
+            VerificationCheck::HeaderIdentity,
+        ));
     }
-    // Only generated sibling headers can redirect OMP's resume target.
-    let dir = file.parent().unwrap_or(root.as_path());
+    if !allowed {
+        return Err(TranscriptError::Verification(
+            VerificationCheck::WorkingDirectory,
+        ));
+    }
+    check_siblings(&file, session, write_mask)?;
+    handle.seek(SeekFrom::Start(0))?;
+    read_branch(handle, recorded)
+}
+/// Generated sibling headers can redirect OMP's target; every such sibling must be readable.
+fn check_siblings(file: &Path, session: &str, write_mask: u32) -> Result<()> {
+    let dir = file.parent().ok_or(TranscriptError::Verification(
+        VerificationCheck::CanonicalLocation,
+    ))?;
+    let uid = rustix::process::getuid().as_raw();
     for sibling in fs::read_dir(dir)? {
         let sibling = sibling?;
-        let sibling_name = sibling.file_name();
-        let Some(sibling_name) = sibling_name.to_str() else {
-            continue;
-        };
-        if sibling_name == name || session_file_id(sibling_name).is_none() {
+        let name = sibling.file_name();
+        let Some(name) = name.to_str() else { continue };
+        if Some(std::ffi::OsStr::new(name)) == file.file_name() || session_file_id(name).is_none() {
             continue;
         }
         let mut other = read_only(&sibling.path())?;
         let entry = other.metadata()?;
         if !entry.is_file() || entry.uid() != uid || entry.mode() & write_mask != 0 {
-            return Ok(None);
+            return Err(TranscriptError::Verification(
+                VerificationCheck::SiblingSafety,
+            ));
         }
         match header(&mut other, HEADER_BYTES)? {
             Some(candidate)
                 if candidate.get("continuationOf").and_then(Value::as_str) != Some(session) => {}
-            _ => return Ok(None),
+            _ => {
+                return Err(TranscriptError::Verification(
+                    VerificationCheck::Continuation,
+                ));
+            }
         }
     }
-    handle.seek(SeekFrom::Start(0))?;
-    read_branch(handle, recorded)
+    Ok(())
 }
 
 /// Reads every entry for the saved model; `None` when the transcript departed or holds a non-object
 /// line.
-fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
+fn read_branch(handle: File, cwd: PathBuf) -> Result<Transcript> {
     let mut reader = BufReader::new(handle);
     let mut entries: HashMap<String, BranchEntry> = HashMap::new();
     let mut leaf: Option<String> = None;
@@ -366,7 +421,7 @@ fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
         trim_newline(&mut line);
         let entry: Value = serde_json::from_slice(&line).map_err(|_| TranscriptError::Malformed)?;
         if !entry.is_object() {
-            return Ok(None);
+            return Err(TranscriptError::Malformed);
         }
         if entry.get("type").and_then(Value::as_str) == Some("custom_message")
             && entry.get("customType").and_then(Value::as_str) == Some("session-transfer")
@@ -374,7 +429,7 @@ fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
                 .get("details")
                 .is_some_and(|d| d.get("kind").and_then(Value::as_str) == Some("departed"))
         {
-            return Ok(None);
+            return Err(TranscriptError::Verification(VerificationCheck::Departed));
         }
         let Some(id) = entry.get("id").and_then(Value::as_str).map(str::to_owned) else {
             continue;
@@ -400,10 +455,10 @@ fn read_branch(handle: File, cwd: PathBuf) -> Result<Option<Transcript>> {
         Some(at) if entries.contains_key(at) => Some(at.as_str()),
         Some(_) => last_self_selected.as_deref(),
     };
-    Ok(Some(Transcript {
+    Ok(Transcript {
         model: saved_model(&entries, start),
         cwd,
-    }))
+    })
 }
 
 fn trim_newline(line: &mut Vec<u8>) {
@@ -415,21 +470,24 @@ fn trim_newline(line: &mut Vec<u8>) {
     }
 }
 
-/// What a delivery search found (PATCH-01 rule 10).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// What a delivery search proved (PATCH-01 rule 10). Only `Yes` and `Absent` are evidence: anything
+/// the search could not read completely is `Unknown`, never absence.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) enum Found {
     /// A user message entry carries the marker.
     Yes,
-    /// The searched part of the file has no such entry.
-    No,
+    /// Every entry of the whole file was read and parsed, and none carries the marker.
+    Absent,
     /// The file does not exist (yet).
     Missing,
-    /// The search ran out of its 2 s budget.
-    OutOfTime,
+    /// Part of the file could not be checked (a partial or unparsable entry, an entry longer than
+    /// 8 MiB, the time budget): whether it holds the marker is not known.
+    Unknown(String),
 }
 
-/// Looks for `marker` in the text of a user `message` entry within the last 8 MiB of `path`. A marker
-/// quoted by the assistant or a tool does not count.
+/// Looks for `marker` in the text of a user `message` entry anywhere in `path`: the newest 8 MiB
+/// first, where a delivery usually is, then the rest. A marker quoted by the assistant or a tool
+/// does not count. Absence needs every line of the file read and parsed within [`MARKER_BUDGET`].
 pub(crate) fn find_marker(path: &Path, marker: &str) -> Result<Found> {
     let started = Instant::now();
     let mut file = match read_only(path) {
@@ -446,37 +504,93 @@ pub(crate) fn find_marker(path: &Path, marker: &str) -> Result<Found> {
     }
     let start = info.len().saturating_sub(SEARCH_TAIL);
     file.seek(SeekFrom::Start(start))?;
-    let mut reader = BufReader::new(file);
-    let mut line = Vec::new();
-    let mut first = start > 0;
-    loop {
-        if started.elapsed() > SEARCH_BUDGET {
-            return Ok(Found::OutOfTime);
+    let mut tail = BufReader::new(file);
+    // A tail that starts mid-file begins inside a line; the head part reads that line whole.
+    let boundary = if start > 0 {
+        start + u64::try_from(tail.skip_until(b'\n')?).unwrap_or(u64::MAX)
+    } else {
+        0
+    };
+    let mut scan = MarkerScan {
+        marker: marker.as_bytes(),
+        text: marker,
+        started,
+        doubt: None,
+    };
+    if let Some(found) = scan.lines(&mut tail)? {
+        return Ok(found);
+    }
+    if boundary > 0 {
+        let mut file = tail.into_inner();
+        file.seek(SeekFrom::Start(0))?;
+        if let Some(found) = scan.lines(&mut BufReader::new(file.take(boundary)))? {
+            return Ok(found);
         }
-        line.clear();
-        if reader
-            .by_ref()
-            .take(SEARCH_TAIL + 1)
-            .read_until(b'\n', &mut line)?
-            == 0
-        {
-            return Ok(Found::No);
+    }
+    Ok(scan.doubt.map_or(Found::Absent, Found::Unknown))
+}
+
+/// One marker search: the first doubt is kept while the search goes on, since a later entry may
+/// still prove the marker there.
+struct MarkerScan<'a> {
+    marker: &'a [u8],
+    text: &'a str,
+    started: Instant,
+    doubt: Option<String>,
+}
+
+impl MarkerScan<'_> {
+    /// Reads `reader` to its end: `Some` for a found marker or a spent budget.
+    fn lines(&mut self, reader: &mut impl std::io::BufRead) -> Result<Option<Found>> {
+        let limit = usize::try_from(SEARCH_TAIL).unwrap_or(usize::MAX);
+        let mut line = Vec::new();
+        loop {
+            if self.started.elapsed() > MARKER_BUDGET {
+                return Ok(Some(Found::Unknown(format!(
+                    "the search ran out of its {} s budget",
+                    MARKER_BUDGET.as_secs()
+                ))));
+            }
+            line.clear();
+            if reader
+                .by_ref()
+                .take(SEARCH_TAIL + 1)
+                .read_until(b'\n', &mut line)?
+                == 0
+            {
+                return Ok(None);
+            }
+            let complete = line.last() == Some(&b'\n');
+            if !complete && line.len() > limit {
+                reader.skip_until(b'\n')?;
+                self.doubt("an entry is longer than 8 MiB and was not checked");
+                continue;
+            }
+            trim_newline(&mut line);
+            if line.iter().all(u8::is_ascii_whitespace) {
+                continue;
+            }
+            if contains(&line, self.marker) {
+                match serde_json::from_slice::<Value>(&line) {
+                    Ok(entry) if user_text_has(&entry, self.text) => return Ok(Some(Found::Yes)),
+                    Ok(_) => {}
+                    Err(_) if complete => {
+                        self.doubt("an entry carrying the marker is not valid JSON");
+                    }
+                    Err(_) => self.doubt("the file ends inside an entry carrying the marker"),
+                }
+            } else if serde_json::from_slice::<serde::de::IgnoredAny>(&line).is_err() {
+                self.doubt(if complete {
+                    "an entry is not valid JSON"
+                } else {
+                    "the file ends inside an unfinished entry"
+                });
+            }
         }
-        // A tail that starts mid-file begins inside a line; that partial line is skipped.
-        if std::mem::take(&mut first) {
-            continue;
-        }
-        if !contains(&line, marker.as_bytes()) {
-            continue;
-        }
-        trim_newline(&mut line);
-        let Ok(entry) = serde_json::from_slice::<Value>(&line) else {
-            // The last line may still be being written.
-            continue;
-        };
-        if user_text_has(&entry, marker) {
-            return Ok(Found::Yes);
-        }
+    }
+
+    fn doubt(&mut self, why: &str) {
+        self.doubt.get_or_insert_with(|| why.to_string());
     }
 }
 
@@ -519,8 +633,14 @@ pub(crate) enum Reply {
     NotFound,
     /// The turn has not ended yet.
     Pending,
-    /// The final assistant text of the turn the request started.
-    Answer(String),
+    /// `text` is the final assistant text of the turn the request started; `more` the final text
+    /// of each later turn OMP started by itself (a background job's result) before another input,
+    /// in order. `open` while no input followed, so more such turns may come.
+    Answer {
+        text: String,
+        more: Vec<String>,
+        open: bool,
+    },
     /// Another input entered the transcript before an answer: the answer would belong to mixed work.
     Abandoned,
 }
@@ -642,7 +762,11 @@ fn message_entries(path: &Path) -> Result<Option<Vec<Said>>> {
 
 /// The answer to each request tag. `prefix` starts every request tag, so a later request in the same
 /// user entry (one batch) takes the answer; `settled` means the session is idle, so a final message
-/// at the end of the file is the answer rather than a step of a turn still running.
+/// at the end of the file has ended its turn rather than being a step of one still running.
+///
+/// A turn ends with its final message, so the first final message after the request ends the turn
+/// the request started. Every later final message before the next input ends a turn OMP started by
+/// itself (a background job's result): it never replaces the answer.
 pub(crate) fn replies(
     path: &Path,
     tags: &[String],
@@ -670,19 +794,33 @@ pub(crate) fn replies(
             if later_request {
                 return Reply::Abandoned;
             }
-            let mut answer: Option<&str> = None;
-            for e in entries.iter().skip(at + 1) {
-                if e.user {
-                    return answer.map_or(Reply::Abandoned, |a| Reply::Answer(a.to_string()));
-                }
-                answer = (e.stop.as_deref() == Some("stop")
-                    && !e.tool_call
-                    && !e.text.trim().is_empty())
-                .then_some(e.text.as_str());
+            let span = entries.get(at + 1..).unwrap_or_default();
+            let end = span.iter().position(|e| e.user);
+            let turns = span.get(..end.unwrap_or(span.len())).unwrap_or_default();
+            // A final message counts once anything follows it or the session is idle.
+            let mut finals: Vec<String> = turns
+                .iter()
+                .enumerate()
+                .filter(|(i, e)| {
+                    e.stop.as_deref() == Some("stop")
+                        && !e.tool_call
+                        && !e.text.trim().is_empty()
+                        && (settled || end.is_some() || i + 1 < turns.len())
+                })
+                .map(|(_, e)| e.text.clone())
+                .collect();
+            if finals.is_empty() {
+                return if end.is_some() {
+                    Reply::Abandoned
+                } else {
+                    Reply::Pending
+                };
             }
-            match answer {
-                Some(a) if settled => Reply::Answer(a.to_string()),
-                _ => Reply::Pending,
+            let text = finals.remove(0);
+            Reply::Answer {
+                text,
+                more: finals,
+                open: end.is_none(),
             }
         })
         .collect())
@@ -710,11 +848,18 @@ pub(crate) async fn search(path: PathBuf, marker: String) -> Result<Found> {
             .find(file, &marker)
             .await
             .map_err(TranscriptError::Io)?;
+        let reason = || {
+            answer
+                .get("reason")
+                .and_then(Value::as_str)
+                .unwrap_or("the worker could not read the whole file")
+                .to_string()
+        };
         return match answer.get("found").and_then(Value::as_str) {
             Some("yes") => Ok(Found::Yes),
-            Some("no") => Ok(Found::No),
+            Some("absent") => Ok(Found::Absent),
             Some("missing") => Ok(Found::Missing),
-            Some("out_of_time") => Ok(Found::OutOfTime),
+            Some("unknown") => Ok(Found::Unknown(reason())),
             _ => Err(TranscriptError::Io(
                 "the worker's search answer is unknown".into(),
             )),
@@ -768,6 +913,25 @@ pub(crate) async fn verify(
         }));
     }
     tokio::task::spawn_blocking(move || exact(&path, &root, &session, &folder))
+        .await
+        .map_err(|e| TranscriptError::Io(format!("verify task: {e}")))?
+}
+
+/// Exact resume with a diagnostic for the precise failed verification gate.
+pub(crate) async fn verify_exact(
+    path: PathBuf,
+    root: PathBuf,
+    session: String,
+    folder: Folder,
+) -> Result<Transcript> {
+    if crate::worker::split_remote(&path).is_some() {
+        return verify(path, root, session, folder)
+            .await?
+            .ok_or(TranscriptError::Verification(
+                VerificationCheck::RemoteUnverified,
+            ));
+    }
+    tokio::task::spawn_blocking(move || exact_checked(&path, &root, &session, &folder))
         .await
         .map_err(|e| TranscriptError::Io(format!("verify task: {e}")))?
 }
@@ -1002,8 +1166,13 @@ mod tests {
         let tags: Vec<String> = ["[d a]", "[d b]", "[d c]", "[d e]", "[d z]"]
             .map(String::from)
             .to_vec();
+        let answer = |text: &str, open: bool| Reply::Answer {
+            text: text.into(),
+            more: Vec::new(),
+            open,
+        };
         let got = replies(&path, &tags, "[d ", false).unwrap();
-        assert_eq!(got[0], Reply::Answer("first answer".into()));
+        assert_eq!(got[0], answer("first answer", false));
         assert_eq!(got[1], Reply::Abandoned, "steered before an answer");
         assert_eq!(
             got[2],
@@ -1013,7 +1182,61 @@ mod tests {
         assert_eq!(got[3], Reply::Pending, "the session still works");
         assert_eq!(got[4], Reply::NotFound);
         let got = replies(&path, &tags, "[d ", true).unwrap();
-        assert_eq!(got[3], Reply::Answer("done".into()));
+        assert_eq!(got[3], answer("done", true));
+    }
+
+    #[test]
+    fn a_turn_omp_starts_itself_never_replaces_the_answer() {
+        let dir = crate::sys::fs::tests::scratch("continuations");
+        let path = dir.join("s.jsonl");
+        let said = |t: &str, stop: &str, tool: bool| {
+            let tool = if tool {
+                r#",{"type":"toolCall","id":"c","name":"bash","arguments":{}}"#
+            } else {
+                ""
+            };
+            format!(
+                r#"{{"type":"message","message":{{"role":"assistant","content":[{{"type":"text","text":"{t}"}}{tool}],"stopReason":"{stop}"}}}}"#
+            )
+        };
+        let result = r#"{"type":"custom_message","customType":"async-result","content":"done","display":true}"#;
+        let mut lines = vec![
+            r#"{"type":"session","id":"x"}"#.to_string(),
+            r#"{"type":"message","message":{"role":"user","content":"[d a] back up"}}"#.to_string(),
+            said("started the backup", "stop", false),
+            result.to_string(),
+            said("checking", "toolUse", true),
+            said("the backup finished", "stop", false),
+            result.to_string(),
+            said("cleaned up", "stop", false),
+        ];
+        let read = |lines: &[String], settled| {
+            std::fs::write(&path, lines.join("\n") + "\n").unwrap();
+            replies(&path, &["[d a]".to_string()], "[d ", settled)
+                .unwrap()
+                .remove(0)
+        };
+        let reply = |more: &[&str], open| Reply::Answer {
+            text: "started the backup".into(),
+            more: more.iter().map(|m| (*m).to_string()).collect(),
+            open,
+        };
+        assert_eq!(
+            read(&lines, false),
+            reply(&["the backup finished"], true),
+            "the last turn may still run"
+        );
+        assert_eq!(
+            read(&lines, true),
+            reply(&["the backup finished", "cleaned up"], true)
+        );
+        lines.push(r#"{"type":"message","message":{"role":"user","content":"[d b] next"}}"#.into());
+        lines.push(said("next answer", "stop", false));
+        assert_eq!(
+            read(&lines, false),
+            reply(&["the backup finished", "cleaned up"], false),
+            "the next input closes the request's turns"
+        );
     }
 
     #[test]
@@ -1074,10 +1297,98 @@ mod tests {
         )
         .unwrap();
         assert_eq!(find_marker(&path, "[cataly:aaa]").unwrap(), Found::Yes);
-        assert_eq!(find_marker(&path, "[cataly:bbb]").unwrap(), Found::No);
+        // A file that ends inside an entry proves nothing about a marker it does not show.
+        assert!(matches!(
+            find_marker(&path, "[cataly:bbb]").unwrap(),
+            Found::Unknown(_)
+        ));
+        let whole = fs::read_to_string(&path).unwrap();
+        let complete = &whole[..=whole.rfind('\n').unwrap()];
+        fs::write(&path, complete).unwrap();
+        assert_eq!(find_marker(&path, "[cataly:bbb]").unwrap(), Found::Absent);
         let string_content = serde_json::json!({"type": "message", "message": {"role": "user", "content": "[cataly:ccc] x"}});
         fs::write(&path, format!("{string_content}\n")).unwrap();
         assert_eq!(find_marker(&path, "[cataly:ccc]").unwrap(), Found::Yes);
+    }
+
+    /// A delivery marker older than the newest 8 MiB is found; absence is proved only by reading
+    /// the whole file, so a long transcript is not mistaken for one without the entry.
+    #[test]
+    fn a_marker_outside_the_newest_8_mib_is_found() {
+        let dir = crate::sys::fs::tests::scratch("transcript-old-marker");
+        let path = dir.join("s.jsonl");
+        let user = |text: &str| {
+            serde_json::json!({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+                .to_string()
+        };
+        let filler = serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": "x".repeat(64 * 1024)}]}}).to_string();
+        let mut text = format!(
+            "{{\"type\":\"session\",\"id\":\"x\"}}\n{}\n",
+            user("[cataly:old] owner\nhi")
+        );
+        while u64::try_from(text.len()).unwrap() < SEARCH_TAIL + 2 * 1024 * 1024 {
+            text.push_str(&filler);
+            text.push('\n');
+        }
+        text.push_str(&user("[cataly:new] owner\nlater"));
+        text.push('\n');
+        fs::write(&path, &text).unwrap();
+        assert_eq!(find_marker(&path, "[cataly:old]").unwrap(), Found::Yes);
+        assert_eq!(find_marker(&path, "[cataly:new]").unwrap(), Found::Yes);
+        assert_eq!(find_marker(&path, "[cataly:none]").unwrap(), Found::Absent);
+        // The entry the tail starts inside is read whole by the head part.
+        let edge = user(&format!("[cataly:edge] {}", "y".repeat(64)));
+        let assistant = |text: &str| {
+            serde_json::json!({"type": "message", "message": {"role": "assistant", "content": [{"type": "text", "text": text}]}})
+                .to_string()
+        };
+        let suffix = usize::try_from(SEARCH_TAIL).unwrap() - edge.len().div_ceil(2);
+        let pad = assistant(&"x".repeat(suffix - 1 - assistant("").len()));
+        assert_eq!(pad.len() + 1, suffix);
+        fs::write(
+            &path,
+            format!("{{\"type\":\"session\",\"id\":\"x\"}}\n{edge}\n{pad}\n"),
+        )
+        .unwrap();
+        assert_eq!(find_marker(&path, "[cataly:edge]").unwrap(), Found::Yes);
+        assert_eq!(find_marker(&path, "[cataly:none]").unwrap(), Found::Absent);
+    }
+
+    /// An unparsable line, an entry over 8 MiB or a partial last entry leaves absence unknown; a
+    /// marker found elsewhere is still found.
+    #[test]
+    fn unreadable_parts_leave_absence_unknown() {
+        let dir = crate::sys::fs::tests::scratch("transcript-unknown");
+        let path = dir.join("s.jsonl");
+        let user = |text: &str| {
+            serde_json::json!({"type": "message", "message": {"role": "user", "content": [{"type": "text", "text": text}]}})
+                .to_string()
+        };
+        fs::write(&path, format!("{}\nnot json\n", user("[cataly:a] x"))).unwrap();
+        assert_eq!(find_marker(&path, "[cataly:a]").unwrap(), Found::Yes);
+        assert!(
+            matches!(find_marker(&path, "[cataly:b]").unwrap(), Found::Unknown(r) if r.contains("not valid JSON"))
+        );
+        let long = format!(
+            "{}\n{}\n",
+            user("[cataly:a] x"),
+            user(&"z".repeat(usize::try_from(SEARCH_TAIL).unwrap() + 16))
+        );
+        fs::write(&path, long).unwrap();
+        assert!(
+            matches!(find_marker(&path, "[cataly:b]").unwrap(), Found::Unknown(r) if r.contains("8 MiB"))
+        );
+        fs::write(
+            &path,
+            format!(
+                "{}\n{{\"type\":\"message\",\"message\":{{\"content\":\"[cataly:b]",
+                user("x")
+            ),
+        )
+        .unwrap();
+        assert!(
+            matches!(find_marker(&path, "[cataly:b]").unwrap(), Found::Unknown(r) if r.contains("ends inside"))
+        );
     }
 
     /// The owner's layout after a 0.1.0 lead: a title line first, the header cwd `<home>/tmp` while the

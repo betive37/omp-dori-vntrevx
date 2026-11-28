@@ -481,6 +481,9 @@ fn print_status(s: &Status) {
             "lead     no lead configured: messages wait; set one with cataly setup --lead-model provider/id",
         ),
     }
+    for report in &s.tools {
+        lead::print_tools(report);
+    }
     if s.task_restarts > 0 || s.panics > 0 {
         out::line(&format!(
             "tasks    {} restarts, {} panics",
@@ -495,7 +498,7 @@ fn print_status(s: &Status) {
 /// `cataly lane <op> [--params <json>]`: one request per lane operation; `op` and the JSON object's
 /// fields are the same as the lead's `lane.<op>` tool operations.
 fn lane(hub: &mut Client, p: &Parsed, as_json: bool) -> Result<(), Failure> {
-    // A start or reopen may take the whole start deadline (LANE req. 15, default 180 s).
+    // Reopen answers on binding, a terminal hold, or the first scheduled retry; recovery outlives the request.
     const LANE_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(240);
     let mut params: Value = match p.value("--params") {
         Some(text) => {
@@ -506,9 +509,20 @@ fn lane(hub: &mut Client, p: &Parsed, as_json: bool) -> Result<(), Failure> {
     let map = params
         .as_object_mut()
         .ok_or_else(|| Failure::Usage("--params must be a JSON object".into()))?;
+    let op = p.args.first().map_or("", String::as_str);
+    if let Some(key) = p.args.get(1) {
+        if op != "status" {
+            return Err(Failure::Usage(
+                "only lane status takes a positional key; use --params for other operations".into(),
+            ));
+        }
+        if map.insert("key".into(), json!(key)).is_some() {
+            return Err(Failure::Usage("lane status key given twice".into()));
+        }
+    }
     map.insert(
         "op".into(),
-        json!(p.args.first().cloned().unwrap_or_default()),
+        json!(if op == "status" { "board" } else { op }),
     );
     let value = hub.call(method::LANE, params, LANE_TIMEOUT)?;
     match value {

@@ -4,7 +4,8 @@
 //!
 //! Idle means, for the whole time: no turn running and no dialog open (an approval or a question
 //! card); nothing in the lead's inbox but quiet notes (no waking message, written batch awaiting its
-//! entry or in-doubt delivery); no open owner question; and no open lane. Quiet notes wait for the
+//! entry or in-doubt delivery); no open owner question; no open lane; and no owed reply with a
+//! reminder still to come, since the reminders only reach a live lead. Quiet notes wait for the
 //! next turn anyway, so they wait through a sleep and go with the first turn after the wake. Every
 //! session event, delivery, settled in-doubt entry and start counts as activity; an idle check that
 //! finds the lead busy restarts the count.
@@ -16,6 +17,8 @@ use super::{Asleep, LEAD, Lead, Phase};
 use crate::host::{Control, Runtime, Status};
 use crate::log;
 use crate::store::host::SessionUpdate;
+use crate::store::lead::REMINDERS_MAX;
+use crate::store::relay::OWED_WINDOW_MS;
 
 /// The stop the session record keeps for a sleeping lead; its detail is how the close went.
 pub(super) const ASLEEP: &str = "asleep";
@@ -70,13 +73,29 @@ impl<R: Runtime> Lead<R> {
         if self.env.config.borrow().lead.is_none() || self.phase().0 != Phase::NotStarted {
             return;
         }
-        let last = match self.env.store.read(|r| r.latest_session("lead")).await {
-            Ok(last) => last,
-            Err(e) => {
-                log::warn("lead sleep not read", &[("error", &e)]);
+        let pin = self
+            .env
+            .config
+            .borrow()
+            .lead
+            .as_ref()
+            .and_then(|settings| settings.session_id.clone());
+        let selected = match self.resolve(pin).await {
+            Ok(selected) => selected,
+            Err(error) => {
+                self.set_phase(Phase::Held, Some(error));
                 return;
             }
         };
+        if let Some(reason) = selected.hold {
+            self.set_phase(Phase::Held, Some(reason));
+            return;
+        }
+        if selected.intent != "resume" {
+            self.set_phase(Phase::Held, Some("fresh start did not bind; choose `lead start --fresh` or `lead start` to resume old".into()));
+            return;
+        }
+        let last = selected.row;
         let Some(row) =
             last.filter(|r| r.state == "stopped" && r.stop_how.as_deref() == Some(ASLEEP))
         else {
@@ -121,18 +140,24 @@ impl<R: Runtime> Lead<R> {
         let session_idle = self.phase().0 == Phase::Live
             && self.current().filter(|s| s.alive()).is_some_and(|s| {
                 let snapshot = s.snapshot();
-                snapshot.status == Status::Idle && snapshot.dialogs.is_empty()
+                snapshot.status == Status::Idle
+                    && !snapshot.input_blocked
+                    && snapshot.dialogs.is_empty()
             });
+        let since = crate::sys::now_ms() - OWED_WINDOW_MS;
         let idle = session_idle
             && matches!(
                 self.env
                     .store
-                    .read(|r| Ok(r
+                    .read(move |r| Ok(r
                         .inbox_open(LEAD)?
                         .iter()
                         .all(|row| row.state == "pending" && !row.urgent && !row.owner)
                         && r.questions(true)?.is_empty()
-                        && r.lanes(true)?.is_empty()))
+                        && r.lanes(true)?.is_empty()
+                        && r.owed_open("discord", since)?
+                            .iter()
+                            .all(|o| o.reminders >= REMINDERS_MAX)))
                     .await,
                 Ok(true)
             );
@@ -195,9 +220,8 @@ impl<R: Runtime> Lead<R> {
     }
 
     /// `lead stop` while the lead sleeps: it stays stopped, and its record shows the clean stop a
-    /// live `lead stop` leaves. `false` when the lead is not asleep.
+    /// live `lead stop` leaves. The caller holds the start lock. `false` when the lead is not asleep.
     pub(super) async fn stop_asleep(&self) -> bool {
-        let _one = self.starting.lock().await;
         let Some(asleep) = self.asleep() else {
             return false;
         };

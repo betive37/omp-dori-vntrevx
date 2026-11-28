@@ -750,21 +750,25 @@ async fn gather(ctx: &Ctx, config: &Config, jobs: &[JobView]) -> (Panel, Extra) 
                 .read(move |r| r.memory(&name, false))
                 .await
                 .unwrap_or_default();
-            let on = |c: &str| {
+            let get = |c: &str| {
                 memory
                     .iter()
-                    .any(|(s, k, v)| s == "host" && k == c && v == "1")
+                    .find(|(s, k, _)| s == "host" && k == c)
+                    .map(|(_, _, v)| v.as_str())
             };
-            if on("alert") {
-                HostState::Alert
-            } else if on("ready") {
-                HostState::Ready
-            } else {
-                HostState::Busy
-            }
+            host_state(
+                get("alert") == Some("1"),
+                get("ready") == Some("1"),
+                get("cause"),
+                &sample,
+                &limits,
+            )
         }
         None => match sample.load_percent {
-            Some(l) if l > f64::from(limits.alert_load) => HostState::Alert,
+            Some(l) if l > f64::from(limits.alert_load) => HostState::Alert(pressure::Causes {
+                load: true,
+                ..Default::default()
+            }),
             Some(l) if l < f64::from(limits.ready_load) => HostState::Ready,
             _ => HostState::Busy,
         },
@@ -808,6 +812,39 @@ async fn gather(ctx: &Ctx, config: &Config, jobs: &[JobView]) -> (Panel, Extra) 
         pin_refused: false,
     };
     (panel, extra)
+}
+
+/// The host as the pressure job last left it (`alert`, `ready` and `cause` in its memory), checked
+/// against the panel's own `sample`: an alert names only the causes the sample still shows, and one
+/// whose causes have all passed is recovering until the job's next tick clears it.
+pub(crate) fn host_state(
+    alert: bool,
+    ready: bool,
+    cause: Option<&str>,
+    sample: &pressure::Sample,
+    limits: &crate::config::owner::Pressure,
+) -> HostState {
+    if !alert {
+        return if ready {
+            HostState::Ready
+        } else {
+            HostState::Busy
+        };
+    }
+    // The job's load margin applies: the load counts as over until it falls below the line less it.
+    let line = f64::from(limits.alert_load) - pressure::HYSTERESIS;
+    let load = sample.load_percent.is_none_or(|l| l > line);
+    let now = pressure::Causes::of(sample, limits, load);
+    let still = match cause.map(pressure::Causes::parse) {
+        Some(c) if c.any() => c.and(now),
+        // An alert recorded before its cause was kept.
+        _ => now,
+    };
+    if still.any() {
+        HostState::Alert(still)
+    } else {
+        HostState::Recovering
+    }
 }
 
 fn limit_of(l: &crate::omp::usage::Limit) -> Limit {
@@ -1085,16 +1122,16 @@ fn picked(now: &DiscordSettings, chosen: &[Snowflake]) -> Picked {
 /// The refusal for anyone but the owner, in the owner's language.
 pub(crate) fn refusal(lang: Language) -> &'static str {
     match lang {
-        Language::Korean => "이 버튼은 주인만 누를 수 있어요.",
-        Language::English => "Only the owner can use these buttons.",
+        Language::Korean => "이 버튼은 주인님만 누를 수 있어요.",
+        Language::English => "Only Master can use these buttons.",
     }
 }
 
 /// The refusal of a watched-channel change by anyone but the owner, or from another server.
 pub(crate) fn watch_refusal(lang: Language) -> &'static str {
     match lang {
-        Language::Korean => "감시 채널은 주인만 바꿀 수 있어요.",
-        Language::English => "Only the owner may change the watched channels.",
+        Language::Korean => "감시 채널은 주인님만 바꿀 수 있어요.",
+        Language::English => "Only Master may change the watched channels.",
     }
 }
 

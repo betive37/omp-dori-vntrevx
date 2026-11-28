@@ -6,17 +6,25 @@
 //! - [`mux`]: frames, channels, credit and heartbeat over the one SSH stream.
 //! - [`serve`]: the worker side: the forced-command entry and the worker protocol's methods.
 //! - [`link`]: the hub side: the `ssh` child, the channel-0 client, and the hub's worker table.
+//! - [`attempt`]: the attempt token of each remote OMP start, its record on the worker, its exit
+//!   acknowledgement and its reconciliation after a reconnect.
 //! - [`enrol`]: keys, the `authorized_keys` line, host-key pins and `tailscale ip`.
 
+pub(crate) mod attempt;
 pub(crate) mod enrol;
 pub(crate) mod link;
 pub(crate) mod mux;
 pub(crate) mod serve;
 
+#[cfg(test)]
+mod attempt_tests;
+
 use serde::{Deserialize, Serialize};
 
-/// Worker protocol major (design 2.2, 2.8): fields are only added within a major.
-pub(crate) const PROTOCOL: u32 = 1;
+/// Worker protocol major (design 2.2, 2.8): fields are only added within a major. 2: `spawn`
+/// requires an attempt token, a spawned channel ends with an `exit` frame, and `attempts`
+/// reconciles tokens after a reconnect.
+pub(crate) const PROTOCOL: u32 = 2;
 /// The command the hub asks for. It does not exist: a server that applies the forced command
 /// ignores it, one that runs it instead fails with "not found" (design 2.2).
 pub(crate) const MARKER: &str = "cataly-worker-v1";
@@ -43,6 +51,10 @@ pub(crate) mod method {
     pub(crate) const FIND: &str = "find";
     /// The resume check of a saved session file, by the same parser on the worker.
     pub(crate) const VERIFY: &str = "verify";
+    /// The state of attempt tokens after a reconnect: running, reaped or unknown (protocol 2).
+    pub(crate) const ATTEMPTS: &str = "attempts";
+    /// Hub acknowledgement that these reaped tokens are no longer referenced.
+    pub(crate) const FORGET_ATTEMPTS: &str = "forget_attempts";
 }
 
 /// Where per-machine work runs (design 2.1): here, or on a worker over its stream. Parsers stay

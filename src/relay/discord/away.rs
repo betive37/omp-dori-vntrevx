@@ -258,7 +258,7 @@ impl<T: crate::host::Runtime> super::intake::Intake<T> {
             Ok(n) if (1..=q.options.len()).contains(&n) => {
                 let picked = ledger::picked(&q, n);
                 Some((
-                    format!("Answered by the owner: {}", ledger::shown(&q, n)),
+                    format!("Answered by Master: {}", ledger::shown(&q, n)),
                     picked,
                 ))
             }
@@ -271,7 +271,7 @@ impl<T: crate::host::Runtime> super::intake::Intake<T> {
                 None
             }
             Err(_) => Some((
-                "Answered by the owner's reply.".to_string(),
+                "Answered by Master's reply.".to_string(),
                 format!(
                     "free answer: {}",
                     text.chars().take(1000).collect::<String>()

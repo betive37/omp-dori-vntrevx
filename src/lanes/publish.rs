@@ -329,9 +329,11 @@ impl<R: Runtime> Lanes<R> {
     pub(super) async fn holds_published(&self, worktree: &str) -> bool {
         docs::all::<Published>(&self.env.store, FILE)
             .await
-            .is_ok_and(|(all, _)| {
-                all.iter()
-                    .any(|(d, _)| Path::new(&d.path).starts_with(worktree))
+            .map_or(true, |(all, damaged)| {
+                !damaged.is_empty()
+                    || all
+                        .iter()
+                        .any(|(d, _)| Path::new(&d.path).starts_with(worktree))
             })
     }
 

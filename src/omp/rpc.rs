@@ -311,28 +311,62 @@ impl Rpc {
         R: AsyncRead + Unpin + Send + 'static,
         W: AsyncWrite + Unpin + Send + 'static,
     {
+        let (_keep, cancel) = tokio::sync::watch::channel(false);
+        Self::connect_supervised(reader, writer, ready_within, events, cancel).await
+    }
+
+    pub(crate) async fn connect_supervised<R, W>(
+        reader: R,
+        mut writer: W,
+        ready_within: Duration,
+        events: Option<mpsc::Sender<Value>>,
+        mut cancel: tokio::sync::watch::Receiver<bool>,
+    ) -> Result<Self, RpcError>
+    where
+        R: AsyncRead + Unpin + Send + 'static,
+        W: AsyncWrite + Unpin + Send + 'static,
+    {
+        let deadline = tokio::time::Instant::now() + ready_within;
         let mut frames = Frames::new(reader);
-        let first = timeout(ready_within, frames.read())
-            .await
-            .map_err(|_| RpcError::Timeout("ready frame"))??;
-        if first.kind != Kind::Ready {
-            return Err(protocol("the first frame is not a ready frame"));
-        }
-        let ready = Ready::parse(&first.value)?;
-        if ready.protocol_version != 1 {
-            return Err(RpcError::Protocol(format!(
-                "OMP starts with rpc protocol {}, this hub needs 1",
-                ready.protocol_version
-            )));
-        }
-        let as_usize = |n: Option<u64>, default| {
-            n.map_or(Some(default), |n| usize::try_from(n).ok())
-                .unwrap_or(default)
+        let first = tokio::select! {
+            result = timeout(ready_within, frames.read()) => result.map_err(|_| RpcError::Timeout("ready frame")).and_then(|r| r),
+            _ = cancel.wait_for(|stop| *stop) => Err(RpcError::Closed),
         };
-        frames.set_limits(
-            as_usize(ready.max_frame_bytes, PHYSICAL_LIMIT),
-            as_usize(ready.max_reassembled_frame_bytes, LOGICAL_LIMIT),
-        )?;
+        let ready = first.and_then(|first| {
+            if first.kind != Kind::Ready {
+                return Err(protocol("the first frame is not a ready frame"));
+            }
+            let ready = Ready::parse(&first.value)?;
+            if ready.protocol_version != 1 {
+                return Err(RpcError::Protocol(format!(
+                    "OMP starts with rpc protocol {}, this hub needs 1",
+                    ready.protocol_version
+                )));
+            }
+            let size = |n: Option<u64>, default| {
+                n.and_then(|n| usize::try_from(n).ok()).unwrap_or(default)
+            };
+            frames.set_limits(
+                size(ready.max_frame_bytes, PHYSICAL_LIMIT),
+                size(ready.max_reassembled_frame_bytes, LOGICAL_LIMIT),
+            )?;
+            Ok(ready)
+        });
+        let ready = match ready {
+            Ok(ready) => ready,
+            Err(error) => {
+                // Keep draining even malformed output while the owning caller reaps its process.
+                tokio::spawn(async move {
+                    let _ = timeout(
+                        Duration::from_secs(30),
+                        tokio::io::copy(&mut frames.reader, &mut tokio::io::sink()),
+                    )
+                    .await;
+                });
+                let _ = timeout(Duration::from_secs(1), writer.shutdown()).await;
+                return Err(error);
+            }
+        };
         let physical = frames.physical;
         let pending: Pending = Arc::default();
         let dropped_events = Arc::new(AtomicU64::new(0));
@@ -356,18 +390,35 @@ impl Rpc {
             let mut command = Map::new();
             command.insert("type".into(), "negotiate_protocol".into());
             command.insert("protocolVersion".into(), 2.into());
-            let reply = rpc.call(command, RESPONSE_TIMEOUT).await?;
+            let reply = tokio::select! {
+                reply = rpc.call(command, deadline.saturating_duration_since(tokio::time::Instant::now())) => reply,
+                _ = cancel.wait_for(|stop| *stop) => Err(RpcError::Closed),
+            };
+            let reply = match reply {
+                Ok(reply) => reply,
+                Err(error) => return Err(rpc.failed_handshake(error).await),
+            };
             let confirmed = reply
                 .data
                 .as_ref()
                 .and_then(|d| d.get("protocolVersion"))
                 .and_then(Value::as_u64);
             if !reply.success || confirmed != Some(2) {
-                return Err(protocol("OMP offered protocol 2 but did not confirm it"));
+                return Err(rpc
+                    .failed_handshake(protocol("OMP offered protocol 2 but did not confirm it"))
+                    .await);
             }
             rpc.negotiated = 2;
         }
         Ok(rpc)
+    }
+
+    async fn failed_handshake(mut self, error: RpcError) -> RpcError {
+        self.end_input().await;
+        tokio::spawn(async move {
+            let _ = timeout(Duration::from_secs(30), &mut self.reader).await;
+        });
+        error
     }
 
     pub(crate) fn ready(&self) -> &Ready {
@@ -401,6 +452,7 @@ impl Rpc {
         mut command: Map<String, Value>,
         within: Duration,
     ) -> (Result<Reply, RpcError>, Option<Instant>) {
+        let deadline = tokio::time::Instant::now() + within;
         let id = format!(
             "cataly-{}",
             self.next_id.fetch_add(1, Ordering::Relaxed) + 1
@@ -430,12 +482,20 @@ impl Rpc {
             forget();
             return (Err(RpcError::Closed), None);
         }
-        if let Err(e) = self.write(&line).await {
+        if let Err(e) = timeout(within, self.write(&line, within))
+            .await
+            .unwrap_or(Err(RpcError::Timeout("write to stdin")))
+        {
             forget();
             return (Err(e), None);
         }
         let written = Instant::now();
-        let result = match timeout(within, rx).await {
+        let result = match timeout(
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            rx,
+        )
+        .await
+        {
             Ok(Ok(Ok(reply))) if reply.command.as_deref() != Some(kind.as_str()) => Err(protocol(
                 "a response echoed a different command than the one sent",
             )),
@@ -455,7 +515,7 @@ impl Rpc {
             return Err(RpcError::Closed);
         }
         let line = encode_line(frame, self.physical)?;
-        self.write(&line).await
+        self.write(&line, WRITE_TIMEOUT).await
     }
 
     /// Whether OMP's output ended (the reader task stopped).
@@ -463,10 +523,10 @@ impl Rpc {
         self.reader.is_finished()
     }
 
-    async fn write(&self, line: &[u8]) -> Result<(), RpcError> {
+    async fn write(&self, line: &[u8], within: Duration) -> Result<(), RpcError> {
         let mut guard = self.writer.lock().await;
         let writer = guard.as_mut().ok_or(RpcError::Closed)?;
-        timeout(WRITE_TIMEOUT, async {
+        timeout(within, async {
             writer.write_all(line).await?;
             writer.flush().await
         })
@@ -478,10 +538,16 @@ impl Rpc {
     /// Closes stdin, OMP's signal to drain and exit. The reader task keeps draining stdout until OMP
     /// closes it.
     pub(crate) async fn end_input(&self) {
-        let mut guard = self.writer.lock().await;
-        if let Some(mut writer) = guard.take() {
-            let _ = timeout(WRITE_TIMEOUT, writer.shutdown()).await;
-        }
+        let close = async {
+            let mut guard = self.writer.lock().await;
+            if let Some(mut writer) = guard.take() {
+                writer.shutdown().await?;
+            }
+            Ok::<(), std::io::Error>(())
+        };
+        // Includes waiting for a concurrent writer. Process termination, not this write, is the
+        // cleanup authority if a pipe or remote connection cannot finish its shutdown.
+        let _ = timeout(Duration::from_secs(1), close).await;
     }
 }
 

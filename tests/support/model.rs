@@ -4,7 +4,7 @@
 //! The reply depends on the last user text: `SLOW` streams for about 4 s (follow-up, steer and abort
 //! cases), `TOOL` asks for a `bash` call first (an approval dialog under always-ask), a line
 //! `CALL <tool> <json arguments>` calls that tool once (call ID `call_named_<request number>`, so
-//! every call is its own), anything else answers `ok` at once. `ASK`
+//! every call is its own), `RETURN <text>` returns scripted text, otherwise answers `ok`. `ASK`
 //! calls the `ask` tool with one question whose recommended choice is the second. The model ID
 //! `limited` answers 429 with a usage-limit error.
 
@@ -149,11 +149,48 @@ type Records = (
     Arc<Mutex<Vec<Instant>>>,
 );
 
+/// The messages transport used by the reasoning-capable fake; stock OMP consumes these SSE frames.
+async fn anthropic_response(tx: &mpsc::Sender<Bytes>, model: &str) {
+    let events = [
+        (
+            "message_start",
+            json!({"type":"message_start","message":{"id":"fake-message","type":"message","role":"assistant","model":model,"content":[],"stop_reason":null,"stop_sequence":null,"usage":{"input_tokens":10,"output_tokens":0}}}),
+        ),
+        (
+            "content_block_start",
+            json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}}),
+        ),
+        (
+            "content_block_delta",
+            json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"ok"}}),
+        ),
+        (
+            "content_block_stop",
+            json!({"type":"content_block_stop","index":0}),
+        ),
+        (
+            "message_delta",
+            json!({"type":"message_delta","delta":{"stop_reason":"end_turn","stop_sequence":null},"usage":{"output_tokens":2}}),
+        ),
+        ("message_stop", json!({"type":"message_stop"})),
+    ];
+    for (event, data) in events {
+        if tx
+            .send(Bytes::from(format!("event: {event}\ndata: {data}\n\n")))
+            .await
+            .is_err()
+        {
+            return;
+        }
+    }
+}
+
 async fn answer(
     req: Request<Incoming>,
     (seen, bodies, arrivals): Records,
 ) -> Result<Response<ChannelBody>, Infallible> {
     let arrived = Instant::now();
+    let messages_api = req.uri().path().ends_with("/messages");
     let bytes = req.into_body().collect().await.unwrap().to_bytes();
     let body: Value = serde_json::from_slice(&bytes).unwrap_or(Value::Null);
     let model = body["model"].as_str().unwrap_or_default().to_string();
@@ -182,6 +219,9 @@ async fn answer(
         .as_array()
         .is_some_and(|m| m.last().is_some_and(|l| l["role"] == "tool"));
     tokio::spawn(async move {
+        if messages_api {
+            return anthropic_response(&tx, &model).await;
+        }
         let role = json!({"role": "assistant", "content": ""});
         let _ = tx.send(chunk(&model, &role, None)).await;
         if let Some((name, args)) = text
@@ -209,11 +249,19 @@ async fn answer(
             let _ = tx.send(chunk(&model, &json!({}), Some("tool_calls"))).await;
         } else {
             let steps = if text.contains("SLOW") { 8 } else { 1 };
+            let response = text
+                .lines()
+                .find_map(|line| line.strip_prefix("RETURN "))
+                .unwrap_or(if model == "reviewer" {
+                    "VERDICT: approve"
+                } else {
+                    "ok"
+                });
             for n in 0..steps {
                 if n > 0 {
                     tokio::time::sleep(Duration::from_millis(500)).await;
                 }
-                let part = json!({"content": if n == 0 { "ok" } else { "." }});
+                let part = json!({"content": if n == 0 { response } else { "." }});
                 if tx.send(chunk(&model, &part, None)).await.is_err() {
                     return;
                 }

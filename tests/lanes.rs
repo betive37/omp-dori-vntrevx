@@ -11,7 +11,17 @@
 
 mod support;
 
+#[path = "lanes/recovery.rs"]
+mod recovery;
+
+#[path = "lanes/tern_recovery.rs"]
+mod tern_recovery;
+
+#[path = "lanes/reopen.rs"]
+mod reopen;
+
 use std::io::{BufRead as _, BufReader, Write as _};
+use std::os::unix::fs::PermissionsExt as _;
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -42,6 +52,15 @@ fn lane_hub(extra: &str) -> (TestHub, PathBuf) {
         work.display()
     ));
     (hub, work)
+}
+
+fn owner_room(hub: &TestHub) -> FakeDiscord {
+    let fake = FakeDiscord::start();
+    fake.channel(CH, 0, None);
+    let token = hub.private_file("owner-token", "fake-token");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!("{config}{}", fake.config(&token, OWNER, &[CH])));
+    fake
 }
 
 fn data(hub: &TestHub) -> PathBuf {
@@ -106,14 +125,11 @@ fn goal(hub: &TestHub, session: &Value) -> String {
         .to_string()
 }
 
-/// The launch token the fake OMP of this session recorded.
-fn token(hub: &TestHub, session: &Value) -> String {
-    let text = std::fs::read_to_string(data(hub).join("launch")).unwrap();
-    text.lines()
-        .rfind(|l| l.split(' ').nth(1) == session.as_str())
-        .and_then(|l| l.split(' ').next())
-        .unwrap()
-        .to_string()
+/// The reconnect key the fake OMP's bridge of this session got: its launch token is used by that
+/// bridge's own hello, so a test speaks for the session as a reconnect.
+fn bridge_key(hub: &TestHub, session: &Value) -> String {
+    let file = data(hub).join(format!("bridge-{}", session.as_str().unwrap()));
+    hub.until(WAIT, || std::fs::read_to_string(&file).ok())
 }
 
 /// A test-side bridge connection.
@@ -165,10 +181,10 @@ impl Bridge {
 }
 
 fn hello(hub: &TestHub, rec: &Value) -> (Bridge, Value) {
-    let tok = token(hub, &rec["session_id"]);
+    let key = bridge_key(hub, &rec["session_id"]);
     Bridge::connect(
         hub,
-        json!({ "ext": 1, "token": tok, "session": rec["session_id"], "agent": "main" }),
+        json!({ "ext": 1, "key": key, "session": rec["session_id"], "agent": "main" }),
     )
 }
 
@@ -242,6 +258,7 @@ fn open_preview_refusals_and_dedupe() {
 #[test]
 fn model_mismatch_holds_the_start() {
     let (mut hub, _) = lane_hub("");
+    let owner = owner_room(&hub);
     hub.fixture("omp", "model", Some("fake/other"));
     start(&mut hub);
     let out = open(&hub, "m-1", &json!({}));
@@ -269,6 +286,15 @@ fn model_mismatch_holds_the_start() {
             .unwrap()
             .contains("start held: model")
     );
+    owner.wait(WAIT, |fake| {
+        fake.bot_messages(CH)
+            .iter()
+            .any(|message| {
+                let text = message["content"].as_str().unwrap();
+                text.contains("m-1") && text.contains("start held: model")
+            })
+            .then_some(())
+    });
     hub.stop();
 }
 
@@ -308,7 +334,7 @@ fn reports_need_the_current_run_and_novelty_counts_only_new_evidence() {
     let other = record(&hub, "r-2");
     let (mut b2, _) = Bridge::connect(
         &hub,
-        json!({ "ext": 1, "token": token(&hub, &other["session_id"]), "session": "not-this-one", "agent": "main" }),
+        json!({ "ext": 1, "key": bridge_key(&hub, &other["session_id"]), "session": "not-this-one", "agent": "main" }),
     );
     let refused = report(&mut b2, "c3", &json!("not-this-one"));
     assert_eq!(refused["error"], true);
@@ -367,10 +393,7 @@ fn reopen_leaves_the_claim_notice_behind(hub: &TestHub, closed: &Value) {
     let note = json!({ "key": "c-ok", "note": "one more thing" });
     let reopened = lane(hub, "reopen", &note).unwrap();
     assert!(
-        reopened
-            .as_str()
-            .unwrap()
-            .starts_with("reopened on session"),
+        reopened.as_str().unwrap().starts_with("resumed on session"),
         "{reopened}"
     );
     let file = record(hub, "c-ok")["session_file"]
@@ -551,6 +574,98 @@ fn pause_resume_and_a_held_lane_that_turns() {
     hub.stop();
 }
 
+/// A lane that paused its own goal to wait for an answer is not held: the owner's thread message
+/// and the lead's message each resume the goal and are delivered (LANE req. 47). A goal blocked by
+/// its budget keeps them out, and the lead hears the real reason.
+#[test]
+fn a_lane_waiting_with_its_own_paused_goal_gets_the_answer() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("[lanes.oversight]\nsweep = \"1s\"\n");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    fake.thread(THREAD, CH);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!("{config}{}", fake.config(&token, OWNER, &[CH])));
+    start(&mut hub);
+    open(
+        &hub,
+        "w-1",
+        &json!({ "thread": format!("discord:{THREAD}"), "cwd": work }),
+    );
+    let rec = record(&hub, "w-1");
+    let id = rec["session_id"].as_str().unwrap();
+    let session_file = || std::fs::read_to_string(rec["session_file"].as_str().unwrap()).unwrap();
+    hub.until(WAIT, || {
+        (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
+    });
+    // The lane sets its goal to `status` in a turn of its own, as OMP's goal tool does while the
+    // lane waits on the owner.
+    let set_goal_in_a_turn = |status: &str| {
+        let before = session_file().matches("background result read").count();
+        std::fs::write(data(&hub).join(format!("goal-{id}")), status).unwrap();
+        std::fs::write(data(&hub).join(format!("background-{id}")), "").unwrap();
+        hub.until(WAIT, || {
+            (session_file().matches("background result read").count() > before).then_some(())
+        });
+    };
+    set_goal_in_a_turn("paused");
+    fake.say(FakeDiscord::message(
+        THREAD,
+        700_000_000_000_000_001,
+        OWNER,
+        "A, the first design",
+    ));
+    hub.until(WAIT, || {
+        session_file().contains("A, the first design").then_some(())
+    });
+    assert_eq!(goal(&hub, &rec["session_id"]), "active");
+    assert_eq!(record(&hub, "w-1")["state"], "running");
+    let resumed = || {
+        events_of(&hub, "lane.alert")
+            .into_iter()
+            .filter(|e| e["text"].as_str().unwrap().contains("goal resumed"))
+            .count()
+    };
+    assert_eq!(resumed(), 1);
+    // The lead's message does the same.
+    set_goal_in_a_turn("paused");
+    lane(
+        &hub,
+        "send",
+        &json!({ "key": "w-1", "text": "the owner picked A" }),
+    )
+    .unwrap();
+    hub.until(WAIT, || {
+        session_file().contains("the owner picked A").then_some(())
+    });
+    assert_eq!(goal(&hub, &rec["session_id"]), "active");
+    assert_eq!(resumed(), 2);
+    // A goal blocked by its budget is not the lane's to lift: the message waits and the lead
+    // hears why.
+    set_goal_in_a_turn("budget-limited");
+    fake.say(FakeDiscord::message(
+        THREAD,
+        700_000_000_000_000_002,
+        OWNER,
+        "any news?",
+    ));
+    let alert = hub.until(WAIT, || {
+        events_of(&hub, "lane.alert")
+            .into_iter()
+            .find(|e| e["text"].as_str().unwrap().contains("messages undelivered"))
+    });
+    assert!(
+        alert["text"]
+            .as_str()
+            .unwrap()
+            .contains("the goal is blocked by its budget"),
+        "{alert}"
+    );
+    assert!(!session_file().contains("any news?"));
+    assert_eq!(resumed(), 2);
+    hub.stop();
+}
+
 /// Check 6: park, then reopen on the exact file with a new run ID; a header naming another session
 /// refuses the reopen.
 #[test]
@@ -597,8 +712,16 @@ fn park_and_reopen_on_the_exact_session() {
         1,
     );
     std::fs::write(path, forged).unwrap();
-    let refused = lane(&hub, "reopen", &json!({ "key": "k-2" })).unwrap_err();
-    assert!(refused.contains("another session"), "{refused}");
+    let refused = lane(&hub, "reopen", &json!({ "key": "k-2" })).unwrap();
+    let refused = refused.as_str().unwrap();
+    assert!(
+        refused.starts_with("held:") && refused.contains("another session"),
+        "{refused}"
+    );
+    let held = record(&hub, "k-2");
+    assert_eq!(held["state"], "closed");
+    assert_eq!(held["session_id"], k2["session_id"]);
+    assert_eq!(held["run_id"], k2["run_id"]);
     hub.stop();
 }
 
@@ -864,12 +987,12 @@ fn reports_reach_the_thread_by_policy() {
     hub.stop();
 }
 
-/// Check 10 (decision 9): three running lanes, two with active goals and one paused by the lead, are
-/// restarted on their exact files after a hub restart; the two get `goal resume`, the paused one
-/// stays paused, the lead receives the recap.
+/// Running lanes resume on their exact files; an owner-paused lane stays down with its goal paused.
+/// The owner receives the recap of both outcomes.
 #[test]
 fn hub_restart_brings_lanes_back_on_their_files() {
     let (mut hub, _) = lane_hub("");
+    let owner = owner_room(&hub);
     start(&mut hub);
     for key in ["a-1", "a-2", "a-3"] {
         open(&hub, key, &json!({}));
@@ -891,7 +1014,7 @@ fn hub_restart_brings_lanes_back_on_their_files() {
             .iter()
             .map(|k| record(&hub, k))
             .collect();
-        r.iter().all(|x| x["live"] == true).then_some(r)
+        (r[0]["live"] == true && r[1]["live"] == true && r[2]["live"] == false).then_some(r)
     });
     for (b, a) in before.iter().zip(&after) {
         assert_eq!(a["session_id"], b["session_id"], "{a}");
@@ -903,13 +1026,73 @@ fn hub_restart_brings_lanes_back_on_their_files() {
     assert_eq!(goal(&hub, &after[0]["session_id"]), "active");
     assert_eq!(goal(&hub, &after[2]["session_id"]), "paused");
     assert_eq!(after[2]["state"], "held");
+    assert_eq!(after[2]["live"], false);
     let recap = hub.until(WAIT, || {
         let r = events_of(&hub, "lane.recap");
         (!r.is_empty()).then_some(r)
     });
     let text = recap[0]["text"].as_str().unwrap();
-    assert!(text.contains("a-3: restarted; stays held"), "{text}");
+    assert!(text.contains("a-3: held:"), "{text}");
     assert!(text.contains("a-1: restarted; goal active"), "{text}");
+    owner.wait(WAIT, |fake| {
+        fake.bot_messages(CH)
+            .iter()
+            .any(|message| {
+                let text = message["content"].as_str().unwrap();
+                text.contains("a-1: restarted") && text.contains("a-3: held:")
+            })
+            .then_some(())
+    });
+    hub.stop();
+}
+
+/// `lane model` pins what OMP resolved the selector to: a literal colon ID stays whole and a level
+/// suffix stays the thinking level, so the lane restarts on exactly that model.
+#[test]
+fn lane_model_keeps_literal_ids_and_levels_over_a_restart() {
+    let (mut hub, _) = lane_hub("");
+    hub.fixture("omp", "literal", Some("ollama/qwen:14b"));
+    start(&mut hub);
+    open(&hub, "mc-1", &json!({}));
+    let file = record(&hub, "mc-1")["session_file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let restarted = |hub: &mut TestHub| {
+        hub.stop();
+        let before = std::fs::read_to_string(data(hub).join("argv")).unwrap();
+        start(hub);
+        hub.until(WAIT, || {
+            let argv = std::fs::read_to_string(data(hub).join("argv")).unwrap();
+            let launch = argv[before.len()..]
+                .lines()
+                .find(|l| l.contains(&file))
+                .map(str::to_string)?;
+            (record(hub, "mc-1")["live"] == true).then_some(launch)
+        })
+    };
+    let changed = lane(
+        &hub,
+        "model",
+        &json!({ "key": "mc-1", "model": "ollama/qwen:14b" }),
+    );
+    assert_eq!(changed, Ok(json!("ollama/qwen:14b")));
+    let launch = restarted(&mut hub);
+    assert!(
+        launch.contains("--model=ollama/qwen:14b") && !launch.contains("--thinking"),
+        "{launch}"
+    );
+    let changed = lane(
+        &hub,
+        "model",
+        &json!({ "key": "mc-1", "model": "fake/second:high" }),
+    );
+    assert_eq!(changed, Ok(json!("fake/second")));
+    let launch = restarted(&mut hub);
+    assert!(
+        launch.contains("--model=fake/second ") && launch.contains("--thinking=high"),
+        "{launch}"
+    );
     hub.stop();
 }
 
@@ -951,7 +1134,7 @@ fn lead_bridge(hub: &TestHub) -> (Bridge, Value) {
     });
     let (bridge, hello) = Bridge::connect(
         hub,
-        json!({ "ext": 1, "token": token(hub, &session), "session": session, "agent": "main" }),
+        json!({ "ext": 1, "key": bridge_key(hub, &session), "session": session, "agent": "main" }),
     );
     (bridge, json!({ "hello": hello, "session": session }))
 }
@@ -1188,6 +1371,116 @@ fn question_ask_posts_in_its_thread() {
     );
     drop(b);
     hub.stop();
+}
+
+/// Owner-facing inventory uses the accepted bridge, not a local OMP session note.
+#[test]
+fn nonstock_capabilities_reach_status_and_stay_scoped_to_live_connections() {
+    let (mut hub, work) = lane_hub("");
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
+        work.display()
+    ));
+    start(&mut hub);
+    let (mut bridge, meta) = lead_bridge(&hub);
+    let session = meta["session"].as_str().unwrap();
+    let empty = json!({ "session": session, "nonstock": [] });
+    assert_eq!(bridge.call("bridge.capabilities", empty.clone()), json!({}));
+    for args in [&["status"][..], &["lead", "status"][..]] {
+        let output = hub.cli(args);
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line == format!("tools    {session}: non-stock none"))
+        );
+    }
+
+    let report = json!({ "session": session, "nonstock": ["owner_tool", "mcp__owner_search", "owner_tool"] });
+    assert_eq!(
+        bridge.call("bridge.capabilities", report.clone()),
+        json!({})
+    );
+    assert_eq!(bridge.call("bridge.capabilities", report), json!({}));
+    let expected = json!([{ "session": session, "nonstock": ["mcp__owner_search", "owner_tool"] }]);
+    for args in [&["status", "--json"][..], &["lead", "status", "--json"][..]] {
+        assert_eq!(hub.json(args)["tools"], expected);
+    }
+    for args in [&["status"][..], &["lead", "status"][..]] {
+        let output = hub.cli(args);
+        assert!(output.status.success());
+        assert!(
+            String::from_utf8(output.stdout)
+                .unwrap()
+                .lines()
+                .any(|line| line
+                    == format!("tools    {session}: non-stock mcp__owner_search, owner_tool"))
+        );
+    }
+    let log = std::fs::read_to_string(hub.state().join("logs/hub.log")).unwrap();
+    assert_eq!(
+        log.lines()
+            .filter(|line| line.contains("session non-stock tools changed"))
+            .count(),
+        2
+    );
+
+    // Malformed and cross-session reports cannot overwrite the accepted connection's inventory.
+    for bad in [
+        json!({ "session": session, "nonstock": [42] }),
+        json!({ "session": "someone-else", "nonstock": ["wrong"] }),
+    ] {
+        assert_eq!(bridge.call("bridge.capabilities", bad), Value::Null);
+    }
+    assert_eq!(hub.json(&["status", "--json"])["tools"], expected);
+
+    let (mut sub, welcome) = Bridge::connect(
+        &hub,
+        json!({
+            "ext": 1, "session": "sub-session", "agent": "sub", "parent": session
+        }),
+    );
+    assert_eq!(welcome["role"], "lead");
+    assert_eq!(
+        sub.call(
+            "bridge.capabilities",
+            json!({
+                "session": "sub-session", "nonstock": ["sub_tool"]
+            })
+        ),
+        json!({})
+    );
+    let mut both = expected.as_array().unwrap().clone();
+    both.push(json!({ "session": "sub-session", "nonstock": ["sub_tool"] }));
+    both.sort_by(|a, b| a["session"].as_str().cmp(&b["session"].as_str()));
+    assert_eq!(hub.json(&["status", "--json"])["tools"], json!(both));
+    assert_eq!(
+        hub.json(&["lead", "status", "--json"])["tools"],
+        json!(both)
+    );
+    drop(sub);
+    hub.until(WAIT, || {
+        (hub.json(&["status", "--json"])["tools"] == expected).then_some(())
+    });
+
+    // Reconnects replace the old connection's report; its later close cannot remove the new one.
+    let (mut replacement, welcome) = Bridge::connect(
+        &hub,
+        json!({
+            "ext": 1, "session": session, "agent": "main", "key": meta["hello"]["key"]
+        }),
+    );
+    assert_eq!(welcome["role"], "lead");
+    assert_eq!(replacement.call("bridge.capabilities", empty), json!({}));
+    drop(bridge);
+    let expected = json!([{ "session": session, "nonstock": [] }]);
+    assert_eq!(hub.json(&["status", "--json"])["tools"], expected);
+    drop(replacement);
+    hub.until(WAIT, || {
+        (hub.json(&["status", "--json"])["tools"] == json!([])).then_some(())
+    });
 }
 
 /// Milestone 7 check 8: onboarding asks one consent question before reading anything (no tool is
@@ -1497,6 +1790,68 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
     hub.stop();
 }
 
+/// The lead's answer can be ready while `lane.open` is still making the thread from the request:
+/// the thread exists, the lane's record does not yet (on a worker it waits for a push). The
+/// answer stays in the channel and the kickoff comes first in the thread.
+#[test]
+fn an_answer_while_its_lane_thread_is_made_stays_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n{}",
+        work.display(),
+        fake.config(&token, OWNER, &[CH])
+    ));
+    start(&mut hub);
+    hub.until(WAIT, || {
+        (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
+    });
+    let (mut b, meta) = lead_bridge(&hub);
+    let lead_file = hub.json(&["lead", "status", "--json"])["session"]["session_file"].clone();
+    std::fs::write(data(&hub).join("hold"), "start the work").unwrap();
+    let asked = 800_000_000_000_000_101u64;
+    fake.say(FakeDiscord::message(CH, asked, OWNER, "start the work"));
+    hub.until(WAIT, || holds(&lead_file, "start the work").then_some(()));
+    // Discord makes the thread, but the open has no answer yet.
+    fake.hold_thread_starts(true);
+    let open = json!({
+        "op": "lane.open", "key": "work-1", "title": "Work", "brief": "Do the work.",
+        "checks": [{ "kind": "command", "argv": ["true"] }],
+        "thread_from": format!("discord:{CH}/{asked}"),
+        "kickoff": "Working; done when the check true passes.",
+        "cwd": work,
+    });
+    let session = meta["session"].clone();
+    let opening = std::thread::spawn(move || lead_tool(&mut b, &session, "l1", open));
+    let made = format!("/channels/{CH}/messages/{asked}/threads");
+    fake.wait(WAIT, |f| (!f.calls("POST", &made).is_empty()).then_some(()));
+    // Meanwhile the lead's turn ends with its answer.
+    std::fs::write(data(&hub).join("release"), "").unwrap();
+    let thread = asked.to_string();
+    let answer = fake.wait(WAIT, |f| {
+        let mut posted = f.bot_messages(CH);
+        posted.extend(f.bot_messages(&thread));
+        posted.into_iter().find(|m| m["content"] == "ok")
+    });
+    fake.hold_thread_starts(false);
+    let (text, err) = opening.join().unwrap();
+    assert!(!err && text.contains("started"), "{text}");
+    assert_eq!(
+        answer["channel_id"], CH,
+        "the lead's pointer stays in the channel"
+    );
+    assert_eq!(answer["message_reference"]["message_id"], thread);
+    let first = fake.wait(WAIT, |f| f.bot_messages(&thread).first().cloned());
+    assert_eq!(
+        first["content"], "Working; done when the check true passes.",
+        "the kickoff comes first in the lane's thread"
+    );
+    hub.stop();
+}
+
 /// A lane the owner opened while the lead sleeps: its start and a progress report are quiet and
 /// leave the lead asleep; a stuck report wakes it on the same session, and both reports reach that
 /// session (the quiet one with the first turn after the wake).
@@ -1548,5 +1903,360 @@ fn a_lane_report_wakes_the_sleeping_lead_on_its_session() {
         (text.contains("stuck-mark-9") && text.contains("progress-mark-7")).then_some(())
     });
     drop(b);
+    hub.stop();
+}
+
+/// Withhold ready only on resume; probes and fresh launches remain real fake-OMP exchanges.
+fn stall_resumes(hub: &TestHub) {
+    let bin = hub.root.join("bin");
+    std::fs::rename(bin.join("omp"), bin.join("omp-real")).unwrap();
+    std::fs::write(
+        bin.join("omp"),
+        "#!/bin/sh\nfor arg do\n case \"$arg\" in --resume=*) printf 'attempt\\n' >> \"$(dirname \"$0\")/omp-data/resume-started\"; cat >/dev/null; exit 1;; esac\ndone\nexec \"$(dirname \"$0\")/omp-real\" \"$@\"\n",
+    )
+    .unwrap();
+    std::fs::set_permissions(bin.join("omp"), std::fs::Permissions::from_mode(0o700)).unwrap();
+}
+
+fn pushed_repo(work: &Path) -> PathBuf {
+    let repo = work.join("repo");
+    std::fs::create_dir_all(&repo).unwrap();
+    git(&repo, &["init", "-q"]);
+    std::fs::write(repo.join("a.txt"), "original").unwrap();
+    std::fs::write(repo.join(".gitignore"), "ignored.txt\n").unwrap();
+    git(&repo, &["add", "."]);
+    git(&repo, &["commit", "-qm", "base"]);
+    let origin = work.join("origin.git");
+    git(work, &["init", "-q", "--bare", origin.to_str().unwrap()]);
+    git(
+        &repo,
+        &["remote", "add", "origin", origin.to_str().unwrap()],
+    );
+    git(&repo, &["push", "-q", "origin", "HEAD:main"]);
+    repo
+}
+
+fn resume_preserves_work(kind: &str, reopen: bool) {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "preserve",
+        &json!({
+            "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
+        }),
+    );
+    let before = record(&hub, "preserve");
+    let files: &[(&str, &str)] = match kind {
+        "dirty" => &[("a.txt", "tracked work"), ("new.txt", "untracked work")],
+        "commit" => &[("a.txt", "unpushed work")],
+        "ignored" => &[("ignored.txt", "unique ignored work")],
+        _ => panic!("unknown case"),
+    };
+    for (file, text) in files {
+        std::fs::write(tree.join(file), text).unwrap();
+    }
+    if kind == "commit" {
+        git(&tree, &["add", "a.txt"]);
+        git(&tree, &["commit", "-qm", "unpublished"]);
+    }
+    if reopen {
+        lane(
+            &hub,
+            "park",
+            &json!({"key":"preserve", "reason":"wait", "condition":"owner"}),
+        )
+        .unwrap();
+        stall_resumes(&hub);
+        assert_recovering_reopen(&hub, "preserve");
+    } else {
+        hub.stop();
+        stall_resumes(&hub);
+        start(&mut hub);
+        hub.until(Duration::from_secs(400), || {
+            hub.events()
+                .iter()
+                .any(|e| e["kind"] == "lane.recap")
+                .then_some(())
+        });
+    }
+    let after = record(&hub, "preserve");
+    assert_eq!(after["state"], "held", "{after}");
+    assert!(
+        after["lost"].as_str().unwrap().contains("Timeout"),
+        "{after}"
+    );
+    assert_eq!(after["worktrees"], json!([tree]));
+    for field in [
+        "session_id",
+        "session_file",
+        "cwd",
+        "worktrees",
+        "thread",
+        "run_id",
+    ] {
+        assert_eq!(after[field], before[field], "{field}: {after}");
+    }
+    assert_eq!(after["live"], false);
+    for (file, text) in files {
+        assert_eq!(std::fs::read_to_string(tree.join(file)).unwrap(), *text);
+    }
+    assert_eq!(
+        goal(&hub, &before["session_id"]),
+        if reopen { "paused" } else { "active" }
+    );
+    hub.stop();
+}
+
+fn assert_recovering_reopen(hub: &TestHub, key: &str) {
+    let asked = Instant::now();
+    let response = lane(hub, "reopen", &json!({"key":key})).unwrap();
+    assert!(
+        response.as_str().unwrap().starts_with("recovering:"),
+        "{response}"
+    );
+    assert!(
+        asked.elapsed() < Duration::from_secs(120),
+        "the response must not wait for the whole episode"
+    );
+    hub.until(WAIT, || {
+        (std::fs::read_to_string(data(hub).join("resume-started"))
+            .unwrap()
+            .lines()
+            .count()
+            == 2)
+            .then_some(())
+    });
+    hub.until(Duration::from_secs(400), || {
+        record(hub, key)["status"]
+            .as_str()
+            .is_some_and(|status| status.contains("start failed; work retained"))
+            .then_some(())
+    });
+}
+
+#[test]
+fn resume_timeout_keeps_dirty_worktree() {
+    resume_preserves_work("dirty", false);
+}
+
+#[test]
+fn resume_timeout_keeps_unpushed_worktree() {
+    resume_preserves_work("commit", false);
+}
+
+#[test]
+fn resume_timeout_keeps_ignored_worktree() {
+    resume_preserves_work("ignored", false);
+}
+
+#[test]
+fn reopen_timeout_keeps_identity_and_worktree() {
+    resume_preserves_work("ignored", true);
+}
+
+#[test]
+fn completed_close_preserves_ignored_files() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "ignored-close",
+        &json!({
+            "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
+        }),
+    );
+    std::fs::write(tree.join("ignored.txt"), "irreplaceable").unwrap();
+    lane(
+        &hub,
+        "close",
+        &json!({"key":"ignored-close", "note":"done"}),
+    )
+    .unwrap();
+    let rec = record(&hub, "ignored-close");
+    assert_eq!(rec["state"], "closed");
+    assert_eq!(
+        std::fs::read_to_string(tree.join("ignored.txt")).unwrap(),
+        "irreplaceable"
+    );
+    assert!(rec["receipt"].to_string().contains("kept"), "{rec}");
+    hub.stop();
+}
+
+#[test]
+fn completed_close_removes_clean_worktree() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "clean-close",
+        &json!({
+            "cwd": repo, "worktree": {"path": tree, "branch": "lane-work", "base": "HEAD"}
+        }),
+    );
+    lane(&hub, "close", &json!({"key":"clean-close", "note":"done"})).unwrap();
+    assert!(!tree.exists());
+    let rec = record(&hub, "clean-close");
+    assert_eq!(rec["state"], "closed");
+    assert!(rec["receipt"].to_string().contains("removed"), "{rec}");
+    hub.stop();
+}
+
+/// A pre-spawn failure proves no writer existed. Git locking is an actual removal refusal.
+#[test]
+fn failed_fresh_worktree_removal_keeps_record() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    let git_bin = Command::new("which").arg("git").output().unwrap();
+    let git_bin = String::from_utf8(git_bin.stdout).unwrap();
+    let wrapper = hub.root.join("bin/git");
+    std::fs::write(&wrapper, format!(
+        "#!/bin/sh\n\"{}\" \"$@\" || exit $?\nif [ \"$1 $2\" = 'worktree add' ]; then \"{}\" worktree lock '{}'; fi\n",
+        git_bin.trim(), git_bin.trim(), tree.display()
+    )).unwrap();
+    std::fs::set_permissions(&wrapper, std::fs::Permissions::from_mode(0o700)).unwrap();
+    let path = std::env::join_paths(
+        std::iter::once(hub.root.join("bin"))
+            .chain(std::env::split_paths(&support::path_without_omp())),
+    )
+    .unwrap();
+    hub.env.push(("PATH".into(), PathBuf::from(path)));
+    start(&mut hub);
+    std::fs::create_dir_all(hub.state().join("sessions/lanes")).unwrap();
+    std::fs::write(
+        hub.state().join("sessions/lanes/refused"),
+        "not a directory",
+    )
+    .unwrap();
+    let result = lane(
+        &hub,
+        "open",
+        &json!({
+            "key":"refused", "title":"Refused allocation", "brief":"Work.",
+            "checks":[{"kind":"command","argv":["true"]}], "cwd":repo,
+            "worktree":{"path":tree,"branch":"refused","base":"HEAD"}
+        }),
+    );
+    assert!(result.is_err());
+    let rec = record(&hub, "refused");
+    assert_eq!(rec["state"], "held", "{rec}");
+    assert!(
+        rec["receipt"]
+            .to_string()
+            .contains("git worktree remove refused"),
+        "{rec}"
+    );
+    assert!(tree.is_dir());
+    hub.stop();
+}
+
+#[test]
+fn queued_fresh_failure_removes_only_its_unused_worktree() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let owned = work.join("owned");
+    let fresh = work.join("fresh");
+    start(&mut hub);
+    open(
+        &hub,
+        "existing",
+        &json!({"cwd":repo,
+        "worktree":{"path":owned,"branch":"owned","base":"HEAD"}}),
+    );
+    let before = record(&hub, "existing");
+    std::fs::write(owned.join("ignored.txt"), "another run's work").unwrap();
+    open(&hub, "predecessor", &json!({}));
+    open(
+        &hub,
+        "queued-fail",
+        &json!({"cwd":repo, "after":["predecessor"],
+        "worktree":{"path":fresh,"branch":"fresh","base":"HEAD"}}),
+    );
+    std::fs::write(
+        hub.state().join("sessions/lanes/queued-fail"),
+        "not a directory",
+    )
+    .unwrap();
+    lane(&hub, "close", &json!({"key":"predecessor","note":"done"})).unwrap();
+    assert!(lane(&hub, "start", &json!({"key":"queued-fail"})).is_err());
+    let queued = lane(&hub, "queued", &json!({})).unwrap();
+    assert!(queued.to_string().contains("failed"), "{queued}");
+    assert!(
+        !fresh.exists(),
+        "only the newly allocated unused worktree is removed"
+    );
+    assert_eq!(record(&hub, "existing")["run_id"], before["run_id"]);
+    assert_eq!(
+        std::fs::read_to_string(owned.join("ignored.txt")).unwrap(),
+        "another run's work"
+    );
+    hub.stop();
+}
+
+#[test]
+fn parking_cancels_an_existing_session_start_without_losing_work() {
+    let (mut hub, work) = lane_hub("");
+    let repo = pushed_repo(&work);
+    let tree = work.join("lane-tree");
+    start(&mut hub);
+    open(
+        &hub,
+        "cancel-resume",
+        &json!({
+            "cwd":repo, "worktree":{"path":tree,"branch":"cancel-resume","base":"HEAD"}
+        }),
+    );
+    std::fs::write(tree.join("ignored.txt"), "retained on cancellation").unwrap();
+    let before = record(&hub, "cancel-resume");
+    hub.stop();
+    stall_resumes(&hub);
+    start(&mut hub);
+    hub.until(WAIT, || {
+        data(&hub).join("resume-started").exists().then_some(())
+    });
+    let parked = lane(
+        &hub,
+        "park",
+        &json!({
+            "key":"cancel-resume", "reason":"owner stopped recovery", "condition":"explicit retry"
+        }),
+    )
+    .unwrap();
+    assert_eq!(parked, "closed parked");
+    let after = record(&hub, "cancel-resume");
+    assert_eq!(after["session_id"], before["session_id"]);
+    assert_eq!(after["run_id"], before["run_id"]);
+    assert_eq!(after["live"], false);
+    assert_eq!(
+        std::fs::read_to_string(tree.join("ignored.txt")).unwrap(),
+        "retained on cancellation"
+    );
+    hub.stop();
+}
+
+#[test]
+fn lane_status_selects_the_positional_key() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "cli-one", &json!({}));
+    open(&hub, "cli-two", &json!({}));
+    let status = hub.cli(&["lane", "status", "cli-one"]);
+    assert!(status.status.success(), "{status:?}");
+    let text = String::from_utf8(status.stdout).unwrap();
+    assert!(text.contains("cli-one"), "{text}");
+    assert!(!text.contains("cli-two"), "{text}");
+    let json_status = hub.json(&["lane", "status", "cli-two", "--json"]);
+    let text = json_status.as_str().unwrap();
+    assert!(
+        text.contains("cli-two") && !text.contains("cli-one"),
+        "{text}"
+    );
     hub.stop();
 }

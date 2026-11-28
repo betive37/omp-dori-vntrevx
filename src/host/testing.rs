@@ -1,6 +1,7 @@
 //! An in-process fake of OMP's rpc-ui side for unit tests: answers `get_state` from a mutable state,
 //! runs a prompt as one complete turn (and appends its user entry to a session file), and lets a
-//! test push any frame or end the stream.
+//! test push any frame or end the stream. Its bridge answers the hub's read-only `model.resolve`
+//! as OMP's resolver does for a catalogue without literal colon IDs.
 
 #![allow(
     clippy::unwrap_used,
@@ -18,6 +19,7 @@ use serde_json::{Value, json};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, DuplexStream, ReadHalf, WriteHalf};
 use tokio::sync::mpsc;
 
+use super::bridge::Links;
 use super::headless::{Session, Settings};
 use super::{Control, Role, Snapshot, StartError, StartSpec, Started};
 use crate::omp::launch::Target;
@@ -35,6 +37,14 @@ pub(crate) struct FakeState {
     pub(crate) answer_prompts: bool,
     /// Append the prompt's user entry to the session file.
     pub(crate) write_entries: bool,
+    /// The goal status `get_state` reports (`active`, `paused`, ...); `None` is no goal.
+    pub(crate) goal: Option<&'static str>,
+    /// The thinking level `get_state` and the bridge report.
+    pub(crate) thinking: Option<String>,
+    /// The `model_resolution_version` of the bridge's hello; `None` is a bridge older than it.
+    pub(crate) resolution_version: Option<u64>,
+    /// Refuse `set_model`, as OMP refuses a model it cannot run.
+    pub(crate) refuse_model: bool,
 }
 
 pub(crate) struct Fake {
@@ -60,7 +70,7 @@ pub(crate) fn spec(handle: &str, expected: Option<(&str, PathBuf)>) -> StartSpec
         expected_id: expected.map(|(id, _)| id.to_string()),
         instructions: None,
         max_cost: None,
-        tools: None,
+        look_only: false,
         worker: None,
     }
 }
@@ -76,6 +86,10 @@ impl Fake {
             extra_usage: false,
             answer_prompts: true,
             write_entries: true,
+            goal: None,
+            thinking: None,
+            resolution_version: Some(super::model::VERSION),
+            refuse_model: false,
         });
         fake.dir = Some(dir);
         fake
@@ -110,14 +124,11 @@ impl Fake {
         let rpc = Rpc::connect(reader, writer, Duration::from_secs(5), Some(tx))
             .await
             .unwrap();
-        Session::bind(
-            rpc,
-            rx,
-            super::headless::Proc::Fake,
-            spec,
-            Settings::default(),
-        )
-        .await
+        let links = Arc::new(Links::default());
+        bridge(&links, &spec.handle, Arc::clone(&self.state));
+        let mut settings = Settings::default();
+        settings.links = links;
+        Session::bind(rpc, rx, super::headless::Proc::Fake, spec, settings).await
     }
 
     pub(crate) fn session_id(&self) -> String {
@@ -224,8 +235,10 @@ fn answer(command: &Value, state: &Arc<Mutex<FakeState>>) -> Vec<Value> {
             let mut data = json!({
                 "sessionId": st.session_id, "sessionFile": st.file.display().to_string(),
                 "isStreaming": st.streaming, "isCompacting": false, "queuedMessageCount": 0,
-                "isSettled": !st.streaming, "goal": null,
+                "isSettled": !st.streaming,
+                "goal": st.goal.map(|g| json!({"goal": {"status": g, "objective": "o"}})),
                 "model": {"provider": st.model.0, "id": st.model.1},
+                "thinkingLevel": st.thinking,
             });
             if st.extra_usage {
                 data["usageLimit"] = json!({"stage": "wrap_up", "extraUsage": true});
@@ -259,6 +272,8 @@ fn answer(command: &Value, state: &Arc<Mutex<FakeState>>) -> Vec<Value> {
             st.streaming = false;
             vec![response(id, kind, json!({}))]
         }
+        "set_model" if st.refuse_model => vec![json!({"type": "response", "id": id,
+            "command": kind, "success": false, "error": "model not available"})],
         "set_model" => {
             st.model = (
                 command["provider"].as_str().unwrap_or_default().into(),
@@ -266,7 +281,65 @@ fn answer(command: &Value, state: &Arc<Mutex<FakeState>>) -> Vec<Value> {
             );
             vec![response(id, kind, json!({}))]
         }
+        "set_thinking_level" => {
+            st.thinking = command["level"].as_str().map(str::to_owned);
+            vec![response(id, kind, json!({}))]
+        }
         "extension_ui_response" => Vec::new(),
         _ => vec![response(id, kind, json!({}))],
     }
+}
+
+/// The session's bridge: connected with the fake's capability, answering each `model.resolve`
+/// with the selector's base model and suffix level, and the level the fake runs.
+fn bridge(links: &Arc<Links>, handle: &str, state: Arc<Mutex<FakeState>>) {
+    const LEVELS: [&str; 7] = ["off", "minimal", "low", "medium", "high", "xhigh", "max"];
+    let (session, version) = {
+        let st = state.lock().unwrap();
+        (st.session_id.clone(), st.resolution_version)
+    };
+    let (tx, mut rx) = mpsc::channel(16);
+    links.connect(handle, Role::Lead, "fake-key", &session);
+    let hello =
+        json!({ "session": session, "version": "fake", "model_resolution_version": version });
+    links.open_query(handle, "fake-key", &hello, tx);
+    let links = Arc::clone(links);
+    tokio::spawn(async move {
+        while let Some(item) = rx.recv().await {
+            let item: crate::proto::Response = item;
+            let cmd = item.item.unwrap_or_default()["cmd"].clone();
+            let selector = cmd["selector"].as_str().unwrap_or_default().to_string();
+            let (base, suffix) = match selector.rsplit_once(':') {
+                Some((base, level)) if LEVELS.contains(&level) => (base, Some(level)),
+                _ => (selector.as_str(), None),
+            };
+            let (provider, id) = base.split_once('/').unwrap_or(("", base));
+            let requested = cmd["thinking"].as_str().or(suffix);
+            let observed = state.lock().unwrap().thinking.clone();
+            links.answer(&json!({ "n": cmd["n"], "model_resolution": { "version": 1,
+                "selector": selector, "provider": provider, "id": id,
+                "thinking": { "requested": requested, "observed": observed } } }));
+        }
+    });
+}
+
+/// A bridge registry whose session `handle` has the fake bridge of a session that runs the
+/// default `fake/primary`, for tests that drive their own rpc peer.
+pub(crate) fn bridged(handle: &str) -> Arc<Links> {
+    let links = Arc::new(Links::default());
+    let state = FakeState {
+        session_id: "A".into(),
+        file: PathBuf::new(),
+        streaming: false,
+        model: ("fake".into(), "primary".into()),
+        extra_usage: false,
+        answer_prompts: true,
+        write_entries: false,
+        goal: None,
+        thinking: None,
+        resolution_version: Some(super::model::VERSION),
+        refuse_model: false,
+    };
+    bridge(&links, handle, Arc::new(Mutex::new(state)));
+    links
 }

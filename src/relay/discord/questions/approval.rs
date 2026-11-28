@@ -38,7 +38,7 @@ const KOREAN: Words = Words {
     command: "명령",
     cut: "(명령이 길어 앞부분 {}자만 보여 줍니다)",
     buttons: ["이번만 허용", "거부"],
-    answered: ["보스가 허용했습니다", "보스가 거부했습니다"],
+    answered: ["주인님이 허용했습니다", "주인님이 거부했습니다"],
     run_ended: "답을 받기 전에 실행이 끝나 거부되었습니다.",
 };
 
@@ -50,8 +50,8 @@ const ENGLISH: Words = Words {
     cut: "(long command: the first {} characters are shown)",
     buttons: ["Approve once", "Deny"],
     answered: [
-        "Answered by the owner: Approve once",
-        "Answered by the owner: Deny",
+        "Answered by Master: Approve once",
+        "Answered by Master: Deny",
     ],
     run_ended: "Denied: the run ended before an answer.",
 };
@@ -169,7 +169,17 @@ mod tests {
         );
         let w = words(Language::Korean);
         assert_eq!(w.buttons, ["이번만 허용", "거부"]);
-        assert_eq!(w.answered[0], "보스가 허용했습니다");
+        assert_eq!(
+            w.answered,
+            ["주인님이 허용했습니다", "주인님이 거부했습니다"]
+        );
+        assert_eq!(
+            words(Language::English).answered,
+            [
+                "Answered by Master: Approve once",
+                "Answered by Master: Deny"
+            ]
+        );
         let english = text(OWNER_LINE, Language::English);
         assert!(english.starts_with("**Permission asked**\n**Tool:** `bash`\n**Command:**\n```\n"));
         assert_eq!(words(Language::English).buttons, ["Approve once", "Deny"]);

@@ -435,7 +435,7 @@ fn the_updated_hub_says_so_once_in_the_home_room() {
     assert_eq!(updated.len(), 1, "{updated:?}");
     assert!(
         updated[0].starts_with(&format!(
-            "{v2} 버전으로 업데이트했습니다. 보스, 감사합니다!\n{V1} -> {v2}"
+            "{v2} 버전으로 업데이트했습니다. 주인님, 감사합니다!\n{V1} -> {v2}"
         )),
         "{updated:?}"
     );
@@ -750,4 +750,261 @@ fn install_sh_picks_the_newest_stable_cataly_release() {
         )),
         "{said}"
     );
+}
+
+/// The sandbox's store.
+fn store(hub: &TestHub) -> PathBuf {
+    hub.root.join("state/cataly/cataly.db")
+}
+
+/// Sets the store's reader floor (`meta.min_reader`), as a later non-additive schema would.
+fn set_floor(hub: &TestHub, floor: i64) {
+    let conn = rusqlite::Connection::open(store(hub)).unwrap();
+    conn.busy_timeout(Duration::from_secs(5)).unwrap();
+    conn.execute(
+        "UPDATE meta SET value = ?1 WHERE key = 'min_reader'",
+        [floor.to_string()],
+    )
+    .unwrap();
+}
+
+/// Copies `from` into `to` as `copy_tree` does, writing a file only when its bytes (after
+/// `rewrite`) changed, so an unchanged tree does not rebuild.
+fn sync_tree(from: &Path, to: &Path, rewrite: &dyn Fn(&Path, Vec<u8>) -> Vec<u8>) {
+    std::fs::create_dir_all(to).unwrap();
+    for entry in std::fs::read_dir(from).unwrap().filter_map(Result::ok) {
+        let name = entry.file_name();
+        if name == "target" || name == ".git" || name == "node_modules" {
+            continue;
+        }
+        let (path, dest) = (entry.path(), to.join(&name));
+        if entry.file_type().unwrap().is_dir() {
+            sync_tree(&path, &dest, rewrite);
+        } else if entry.file_type().unwrap().is_file() {
+            let bytes = rewrite(&path, std::fs::read(&path).unwrap());
+            if std::fs::read(&dest).ok().as_deref() != Some(&bytes[..]) {
+                std::fs::write(&dest, bytes).unwrap();
+            }
+        }
+    }
+}
+
+const CAPABILITY_LESS_VERSION: &str = "0.2.6";
+
+/// A build reporting the last release without `store_reader`, under the variants' build lock.
+fn capability_less() -> PathBuf {
+    let repo = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let out_dir = Path::new(env!("CARGO_TARGET_TMPDIR")).join("install-variants");
+    std::fs::create_dir_all(&out_dir).unwrap();
+    let lock = std::fs::File::create(out_dir.join(".lock")).unwrap();
+    lock.lock().unwrap();
+    let report = repo.join("src/sys/release.rs");
+    let manifest = repo.join("Cargo.toml");
+    let field = "store_reader: Some(crate::store::latest_schema()),";
+    sync_tree(
+        repo,
+        &out_dir.join("src-capability-less"),
+        &|path, bytes| {
+            if path == manifest {
+                return String::from_utf8(bytes)
+                    .unwrap()
+                    .replacen(
+                        &format!("\nversion = \"{V1}\"\n"),
+                        &format!("\nversion = \"{CAPABILITY_LESS_VERSION}\"\n"),
+                        1,
+                    )
+                    .into_bytes();
+            }
+            if path != report {
+                return bytes;
+            }
+            let text = String::from_utf8(bytes).unwrap();
+            assert!(text.contains(field), "the report no longer sets {field}");
+            // `.and(None)` keeps the schema import in use, so the build stays free of warnings.
+            let none = "store_reader: Some(crate::store::latest_schema()).and(None),";
+            text.replacen(field, none, 1).into_bytes()
+        },
+    );
+    // Its own target folder: the shared one's `target/debug/cataly` is whichever crate copy put it
+    // there last, and a variant's binary (also 0.2.6, with the capability) was seen standing in
+    // for this one after a build that found nothing to rebuild.
+    let target = out_dir.join("target-capability-less");
+    let cargo = std::env::var("CARGO").unwrap_or_else(|_| "cargo".into());
+    let built = std::process::Command::new(cargo)
+        .args(["build", "--offline", "--bin", "cataly"])
+        .current_dir(out_dir.join("src-capability-less"))
+        .env("CARGO_TARGET_DIR", &target)
+        .env("CARGO_PROFILE_DEV_DEBUG", "false")
+        .env_remove("CATALY_RELEASE_KEY")
+        .env_remove("CATALY_COMMIT")
+        .status()
+        .unwrap();
+    assert!(built.success(), "the capability-less build failed");
+    let out = out_dir.join("cataly-capability-less");
+    let part = out_dir.join("cataly-capability-less.part");
+    std::fs::copy(target.join("debug/cataly"), &part).unwrap();
+    std::fs::rename(&part, &out).unwrap();
+    out
+}
+
+/// The store refusal, in the default language (Korean), naming `version`.
+fn refused_for_the_store(out: &Output, version: &str) -> bool {
+    String::from_utf8_lossy(&out.stderr).contains(&format!(
+        "대화 보존을 위해 저장소를 업그레이드했습니다. {version} 버전은 이 저장소를 읽을 수 없습니다"
+    ))
+}
+
+/// An older reader is refused before the live hub is stopped or anything switched. Store reads
+/// leave its writer usable. The permitted rollback also restarts normally; simulated floor changes
+/// happen only while the hub is stopped, never through a second live writer.
+#[test]
+fn a_rollback_across_the_store_floor_is_refused_before_anything_stops() {
+    let v2 = bump(V1, 1);
+    let hub = sandbox("");
+    let r1 = release(
+        &hub.root.join("r1"),
+        &capability_less(),
+        CAPABILITY_LESS_VERSION,
+    );
+    let r2 = release(&hub.root.join("r2"), &variant(&v2, false), &v2);
+    let out = run(
+        &hub,
+        BIN.as_ref(),
+        &["install", "--from", r1.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let out = run(
+        &hub,
+        &command_link(&hub),
+        &["update", "--from", r2.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+
+    let mut running = installed_hub(&hub);
+    hub.until(Duration::from_secs(20), || {
+        (hub_version(&hub).as_deref() == Some(v2.as_str())).then_some(())
+    });
+    let before = snapshot(&hub);
+    let out = run(&hub, &command_link(&hub), &["rollback"]);
+    assert_eq!(out.status.code(), Some(6), "{}", text(&out));
+    assert!(
+        refused_for_the_store(&out, CAPABILITY_LESS_VERSION),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("업그레이드 전 저장소 사본이 없어"),
+        "no copy is invented: {}",
+        text(&out)
+    );
+    assert_eq!(snapshot(&hub), before, "nothing switched");
+    assert!(!root(&hub).join("silenced").exists());
+    assert_eq!(
+        hub_version(&hub).as_deref(),
+        Some(v2.as_str()),
+        "the hub was not stopped"
+    );
+
+    // Normal CLI reads must leave the running hub and its store writer usable.
+    let commands: &[&[&str]] = &[
+        &["status", "--json"],
+        &["lead", "status", "--json"],
+        &[
+            "lead",
+            "send",
+            "keep this queued across the reader preflight",
+        ],
+    ];
+    for args in commands {
+        let out = run(&hub, &command_link(&hub), args);
+        assert!(out.status.success(), "{}", text(&out));
+    }
+    assert_eq!(hub_version(&hub).as_deref(), Some(v2.as_str()));
+
+    stop_hub(&hub);
+    let _ = running.wait();
+    // Simulate a compatible store only after its sole writer has stopped.
+    set_floor(&hub, 10);
+    let mut running = installed_hub(&hub);
+    hub.until(Duration::from_secs(20), || {
+        (hub_version(&hub).as_deref() == Some(v2.as_str())).then_some(())
+    });
+    let out = run(&hub, &command_link(&hub), &["rollback"]);
+    assert!(out.status.success(), "{}", text(&out));
+    assert_eq!(hub_version(&hub).as_deref(), Some(CAPABILITY_LESS_VERSION));
+    let _ = running.wait();
+    stop_hub(&hub);
+}
+
+/// A previous version whose report predates the store reader capability is refused once the
+/// store's floor is above the schema such releases read, and allowed at it; `install.sh` going
+/// back over an install whose binary has the check is refused by that binary before anything is
+/// replaced.
+#[test]
+fn unknown_capability_and_install_sh_downgrades_are_refused() {
+    let v2 = bump(V1, 1);
+    let hub = sandbox("");
+    let old = release(
+        &hub.root.join("old"),
+        &capability_less(),
+        CAPABILITY_LESS_VERSION,
+    );
+    let r1 = release(&hub.root.join("r1"), &variant(V1, false), V1);
+    let r2 = release(&hub.root.join("r2"), &variant(&v2, false), &v2);
+    let out = run(
+        &hub,
+        BIN.as_ref(),
+        &["install", "--from", old.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let out = run(
+        &hub,
+        &command_link(&hub),
+        &["update", "--from", r2.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "{}", text(&out));
+    let mut first = installed_hub(&hub);
+    hub.until(Duration::from_secs(20), || {
+        (hub_version(&hub).as_deref() == Some(v2.as_str())).then_some(())
+    });
+    stop_hub(&hub);
+    let _ = first.wait();
+
+    set_floor(&hub, 11);
+    let before = snapshot(&hub);
+    let out = run(&hub, &command_link(&hub), &["rollback"]);
+    assert_eq!(out.status.code(), Some(6), "{}", text(&out));
+    assert!(
+        refused_for_the_store(&out, CAPABILITY_LESS_VERSION),
+        "{}",
+        text(&out)
+    );
+    assert!(
+        String::from_utf8_lossy(&out.stderr).contains("스키마 10까지 읽고"),
+        "{}",
+        text(&out)
+    );
+    assert_eq!(snapshot(&hub), before, "nothing switched");
+
+    for (folder, floor, version) in [(&old, 11, CAPABILITY_LESS_VERSION), (&r1, 99, V1)] {
+        set_floor(&hub, floor);
+        let out = install_sh(&hub, folder);
+        assert_eq!(out.status.code(), Some(1), "{}", text(&out));
+        assert!(refused_for_the_store(&out, version), "{}", text(&out));
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(&format!(
+                "the installed Cataly refused {version}; nothing was installed"
+            )),
+            "{}",
+            text(&out)
+        );
+        assert_eq!(snapshot(&hub), before, "nothing replaced");
+    }
+
+    // At the schema capability-less releases read, the same rollback goes through.
+    set_floor(&hub, 10);
+    let out = run(&hub, &command_link(&hub), &["rollback"]);
+    assert!(out.status.success(), "{}", text(&out));
+    let (_, s) = status_install(&hub);
+    assert_eq!(s["current"]["version"], CAPABILITY_LESS_VERSION);
 }
