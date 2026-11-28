@@ -110,7 +110,7 @@ impl<R: Runtime> Lanes<R> {
         evidence::check_report(&r)?;
         let mut items = Vec::new();
         for f in &r.files {
-            items.push(evidence::file_item(Path::new(&rec.cwd), f)?);
+            items.push(evidence::place_file_item(&rec.place(), Path::new(&rec.cwd), f).await?);
         }
         items.extend(evidence::tool_items(&r.calls, r.facts.as_ref())?);
         let total = items.len();
@@ -310,7 +310,7 @@ impl<R: Runtime> Lanes<R> {
         }
         let mut items = Vec::new();
         for f in p::FILES.list(input) {
-            items.push(evidence::file_item(Path::new(&rec.cwd), &f)?);
+            items.push(evidence::place_file_item(&rec.place(), Path::new(&rec.cwd), &f).await?);
         }
         let calls = p::CALLS.list(input);
         items.extend(evidence::tool_items(&calls, p::FACTS.raw(input))?);

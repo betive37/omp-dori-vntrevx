@@ -84,6 +84,9 @@
   on the same machine works inside it or has registered a path inside it, resolving symlinks, and
   name that lane in the close receipt. Concurrent worktree registration takes the lane's turn before
   reserving paths, rechecks the run, and reports success only when the registration is stored.
+- A worker lane's report or step with `files` read those files on the hub, at the worker's path:
+  a file only on the worker was refused as missing, and a hub file at the same path was recorded
+  instead. They are now read on the worker (at most 8 MiB per file there).
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
