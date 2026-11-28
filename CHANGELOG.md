@@ -2,9 +2,11 @@
 
 ## 0.2.9 (Unreleased)
 
-- Retrying a lane steering message with the same caller ID no longer steers twice. The receipt is
-  stored before sending; a definite refusal allows retry, and an uncertain result blocks further
-  messages until released without resending the original.
+- Retrying a lane steering message with the same caller ID no longer steers twice; reusing the ID
+  with different text is refused. Its receipt and in-doubt fence are stored together before sending,
+  so a crash before the result is recorded also blocks further messages until released. A definite
+  refusal allows retry; release never resends the original. Settled steering receipts obey the same
+  per-session cap as queued messages.
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
   "300 s recovery episode has no startup and cleanup budget remaining", with nothing attempted:

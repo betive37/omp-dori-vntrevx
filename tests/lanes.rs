@@ -395,6 +395,79 @@ fn steer_request_id_survives_an_uncertain_result_and_release() {
     hub.stop();
 }
 
+/// A receipt is a duplicate only for the same steering text.
+#[test]
+fn steer_request_id_rejects_different_text() {
+    let (mut hub, _) = lane_hub("");
+    start(&mut hub);
+    open(&hub, "steer-a", &json!({}));
+    working_for_steering(&hub, "steer-a");
+    let mut request =
+        json!({ "key": "steer-a", "text": "first instruction", "steer": true, "id": "same-id" });
+    lane(&hub, "send", &request).unwrap();
+    request["text"] = json!("different instruction");
+    let refused = lane(&hub, "send", &request).unwrap_err();
+    assert!(refused.contains("different text"), "{refused}");
+    request["text"] = json!("first instruction");
+    let again = lane(&hub, "send", &request).unwrap();
+    assert!(again.as_str().unwrap().contains("earlier"), "{again}");
+    assert_eq!(steering_commands(&hub).len(), 1);
+    hub.stop();
+}
+
+/// Both sides of the write retain the same durable fence when the hub dies before settlement.
+#[test]
+fn steer_request_id_crash_keeps_the_fence_after_restart() {
+    for (point, written) in [("steer_reserved", 0), ("steer_written", 1)] {
+        let (mut hub, _) = lane_hub("");
+        hub.env.push(("CATALY_FAULT".into(), PathBuf::from(point)));
+        start(&mut hub);
+        open(&hub, "steer-a", &json!({}));
+        working_for_steering(&hub, "steer-a");
+        let request = json!({ "key": "steer-a", "text": "change direction", "steer": true, "id": "crash-id" });
+        assert!(lane(&hub, "send", &request).is_err());
+        assert!(!hub.wait_exit(WAIT).success());
+        assert!(has_steering_receipt(&hub, "steer-a", "crash-id"));
+        assert_eq!(steering_commands(&hub).len(), written);
+        hub.env.clear();
+        hub.fixture("omp", "busy", None);
+        start(&mut hub);
+        let rec = hub.until(WAIT, || {
+            let rec = record(&hub, "steer-a");
+            (rec["live"] == true).then_some(rec)
+        });
+        assert!(
+            rec["doubt"]
+                .as_str()
+                .is_some_and(|d| d.contains("crash-id")),
+            "{point}: {rec}"
+        );
+        let repeat = lane(&hub, "send", &request).unwrap_err();
+        assert!(repeat.contains("in doubt"), "{repeat}");
+        let fresh = lane(
+            &hub,
+            "send",
+            &json!({ "key": "steer-a", "text": "new instruction", "id": "new-id" }),
+        )
+        .unwrap_err();
+        assert!(fresh.contains("in doubt"), "{fresh}");
+        lane(
+            &hub,
+            "release",
+            &json!({ "key": "steer-a", "note": "checked the transcript" }),
+        )
+        .unwrap();
+        let again = lane(&hub, "send", &request).unwrap();
+        assert!(again.as_str().unwrap().contains("earlier"), "{again}");
+        assert_eq!(
+            steering_commands(&hub).len(),
+            written,
+            "restart and release never resend"
+        );
+        hub.stop();
+    }
+}
+
 /// Check 2: a model mismatch at start keeps the process, sends no brief, marks the start held and
 /// tells the lead.
 #[test]

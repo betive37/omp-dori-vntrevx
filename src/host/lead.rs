@@ -1865,16 +1865,16 @@ impl<R: Runtime> Lead<R> {
             .map_err(|e| e.to_string())?;
         Ok(match found {
             None => None,
-            Some(crate::store::host::StoredReceipt { inbox_id: None }) => Some(Receipt {
+            Some(crate::store::host::StoredReceipt { inbox_id: None, .. }) => Some(Receipt {
                 request_id: Some(request_id.into()),
                 inbox_id: None,
                 state: inbox::ReceiptState::Duplicate,
                 delivery_id: None,
                 reason: None,
             }),
-            Some(crate::store::host::StoredReceipt { inbox_id: Some(id) }) => {
-                Some(self.mailbox.receipt(Some(request_id.into()), id).await)
-            }
+            Some(crate::store::host::StoredReceipt {
+                inbox_id: Some(id), ..
+            }) => Some(self.mailbox.receipt(Some(request_id.into()), id).await),
         })
     }
 
