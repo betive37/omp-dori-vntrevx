@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::time::Instant;
 
+use crate::jobs::owner::gh_list;
 use crate::sys::command::{self, Output, Spec};
 use crate::worker::Place;
 
@@ -462,27 +463,6 @@ impl PolicyGh<'_> {
         }
         Err("pull-request policy read deadline reached".into())
     }
-
-    /// A list bounded by the advertised count. The caller checks the final snapshot and count
-    /// too: a short page (including GitHub's commit-list cap) is not proof of completeness.
-    async fn list(&self, path: &str, count: usize) -> Result<Vec<Value>, String> {
-        const PAGE: usize = 100;
-        let mut rows = Vec::new();
-        for page in 1..=count.div_ceil(PAGE).max(1) {
-            let answer = self
-                .read(&format!("{path}?per_page={PAGE}&page={page}"))
-                .await?;
-            let Value::Array(batch) = answer else {
-                return Err(format!("{path}: not a list"));
-            };
-            let n = batch.len();
-            rows.extend(batch);
-            if n < PAGE {
-                break;
-            }
-        }
-        Ok(rows)
-    }
 }
 
 fn policy_count(pr: &Value, field: &str) -> Result<usize, String> {
@@ -511,8 +491,10 @@ async fn policy(
     if file_count > FILES_MAX {
         return Err("more than 3000 files".into());
     }
-    let commits = gh.list(&format!("{path}/commits"), commit_count).await?;
-    let files = gh.list(&format!("{path}/files"), file_count).await?;
+    // Bounded by the PR's counts; a short page (GitHub lists at most 250 commits) is checked below.
+    let read = |p: String| async move { gh.read(&p).await };
+    let commits = gh_list(&format!("{path}/commits"), None, Some(commit_count), read).await?;
+    let files = gh_list(&format!("{path}/files"), None, Some(file_count), read).await?;
     let after = gh.read(&path).await?;
     if before.pointer("/head/sha") != after.pointer("/head/sha")
         || ["body", "commits", "changed_files"]
@@ -521,11 +503,10 @@ async fn policy(
     {
         return Err("moved while being checked".into());
     }
-    for (name, rows, field) in [
-        ("commits", &commits, "commits"),
-        ("files", &files, "changed_files"),
+    for (name, rows, expected) in [
+        ("commits", &commits, commit_count),
+        ("files", &files, file_count),
     ] {
-        let expected = policy_count(&after, field)?;
         if rows.len() != expected {
             return Err(format!(
                 "incomplete {name}: read {}, expected {expected}",
