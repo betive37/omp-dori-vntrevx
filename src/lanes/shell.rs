@@ -202,17 +202,22 @@ fn segment_blocked(raw: &[String], words: &[Option<String>], depth: usize) -> bo
             .unwrap_or(after.len());
         let (head, tail) = after.split_at(dash);
         let wrapped = tail.get(1..).unwrap_or_default();
-        head.iter()
-            .any(|w| w.as_ref().is_none_or(|w| w.chars().any(char::is_whitespace)))
-            || (!tail.is_empty()
-                && segment_blocked(
-                    raw.get(raw.len() - wrapped.len()..).unwrap_or_default(),
-                    wrapped,
-                    depth + 1,
-                ))
+        head.iter().any(|w| {
+            w.as_ref()
+                .is_none_or(|w| w.chars().any(char::is_whitespace))
+        }) || (!tail.is_empty()
+            && segment_blocked(
+                raw.get(raw.len() - wrapped.len()..).unwrap_or_default(),
+                wrapped,
+                depth + 1,
+            ))
     };
     let blocked_here = |i: usize, word: &str| match base(word) {
-        "cataly" if words.get(i + 1).is_some_and(|w| w.as_deref() == Some("slot")) => {
+        "cataly"
+            if words
+                .get(i + 1)
+                .is_some_and(|w| w.as_deref() == Some("slot")) =>
+        {
             slot_blocked(i + 1)
         }
         "cataly" => cataly_writes(&rest(i + 1)),
