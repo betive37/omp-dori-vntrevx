@@ -58,6 +58,8 @@
   until `--service on` or `cataly service enable`.
 - Setup can update settings under a table header with a trailing comment, such as `[lead] # main`,
   without adding a duplicate table and failing validation. The header and its comment are kept.
+- Voice setup no longer rejects a channel whose overwrites grant Connect or Speak when the bot's
+  server roles lack them. It checks effective channel permissions before asking for role changes.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
