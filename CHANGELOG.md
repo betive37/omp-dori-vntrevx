@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Switching voice to a Discord channel created while the hub is running no longer rejects it as
+  "not a guild voice channel". The voice channel cache now follows channel creations, updates and
+  deletions in the configured guild.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
