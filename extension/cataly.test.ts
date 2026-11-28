@@ -83,6 +83,56 @@ test("role none leaves the session inert", async () => {
 	expect(pi.tools.length).toBe(0);
 });
 
+test.each(["session_switch", "session_branch", "session_tree"])("a switch replaces role tools and none clears authority without reconnecting (%s)", async event => {
+	const pi = fakePi();
+	// A delayed initial activation must not put the lead tool back after the role changes.
+	const activating = Promise.withResolvers<void>();
+	const activate = pi.setActiveTools;
+	let first = true;
+	pi.setActiveTools = async names => {
+		if (first) { first = false; await activating.promise; }
+		activate(names);
+	};
+	let session = "s1", role = "lead", closed = 0, retries = 0;
+	const connect: Deps["connect"] = async (_path, onLine, onClose) => ({
+		write(line) {
+			const msg = JSON.parse(line);
+			if (msg.method !== "bridge.hello" && msg.method !== "bridge.switch") return;
+			const ok = { role, key: "key", guidance: role, shell: role !== "none", pin: role === "lane" ? "fake/primary" : null,
+				tools: role === "none" ? [] : [{ name: `cataly_${role}`, parameters: { type: "object" } }] };
+			queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ok })));
+		},
+		close() { closed += 1; onClose(); },
+	});
+	const ctx = { ...ctxOf(pi), setTimeout: () => { retries += 1; return 0; } };
+	ctx.sessionManager.getSessionId = () => session;
+	const b = bridge(pi, { env: { CATALY_LAUNCH: "token" }, connect, uid: () => 1 });
+	await pi.emit("session_start", {}, ctx);
+	const leadTool = pi.tools[0];
+	role = "lane"; session = "lane-session";
+	await pi.emit(event, { reason: "resume" }, ctx);
+	activating.resolve();
+	await b.toolsActive;
+	expect(pi.active()).toEqual(["read", "bash", "cataly_lane"]);
+	expect(b.pin).toBe("fake/primary");
+	await expect(leadTool.execute("old-lead", {}, undefined, undefined, ctx)).rejects.toThrow("not available");
+	role = "lead"; session = "s1";
+	await pi.emit(event, { reason: "resume" }, ctx);
+	await b.toolsActive;
+	expect(pi.active()).toEqual(["read", "bash", "cataly_lead"]);
+	expect(b.pin).toBeUndefined();
+	expect(pi.tools.filter(t => t.name === "cataly_lead").length).toBe(1);
+	role = "none"; session = "unrelated";
+	await pi.emit(event, { reason: "resume" }, ctx);
+	await b.toolsActive;
+	expect(pi.active()).toEqual(["read", "bash"]);
+	expect([b.role, b.key, b.guidance, b.shell, b.wire]).toEqual(["none", undefined, "", false, undefined]);
+	expect(closed).toBe(1);
+	expect(retries).toBe(0);
+	expect(await pi.emit("before_agent_start", { systemPrompt: ["BASE"] }, ctx)).toBeUndefined();
+	await expect(leadTool.execute("after-none", {}, undefined, undefined, ctx)).rejects.toThrow("not available");
+});
+
 test("events are buffered while disconnected, oldest dropped first", () => {
 	const pi = fakePi();
 	const b = bridge(pi, { env: {}, connect: fakeHub("lead", [], { n: 0 }), uid: () => 1 });

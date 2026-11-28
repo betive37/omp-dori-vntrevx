@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Resuming another session in a Tern lead could keep the lead's tools. The bridge now checks the
+  destination's lead or lane identity again, removes tools for unrelated sessions, and keeps the
+  previous role only for an explicit new-session command.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

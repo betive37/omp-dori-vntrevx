@@ -130,6 +130,41 @@ async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String
     Err("not a session of this hub".into())
 }
 
+/// A switch without `reason: new` carries no authority from the previous conversation (EXT req. 8).
+/// Match both the ID and transcript before forwarding the transition to the terminal port.
+async fn switched(hub: &Hub, params: &Value) -> Option<(String, Role)> {
+    let session = params.get("session")?.as_str()?.to_string();
+    let file = params.get("file")?.as_str()?.to_string();
+    if session.is_empty() || file.is_empty() {
+        return None;
+    }
+    hub.store
+        .read(move |r| {
+            if let Some(row) = r.lead_target(None)?.row
+                && row.session_id.as_deref() == Some(session.as_str())
+                && row.session_file.as_deref() == Some(file.as_str())
+            {
+                return Ok(Some((row.handle, Role::Lead)));
+            }
+            for row in r.lanes(true)? {
+                let Ok(rec) = serde_json::from_str::<crate::lanes::record::Record>(&row.record)
+                else {
+                    continue;
+                };
+                if rec.session_id.as_deref() == Some(session.as_str())
+                    && rec.session_file.as_deref() == Some(file.as_str())
+                    && let Some(handle) = rec.handle
+                {
+                    return Ok(Some((handle, Role::Lane)));
+                }
+            }
+            Ok(None)
+        })
+        .await
+        .ok()
+        .flatten()
+}
+
 /// The root session a subagent's `parent` names: a session ID as sent, or (from a worker in its own
 /// realm) its header's parent file, whose stamped file or artifact directory carries the ID; OMP keeps
 /// nested subagent files below that directory.
@@ -247,7 +282,7 @@ pub(crate) async fn serve<R, W>(
         },
         Err(e) => Err(e),
     };
-    let (handle, role, fresh, port) = match decided {
+    let (mut handle, mut role, fresh, mut port) = match decided {
         Ok(found) => found,
         Err(reason) => return refuse(hub, &mut writer, id, hello.ext != PROTOCOL, reason).await,
     };
@@ -266,7 +301,7 @@ pub(crate) async fn serve<R, W>(
     if !sub {
         hub.links.connect(&handle, role, &key, &hello.session);
     }
-    let role_name = if role == Role::Lane { "lane" } else { "lead" };
+    let mut active = true;
     let notes = crate::jobs::notes::Notes::new(&hub.paths.state_dir).exists();
     let mut answer = welcome(&key, sub, lane_pin.as_ref(), notes);
     if let (Some(_), Some(map)) = (&port, answer.as_object_mut()) {
@@ -300,6 +335,13 @@ pub(crate) async fn serve<R, W>(
         let Ok(request) = crate::proto::decode(&line) else {
             continue;
         };
+        if !active {
+            let reply = Response::err(request.id, code::BAD_REQUEST, "this session has no role");
+            if tx.send(reply).await.is_err() {
+                break;
+            }
+            continue;
+        }
         let form = terminal(port.as_ref(), &request);
         let method = request.method.clone();
         match method.as_str() {
@@ -337,14 +379,65 @@ pub(crate) async fn serve<R, W>(
                 let _ = tx.send(Response::ok(request.id, reply)).await;
             }
             "bridge.switch" => {
-                let switched = request.params.get("session").and_then(Value::as_str);
-                hub.links.observe(&handle, 0, switched, 0);
-                if let Some(s) = switched {
-                    session = s.to_string();
-                }
-                let _ = tx
-                    .send(Response::ok(request.id, json!({ "role": role_name })))
-                    .await;
+                let current = request
+                    .params
+                    .get("session")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let next = if current.is_empty() {
+                    None
+                } else if request.params.get("reason").and_then(Value::as_str) == Some("new") {
+                    Some((handle.clone(), role))
+                } else {
+                    switched(hub, &request.params).await
+                };
+                let next = match next {
+                    Some((h, r)) if placed(hub, &h, r, worker).await.is_ok() => {
+                        let pin = if r == Role::Lane {
+                            hub.lanes.hello(&h).await
+                        } else {
+                            None
+                        };
+                        (r != Role::Lane || pin.is_some()).then_some((h, r, pin))
+                    }
+                    _ => None,
+                };
+                let answer = if let Some((next_handle, next_role, pin)) = next {
+                    if next_handle != handle {
+                        hub.links.revoke(&handle, &key);
+                        if let Some(old) = port.take() {
+                            old.detach(&key);
+                        }
+                        handle = next_handle;
+                        role = next_role;
+                        if !sub {
+                            hub.links.connect(&handle, role, &key, current);
+                            let mut hello = raw.clone();
+                            if let Some(map) = hello.as_object_mut() {
+                                map.insert("session".into(), json!(current));
+                            }
+                            hub.links.open_query(&handle, &key, &hello, tx.clone());
+                        }
+                    }
+                    current.clone_into(&mut session);
+                    hub.links.observe(&handle, 0, Some(&session), 0);
+                    if let Some(port) = &port {
+                        port.event(&request.params);
+                    }
+                    let mut answer = welcome(&key, sub, pin.as_ref(), notes);
+                    if let Some(map) = answer.as_object_mut() {
+                        map.insert("tern".into(), json!(port.is_some()));
+                    }
+                    answer
+                } else {
+                    active = false;
+                    hub.links.revoke(&handle, &key);
+                    if let Some(old) = port.take() {
+                        old.detach(&key);
+                    }
+                    json!({ "role": "none" })
+                };
+                let _ = tx.send(Response::ok(request.id, answer)).await;
             }
             "bridge.shell" | "bridge.model" | "bridge.tool" | "bridge.stop" => {
                 answer_later(hub, &tx, (role, sub), (&handle, &session), request);
@@ -386,7 +479,7 @@ async fn refuse<W: AsyncWrite + Unpin>(
 }
 
 /// The terminal runtime's part of a bridge line (DESIGN 4.3): every line keeps the link alive,
-/// events and switches move the session, replies answer its commands, and a form is offered for
+/// events move the session (switches wait for the role decision), replies answer its commands, and a form is offered for
 /// mirroring; returns the form's answer.
 fn terminal(
     port: Option<&Arc<crate::host::tern::Port>>,
@@ -395,7 +488,7 @@ fn terminal(
     let port = port?;
     port.heard();
     match request.method.as_str() {
-        "bridge.event" | "bridge.switch" => port.event(&request.params),
+        "bridge.event" => port.event(&request.params),
         "bridge.reply" => port.reply(&request.params),
         "bridge.form" => return Some(port.form(&request.params)),
         _ => {}

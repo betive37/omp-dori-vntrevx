@@ -167,6 +167,7 @@ export class Bridge {
 	forms = new Map<string, (answer: unknown) => void>();
 	token: string | undefined; parent = "";
 	private reportedCapabilities: string | undefined;
+	private registered = new Set<string>();
 
 	constructor(readonly pi: Pi, readonly deps: Deps) {
 		this.token = deps.env.CATALY_LAUNCH || undefined;
@@ -179,11 +180,11 @@ export class Bridge {
 		const sub = ctx?.agent?.kind === "sub";
 		if (sub && (this.wired || this.parent)) return;
 		const id = String(ctx.sessionManager?.getSessionId?.() ?? "");
-		if (this.wired) {
+		if (this.wired && this.role !== "none") {
 			this.ctx = ctx;
 			this.changing = 0;
 			if (id !== this.session) {
-				this.calls.clear();
+				this.calls.clear(); this.fallbackTo = ""; this.lastAnswer = false;
 				this.session = id;
 				owners.set(String(ctx.agent?.id), id);
 				const answer = await this.request("bridge.switch", { session: id, file: this.file(), ...transition }, TOOL_MS);
@@ -231,14 +232,13 @@ export class Bridge {
 		if (!answer) return this.wire?.close();
 		if (answer.role !== "lead" && answer.role !== "lane") {
 			// Role none: inert for this session (EXT req. 4).
-			[this.role, this.key] = ["none", undefined];
-			return void (this.wire?.close(), (this.wire = undefined));
+			return this.apply({ ...answer, role: "none" });
 		}
 		[this.attempt, this.key] = [0, String(answer.key ?? "")];
 		owners.set(String(this.ctx.agent?.id), this.parent || this.session);
 		this.tern ||= answer.tern === true;
 		this.apply(answer);
-		if (!this.wired) this.wire_up(answer);
+		if (!this.wired) this.wire_up();
 		else this.resend();
 		this.reportedCapabilities = undefined; // A new connection needs its own snapshot, including after a hub restart.
 		this.capabilities();
@@ -249,9 +249,19 @@ export class Bridge {
 	apply(answer: Json | undefined): void {
 		if (!answer) return;
 		this.role = String(answer.role ?? this.role);
+		if (typeof answer.key === "string") this.key = answer.key;
 		if (typeof answer.guidance === "string") this.guidance = answer.guidance;
-		if (typeof answer.pin === "string") this.pin = answer.pin;
+		if ("pin" in answer || this.role !== "lane") this.pin = typeof answer.pin === "string" ? answer.pin : undefined;
 		if (answer.shell !== undefined) this.shell = Boolean(answer.shell);
+		if (typeof answer.tern === "boolean") this.tern = answer.tern;
+		if (Array.isArray(answer.tools) || this.role === "none") this.set_tools(answer);
+		if (this.role === "none") {
+			[this.key, this.guidance, this.pin, this.shell, this.tern] = [undefined, "", undefined, false, false];
+			owners.delete(String(this.ctx?.agent?.id));
+			this.queue = []; this.queued = 0; this.dropped = 0;
+			this.wire?.close(); this.wire = undefined;
+			this.status(undefined);
+		}
 		if (this.role !== "none" && !this.parent && this.ctx && !marked(this.ctx))
 			safe(() => this.pi.appendEntry(MARKER, { v: PROTOCOL }));
 	}
@@ -281,7 +291,7 @@ export class Bridge {
 		this.wire = undefined;
 		for (const resolve of this.pending.values()) resolve(undefined);
 		this.pending.clear();
-		if (this.wired && !this.shutting) this.retry();
+		if (this.wired && this.role !== "none" && !this.shutting) this.retry();
 	}
 
 	receive(line: string): void {
@@ -363,15 +373,15 @@ export class Bridge {
 		if (heartbeat) this.send("bridge.ping", {});
 	}
 
-	/** After the first acceptance: handlers, tools and the heartbeat (EXT req. 4, 15, 17). Hub commands wait for the tools'
-	 * activation: OMP's goal mode reads the enabled tools, awaits, then sets them, so it would drop a pending bridge tool. */
-	wire_up(answer: Json): void {
-		this.wired = true;
+	/** Reapply role visibility on every welcome or switch (EXT req. 17); register each tool only once. */
+	set_tools(answer: Json): void {
 		const pi = this.pi;
-		const tools = Array.isArray(answer.tools) ? (answer.tools as Json[]) : [];
+		const tools = this.role !== "none" && Array.isArray(answer.tools) ? (answer.tools as Json[]) : [];
 		const names = tools.map(def => String(def.name ?? "")).filter(Boolean);
 		for (const def of tools.filter(def => def.name)) {
 			const name = String(def.name);
+			if (this.registered.has(name)) continue;
+			this.registered.add(name);
 			// The hub sets each tool's answer deadline (a lane report reads evidence files).
 			const ms = Number(def.timeout_ms) || TOOL_MS;
 			const parameters = (def.parameters ?? { type: "object" }) as ToolDefinition["parameters"];
@@ -382,7 +392,13 @@ export class Bridge {
 			const execute: ToolDefinition["execute"] = (callId, params, _s, _u, ctx) => this.tool(name, ms, callId, params as Json, ctx);
 			pi.registerTool({ name, label, description, parameters, approval, loadMode: "essential", execute });
 		}
-		this.toolsActive = Promise.resolve(safe(() => pi.setActiveTools?.([...(pi.getActiveTools?.() ?? []).filter((n: string) => !names.includes(n)), ...names]))).catch(() => undefined);
+		this.toolsActive = this.toolsActive.then(() => safe(() => pi.setActiveTools?.([...(pi.getActiveTools?.() ?? []).filter((n: string) => n !== "cataly_lead" && n !== "cataly_lane"), ...names]))).catch(() => undefined);
+	}
+
+	/** Install handlers once; commands wait for role-tool activation so goal mode cannot drop a pending tool. */
+	wire_up(): void {
+		this.wired = true;
+		const pi = this.pi;
 		this.timer(() => this.capabilities(true), HEARTBEAT_MS, true);
 		pi.on("before_agent_start", async (e, ctx) => (await this.barrier(ctx), this.guide(e, ctx)));
 		// Lane and terminal hooks, added only once the hub said they apply (EXT req. 1, 32, 34, 38, 42).
@@ -390,7 +406,7 @@ export class Bridge {
 			pi.on("tool_call", (e, ctx) => (this.tern && e.toolName === "ask" ? this.form(e, ctx) : this.shell ? this.veto(e, ctx) : undefined));
 		const guard = (_e: unknown, ctx: Ctx) => this.guard(ctx);
 		if (this.tern) [pi.on("session_before_switch", guard), pi.on("session_before_branch", guard), pi.on("session_before_tree", guard)];
-		if (this.pin) pi.on("retry_fallback_applied", e => void (this.fallbackTo = e.to));
+		pi.on("retry_fallback_applied", e => void (this.fallbackTo = e.to));
 		pi.on("session_stop", (_e, ctx) => this.stop(ctx));
 		pi.on("session_shutdown", (_e, ctx) => this.shutdown(ctx));
 		pi.on("session_branch", (e, ctx) => this.transition("session_branch", e.reason, ctx));
@@ -416,11 +432,12 @@ export class Bridge {
 		return this.role !== "none" && ctx?.agent?.kind !== "sub";
 	}
 
-	transition(kind: string, reason: string | undefined, ctx: Ctx): void {
+	async transition(kind: string, reason: string | undefined, ctx: Ctx): Promise<void> {
+		if (!this.main(ctx)) return;
+		await this.consider(ctx, { reason: kind });
 		if (!this.main(ctx)) return;
 		this.changing = 0;
 		this.calls.clear();
-		this.session = String(ctx.sessionManager?.getSessionId?.() ?? this.session);
 		this.event(kind, { file: this.file(), reason });
 		this.capabilities();
 	}
@@ -436,9 +453,7 @@ export class Bridge {
 		const mark = (this.changing = Date.now());
 		this.timer(() => {
 			if (this.changing !== mark) return;
-			this.changing = 0;
-			this.session = String(ctx?.sessionManager?.getSessionId?.() ?? this.session);
-			this.event("session_current", { file: this.file() });
+			void this.transition("session_current", undefined, ctx);
 		}, CHANGE_MS, false);
 	}
 
@@ -599,7 +614,7 @@ export class Bridge {
 
 	/** Forwards one tool call with its recorded call facts (EXT req. 18, 21-22); the hub judges them. */
 	async tool(name: string, ms: number, callId: string, params: Json, ctx: Ctx): Promise<AgentToolResult> {
-		if (!this.main(ctx)) throw new Error(`${name} is not available in this session.`);
+		if (!this.main(ctx) || name !== `cataly_${this.role}`) throw new Error(`${name} is not available in this session.`);
 		const facts = Array.isArray(params?.calls) ? params.calls.slice(0, 64).map(raw => {
 			const call = this.calls.get(String(raw));
 			return call ? { call: String(raw), seen: true, ...call, ambiguous: call.starts > 1 } : { call: String(raw), seen: false };

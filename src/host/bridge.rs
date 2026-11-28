@@ -237,6 +237,23 @@ impl Links {
         }
     }
 
+    /// A session switch leaves this identity: its key must not restore the old role on reconnect.
+    pub(crate) fn revoke(&self, handle: &str, key: &str) {
+        let mut inner = self.lock();
+        inner.capabilities.remove(key);
+        if inner.links.get(handle).is_some_and(|link| link.key == key) {
+            inner.links.remove(handle);
+        }
+        if inner
+            .queries
+            .get(handle)
+            .is_some_and(|query| query.key == key)
+        {
+            inner.queries.remove(handle);
+            inner.asked.retain(|_, (h, _)| h != handle);
+        }
+    }
+
     /// Notes an event: its number, a new session ID, events the bridge had to drop.
     pub(crate) fn observe(&self, handle: &str, seq: u64, session: Option<&str>, dropped: u64) {
         let mut inner = self.lock();
