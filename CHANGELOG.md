@@ -95,6 +95,11 @@
 - A `lane.review` call from the lead no longer times out after 5 s while the review still runs,
   telling the model that nothing was recorded and a retry is safe (a retry ran a second paid
   review). The hub now serves a per-operation wait, and the bridge waits about 40 minutes for a review.
+- A work item that had run once and was added again never started: the planner opened the old
+  lane key, every open was refused, and after two tries the item became a question. Each start
+  now opens a lane under a fresh key (`<id>-2`, `<id>-3`, ...) and the item remembers it; an item
+  added again waits while its earlier lane is still open. Failed starts also remember the attempted
+  key, so a retained lane blocks another start; a rolled-back allocation frees its key for a retry.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
