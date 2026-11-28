@@ -1,11 +1,27 @@
 # Changelog
 
-## Unreleased
+## 0.2.9 (Unreleased)
 
 - The board post cleans each lane's latest report as a thread post is cleaned, as EVR req. 51
   says: the home directory shows as `~`, other local paths as `[path removed]`, and links lose
   their query. It only flattened the text, so paths and URL queries (tokens among them) from a
   report reached every board destination as written.
+- A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
+  "ambiguous lead binding history" does) could be held again by the first message that woke it,
+  "300 s recovery episode has no startup and cleanup budget remaining", with nothing attempted:
+  the wake reused the recovery episode an earlier start had left open. An automatic start, wake or
+  restart now continues an episode only while its 300 s window is open; one that ended or expired
+  begins a fresh episode, so the lead resumes its conversation and the message is delivered. A held
+  or cancelled episode still holds until the owner acts, and the cap within a live episode is
+  unchanged. Lanes follow the same rule; a reopen that comes up fenced for its model now ends its
+  episode, so a later exit gets a fresh retry window. No migration: a store with such an open or
+  ended episode recovers on its next wake; a lead already held by this message needs one
+  `cataly lead start`, as the hold says.
+- The lead's hold texts (the hold notice, the update result, `cataly lead status`, `cataly health`)
+  no longer quote internal reasons such as "recovery is held (300 s recovery episode has no
+  startup and cleanup budget remaining); explicit owner retry required". Each hold reason is told
+  as a short sentence in `[hub] language`, Korean or English, saying what happened and what to do;
+  the raw reason stays in the log and `cataly lead status --json`.
 
 ## 0.2.8 (2026-11-28)
 
