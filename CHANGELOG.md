@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Discord: a form with an optional radio group or select left unanswered was refused, its card
+  closed and posted again, so the choice had to be made. The unselected field is now left out of
+  the answer, as OMP does, and the form is submitted.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
