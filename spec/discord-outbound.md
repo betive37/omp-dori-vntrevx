@@ -123,6 +123,9 @@ Totals: KEEP 12, SIMPLIFY 8, MERGE 4, DROP 4.
     later turns not stored yet in the transcript again.
 22. If, before that turn ends, another user input or request enters the same transcript, the pending
     reply is abandoned (the answer would belong to mixed work) and the obligation stays open.
+    While the session works, a pending reply waits however long the turn runs, also when the
+    request is still queued behind it. Only once the session is idle (or its turn ended) is a
+    pending reply with no answer, handed off more than 30 minutes ago, abandoned the same way.
 23. The daemon reads the answer from OMP's public surfaces (rpc-ui events or the session file) and
     confirms it is persisted in the transcript before posting. It never posts text it only saw in a
     transient event.

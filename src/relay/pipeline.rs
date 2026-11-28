@@ -1148,7 +1148,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                 let later_reply = later.as_ref().and_then(|_| replies.pop());
                 for (h, reply) in waiting.iter().zip(replies) {
-                    self.settle_reply(h, reply).await?;
+                    self.settle_reply(h, reply, settled).await?;
                 }
                 if let (Some(h), Some(reply)) = (later, later_reply) {
                     self.later_turns(&h, reply).await?;
@@ -1182,7 +1182,17 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
-    async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
+    /// Stores what one read found for `h`. `settled` is true when the lead's turn is over (idle or
+    /// `turn_over`): only then does a request with no answer stop waiting once it is older than the
+    /// owed window. While the lead works, an unfinished turn (`Pending`) and a request still queued
+    /// behind it (`NotFound`) keep waiting however long the turn runs; the next input entering the
+    /// transcript ends the wait instead (DISC-OUT req. 21-22).
+    async fn settle_reply(
+        &self,
+        h: &HandoffRow,
+        reply: Reply,
+        settled: bool,
+    ) -> Result<(), String> {
         let answer = |answer: &str| RelayWrite::Answer {
             relay: R::NAME.into(),
             room: h.room.clone(),
@@ -1227,8 +1237,11 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            // Once the lead is settled, `Pending` is a turn that ended without an answer and
+            // `NotFound` a request that never reached this transcript (another session file, or
+            // outside the part read): past the owed window, neither waits on work still running.
             Reply::NotFound | Reply::Pending => {
-                if now_ms() - h.created_ms > OWED_WINDOW_MS {
+                if settled && now_ms() - h.created_ms > OWED_WINDOW_MS {
                     self.store
                         .relay(answer("abandoned"))
                         .await

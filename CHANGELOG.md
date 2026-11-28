@@ -1,5 +1,14 @@
 # Changelog
 
+## Unreleased
+
+- The lead's answer is no longer lost when its turn runs past 30 minutes. A turn that ran longer
+  (subagents, long tool calls), or a message of yours waiting behind such a turn, was given up 30
+  minutes after it arrived, and the answer that came later was never posted. While the lead works,
+  the message now waits for its answer however long the turn runs; the next message that reaches
+  the lead still ends the wait, and the 30-minute limit applies only once the lead is idle with no
+  answer. Discord, Telegram and Slack alike.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes

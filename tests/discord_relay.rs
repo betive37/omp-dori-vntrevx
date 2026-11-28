@@ -257,6 +257,89 @@ fn busy_lead_answers_in_order() {
     assert!(hub.stop().success());
 }
 
+/// Discord hand-offs in the hub's store.
+fn handoffs(hub: &TestHub) -> i64 {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT COUNT(*) FROM handoffs WHERE relay = 'discord'",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+/// A request whose turn outlasts the 30 min owed window, and a request queued behind that turn,
+/// keep waiting while the lead works; each answer is posted once its turn ends (DISC-OUT req.
+/// 21-22). The hand-offs are aged in the store rather than waited out.
+#[test]
+fn answers_wait_for_a_turn_longer_than_the_owed_window() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    hub.fixture("omp", "hold", Some("the long job"));
+    hub.fixture("omp", "hold-busy", Some(""));
+    hub.start();
+    ready(&hub);
+    let (long, queued) = ("800000000000000021", "800000000000000022");
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_021,
+        OWNER,
+        "the long job",
+    ));
+    // Its turn runs: the request is in the transcript with no answer yet (Pending).
+    let tag = format!("[discord {CH}/{long}]");
+    hub.until(WAIT, || {
+        requests(&hub)
+            .iter()
+            .any(|r| r.contains(&tag))
+            .then_some(())
+    });
+    fake.say(FakeDiscord::message(
+        CH,
+        800_000_000_000_000_022,
+        OWNER,
+        "then this",
+    ));
+    // Handed to the lead, it waits behind the turn, not in the transcript yet (NotFound).
+    hub.until(WAIT, || (handoffs(&hub) == 2).then_some(()));
+    assert_eq!(requests(&hub).len(), 1);
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    // The hub's writer does not wait for the lock: hold it as briefly as possible.
+    db.execute_batch("PRAGMA synchronous=OFF").unwrap();
+    let aged = db
+        .execute(
+            "UPDATE handoffs SET created_ms = created_ms - 31 * 60 * 1000 WHERE relay = 'discord'",
+            [],
+        )
+        .unwrap();
+    assert_eq!(aged, 2);
+    drop(db);
+    // Typing renews every 8 s while a request waits and the turn runs: the second renewal comes
+    // from a round that began after the hand-offs aged.
+    let typing = format!("/channels/{CH}/typing");
+    let typed = fake.calls("POST", &typing).len();
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &typing).len() >= typed + 2).then_some(())
+    });
+    assert_eq!(answer_state(&hub, long), "waiting");
+    assert_eq!(answer_state(&hub, queued), "waiting");
+    assert_eq!(requests(&hub).len(), 1);
+    hub.fixture("omp", "release", Some(""));
+    let creates = fake.wait_creates(2, WAIT);
+    assert_eq!(reference(&creates[0]).as_deref(), Some(long));
+    assert_eq!(reference(&creates[1]).as_deref(), Some(queued));
+    hub.until(WAIT, || {
+        (answer_state(&hub, long) == "posted" && answer_state(&hub, queued) == "posted")
+            .then_some(())
+    });
+    assert!(hub.stop().success());
+}
+
 /// Sends an owner message from which the owner has already started a thread (the thread takes the
 /// message's ID); `THREAD_CREATE` goes first, so intake follows the thread before the request.
 fn ask_with_thread(fake: &FakeDiscord, message: u64, text: &str) -> String {
