@@ -5,7 +5,9 @@
 - Discord could skip an owner's message after a restart, reconnect or arrival-queue overflow when
   a newer message from someone else or a bot arrived during catch-up. Live ignored messages now
   leave that room's read position alone from the moment catch-up is owed until its history has been
-  read, including while a failed thread listing is retried.
+  read, including while a failed thread listing is retried. History stops at a full queue and
+  retries with backoff; an overflow during another room's read cannot erase the pending recovery,
+  even if the affected thread disappears from the active-thread listing.
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
   "300 s recovery episode has no startup and cleanup budget remaining", with nothing attempted:

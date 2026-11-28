@@ -140,6 +140,11 @@ operator who configures the daemon (in practice the same person).
     queued, a catch-up read is marked owed (req. 23), and that read recovers the message. The
     rejected message's conversation immediately stops advancing past live non-owner messages
     (req. 29), including while thread discovery fails before the catch-up history read begins.
+    If history itself meets a full queue, that conversation stops before passing later messages.
+    The read remains owed and retries with backoff until capacity returns. A new overflow during
+    a catch-up pass renews that conversation's pending read, even if it was already read in the
+    pass. A pending thread is still read if it disappears from the active listing while its
+    parent remains watched; leaving the configured scope or losing read access ends that read.
 25. The queue is keyed by (channel ID, message ID). A second copy of the same key is ignored;
     the first copy wins, including its queue position. A later copy with different content is
     logged once and otherwise ignored; it never halts intake.

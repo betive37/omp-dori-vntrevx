@@ -1494,6 +1494,213 @@ fn queue_overflow_fences_live_passes_until_catch_up_recovers() {
     assert!(hub.stop().success());
 }
 
+const CATCH_UP_THREAD: &str = "700000000000000201";
+const CAPACITY_ROOM: &str = "700000000000000202";
+const CATCH_UP_POSITION: u64 = 800_000_000_000_000_100;
+
+fn overflow_catch_up_hub() -> (FakeDiscord, TestHub, rusqlite::Connection) {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    fake.thread(CATCH_UP_THREAD, CH);
+    fake.thread(CAPACITY_ROOM, CH);
+    for room in [CH, CATCH_UP_THREAD] {
+        fake.put(FakeDiscord::message(
+            room,
+            CATCH_UP_POSITION,
+            OTHER,
+            "already read",
+        ));
+    }
+    hub.start();
+    ready(&hub);
+    recap_delivered(&hub);
+    let db = full_arrival_queue(&hub, CAPACITY_ROOM, CATCH_UP_POSITION + 100);
+    (fake, hub, db)
+}
+
+fn release_full_queue(db: &rusqlite::Connection) {
+    db.execute(
+        "DELETE FROM arrival_queue WHERE relay = 'discord' AND room = ?1",
+        [CAPACITY_ROOM],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE positions SET held = NULL WHERE relay = 'discord' AND room = ?1",
+        [CAPACITY_ROOM],
+    )
+    .unwrap();
+}
+
+fn catch_up_owed(db: &rusqlite::Connection) -> bool {
+    db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM relay_flags WHERE relay = 'discord' AND flag = 'catch_up')",
+        [],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
+fn catch_up_drained(hub: &TestHub, db: &rusqlite::Connection) {
+    hub.until(WAIT, || {
+        let empty: bool = db
+            .query_row(
+                "SELECT NOT EXISTS (SELECT 1 FROM arrival_queue WHERE relay = 'discord')",
+                [],
+                |r| r.get(0),
+            )
+            .unwrap();
+        (empty && !catch_up_owed(db)).then_some(())
+    });
+}
+
+fn overflow_gateway_barrier(hub: &TestHub, fake: &FakeDiscord, db: &rusqlite::Connection) {
+    let barrier = "700000000000000203";
+    fake.gw(Gw::Dispatch(
+        "THREAD_CREATE",
+        json!({"id": barrier, "parent_id": CH}),
+    ));
+    hub.until(WAIT, || {
+        db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM positions WHERE relay = 'discord' AND room = ?1)",
+            [barrier],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+        .then_some(())
+    });
+}
+
+/// A full REST admission must stop before later passes, preserve the owed read, and recover a
+/// pending thread even when the next active-thread listing omits it.
+#[test]
+fn queue_overflow_during_history_keeps_catch_up_owed() {
+    let (fake, mut hub, db) = overflow_catch_up_hub();
+    let rooms = [CH, CATCH_UP_THREAD];
+    let paths = rooms.map(|room| format!("/channels/{room}/messages"));
+    let reads = paths.each_ref().map(|path| fake.calls("GET", path).len());
+    for (i, room) in rooms.iter().enumerate() {
+        let id = CATCH_UP_POSITION + 1 + u64::try_from(i).unwrap() * 2;
+        fake.put(FakeDiscord::message(
+            room,
+            id,
+            OWNER,
+            "recover from full history",
+        ));
+        fake.put(FakeDiscord::message(room, id + 1, OTHER, "later non-owner"));
+    }
+    let mut releases = rooms.map(|room| Some(fake.hold_history(room)));
+    fake.gw(Gw::Op7);
+    // Room iteration is intentionally unordered: gate whichever REST read starts first.
+    let first = fake.wait(WAIT, |f| {
+        (0..2).find(|&i| f.calls("GET", &paths[i]).len() > reads[i])
+    });
+    let second = 1 - first;
+    releases[first].take().unwrap().send(()).unwrap();
+    fake.wait(WAIT, |f| {
+        (f.calls("GET", &paths[second]).len() > reads[second]).then_some(())
+    });
+    let position: i64 = db
+        .query_row(
+            "SELECT position FROM positions WHERE relay = 'discord' AND room = ?1",
+            [rooms[first]],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        position,
+        i64::try_from(CATCH_UP_POSITION).unwrap(),
+        "REST passed an owner rejected by the full queue"
+    );
+    releases[second].take().unwrap().send(()).unwrap();
+    hub.until(WAIT, || {
+        (status(&hub)["health"]["last_error"] == "catch-up read: catch-up remains owed")
+            .then_some(())
+    });
+    assert!(catch_up_owed(&db));
+    assert_eq!(requests(&hub), Vec::<String>::new());
+    fake.hide_thread(CATCH_UP_THREAD);
+    release_full_queue(&db);
+    catch_up_drained(&hub, &db);
+    let asked = requests(&hub);
+    assert_eq!(
+        asked.len(),
+        2,
+        "both rejected owners must be recovered: {asked:?}"
+    );
+    for id in [CATCH_UP_POSITION + 1, CATCH_UP_POSITION + 3] {
+        let id = id.to_string();
+        assert_eq!(asked.iter().filter(|r| r.contains(&id)).count(), 1);
+    }
+    fake.wait_creates(2, WAIT);
+    assert!(hub.stop().success());
+}
+
+/// A live Full renews a fence both during that room's read and after it, while a second room's
+/// response is held. The pass must retry rather than clear the new recovery request.
+#[test]
+fn queue_overflow_during_multi_room_catch_up_is_retried() {
+    for during_read in [false, true] {
+        let (fake, mut hub, db) = overflow_catch_up_hub();
+        let rooms = [CH, CATCH_UP_THREAD];
+        let paths = rooms.map(|room| format!("/channels/{room}/messages"));
+        let reads = paths.each_ref().map(|path| fake.calls("GET", path).len());
+        let mut releases = rooms.map(|room| Some(fake.hold_history(room)));
+        fake.gw(Gw::Op7);
+        let first = fake.wait(WAIT, |f| {
+            (0..2).find(|&i| f.calls("GET", &paths[i]).len() > reads[i])
+        });
+        let second = 1 - first;
+        if !during_read {
+            releases[first].take().unwrap().send(()).unwrap();
+            fake.wait(WAIT, |f| {
+                (f.calls("GET", &paths[second]).len() > reads[second]).then_some(())
+            });
+        }
+        fake.say(FakeDiscord::message(
+            rooms[first],
+            CATCH_UP_POSITION + 1,
+            OWNER,
+            "overflow after history snapshot",
+        ));
+        fake.say(FakeDiscord::message(
+            rooms[first],
+            CATCH_UP_POSITION + 2,
+            OTHER,
+            "live pass behind overflow",
+        ));
+        overflow_gateway_barrier(&hub, &fake, &db);
+        assert_eq!(queued(&hub, CATCH_UP_POSITION + 1), 0);
+        let retry = fake.hold_history(rooms[first]);
+        if during_read {
+            releases[first].take().unwrap().send(()).unwrap();
+            fake.wait(WAIT, |f| {
+                (f.calls("GET", &paths[second]).len() > reads[second]).then_some(())
+            });
+        }
+        releases[second].take().unwrap().send(()).unwrap();
+        let retried = hub.until(WAIT, || {
+            if catch_up_owed(&db) {
+                (fake.calls("GET", &paths[first]).len() > reads[first] + 1).then_some(true)
+            } else {
+                Some(false)
+            }
+        });
+        assert!(
+            retried,
+            "catch-up erased the renewed fence: during_read={during_read}"
+        );
+        release_full_queue(&db);
+        retry.send(()).unwrap();
+        catch_up_drained(&hub, &db);
+        let asked = requests(&hub);
+        assert_eq!(asked.len(), 1, "during_read={during_read}: {asked:?}");
+        assert!(asked[0].contains("overflow after history snapshot"));
+        fake.wait_creates(1, WAIT);
+        settled(&hub);
+        assert!(hub.stop().success());
+    }
+}
+
 /// Check 5: a resume URL that is not the test Gateway's is refused and the session identifies again.
 #[test]
 fn bad_resume_url_identifies_again() {

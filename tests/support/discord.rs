@@ -302,6 +302,11 @@ impl FakeDiscord {
             "guild_id": GUILD, "thread_metadata": {"archived": false}}));
     }
 
+    /// Removes a thread from discovery without removing its readable channel or history.
+    pub fn hide_thread(&self, id: &str) {
+        self.state.lock().unwrap().threads.retain(|t| t["id"] != id);
+    }
+
     /// Starts a thread from a message as the Discord client does: the thread takes the message's
     /// ID, the message names it in `thread`, the active listing has it and `THREAD_CREATE` is sent.
     pub fn start_thread(&self, channel: &str, message: &str, by: &str) {
