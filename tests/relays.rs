@@ -363,6 +363,97 @@ fn slack_threads_allowlist_acks_and_uploads() {
     assert!(hub.stop().success());
 }
 
+/// Uses a later policy-dropped envelope as a socket barrier: once it is acknowledged, an earlier
+/// failed admission must already have finished. No negative assertion depends on a sleep.
+fn slack_retries_unadmitted(setup: &str, recover: &str) {
+    let slack = FakeSlack::start();
+    let mut hub = relay_hub(None, Some(&slack), "");
+    hub.start();
+    ready(&hub, &["slack"]);
+    assert!(hub.stop().success());
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.execute_batch(setup).unwrap();
+    drop(db);
+    hub.start();
+    // A queued fixture intentionally makes `healthy` false; wait for the live socket instead.
+    hub.until(WAIT, || {
+        let slack = status(&hub, "slack");
+        let lead = hub.json(&["lead", "status", "--json"]);
+        (slack["health"]["state"] == "connected"
+            && slack["health"]["caught_up"] == true
+            && lead["phase"] == "live")
+            .then_some(())
+    });
+
+    // A top-level channel mention has no remembered thread or DM history to recover it.
+    let ts = slack.ts();
+    let event = json!({"type": "message", "channel": GEN, "channel_type": "channel",
+        "user": fake_slack::OWNER, "text": format!("<@{}> keep this request", fake_slack::ACCOUNT),
+        "ts": ts});
+    let failed = slack.push(event.clone());
+    let dropped = slack.push(json!({"type": "reaction_added"}));
+    let acks = slack.wait(WAIT, |f| {
+        let acks = f.acks();
+        acks.iter().any(|(id, _)| id == &dropped).then_some(acks)
+    });
+    assert!(
+        !acks.iter().any(|(id, _)| id == &failed),
+        "unadmitted envelope {failed} was acknowledged: {acks:?}"
+    );
+    assert_eq!(
+        requests(&hub, &format!("[slack {GEN}/{ts}]")),
+        Vec::<String>::new()
+    );
+
+    assert!(hub.stop().success());
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.execute_batch(recover).unwrap();
+    drop(db);
+    hub.start();
+    ready(&hub, &["slack"]);
+
+    // Slack can redeliver the same message after recovery; a subsequent duplicate is safe to ack.
+    let retried = slack.push(event.clone());
+    slack.wait(WAIT, |f| {
+        f.acks().iter().any(|(id, _)| id == &retried).then_some(())
+    });
+    slack.wait(WAIT, |f| slack_posts_in(f, GEN, &ts).pop());
+    let duplicate = slack.push(event);
+    slack.wait(WAIT, |f| {
+        f.acks()
+            .iter()
+            .any(|(id, _)| id == &duplicate)
+            .then_some(())
+    });
+    assert_eq!(requests(&hub, &format!("[slack {GEN}/{ts}]")).len(), 1);
+    assert!(hub.stop().success());
+}
+
+#[test]
+fn slack_does_not_ack_a_failed_arrival_write() {
+    slack_retries_unadmitted(
+        "CREATE TRIGGER fail_slack_arrival BEFORE INSERT ON arrival_queue \
+         WHEN NEW.relay = 'slack' AND NEW.room = 'C0GEN' \
+         BEGIN SELECT RAISE(FAIL, 'test admission failure'); END;",
+        "DROP TRIGGER fail_slack_arrival;",
+    );
+}
+
+#[test]
+fn slack_does_not_ack_a_full_arrival_queue() {
+    slack_retries_unadmitted(
+        // The byte count fills the queue without allocating 256 MiB. A held room keeps the
+        // fixture queued while the live message tries to enter a different room.
+        "INSERT INTO positions (relay, room, position, held, updated_ms) \
+         VALUES ('slack', 'D0FULL', 0, 'test queue full', 0); \
+         INSERT INTO arrival_queue \
+         (relay, room, message, seq, position_at, raw, bytes, created_ms) \
+         VALUES ('slack', 'D0FULL', '1.000001', 1000001, 0, '{}', 268435456, 0);",
+        "DELETE FROM arrival_queue WHERE relay = 'slack' AND room = 'D0FULL'; \
+         DELETE FROM positions WHERE relay = 'slack' AND room = 'D0FULL';",
+    );
+}
+
 /// Check 1, start-up: a webhook or a non-bot identity keeps intake off and nothing is polled.
 #[test]
 fn telegram_refuses_a_webhook_and_a_non_bot() {
