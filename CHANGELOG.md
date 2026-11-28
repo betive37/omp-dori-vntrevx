@@ -13,6 +13,11 @@
   episode, so a later exit gets a fresh retry window. No migration: a store with such an open or
   ended episode recovers on its next wake; a lead already held by this message needs one
   `cataly lead start`, as the hold says.
+- The lead's hold texts (the hold notice, the update result, `cataly lead status`, `cataly health`)
+  no longer quote internal reasons such as "recovery is held (300 s recovery episode has no
+  startup and cleanup budget remaining); explicit owner retry required". Each hold reason is told
+  as a short sentence in `[hub] language`, Korean or English, saying what happened and what to do;
+  the raw reason stays in the log and `cataly lead status --json`.
 
 ## 0.2.8 (2026-11-28)
 
