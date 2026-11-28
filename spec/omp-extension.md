@@ -182,7 +182,8 @@ logic can move to Rust, leaving the extension as a forwarder.
 18. Each tool call is forwarded to the daemon with the session ID, agent ID and tool call ID, and the daemon's
     answer text is returned unchanged. Timeout: 10 s for the report tool, 5 s for the background-job tool, except that an operation the daemon
     lists with its own wait in the tool definition (`op_timeout_ms`) gets that wait: `lane.review` answers only
-    when the review ends, so it waits the review limit plus 5 minutes. On
+    when the review ends, so it waits the review limit plus
+    the GitHub reads before it and a minute (about 40 minutes). On
     timeout or disconnect the tool returns an error stating that nothing was recorded or started, unless the
     daemon later reports otherwise; a retry is safe because the daemon deduplicates by tool call ID.
 19. The extension never checks lane registration, run identity or ownership for a report. The daemon does, based

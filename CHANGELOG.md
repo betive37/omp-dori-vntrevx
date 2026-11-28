@@ -4,7 +4,7 @@
 
 - A `lane.review` call from the lead no longer times out after 5 s while the review still runs,
   telling the model that nothing was recorded and a retry is safe (a retry ran a second paid
-  review). The hub now serves a per-operation wait, and the bridge waits 35 minutes for a review.
+  review). The hub now serves a per-operation wait, and the bridge waits about 40 minutes for a review.
 
 ## 0.2.7 (2026-11-28)
 
