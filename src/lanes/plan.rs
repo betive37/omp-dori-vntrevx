@@ -344,7 +344,8 @@ impl<R: Runtime> Lanes<R> {
             reminded_ms: None,
             failed_tries: 0,
             start_failures: 0,
-            lane: None,
+            // Kept, so the item does not start while its earlier lane is still open.
+            lane: earlier.as_ref().and_then(|(i, _)| i.lane.clone()),
             source: None,
             created_ms: now,
             updated_ms: now,
@@ -815,17 +816,19 @@ impl<R: Runtime> Lanes<R> {
                     .to_string();
                 if line.starts_with("unconfirmed") {
                     fresh.question = Some(format!(
-                        "the start of {} is uncertain ({line}); inspect the lane before anything else",
+                        "the start of {} is uncertain ({line}); inspect lane {key} before anything else",
                         fresh.id
                     ));
+                    fresh.note(now, &format!("start of lane {key} uncertain: {line}"));
+                    run.held
+                        .push(format!("{} start uncertain (lane {key})", fresh.id));
                     fresh.lane = Some(key);
-                    fresh.note(now, &format!("start uncertain: {line}"));
-                    run.held.push(format!("{} start uncertain", fresh.id));
                 } else {
                     fresh.status = "running".into();
+                    fresh.note(now, &format!("lane {key} opened: {line}"));
+                    run.started
+                        .push(format!("{} (lane {key}: {line})", fresh.id));
                     fresh.lane = Some(key);
-                    fresh.note(now, &format!("lane opened: {line}"));
-                    run.started.push(format!("{} ({line})", fresh.id));
                 }
             }
             Err(e) => {
@@ -857,13 +860,21 @@ impl<R: Runtime> Lanes<R> {
     async fn fresh_key(&self, id: &str) -> String {
         let mut key = id.to_string();
         let mut n: usize = 2;
-        while matches!(self.row(&key).await, Ok(Some(_))) {
+        while self.key_taken(&key).await {
             let suffix = format!("-{n}");
             let base: String = id.chars().take(61 - suffix.len()).collect();
             key = format!("{base}{suffix}");
             n += 1;
         }
         key
+    }
+
+    /// Whether a lane record or a waiting queued launch holds the key (LANE req. 3).
+    async fn key_taken(&self, key: &str) -> bool {
+        matches!(self.row(key).await, Ok(Some(_)))
+            || docs::get::<super::queue::Queued>(&self.env.store, docs::QUEUED, key)
+                .await
+                .is_ok_and(|q| q.is_some_and(|(q, _)| q.reserves()))
     }
 
     /// COORD req. 32: each question once, one reminder after 6 h.

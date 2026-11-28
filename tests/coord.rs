@@ -358,6 +358,24 @@ fn planner_restarts_a_reused_item_id() {
     assert_eq!(x["question"], Value::Null, "{x}");
     assert_eq!(x["lane"], "it-x-2", "{x}");
     assert_eq!(record(&hub, "it-x-2")["state"], "running", "{x}");
+    // Done by a merged PR while lane it-x-2 stays open: added again, it waits for that lane.
+    hub.fixture(
+        "gh",
+        "repos_o_r_pulls_5.json",
+        Some(&json!({ "merged": true }).to_string()),
+    );
+    lane(
+        &hub,
+        "claim",
+        &json!({ "key": "it-x-2", "evidence": "https://github.com/o/r/pull/5" }),
+    )
+    .unwrap();
+    let merged = plan(&hub);
+    assert!(merged.contains("it-x done (o/r#5 merged"), "{merged}");
+    lane(&hub, "item-add", &add).unwrap();
+    let held = plan(&hub);
+    assert!(!held.contains("started:"), "{held}");
+    assert_eq!(record(&hub, "it-x-3"), Value::Null, "{held}");
     assert!(hub.stop().success());
 }
 

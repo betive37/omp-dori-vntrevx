@@ -184,14 +184,14 @@ client) plus the lead's OMP session, and every record has one writer.
     never below 0; defaults 3 and 2. Candidates are open items with no open question whose lane is not open,
     ordered by priority, then creation time, then id. If the admission guard (LANE-08) refuses, no item starts and
     the reason is recorded.
-31. Each attempt uses one start and opens its lane under a key no lane has used (LANE req. 3): the item id, else
-    the id with `-2`, `-3`, ... (shortened to keep the key within 61 characters); the item records that key as
-    its lane. A failed open adds one start failure; at 2 the item gets an open question that
-    quotes the first 120 characters of the error and asks whether to fix the brief or directory or give it up. A
-    start that the session host left in an uncertain state gets a question at once and is never retried
-    automatically. A lane that opened but whose start notice did not reach the lead still counts as started. An item
-    becomes running only if it is still the same item (same creation time), open and without a question. Leftover
-    candidates are summarised with their count, the free lane places against the maximum, and the per-run limit.
+31. Each attempt uses one start and opens its lane under a key no lane or queued launch holds (LANE req. 3): the
+    item id, else the id with `-2`, `-3`, ... (shortened to keep the key within 61 characters); the item records
+    that key as its lane. A failed open adds one start failure; at 2 the item gets an open question that quotes the
+    first 120 characters of the error and asks whether to fix the brief or directory or give it up. A start that
+    the session host left in an uncertain state gets a question at once and is never retried automatically. A lane
+    that opened but whose start notice did not reach the lead still counts as started. An item becomes running only
+    if it is still the same item (same creation time), open and without a question. Leftover candidates are
+    summarised with their count, the free lane places against the maximum, and the per-run limit.
 32. Ask: each open item with a question is sent to the lead once as an item question; one reminder follows after
     6 hours; no more after that. The question line tells the lead how to answer or drop the item.
 33. Then the owner-notes refresh step (rule 49) runs.
@@ -208,10 +208,11 @@ client) plus the lead's OMP session, and every record has one writer.
 
 36. An item has id (lane key rules, LANE-01, not a reserved role name), title (default the id), brief (copied into
     the store when added), working directory (default the caller's), priority 1-9 (default 5), status (open,
-    running, done, dropped), the key of its latest lane, optional open question, ask and reminder times, failed tries, start failures,
-    optional GitHub source, creation and update times, and a log of what happened.
+    running, done, dropped), the key of its latest lane, optional open question, ask and reminder times, failed
+    tries, start failures, optional GitHub source, creation and update times, and a log of what happened.
 37. Adding refuses an invalid id, a missing brief file, a priority outside 1-9, and an id whose item is open or
-    running. A done or dropped id may be reused.
+    running. A done or dropped id may be reused; the new item keeps the earlier item's lane, so it does not start
+    while that lane is open.
 38. Answering needs non-empty text and an open item; it appends the question and answer to the item's brief,
     clears the question and its ask and reminder times, and resets both try counters.
 39. Dropping refuses a running item (close its lane first); otherwise sets dropped with a reason.
