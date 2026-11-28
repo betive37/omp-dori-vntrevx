@@ -394,9 +394,9 @@ fn intake_restart_recovers_only_recent_lead_work() {
         });
         let source = "800000000000000023";
         assert_eq!(answer_state(&hub, source), "waiting");
-        // Let readback show idle without releasing the delayed final answer. The old pipeline
-        // still remembers the busy read; the new one has only the transcript's modification time.
-        hub.fixture("omp", "busy", None);
+        // The fake clears streaming and emits session_settled to trigger an idle readback, but
+        // keeps the final answer held. The old pipeline remembers work; the new one needs mtime.
+        hub.fixture("omp", "hold-idle", Some(""));
         hub.until(WAIT, || {
             (hub.json(&["lead", "status", "--json"])["session"]["status"] == "idle")
                 .then_some(())

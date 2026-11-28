@@ -21,6 +21,8 @@
 #                               with omp-data/hold (a text) a message containing that text waits for
 #                               omp-data/release before its answer (with omp-data/hold-busy that
 #                               turn shows streaming and queues later input, as slow does);
+#                               omp-data/hold-idle is consumed by a held turn to clear streaming and
+#                               emit session_settled without releasing its delayed final answer;
 #                               omp-data/noentry answers the prompt and writes nothing; with omp-data/ask
 #                               a message containing ASK opens the HTML `form` dialog stock OMP's ask
 #                               tool sends, and the turn ends when it is answered: "picked <choice>";
@@ -148,7 +150,13 @@ turn() {
     [ -f "$dir/answer.json" ] && answer=$(cat "$dir/answer.json")
     if [ -n "$held" ]; then
         (
-            while [ -d "$dir" ] && [ ! -f "$dir/release" ]; do sleep 0.1; done
+            while [ -d "$dir" ] && [ ! -f "$dir/release" ]; do
+                if [ -f "$dir/hold-idle" ]; then
+                    rm -f "$dir/hold-idle" "$dir/busy"
+                    echo '{"type":"session_settled"}'
+                fi
+                sleep 0.1
+            done
             [ -f "$dir/release" ] || exit 0
             if [ -f "$dir/hold-busy" ]; then
                 busy_end "$answer" "$2"
