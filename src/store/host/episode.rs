@@ -1,4 +1,9 @@
 //! Recovery episodes are independent of the attempt log and never roll their deadline forward.
+//!
+//! An automatic start, wake or restart continues an episode only while it is live: active, with its
+//! window open. An episode that ended `bound`, or whose window closed, is no longer anyone's
+//! recovery; the next automatic start begins a fresh one. A `held` or `cancelled` episode is the
+//! target's hold and stays until the owner's explicit retry replaces it.
 
 use rusqlite::{OptionalExtension, Transaction, params};
 use serde::Serialize;
@@ -18,12 +23,35 @@ pub(crate) struct Episode {
     pub(crate) detail: Option<String>,
 }
 
+/// How a start meets the target's recorded episode.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Begin {
+    /// The owner's explicit retry or reopen: always a fresh episode.
+    Reset,
+    /// An automatic start, wake or restart: the live episode, else a fresh one. A held or
+    /// cancelled episode stays.
+    Renew,
+    /// Inside one attempt: the recorded episode even past its window. Only an ended (`bound`) one
+    /// is replaced, as by every mode.
+    Continue,
+}
+
+impl Begin {
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::Reset => "reset",
+            Self::Renew => "renew",
+            Self::Continue => "continue",
+        }
+    }
+}
+
 #[derive(Clone, Debug)]
 pub(crate) enum Change {
     Begin {
         target: String,
         session_id: String,
-        reset: bool,
+        mode: Begin,
     },
     Retry {
         target: String,
@@ -45,13 +73,14 @@ pub(super) fn write(tx: &Transaction<'_>, change: &Change, now: i64) -> rusqlite
         Change::Begin {
             target,
             session_id,
-            reset,
+            mode,
         } => {
             tx.execute(
                 "INSERT INTO startup_episodes(target, session_id, started_ms, deadline_ms, state) VALUES (?1, ?2, ?3, ?4, 'active') \
                  ON CONFLICT(target) DO UPDATE SET session_id = excluded.session_id, started_ms = excluded.started_ms, deadline_ms = excluded.deadline_ms, \
-                 state = 'active', retries = 0, next_ms = NULL, detail = NULL WHERE ?5 OR startup_episodes.state = 'bound'",
-                params![target, session_id, now, now.saturating_add(millis(EPISODE_BUDGET)), reset])?;
+                 state = 'active', retries = 0, next_ms = NULL, detail = NULL WHERE ?5 = 'reset' OR startup_episodes.state = 'bound' \
+                 OR (?5 = 'renew' AND startup_episodes.state = 'active' AND startup_episodes.deadline_ms <= ?3)",
+                params![target, session_id, now, now.saturating_add(millis(EPISODE_BUDGET)), mode.as_str()])?;
             target
         }
         Change::Retry { target, detail } => {
@@ -130,18 +159,18 @@ mod tests {
         db
     }
 
-    fn begin(reset: bool) -> Change {
+    fn begin(mode: Begin) -> Change {
         Change::Begin {
             target: "lead".into(),
             session_id: "A".into(),
-            reset,
+            mode,
         }
     }
 
     #[test]
     fn retries_and_deadline_survive_reopening_the_episode() {
         let mut db = database();
-        apply(&mut db, &begin(false), 100);
+        apply(&mut db, &begin(Begin::Renew), 100);
         for (index, delay) in [1000, 2000, 4000, 8000, 16000].into_iter().enumerate() {
             let now = 200 + i64::try_from(index).unwrap();
             apply(
@@ -152,7 +181,7 @@ mod tests {
                 },
                 now,
             );
-            apply(&mut db, &begin(false), now + 1);
+            apply(&mut db, &begin(Begin::Renew), now + 1);
             let (next, deadline): (i64, i64) = db
                 .query_row(
                     "SELECT next_ms, deadline_ms FROM startup_episodes",
@@ -180,7 +209,7 @@ mod tests {
     #[test]
     fn episode_reserves_cleanup_and_never_rolls_its_cap_forward() {
         let mut db = database();
-        apply(&mut db, &begin(false), 0);
+        apply(&mut db, &begin(Begin::Renew), 0);
         apply(
             &mut db,
             &Change::Retry {
@@ -189,11 +218,51 @@ mod tests {
             },
             213_000,
         );
-        apply(&mut db, &begin(false), 900_000);
+        apply(&mut db, &begin(Begin::Renew), 900_000);
         let reads = Reads(db);
         let episode = reads.startup_episode("lead").unwrap().unwrap();
         assert_eq!(episode.deadline_ms, 300_000);
         assert_eq!(episode.state, "held");
         assert_eq!(episode.next_ms, None);
+    }
+
+    /// Within one attempt the recorded episode is kept even past its window, which then holds;
+    /// an automatic start past it begins a fresh one; the owner's retry always does.
+    #[test]
+    fn only_an_automatic_start_or_the_owner_replaces_an_expired_episode() {
+        let mut db = database();
+        apply(&mut db, &begin(Begin::Renew), 0);
+        apply(&mut db, &begin(Begin::Continue), 300_000);
+        let held: (i64, String) = db
+            .query_row("SELECT started_ms, state FROM startup_episodes", [], |r| {
+                Ok((r.get(0)?, r.get(1)?))
+            })
+            .unwrap();
+        assert_eq!(held, (0, "held".into()));
+        apply(&mut db, &begin(Begin::Renew), 400_000);
+        let still: String = db
+            .query_row("SELECT state FROM startup_episodes", [], |r| r.get(0))
+            .unwrap();
+        assert_eq!(still, "held", "a held episode is the hold");
+        apply(&mut db, &begin(Begin::Reset), 500_000);
+        apply(
+            &mut db,
+            &Change::Retry {
+                target: "lead".into(),
+                detail: "timeout".into(),
+            },
+            501_000,
+        );
+        apply(&mut db, &begin(Begin::Renew), 800_000);
+        let renewed = Reads(db).startup_episode("lead").unwrap().unwrap();
+        assert_eq!(
+            (
+                renewed.started_ms,
+                renewed.deadline_ms,
+                renewed.retries,
+                renewed.state.as_str()
+            ),
+            (800_000, 1_100_000, 0, "active")
+        );
     }
 }

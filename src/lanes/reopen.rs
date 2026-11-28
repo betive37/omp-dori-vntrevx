@@ -82,7 +82,7 @@ impl<R: Runtime> Lanes<R> {
             store: &self.env.store,
             target: &target,
         }
-        .begin(&id, true)
+        .begin(&id, crate::host::startup::Begin::Reset)
         .await?;
         let pending = rec.pending_reopen.get_or_insert_with(|| Pending {
             episode_ms: episode.started_ms,
