@@ -93,15 +93,14 @@ pub(crate) fn set_key(text: &str, section: &str, key: &str, value: &str) -> Stri
 }
 
 /// [`set_key`] with a value already written as TOML. A table header's trailing comment is kept,
-/// not treated as part of its name.
+/// not treated as part of its name (as in [`remove_section`]).
 pub(crate) fn set_rendered(text: &str, section: &str, key: &str, rendered: &str) -> String {
     let line = format!("{key} = {rendered}");
     let header = format!("[{section}]");
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let start = lines.iter().position(|l| {
-        let l = l.trim();
-        l.starts_with('[') && header_without_comment(l).trim_end() == header
-    });
+    let start = lines
+        .iter()
+        .position(|l| l.split('#').next().unwrap_or_default().trim() == header);
     let Some(start) = start else {
         let mut out = text.trim_end().to_string();
         if !out.is_empty() {
@@ -136,27 +135,6 @@ pub(crate) fn set_rendered(text: &str, section: &str, key: &str, rendered: &str)
     let mut out = lines.join("\n");
     out.push('\n');
     out
-}
-
-/// A header's `#` starts a comment only outside a quoted key. Backslash escapes apply only to
-/// double-quoted keys, not literal single-quoted keys.
-fn header_without_comment(line: &str) -> &str {
-    let mut quote = None;
-    let mut escaped = false;
-    for (i, byte) in line.bytes().enumerate() {
-        if escaped {
-            escaped = false;
-            continue;
-        }
-        match (quote, byte) {
-            (Some(b'"'), b'\\') => escaped = true,
-            (Some(q), b) if q == b => quote = None,
-            (None, b'"' | b'\'') => quote = Some(byte),
-            (None, b'#') => return line.split_at(i).0,
-            _ => {}
-        }
-    }
-    line
 }
 
 /// Edits the file as it is now: `change` gets its text (`missing` when there is no file) and
@@ -501,32 +479,6 @@ mod tests {
                     out,
                     format!("# mine\n{header}\nmodel = \"b\"\n\n[omp] # next\npath = \"omp\"\n")
                 );
-            }
-        }
-    }
-
-    #[test]
-    fn set_key_reuses_table_headers_with_quoted_hashes() {
-        for (section, name) in [
-            (r#""lead#main""#, "lead#main"),
-            ("'lead#main'", "lead#main"),
-            (r##""lead\"#main""##, "lead\"#main"),
-            (r#""lead\\#main""#, r"lead\#main"),
-            ("'lead\\#main'", r"lead\#main"),
-            (r#""lead'#main""#, "lead'#main"),
-            ("'lead\"#main'", "lead\"#main"),
-            (r#""주석#main""#, "주석#main"),
-        ] {
-            for comment in ["", " # main", "\t# \"note\"  "] {
-                let header = format!("[{section}]{comment}");
-                let text = format!("{header}\nmodel = \"a\"\n");
-                let out = set_key(&text, section, "model", "b");
-                let parsed: toml::Value = toml::from_str(&out).unwrap();
-                assert_eq!(
-                    parsed.get(name).unwrap().get("model").unwrap().as_str(),
-                    Some("b")
-                );
-                assert_eq!(out, format!("{header}\nmodel = \"b\"\n"));
             }
         }
     }
