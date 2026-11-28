@@ -347,7 +347,7 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
     };
     let url = push_url(git, b).await?;
     if let Some(previous) = git.t.memory.get(PUSHED, "destination") {
-        if previous.split_once('\n') != Some((b.branch.as_str(), url.as_str())) {
+        if previous != destination_id(&b.branch, &url) {
             return Ok(true);
         }
         if let Some(pushed) = git.t.memory.get(PUSHED, "commit") {
@@ -359,7 +359,8 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
                 .await?;
             return match done.exit {
                 crate::sys::command::Exit::Code(0) => Ok(false),
-                crate::sys::command::Exit::Code(1) => Ok(true),
+                // A shallow replacement may no longer contain the recorded object.
+                crate::sys::command::Exit::Code(1 | 128) => Ok(true),
                 _ => Err(format!("git merge-base failed: {}", super::said(&done))),
             };
         }
@@ -390,13 +391,24 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
     }
 }
 
-/// All expanded push URLs, or the remote itself when it is a direct URL rather than a name.
+/// A stable destination identifier that never persists credentials from the expanded URLs.
+fn destination_id(branch: &str, url: &str) -> String {
+    let mut hash = ring::digest::Context::new(&ring::digest::SHA256);
+    hash.update(branch.as_bytes());
+    hash.update(b"\n");
+    hash.update(url.as_bytes());
+    crate::sys::hex(hash.finish().as_ref())
+}
+
+/// Expanded push URLs, including URL rewrites for a direct remote. Neither read uses the network.
 async fn push_url(git: &Git<'_, '_>, b: &Backup) -> Result<String, String> {
-    Ok(
-        git_value(git, &["remote", "get-url", "--push", "--all", &b.remote])
-            .await?
-            .unwrap_or_else(|| b.remote.clone()),
-    )
+    if let Some(url) = git_value(git, &["remote", "get-url", "--push", "--all", &b.remote]).await? {
+        return Ok(url);
+    }
+    let url = git
+        .ok(&["ls-remote", "--get-url", &b.remote], LOCAL)
+        .await?;
+    Ok(String::from_utf8_lossy(&url).trim().to_string())
 }
 
 /// Pushes the resolved HEAD to the configured branch and returns its receipt. Never forced.
@@ -416,7 +428,7 @@ async fn push(git: &Git<'_, '_>, b: &Backup) -> Result<Pushed, String> {
     if done.success() {
         Ok(Pushed {
             commit: commit.to_string(),
-            destination: format!("{}\n{url}", b.branch),
+            destination: destination_id(&b.branch, &url),
         })
     } else {
         Err(super::said(&done))
@@ -947,6 +959,137 @@ mod tests {
                 .iter()
                 .any(|(s, c, v)| s == super::PUSHED && c == "commit" && v == pushed.trim())
         );
+    }
+
+    #[tokio::test]
+    async fn receipt_does_not_persist_expanded_url_secrets() {
+        let root = crate::sys::fs::tests::scratch("backup-receipt-secret");
+        let (_fetch, work) = repos(&root);
+        let token = format!("ghp_{}", "Ab3".repeat(12));
+        let remote = root.join(format!("{token}.git"));
+        let alias = root.join("push-alias");
+        git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(
+            &work,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", remote.display()),
+                alias.to_str().unwrap(),
+            ],
+        );
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                alias.to_str().unwrap(),
+            ],
+        );
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\ninclude_cataly = true\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-receipt-secret-ctx");
+        std::fs::write(work.join("notes.md"), "backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        // The next snapshot includes the first push's receipt and must still pass the scan.
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let memory = ctx.store.read(|r| r.memory("bk", false)).await.unwrap();
+        let (_, _, destination) = memory
+            .iter()
+            .find(|(s, c, _)| s == super::PUSHED && c == "destination")
+            .unwrap();
+        assert_eq!(destination.len(), 64);
+        assert!(destination.bytes().all(|b| b.is_ascii_hexdigit()));
+        assert!(memory.iter().all(|(_, _, v)| !v.contains(&token)));
+        let snapshot = std::fs::read(work.join("store/cataly.db")).unwrap();
+        assert!(crate::sys::secrets::find_rule(&snapshot).is_none());
+        assert_eq!(
+            git(&remote, &["rev-parse", "main"]),
+            git(&work, &["rev-parse", "HEAD"])
+        );
+    }
+
+    #[tokio::test]
+    async fn receipt_with_missing_commit_retries_push() {
+        let root = crate::sys::fs::tests::scratch("backup-receipt-missing");
+        let (remote, work) = repos(&root);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-receipt-missing-ctx");
+        std::fs::write(work.join("notes.md"), "first backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let remembered = git(&work, &["rev-parse", "HEAD"]);
+        std::fs::write(work.join("notes.md"), "later commit\n").unwrap();
+        commit(&work, "pushed outside the job");
+        git(&work, &["push", "-q", "origin", "main"]);
+
+        // Reclone shallowly while retaining the job's memory and the same destination URL.
+        std::fs::rename(&work, root.join("old-work")).unwrap();
+        git(
+            &root,
+            &[
+                "clone",
+                "-q",
+                "--depth",
+                "1",
+                &format!("file://{}", remote.display()),
+                work.to_str().unwrap(),
+            ],
+        );
+        git(
+            &work,
+            &["remote", "set-url", "origin", remote.to_str().unwrap()],
+        );
+        let missing = Command::new("git")
+            .arg("-C")
+            .arg(&work)
+            .args(["cat-file", "-e", remembered.trim()])
+            .output()
+            .unwrap();
+        assert!(!missing.status.success(), "the recorded object is absent");
+        std::fs::write(work.join("notes.md"), "unpushed commit\n").unwrap();
+        commit(&work, "not backed up");
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "main"]), head);
+    }
+
+    #[tokio::test]
+    async fn receipt_tracks_direct_url_rewrites() {
+        let root = crate::sys::fs::tests::scratch("backup-receipt-direct");
+        let (first, work) = repos(&root);
+        let second = root.join("second.git");
+        let alias = root.join("direct-alias");
+        git(&root, &["init", "-q", "--bare", second.to_str().unwrap()]);
+        let first_key = format!("url.{}.insteadOf", first.display());
+        git(&work, &["config", &first_key, alias.to_str().unwrap()]);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\nremote = \"{}\"\n",
+            work.display(),
+            alias.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-receipt-direct-ctx");
+        std::fs::write(work.join("notes.md"), "backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&first, &["rev-parse", "main"]), head);
+        git(&work, &["config", "--unset-all", &first_key]);
+        git(
+            &work,
+            &[
+                "config",
+                &format!("url.{}.insteadOf", second.display()),
+                alias.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&second, &["rev-parse", "main"]), head);
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
     }
 
     #[tokio::test]

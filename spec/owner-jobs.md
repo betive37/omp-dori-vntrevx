@@ -175,11 +175,13 @@ limits view and health report of the watch-schedule area (WS-xx), on dialogs and
 40. The configuration is invalid if the daemon's own secret store or configuration file lies inside the directory
     and is not ignored.
 41. Tick: stage every change; if nothing is staged, skip the scan and commit but still retry a pending push
-    or push commits missing from the configured backup remote and branch. Record the full commit,
-    expanded push URLs and branch in job memory after each successful push. Compare HEAD with that
-    commit only for the same destination, skipping a push when HEAD equals it or is its ancestor;
-    a changed destination triggers a push. Without that memory, separate fetch and push URLs trigger
-    a push rather than trusting the fetch repository. Only when those URLs agree, compare with
+    or push commits missing from the configured backup remote and branch. Record the full commit and
+    a SHA-256 identifier of the expanded push URLs and branch in job memory after each successful push,
+    never the URL credentials. Direct URL remotes are expanded too. Compare HEAD with that commit only
+    for the same destination, skipping a push when HEAD equals it or is its ancestor. If the recorded
+    object is missing, attempt a non-forced push; a changed destination also triggers a push. Without
+    that memory, separate fetch and push URLs trigger a push rather than trusting the fetch repository.
+    Only when those URLs agree, compare with
     `refs/remotes/<remote>/<branch>`; a missing tracking ref then triggers a push. Do not use the branch's
     upstream. If HEAD does not exist, there is nothing to push.
     Scan the staged content with the built-in token shapes
