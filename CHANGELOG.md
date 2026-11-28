@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A lane could remove a worktree containing a published file when the worktree was opened through
+  a symlink. Ownership now records the canonical path, and close resolves older paths too, keeping
+  the worktree when the path cannot be resolved.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
