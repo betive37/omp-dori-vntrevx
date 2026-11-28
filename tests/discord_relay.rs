@@ -1005,6 +1005,13 @@ fn a_lane_hand_off_ends_after_the_owed_window_while_the_lead_works() {
         (answer_state(&hub, &lane.to_string()) == "abandoned").then_some(())
     });
     assert_eq!(answer_state(&hub, long), "waiting");
+    // The lead's turn ends, so the hub stops promptly. The lane's input queued in the shared fake
+    // is dropped first: the lead's process would run it in its own transcript.
+    hub.fixture("omp", "queued", None);
+    hub.fixture("omp", "release", Some(""));
+    hub.until(WAIT, || {
+        (answer_state(&hub, long) == "posted").then_some(())
+    });
     assert!(hub.stop().success());
 }
 
