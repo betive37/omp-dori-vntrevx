@@ -3,9 +3,10 @@
 ## Unreleased
 
 - A backup interrupted after committing could leave that commit local forever when nothing else
-  changed. An unchanged tick now pushes commits missing from the configured backup remote and
-  branch, even without pending-push memory or a branch upstream. A missing remote-tracking ref
-  also triggers a push.
+  changed. An unchanged tick now compares HEAD with the last successfully pushed commit in job
+  memory, so fetching from a separate URL cannot hide an unpushed backup or trigger a redundant
+  push. Without that memory it checks the configured remote and branch's tracking ref and pushes
+  if the ref is missing; no branch upstream is required. A repository with no HEAD is left alone.
 
 ## 0.2.8 (2026-11-28)
 

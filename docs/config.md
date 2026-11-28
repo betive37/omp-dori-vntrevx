@@ -998,8 +998,10 @@ rewrites history or pulls. A refusal commits nothing and names files and rule, n
 text. The config file and `secrets/` inside the tree are refused unless git ignores them.
 An unchanged tick retries a pending push and also pushes commits missing from the configured backup
 remote and branch, recovering interrupted ticks even when no pending push was recorded. It compares
-HEAD with `refs/remotes/<remote>/<branch>`; if that ref is missing, it attempts the push. The working
-branch's upstream is not used and need not be configured.
+HEAD with the last successfully pushed commit saved in job memory, so a separate fetch URL cannot
+hide an unpushed backup or trigger another push of the same commit. Only when that memory is absent
+is `refs/remotes/<remote>/<branch>` used; a missing ref then triggers a push. The working branch's
+upstream is not used and need not be configured. A repository with no HEAD has nothing to push.
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|

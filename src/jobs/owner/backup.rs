@@ -196,7 +196,7 @@ async fn cataly_files(t: &Tick<'_>, b: &Backup) -> Result<(), String> {
 /// What a tick found, applied to memory and events after git is done.
 enum Found {
     Nothing {
-        push: Option<Result<(), String>>,
+        push: Option<Result<String, String>>,
     },
     Refused {
         files: Vec<String>,
@@ -204,7 +204,7 @@ enum Found {
     },
     Committed {
         commit: String,
-        push: Option<Result<(), String>>,
+        push: Option<Result<String, String>>,
     },
 }
 
@@ -333,11 +333,18 @@ async fn own_files_not_ignored(
     Ok(found)
 }
 
-/// Commits absent from the backup target. A missing remote-tracking ref also needs a push.
+/// Compare HEAD with the last successful push; fetches may track a different repository.
+/// Without that memory, fall back to the remote-tracking ref, pushing if it is missing.
 async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
+    let Some(head) = git_value(git, &["rev-parse", "--verify", "HEAD"]).await? else {
+        return Ok(false);
+    };
+    if let Some(pushed) = git.t.memory.get(PUSHED, "commit") {
+        return Ok(head != pushed);
+    }
     let target = format!("refs/remotes/{}/{}", b.remote, b.branch);
     let done = git
-        .run(&["rev-list", "--count", "HEAD", "--not", &target], LOCAL)
+        .run(&["rev-list", "--count", &head, "--not", &target], LOCAL)
         .await?;
     if done.success() {
         return Ok(String::from_utf8_lossy(&done.stdout)
@@ -355,17 +362,21 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
     }
 }
 
-/// Pushes HEAD to the configured branch. Never forced.
-async fn push(git: &Git<'_, '_>, b: &Backup) -> Result<(), String> {
+/// Pushes the resolved HEAD to the configured branch and returns its commit. Never forced.
+async fn push(git: &Git<'_, '_>, b: &Backup) -> Result<String, String> {
     if b.include_cataly {
         remote_is_private(git, b).await?;
     }
-    let target = format!("HEAD:refs/heads/{}", b.branch);
+    let head = git.ok(&["rev-parse", "--verify", "HEAD"], LOCAL).await?;
+    let head = String::from_utf8_lossy(&head);
+    let commit = head.trim();
+    // Pin the source so a concurrent HEAD change cannot be recorded as already pushed.
+    let target = format!("{commit}:refs/heads/{}", b.branch);
     let done = git
         .run(&["push", "--quiet", &b.remote, &target], PUSH)
         .await?;
     if done.success() {
-        Ok(())
+        Ok(commit.to_string())
     } else {
         Err(super::said(&done))
     }
@@ -474,7 +485,8 @@ fn apply(t: &mut Tick<'_>, found: Found) {
         }
     };
     match push {
-        Some(Ok(())) => {
+        Some(Ok(commit)) => {
+            t.memory.transition(PUSHED, "commit", &commit);
             t.memory.clear(PUSHED, "pending");
             t.memory.clear(PUSHED, "error");
         }
@@ -647,7 +659,20 @@ mod tests {
         assert_eq!(git(&remote, &["rev-parse", "main"]), head);
         assert_eq!(git(&work, &["rev-parse", "HEAD"]), head, "no extra commit");
 
-        // A missing tracking ref must also trigger a push, even with a clean tree.
+        // With no successful-push memory, a missing tracking ref must also trigger a push.
+        ctx.store
+            .apply(crate::store::Apply {
+                memory: vec![crate::store::MemoryWrite {
+                    job: "bk".into(),
+                    subject: super::PUSHED.into(),
+                    condition: "commit".into(),
+                    dry: false,
+                    value: None,
+                }],
+                ..crate::store::Apply::default()
+            })
+            .await
+            .unwrap();
         git(&work, &["update-ref", "-d", "refs/remotes/origin/main"]);
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
         assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
@@ -712,6 +737,89 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn unchanged_tick_uses_successful_push_not_fetch_tracking_ref() {
+        let root = crate::sys::fs::tests::scratch("backup-pushurl");
+        let (fetch, work) = repos(&root);
+        let remote = root.join("backup.git");
+        git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-pushurl-ctx");
+        std::fs::write(work.join("notes.md"), "first backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let first = git(&remote, &["rev-parse", "main"]);
+
+        // A fetch says HEAD is up to date, but only the fetch repository has this commit.
+        std::fs::write(work.join("notes.md"), "interrupted backup\n").unwrap();
+        commit(&work, "interrupted backup");
+        git(&work, &["push", "-q", fetch.to_str().unwrap(), "main"]);
+        git(&work, &["fetch", "-q", "origin"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
+        assert_eq!(git(&remote, &["rev-parse", "main"]), first);
+        assert_ne!(first, head);
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "main"]), head);
+        let memory = ctx.store.read(|r| r.memory("bk", false)).await.unwrap();
+        assert!(
+            memory
+                .iter()
+                .any(|(s, c, v)| s == super::PUSHED && c == "commit" && v == head.trim())
+        );
+        assert!(
+            !memory
+                .iter()
+                .any(|(s, c, _)| s == super::PUSHED && c == "pending")
+        );
+
+        // After a normal backup, fetching the older mirror must not trigger another push.
+        std::fs::write(work.join("notes.md"), "latest backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let latest = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(latest, head);
+        assert_eq!(git(&remote, &["rev-parse", "main"]), latest);
+        git(&work, &["fetch", "-q", "origin"]);
+        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                root.join("missing.git").to_str().unwrap(),
+            ],
+        );
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_without_head_does_not_attempt_push() {
+        let root = crate::sys::fs::tests::scratch("backup-unborn");
+        let (_remote, work) = repos(&root);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-unborn-ctx");
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let memory = ctx.store.read(|r| r.memory("bk", false)).await.unwrap();
+        assert!(!memory.iter().any(|(s, _, _)| s == super::PUSHED));
+    }
+
+    #[tokio::test]
     async fn refuses_tokens_and_big_files_then_commits_and_pushes_without_force() {
         let root = crate::sys::fs::tests::scratch("backup");
         let (remote, work) = repos(&root);
@@ -765,6 +873,7 @@ mod tests {
             "Backup"
         );
         // A remote that moved on is never overwritten: the push fails and is reported once.
+        let pushed = git(&remote, &["rev-parse", "main"]);
         push_from_another_clone(&root, &remote);
         std::fs::write(work.join("notes.md"), "more\n").unwrap();
         assert_eq!(live_tick(&ctx, "bk").await, ["backup.push_failed"]);
@@ -776,6 +885,13 @@ mod tests {
         assert!(
             git(&remote, &["log", "--format=%s", "main"]).starts_with("theirs"),
             "never forced"
+        );
+        let memory = ctx.store.read(|r| r.memory("bk", false)).await.unwrap();
+        assert!(
+            memory
+                .iter()
+                .any(|(s, c, v)| s == super::PUSHED && c == "commit" && v == pushed.trim()),
+            "failed pushes must not advance the remembered commit"
         );
     }
 }
