@@ -15,6 +15,10 @@ use crate::sys::now_ms;
 
 /// The recap is at most this long (EVR req. 48).
 const RECAP_MAX: usize = 8 * 1024;
+/// A `requests` or `questions` reply is at most this long before its "and N more" line. Open lists
+/// are not capped by count, so a large open set must not outgrow the bridge's 1 MiB reply line
+/// even when every byte needs a six-byte JSON escape.
+const LIST_MAX: usize = 64 * 1024;
 /// The owner notes are capped (OPC req. 55, COORD req. 51).
 pub(crate) const PROFILE_MAX: usize = crate::jobs::notes::MAX;
 
@@ -133,7 +137,7 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
                 .read(move |r| r.requests(!all))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(list_requests(&rows, usize::MAX))
+            Ok(list_requests(&rows, LIST_MAX))
         }
         "request.add" => {
             let write = LeadWrite::RequestAdd {
@@ -166,7 +170,7 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
                 .read(|r| r.questions(true))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(list_questions(&rows, usize::MAX))
+            Ok(list_questions(&rows, LIST_MAX))
         }
         "question.ask" => ask(hub, input).await,
         "question.answer" | "question.choose" | "question.withdraw" => settle(hub, op, input).await,
@@ -419,7 +423,7 @@ fn list_requests(rows: &[RequestRow], max: usize) -> String {
         return "no open request-log items".into();
     }
     let mut out = String::new();
-    for r in rows {
+    for (shown, r) in rows.iter().enumerate() {
         let line = match &r.closed_ms {
             Some(_) => format!(
                 "- {} [closed] {}: {}",
@@ -437,7 +441,7 @@ fn list_requests(rows: &[RequestRow], max: usize) -> String {
             ),
         };
         if out.len() + line.len() > max {
-            let _ = write!(out, "\nand {} more", rows.len() - out.lines().count());
+            let _ = write!(out, "\nand {} more", rows.len() - shown);
             break;
         }
         out.push_str(&line);
@@ -451,7 +455,7 @@ fn list_questions(rows: &[QuestionRow], max: usize) -> String {
         return "no open owner questions".into();
     }
     let mut out = String::new();
-    for q in rows {
+    for (shown, q) in rows.iter().enumerate() {
         let who = if q.lead_may {
             "lead may settle"
         } else {
@@ -481,7 +485,7 @@ fn list_questions(rows: &[QuestionRow], max: usize) -> String {
             options.join("; ")
         );
         if out.len() + line.len() > max {
-            let _ = write!(out, "\nand {} more", rows.len() - out.lines().count());
+            let _ = write!(out, "\nand {} more", rows.len() - shown);
             break;
         }
         out.push_str(&line);
@@ -540,6 +544,7 @@ pub(crate) async fn recap(hub: &Hub) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::store::tests::open_temp;
 
     #[test]
     fn the_bridge_waits_for_a_review_past_its_limit() {
@@ -548,5 +553,113 @@ mod tests {
             .unwrap();
         assert!(wait > 30 * 60 * 1000, "{wait}");
         assert_eq!(definition()["op_timeout_ms"].as_object().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn open_lists_and_recap_count_all_items() {
+        let (store, _writer, _dir) = open_temp("open-lists-recap");
+        for n in 1..=201 {
+            let LeadDone::Id(id) = store
+                .lead(LeadWrite::RequestAdd {
+                    title: format!("Request {n}"),
+                    source: format!("test:{n}"),
+                    thread: None,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("no request ID")
+            };
+            if n == 201 {
+                assert_eq!(
+                    store
+                        .lead(LeadWrite::RequestNext {
+                            id,
+                            text: "first step\nsecond step".into(),
+                        })
+                        .await
+                        .unwrap(),
+                    LeadDone::Done
+                );
+            }
+            assert_eq!(
+                store
+                    .lead(LeadWrite::QuestionAsk(Box::new(QuestionRow {
+                        id: format!("{n:08x}"),
+                        text: "Which option?\nMore detail".into(),
+                        source: format!("test:{n}"),
+                        thread: None,
+                        options: vec!["a".into(), "b".into()],
+                        recommended: Some(1),
+                        lead_may: false,
+                        request: Some(id),
+                        room: None,
+                        message: None,
+                        state: "open".into(),
+                        outcome: None,
+                        created_ms: 0,
+                    })))
+                    .await
+                    .unwrap(),
+                LeadDone::Done
+            );
+        }
+        let requests = store.read(|r| r.requests(true)).await.unwrap();
+        let questions = store.read(|r| r.questions(true)).await.unwrap();
+        assert_eq!(requests.len(), 201);
+        assert_eq!(questions.len(), 201);
+        assert_eq!(requests.first().unwrap().title, "Request 201");
+        assert_eq!(requests.last().unwrap().title, "Request 1");
+        assert!(questions.iter().any(|q| q.id == "00000001"));
+        // Including history still keeps its existing 200-entry cap.
+        assert_eq!(store.read(|r| r.requests(false)).await.unwrap().len(), 200);
+        assert_eq!(store.read(|r| r.questions(false)).await.unwrap().len(), 200);
+        for listing in [
+            list_requests(&requests, usize::MAX),
+            list_questions(&questions, usize::MAX),
+        ] {
+            assert_eq!(listing.lines().filter(|l| l.starts_with("- ")).count(), 201);
+            assert!(!listing.contains("and "));
+        }
+        for listing in [
+            list_requests(&requests, RECAP_MAX / 3),
+            list_questions(&questions, RECAP_MAX / 3),
+        ] {
+            let shown = listing.lines().filter(|l| l.starts_with("- ")).count();
+            assert!(shown > 0 && shown < 201);
+            assert!(listing.ends_with(&format!("\nand {} more", 201 - shown)));
+        }
+    }
+
+    #[tokio::test]
+    async fn a_large_open_set_stays_within_the_reply_line() {
+        let (store, _writer, _dir) = open_temp("open-lists-reply-size");
+        for n in 1..=120 {
+            let LeadDone::Id(id) = store
+                .lead(LeadWrite::RequestAdd {
+                    title: format!("Request {n}"),
+                    source: format!("test:{n}"),
+                    thread: None,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("no request ID")
+            };
+            store
+                .lead(LeadWrite::RequestNext {
+                    id,
+                    text: "\"".repeat(1000),
+                })
+                .await
+                .unwrap();
+        }
+        let requests = store.read(|r| r.requests(true)).await.unwrap();
+        let listing = list_requests(&requests, LIST_MAX);
+        let shown = listing.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(shown > 0 && shown < 120);
+        assert!(listing.ends_with(&format!("\nand {} more", 120 - shown)));
+        let reply = json!({ "text": listing, "error": false }).to_string();
+        assert!(reply.len() <= crate::proto::MAX_LINE, "{}", reply.len());
     }
 }

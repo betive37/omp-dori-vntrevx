@@ -199,6 +199,8 @@
   reminder names the message's own relay.
 - Request notes that would exceed 16 KiB are refused instead of silently truncated while reporting
   success. Automatic question notes are skipped when the request's notes are full.
+- Open request and owner-question lists no longer stop at 200 items. Recovery summaries count
+  every omitted item in "and N more", including when a next step or question spans several lines.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
