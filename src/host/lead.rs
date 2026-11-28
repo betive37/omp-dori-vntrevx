@@ -563,7 +563,7 @@ impl<R: Runtime> Lead<R> {
     }
 
     /// Why the lead may not be stopped now, if it may not.
-    pub(crate) fn busy(&self) -> Option<&'static str> {
+    pub(crate) fn busy(&self) -> Option<crate::host::Busy> {
         self.current().and_then(|s| s.snapshot().busy())
     }
 

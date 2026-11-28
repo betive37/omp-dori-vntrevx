@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- `cataly update` and `cataly rollback` speak the owner's `[hub] language`: the result line, the
+  held, switched-back and needs-attention outcomes (`보류:`, `되돌림:`, `확인 필요:`), the busy wait
+  and hold with the busy session named by the hub in that language, and every refusal the owner acts
+  on. Errors meant for developers (a file, network or store failure) stay as they were said, inside
+  those sentences. `--help` stays English, as it is for every command.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

@@ -209,7 +209,7 @@ impl<R: Runtime> Lanes<R> {
     }
 
     /// Live lanes that may not be stopped now, with the reason.
-    pub(crate) fn busy(&self) -> Vec<(String, &'static str)> {
+    pub(crate) fn busy(&self) -> Vec<(String, crate::host::Busy)> {
         self.live_map()
             .iter()
             .filter(|(_, s)| s.alive())
