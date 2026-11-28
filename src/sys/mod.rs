@@ -37,6 +37,7 @@ pub(crate) mod fault {
 }
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The one decision class every error carries (DESIGN 9.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -89,6 +90,12 @@ pub(crate) fn xdg_homes<V: AsRef<std::ffi::OsStr>>(
             let value = lookup(name).filter(|v| std::path::Path::new(v).is_absolute())?;
             Some((name, value))
         })
+}
+
+/// `<now_ms>-<n>`, `n` counting up in this process: a file stem no other call here returns.
+pub(crate) fn unique_stem() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", now_ms(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Lower-case hexadecimal of `bytes`.

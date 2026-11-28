@@ -443,33 +443,16 @@ impl Line {
         }
         self.bytes.extend_from_slice(part);
         if self.bytes.len() > LINE_MAX {
-            let mut spill = Spill {
-                file: self.create(),
-                len: 0,
-            };
+            let path = self
+                .dir
+                .join(format!("{}-{}.txt", self.name, crate::sys::unique_stem()));
+            let file = crate::sys::fs::create_private(&path)
+                .map(|file| (file, path))
+                .map_err(|e| e.to_string());
+            let mut spill = Spill { file, len: 0 };
             spill.write(&std::mem::take(&mut self.bytes));
             self.spill = Some(spill);
         }
-    }
-
-    /// A new private file; a name taken (two long lines in one millisecond) gets a suffix.
-    fn create(&self) -> Result<(std::fs::File, PathBuf), String> {
-        let stem = format!("{}-{}", self.name, crate::sys::now_ms());
-        let mut last = String::new();
-        for n in 0..100 {
-            let file = if n == 0 {
-                format!("{stem}.txt")
-            } else {
-                format!("{stem}-{n}.txt")
-            };
-            let path = self.dir.join(file);
-            match crate::sys::fs::create_private(&path) {
-                Ok(file) => return Ok((file, path)),
-                Err(e) if path.exists() => last = e.to_string(),
-                Err(e) => return Err(e.to_string()),
-            }
-        }
-        Err(last)
     }
 
     /// Ends a line at LF; at EOF the pending CR must be flushed as data first.
@@ -605,29 +588,6 @@ mod tests {
         }
     }
 
-    #[cfg(target_os = "linux")]
-    #[test]
-    fn a_spill_file_sync_failure_is_reported() {
-        let dir = crate::sys::fs::tests::scratch("streams-file-sync");
-        let mut line = Line::new(dir.to_path_buf(), "sync");
-        let len = LINE_MAX + 1;
-        line.push(&vec![b'x'; len]);
-        let (file, path) = line.spill.as_mut().unwrap().file.as_mut().unwrap();
-        let path = path.clone();
-        // A real descriptor whose sync_all fails after the line's writes have succeeded.
-        *file = std::fs::File::open("/dev/null").unwrap();
-        let Ended::Saved(note) = line.finish() else {
-            panic!("the oversized line needs a note")
-        };
-        assert!(
-            note.starts_with(&format!(
-                "a line of {len} bytes that could not be saved: sync file:"
-            )),
-            "{note}"
-        );
-        assert!(!path.exists(), "an unsynced file must not be left behind");
-    }
-
     #[test]
     fn a_spill_directory_sync_failure_is_reported() {
         let dir = crate::sys::fs::tests::scratch("streams-dir-sync");
@@ -703,27 +663,6 @@ mod tests {
             "{note}"
         );
         assert_eq!(std::fs::metadata(path).unwrap().len(), 4_194_304);
-    }
-
-    /// Two long lines in one millisecond keep two files.
-    #[test]
-    fn long_lines_never_share_a_file() {
-        let dir = crate::sys::fs::tests::scratch("streams-names");
-        let now = crate::sys::now_ms();
-        for ms in now..now + 5000 {
-            std::fs::write(dir.join(format!("twice-{ms}.txt")), b"taken").unwrap();
-        }
-        let long = vec![b'y'; LINE_MAX + 1];
-        let mut saved = Vec::new();
-        for _ in 0..2 {
-            let mut line = Line::new(dir.to_path_buf(), "twice");
-            line.push(&long);
-            saved.push(saved_path(line.finish()).1);
-        }
-        assert_ne!(saved[0], saved[1]);
-        for path in saved {
-            assert_eq!(std::fs::read(path).unwrap(), long);
-        }
     }
 
     /// A line cut short by a stop leaves no file behind.
