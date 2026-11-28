@@ -136,7 +136,7 @@ async fn cancelled_terminal_start_requires_a_confirmed_block_close() {
         let program = dir.join("tern");
         let opened = dir.join("opened");
         std::fs::write(&program, format!(
-            "#!/bin/sh\ncase \"$1\" in\nnew) touch '{}'; printf '{{\"id\":\"owned-block\"}}\\n';;\nclose) exit {exit};;\nesac\n",
+            "#!/bin/sh\ncase \"$1\" in\nnew) touch '{}'; printf '{{\"session\":1,\"tab\":2,\"block\":3}}\\n';;\nclose) exit {exit};;\nesac\n",
             opened.display(),
         )).unwrap();
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
@@ -209,7 +209,9 @@ fn the_block_runs_omp_with_the_token_and_without_rpc_flags() {
     assert_eq!(pins, ["PI_PY=0", "PI_JS=0"]);
     assert!(!argv.iter().any(|a| a == "rpc-ui" || a == "--approval-mode"));
     assert!(argv.iter().any(|a| a == "--model=fake/primary"));
-    assert_eq!(block_id(br#"{"id":"b7"}"#).as_deref(), Some("b7"));
+    // What Tern 0.9.36 prints for `tern new tab --json`.
+    let printed = br#"{"session": 1, "tab": 8589934593, "block": 8589934594}"#;
+    assert_eq!(block_id(printed).as_deref(), Some("8589934594"));
 }
 
 #[tokio::test]

@@ -168,13 +168,13 @@ fn tern_spec<'a>(argv: &'a [String], cwd: Option<&'a Path>) -> Spec<'a> {
     }
 }
 
-/// The block ID `tern new --json` printed, if any.
+/// The block ID `tern new --json` printed (`{"session": 1, "tab": 2, "block": 3}`), if any.
 fn block_id(stdout: &[u8]) -> Option<String> {
     let value: Value = serde_json::from_slice(stdout).ok()?;
-    let id = value.get("id").or_else(|| value.pointer("/block/id"))?;
-    id.as_str()
-        .map(str::to_string)
-        .or_else(|| id.as_u64().map(|n| n.to_string()))
+    let id = value.get("block")?;
+    id.as_u64()
+        .map(|n| n.to_string())
+        .or_else(|| id.as_str().map(str::to_string))
 }
 
 impl Runtime for Tern {

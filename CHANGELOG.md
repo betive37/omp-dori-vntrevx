@@ -75,8 +75,10 @@
   ended (5 s more at most; a process still running stays unconfirmed). Before, `lead stop`
   answered while OMP still ran, and a `lead start` right after it could find the session held.
   A hub stopped during a Tern start before the bridge's hello, with no process recorded yet,
-  reconciles that attempt by a confirmed close of its recorded block instead of holding the lead
-  for good.
+  reconciles that attempt by a confirmed close of its recorded block, or Tern's answer that it
+  has no such block, instead of holding the lead for good. The block ID is read from what Tern
+  prints (`"block": 3`); before, it was never recorded with Tern 0.9.36, so neither this nor the
+  block close at a stop could happen.
   Settled startup receipts are pruned only after no anchor, recovery episode or lane references
   them; current and uncertain attempts are never discarded merely because they are old.
   Maintenance collapses only superseded duplicate binding tuples, retaining the current anchor

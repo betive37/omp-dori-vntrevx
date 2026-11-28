@@ -386,10 +386,9 @@ fn without_bridge(hub: &TestHub, model: &FakeModel, argv: &[String]) -> (u64, u6
         .unwrap();
     let block: Value = serde_json::from_slice(&out.stdout).unwrap();
     let mut input = input.join().unwrap();
-    let pidfile = hub.root.join(format!(
-        "bin/tern-data/block-{}.pid",
-        block["id"].as_str().unwrap()
-    ));
+    let pidfile = hub
+        .root
+        .join(format!("bin/tern-data/block-{}.pid", block["block"]));
     let pty: u64 = std::fs::read_to_string(pidfile)
         .unwrap()
         .trim()

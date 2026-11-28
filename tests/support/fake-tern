@@ -1,19 +1,22 @@
 #!/bin/sh
-# A stand-in for Tern's command line in tests (Tern 0.9.33 `tern new --help`). It never opens a
-# window and never talks to a Tern daemon. Each call is appended to `tern-data/calls.log`.
+# A stand-in for Tern's command line in tests (Tern 0.9.33 `tern new --help`; its output and
+# refusals as Tern 0.9.36 gives them). It never opens a window and never talks to a Tern daemon.
+# Each call is appended to `tern-data/calls.log`.
 #   tern new tab [SESSION] [--json] [--cwd DIR] [--keep-open] -- COMMAND...
 #       runs COMMAND in DIR in a pseudo-terminal (Python's pty module), in the background, its
-#       screen output going to tern-data/block-<id>.out; prints {"id":"<id>"}. The block's wrapper
-#       (PID and process group in block-<id>.pid) and COMMAND (block-<id>.omp, its own session and
-#       group) never outlive the test: see `block` below.
-#   tern close ID   ends that block's program
+#       screen output going to tern-data/block-<id>.out; prints {"session":1,"tab":1,"block":<id>}.
+#       The block's wrapper (PID and process group in block-<id>.pid) and COMMAND (block-<id>.omp,
+#       its own session and group) never outlive the test: see `block` below.
+#   tern close ID   ends that block's program; a block it never opened is refused as Tern does
 #   tern --version
 dir=$(cd "$(dirname "$0")" && pwd)/tern-data
 mkdir -p "$dir"
 printf '%s\n' "$*" >> "$dir/calls.log"
 case "$1" in
 --version) echo "tern 0.0.0 (test stand-in)"; exit 0 ;;
-close) [ -f "$dir/block-$2.pid" ] && kill "$(cat "$dir/block-$2.pid")" 2>/dev/null; exit 0 ;;
+close)
+    if [ -f "$dir/block-$2.pid" ]; then kill "$(cat "$dir/block-$2.pid")" 2>/dev/null; exit 0; fi
+    echo "tern close: no block is called \`$2\`" >&2; exit 1 ;;
 new) [ "$2" = tab ] || { echo "stand-in: only new tab" >&2; exit 2; }; shift 2 ;;
 *) echo "stand-in: unsupported command $1" >&2; exit 2 ;;
 esac
@@ -27,7 +30,7 @@ done
 [ "$1" = "--" ] || { echo "stand-in: no command" >&2; exit 2; }
 shift
 cd "$cwd" || exit 3
-id="b$$"
+id=$$
 # Measurements type into the block through the named pipe tern-data/input when it exists.
 input=/dev/null
 [ -p "$dir/input" ] && input=$dir/input
@@ -112,4 +115,4 @@ kill(signal.SIGKILL)
 TERM=${TERM:-xterm-256color} python3 -c "$block" "$owner" "$dir/block-$id.omp" "$@" \
     > "$dir/block-$id.out" 2>&1 < "$input" &
 echo $! > "$dir/block-$id.pid"
-printf '{"id":"%s"}\n' "$id"
+printf '{"session":1,"tab":1,"block":%s}\n' "$id"

@@ -106,38 +106,54 @@ async fn a_terminal_close_is_confirmed_only_by_the_process_exit() {
 }
 
 /// A hub that stopped during a Tern start before the bridge hello recorded only the block: its
-/// reconciliation is a confirmed close of that block, kept once confirmed; a refused close stays
-/// unknown.
+/// reconciliation is a confirmed close of that block, or Tern's answer that it has no such block
+/// (it already ended), kept once confirmed. Any other refusal stays unknown.
 #[tokio::test]
-async fn a_block_without_its_process_is_reconciled_by_a_confirmed_close() {
+async fn a_block_without_its_process_is_reconciled_by_its_close_or_its_absence() {
     use std::os::unix::fs::PermissionsExt as _;
     let dir = crate::sys::fs::tests::scratch("prehello-block");
     let calls = dir.join("calls");
-    for (exit, expected) in [(1, Cleanup::Unknown), (0, Cleanup::LocalReaped)] {
-        let tern = dir.join(format!("tern-{exit}"));
+    // Tern 0.9.36's answers to `tern close BLOCK`.
+    let cases = [
+        (
+            "down",
+            "echo 'tern close: no Tern is running (no session daemon on /run/tern.sock)' >&2; exit 1",
+            Cleanup::Unknown,
+        ),
+        (
+            "absent",
+            "echo 'tern close: no block is called `8589934594`' >&2; exit 1",
+            Cleanup::LocalReaped,
+        ),
+        ("closed", "exit 0", Cleanup::LocalReaped),
+    ];
+    for (name, answer, expected) in cases {
+        let tern = dir.join(format!("tern-{name}"));
         std::fs::write(
             &tern,
             format!(
-                "#!/bin/sh\necho \"$*\" >> '{}'\nexit {exit}\n",
+                "#!/bin/sh\necho \"$*\" >> '{}'\n{answer}\n",
                 calls.display()
             ),
         )
         .unwrap();
         std::fs::set_permissions(&tern, std::fs::Permissions::from_mode(0o700)).unwrap();
-        let handle = format!("prehello-{exit}");
+        let handle = format!("prehello-{name}");
         let owner = Ownership::prepare(&dir, &handle).unwrap();
-        owner.terminal(&tern, "lost-block").unwrap();
+        owner.terminal(&tern, "8589934594").unwrap();
         drop(owner);
-        assert_eq!(reconcile(&dir, &handle).await.unwrap(), expected);
+        assert_eq!(reconcile(&dir, &handle).await.unwrap(), expected, "{name}");
     }
     assert_eq!(
         std::fs::read_to_string(&calls).unwrap(),
-        "close lost-block\nclose lost-block\n"
+        "close 8589934594\n".repeat(3)
     );
-    // The confirmed close is kept: no second close.
-    assert_eq!(
-        reconcile(&dir, "prehello-0").await.unwrap(),
-        Cleanup::LocalReaped
-    );
-    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 2);
+    // A confirmed cleanup is kept: no second close.
+    for name in ["absent", "closed"] {
+        assert_eq!(
+            reconcile(&dir, &format!("prehello-{name}")).await.unwrap(),
+            Cleanup::LocalReaped
+        );
+    }
+    assert_eq!(std::fs::read_to_string(&calls).unwrap().lines().count(), 3);
 }

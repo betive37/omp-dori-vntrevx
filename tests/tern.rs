@@ -605,10 +605,7 @@ fn a_block_ends_when_its_owner_is_gone() {
     let out = output_of(
         std::process::Command::new(&tern).args(["new", "tab", "--json", "--", "sleep", "60"]),
     );
-    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["id"]
-        .as_str()
-        .unwrap()
-        .to_string();
+    let id = serde_json::from_slice::<Value>(&out.stdout).unwrap()["block"].to_string();
     let data = hub.root.join("bin/tern-data");
     let wrapper = std::fs::read_to_string(data.join(format!("block-{id}.pid"))).unwrap();
     let program = hub.until(Duration::from_secs(10), || {

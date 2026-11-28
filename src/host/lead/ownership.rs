@@ -156,8 +156,9 @@ impl Ownership {
     /// Proves the terminal session's OMP gone: its own exit within `grace` (it was asked to shut
     /// down, or did), else Tern's close of its block and then the process's exit. Tern's close
     /// only asks the block to end, so a recorded process still running after it stays unconfirmed:
-    /// a stop must not answer while OMP still holds the session it shut down. A block that never
-    /// named its process has only the close as evidence.
+    /// a stop must not answer while OMP still holds the session it shut down. Tern's answer that
+    /// it has no such block counts as the close: the block already ended. A block that never named
+    /// its process has only the close as evidence.
     pub(crate) async fn close_terminal(&self, grace: Duration) -> Result<Cleanup, String> {
         let proof = self.exit_within(grace).await?;
         if proof.confirmed() {
@@ -176,7 +177,7 @@ impl Ownership {
         let argv = [
             terminal.program.display().to_string(),
             "close".into(),
-            terminal.block,
+            terminal.block.clone(),
         ];
         let result = crate::sys::command::run(&crate::sys::command::Spec {
             argv: &argv,
@@ -189,7 +190,9 @@ impl Ownership {
         })
         .await
         .map_err(|e| e.to_string())?;
-        if !result.success() {
+        // Tern 0.9.36: `tern close: no block is called `ID`` and exit 1.
+        let absent = format!("no block is called `{}`", terminal.block);
+        if !result.success() && !String::from_utf8_lossy(&result.stderr).contains(&absent) {
             return Ok(Cleanup::Unknown);
         }
         let proof = if self.identified() {
@@ -226,7 +229,8 @@ pub(crate) fn recorded(state: &Path, handle: &str) -> Result<bool, String> {
 
 /// Reconciles attempt `handle` from its journal here. A Tern block whose process identity was never
 /// recorded (the hub stopped before the bridge hello) has only a confirmed close of the recorded
-/// block as evidence, as at a failed start; without it the attempt would stay held for good.
+/// block, or Tern's answer that it has no such block, as evidence, as at a failed start; without it
+/// the attempt would stay held for good.
 pub(crate) async fn reconcile(state: &Path, handle: &str) -> Result<Cleanup, String> {
     let path = state.join("startup").join(format!("{handle}.json"));
     let Some(bytes) = fs::read_private(&path, 4096).map_err(|e| e.to_string())? else {
