@@ -21,7 +21,7 @@ use super::{Inbound, PartOutcome, Relay};
 use crate::config::Config;
 use crate::host::inbox::{self, Message, ReceiptState};
 use crate::host::lead::{Events, Lead};
-use crate::host::{Runtime, SessionEvent, Status};
+use crate::host::{Runtime, SessionEvent, Snapshot, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::omp::transcript::{self, Reply};
@@ -1128,8 +1128,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         {
             let settled = turn_over || snap.status == Status::Idle;
             let file = PathBuf::from(file);
+            let metadata = std::fs::metadata(&file).ok();
+            let worked = last_work(&snap, settled, metadata.as_ref());
             // The newest answered request's later turns: read again only when something changed.
-            let length = std::fs::metadata(&file).map(|m| m.len()).ok();
+            let length = metadata.map(|m| m.len());
             let later = newest.filter(|h| {
                 let seen = &self.later().read;
                 !matches!((seen, length), (Some((m, f, l, s)), Some(length))
@@ -1148,7 +1150,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                 let later_reply = later.as_ref().and_then(|_| replies.pop());
                 for (h, reply) in waiting.iter().zip(replies) {
-                    self.settle_reply(h, reply).await?;
+                    self.settle_reply(h, reply, worked).await?;
                 }
                 if let (Some(h), Some(reply)) = (later, later_reply) {
                     self.later_turns(&h, reply).await?;
@@ -1182,7 +1184,18 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
-    async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
+    /// Stores what one read found for `h`, a request to the lead. With no answer it stops waiting
+    /// only once both its hand-off and the lead's last work (`worked`) are older than the owed
+    /// window: while a turn runs, an unfinished turn (`Pending`) and a request still queued behind
+    /// it (`NotFound`) keep waiting, and a request queued behind it keeps the window after the turn
+    /// ends to reach the transcript. The next input entering the transcript ends the wait sooner
+    /// (DISC-OUT req. 21-22).
+    async fn settle_reply(
+        &self,
+        h: &HandoffRow,
+        reply: Reply,
+        worked: Option<i64>,
+    ) -> Result<(), String> {
         let answer = |answer: &str| RelayWrite::Answer {
             relay: R::NAME.into(),
             room: h.room.clone(),
@@ -1227,8 +1240,12 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                     .await
                     .map_err(|e| e.to_string())?;
             }
+            // With the lead idle that long, `Pending` is a turn that ended without an answer and
+            // `NotFound` a request that never reached this transcript (another session file, or
+            // outside the part read): neither waits on work still running.
             Reply::NotFound | Reply::Pending => {
-                if now_ms() - h.created_ms > OWED_WINDOW_MS {
+                let since = worked.map_or(h.created_ms, |w| w.max(h.created_ms));
+                if now_ms() - since > OWED_WINDOW_MS {
                     self.store
                         .relay(answer("abandoned"))
                         .await
@@ -1694,6 +1711,18 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
         Ok(true)
     }
+}
+
+/// When the lead last worked (ms): now while its turn runs or waits on a dialog, else the last
+/// write to its session file, which ended its last turn. Nothing is kept, so a restart neither
+/// loses the time nor gives an untouched transcript a fresh window.
+fn last_work(snap: &Snapshot, settled: bool, file: Option<&std::fs::Metadata>) -> Option<i64> {
+    if !settled && snap.in_turn() {
+        return Some(now_ms());
+    }
+    file.and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|t| i64::try_from(t.as_millis()).ok())
 }
 
 /// Keeps only the sources still being posted: a delivery that finished or was given up leaves no

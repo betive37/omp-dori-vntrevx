@@ -13,6 +13,24 @@
 - Two flushes of a lane's inbox at once (a turn end and a new message from the lead, say) could
   both write the same waiting messages, or both resend the same unconfirmed one, so the lane got
   them twice. A lane's inbox now takes one flush or delivery at a time, as the lead's does.
+- An approval the lead raised while an owner message was being handed to a lane in its thread
+  could reply to that lane message instead of the lead's request; typing and the lead's answer
+  bookkeeping also counted lane messages. Only messages handed to the lead are now treated as
+  waiting for the lead's answer.
+- The lead's answer is no longer lost when its turn runs past 30 minutes. A turn that ran longer
+  (subagents, long tool calls), or a message of yours waiting behind such a turn, was given up 30
+  minutes after it arrived, and the answer that came later was never posted. While the lead's turn
+  runs or waits on a dialog, a message to the lead now keeps waiting for its answer; the next
+  message that reaches the lead still ends the wait, and a message with no answer is given up only
+  once both it and the last write to the lead's session file (the end of its last turn) are 30
+  minutes old, also across intake and hub restarts. A lead that faulted, or whose goal is blocked
+  by its budget, runs no turn and keeps nothing waiting. Limits: a message whose line in the lead's
+  session file is pushed out of the last 8 MiB read, or whose session file changed, waits until the
+  lead has been idle for 30 minutes and is then given up; a resume that writes to the session file
+  gives an old request another 30-minute window. A message queued behind a long turn can still go
+  in doubt when its delivery is not confirmed within 30 seconds (a separate cause, fixed by
+  [PR #314](https://github.com/vntrevx/Cataly/pull/314)); the full effect for such messages needs
+  both. Discord, Telegram and Slack alike.
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
   "300 s recovery episode has no startup and cleanup budget remaining", with nothing attempted:

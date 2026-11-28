@@ -301,6 +301,17 @@ impl Snapshot {
             None
         }
     }
+
+    /// Whether a turn runs or waits on a dialog, as OMP's events and readbacks show it: a turn start
+    /// not read back as idle since (its readback may be stale meanwhile), a working readback, or an
+    /// open dialog. A fault or a stop ends it. A status that is merely not idle (a goal blocked by
+    /// its budget, no binding, no fresh readback) is none without one of these, however long.
+    pub(crate) fn in_turn(&self) -> bool {
+        self.stop.is_none()
+            && self.status != Status::Error
+            && (self.busy().is_some()
+                || (self.turn_started_ms.is_some() && self.status != Status::Idle))
+    }
 }
 
 /// A page of numbered events; `missed` when the caller's number is older than the oldest kept.
