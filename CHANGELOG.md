@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Large queued messages could leave an inbox stuck retrying a batch over 256 KiB. Batches now
+  include their envelope in that limit, new messages leave room for it, and an older oversized
+  message fails alone instead of blocking later messages.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
