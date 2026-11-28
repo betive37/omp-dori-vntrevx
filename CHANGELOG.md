@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- The board post cleans each lane's latest report as a thread post is cleaned, as EVR req. 51
+  says: the home directory shows as `~`, other local paths as `[path removed]`, and links lose
+  their query. It only flattened the text, so paths and URL queries (tokens among them) from a
+  report reached every board destination as written.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
