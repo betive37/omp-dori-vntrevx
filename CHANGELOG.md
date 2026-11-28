@@ -4,7 +4,7 @@
 
 - Stream jobs: output without line ends (a `\r` progress bar, binary data) no longer grows the hub's
   memory until the line ends. Past 64 KiB the line continues in its private file as it arrives;
-  one event gives the path and size when it ends.
+  one event gives the path and size when it ends. The file keeps at most the line's first 4 MiB.
 
 ## 0.2.7 (2026-11-28)
 

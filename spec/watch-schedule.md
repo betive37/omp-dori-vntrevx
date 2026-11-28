@@ -286,7 +286,8 @@ lead's OMP session. The new model: **one Rust daemon, one job table, one typed e
 
 71. A stream job runs a long-lived command (argument vector, no shell, the lead's working directory) and turns each
     output line matching its regular expression into an event (urgent unless the job is marked low priority).
-72. A line over 64 KiB is not filtered; it is written to a private file and one event gives its path and size.
+72. A line over 64 KiB is not filtered; it is written to a private file as it arrives (at most its first 4 MiB;
+    the rest is counted, not kept) and one event gives its path and size.
 73. Restart policy: none (exit reported once), or up to N restarts (0 to 100, default 5) with exponential backoff
     from a given delay (default 10 s). A clean exit with "run until success" ends the job. Exhaustion stops the job,
     reported once. An optional silence alert emits one event per quiet spell of at least M minutes; any output

@@ -29,6 +29,8 @@ const ARGV_MAX: usize = 64;
 const STDERR_CAP: u64 = 256 * 1024;
 /// How much output one read takes; a line in memory never exceeds `LINE_MAX` plus this.
 const CHUNK: usize = 8 * 1024;
+/// The most of one long line its file keeps (WS req. 72); the rest is counted, not saved.
+const SPILL_MAX: usize = 4 * 1024 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Spec {
@@ -323,6 +325,7 @@ impl Streams {
                     continue;
                 }
                 _ = stopped.changed() => {
+                    line.discard();
                     child.close(Duration::ZERO, KILL_GRACE).await;
                     return None;
                 }
@@ -379,7 +382,8 @@ enum Ended {
 }
 
 /// The output line being read. Up to `LINE_MAX` bytes stay in memory; a longer line continues in a
-/// private file (WS req. 72), so output without line ends never grows the hub's memory.
+/// private file (WS req. 72), so output without line ends never grows the hub's memory. The file
+/// keeps the first `SPILL_MAX` bytes; the rest is only counted.
 struct Line {
     dir: PathBuf,
     name: String,
@@ -388,8 +392,8 @@ struct Line {
 }
 
 struct Spill {
-    path: PathBuf,
-    file: Result<std::fs::File, String>,
+    /// The file and its path; `Err` once it could not be made or written (no file is left then).
+    file: Result<(std::fs::File, PathBuf), String>,
     len: usize,
 }
 
@@ -414,14 +418,33 @@ impl Line {
         }
         self.bytes.extend_from_slice(part);
         if self.bytes.len() > LINE_MAX {
-            let path = self
-                .dir
-                .join(format!("{}-{}.txt", self.name, crate::sys::now_ms()));
-            let file = crate::sys::fs::create_private(&path).map_err(|e| e.to_string());
-            let mut spill = Spill { path, file, len: 0 };
+            let mut spill = Spill {
+                file: self.create(),
+                len: 0,
+            };
             spill.write(&std::mem::take(&mut self.bytes));
             self.spill = Some(spill);
         }
+    }
+
+    /// A new private file; a name taken (two long lines in one millisecond) gets a suffix.
+    fn create(&self) -> Result<(std::fs::File, PathBuf), String> {
+        let stem = format!("{}-{}", self.name, crate::sys::now_ms());
+        let mut last = String::new();
+        for n in 0..100 {
+            let file = if n == 0 {
+                format!("{stem}.txt")
+            } else {
+                format!("{stem}-{n}.txt")
+            };
+            let path = self.dir.join(file);
+            match crate::sys::fs::create_private(&path) {
+                Ok(file) => return Ok((file, path)),
+                Err(e) if path.exists() => last = e.to_string(),
+                Err(e) => return Err(e.to_string()),
+            }
+        }
+        Err(last)
     }
 
     fn finish(&mut self) -> Ended {
@@ -432,24 +455,42 @@ impl Line {
             }
             return Ended::Text(String::from_utf8_lossy(&bytes).into_owned());
         };
+        let len = spill.len;
         Ended::Saved(match spill.file {
-            Ok(_) => format!(
-                "a line of {} bytes, saved in {}",
-                spill.len,
-                spill.path.display()
+            Ok((_, path)) if len > SPILL_MAX => format!(
+                "a line of {len} bytes, the first {SPILL_MAX} saved in {}",
+                path.display()
             ),
-            Err(e) => format!("a line of {} bytes that could not be saved: {e}", spill.len),
+            Ok((_, path)) => format!("a line of {len} bytes, saved in {}", path.display()),
+            Err(e) => format!("a line of {len} bytes that could not be saved: {e}"),
         })
+    }
+
+    /// Drops a line cut short by a stop, with its unfinished file.
+    fn discard(&mut self) {
+        if let Some(Spill {
+            file: Ok((_, path)),
+            ..
+        }) = self.spill.take()
+        {
+            let _ = std::fs::remove_file(path);
+        }
     }
 }
 
 impl Spill {
     fn write(&mut self, part: &[u8]) {
         use std::io::Write as _;
+        let room = SPILL_MAX.saturating_sub(self.len);
         self.len += part.len();
-        if let Ok(file) = &mut self.file
-            && let Err(e) = file.write_all(part)
-        {
+        let Ok((file, path)) = &mut self.file else {
+            return;
+        };
+        let Some(kept) = part.get(..part.len().min(room)) else {
+            return;
+        };
+        if let Err(e) = file.write_all(kept) {
+            let _ = std::fs::remove_file(&*path);
             self.file = Err(e.to_string());
         }
     }
@@ -467,6 +508,62 @@ mod tests {
         assert!(spec_of(&json!({"name": "x", "argv": []})).is_err());
         assert!(spec_of(&json!({"name": "x", "argv": ["a"], "filter": "("})).is_err());
         assert!(spec_of(&json!({"name": "x", "argv": ["a"], "restarts": 101})).is_err());
+    }
+
+    fn saved_path(ended: Ended) -> (String, PathBuf) {
+        let Ended::Saved(note) = ended else {
+            panic!("not saved")
+        };
+        let path = PathBuf::from(note.rsplit(" saved in ").next().unwrap());
+        (note, path)
+    }
+
+    /// WS req. 72: the file keeps the first `SPILL_MAX` bytes; the event gives the whole length.
+    #[test]
+    fn a_long_line_file_is_capped() {
+        let dir = crate::sys::fs::tests::scratch("streams-cap");
+        let mut line = Line::new(dir.to_path_buf(), "cap");
+        let chunk = vec![b'x'; CHUNK];
+        for _ in 0..(5 * 1024 * 1024 / CHUNK) {
+            line.push(&chunk);
+        }
+        let (note, path) = saved_path(line.finish());
+        assert!(
+            note.starts_with("a line of 5242880 bytes, the first 4194304 saved in "),
+            "{note}"
+        );
+        assert_eq!(std::fs::metadata(path).unwrap().len(), 4_194_304);
+    }
+
+    /// Two long lines in one millisecond keep two files.
+    #[test]
+    fn long_lines_never_share_a_file() {
+        let dir = crate::sys::fs::tests::scratch("streams-names");
+        let now = crate::sys::now_ms();
+        for ms in now..now + 5000 {
+            std::fs::write(dir.join(format!("twice-{ms}.txt")), b"taken").unwrap();
+        }
+        let long = vec![b'y'; LINE_MAX + 1];
+        let mut saved = Vec::new();
+        for _ in 0..2 {
+            let mut line = Line::new(dir.to_path_buf(), "twice");
+            line.push(&long);
+            saved.push(saved_path(line.finish()).1);
+        }
+        assert_ne!(saved[0], saved[1]);
+        for path in saved {
+            assert_eq!(std::fs::read(path).unwrap(), long);
+        }
+    }
+
+    /// A line cut short by a stop leaves no file behind.
+    #[test]
+    fn a_stopped_line_leaves_no_file() {
+        let dir = crate::sys::fs::tests::scratch("streams-stop");
+        let mut line = Line::new(dir.to_path_buf(), "cut");
+        line.push(&vec![b'z'; LINE_MAX + 1]);
+        line.discard();
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
     }
 
     /// WS req. 72: a line without an end goes to its file while it grows, not into memory first.
