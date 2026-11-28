@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A lane step with new evidence now starts a new progress round, as a report with new evidence
+  does: after one stall alert, a lane that moved on only through steps was never reminded or
+  alerted again; now it is when it stalls again.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
