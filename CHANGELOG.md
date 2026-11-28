@@ -128,6 +128,12 @@
   fewer days than before. A next run already saved for a day the new rule excludes moves to the next
   valid day instead of firing. The search covers 40-year gaps between rare date-and-weekday matches,
   such as leap-day Sundays from 2088 to 2128 across the non-leap year 2100.
+- Stream jobs: output without line ends (a `\r` progress bar, binary data) no longer grows the hub's
+  memory until the line ends. Past 64 KiB the line continues in its private file as it arrives;
+  one event gives the path and size when it ends. The file keeps at most the line's first 4 MiB.
+  CRLF endings do not count toward either limit or appear in the saved bytes; a bare `\r` at EOF
+  remains data. The file and its directory are synced before the event reports it saved; a sync
+  failure is reported in the event instead.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
