@@ -109,6 +109,13 @@
   the `hello` of a worker it refused as incompatible, so it knows which version that PC runs. An
   unreachable or never-reached worker is reported as unknown, never as outdated. Nothing is asked
   of, or installed on, a worker for this.
+- Stopping the hub's systemd user service sends TERM to the hub alone (`KillMode=mixed`, as
+  launchd already does). It used to reach every session, job and stream job at the same moment,
+  so they could die before the hub knew it was stopping: the lead and lanes ended on the signal
+  instead of the hub's clean close, and a stream job could take the stop for its own exit. The hub
+  now ends them itself; whatever is left once it exits is killed. `cataly update` and
+  `cataly rollback` rewrite the unit before they start the hub; after `--no-restart`, or a switch
+  outside them, run `cataly service refresh`.
 
 ## 0.2.8 (2026-11-28)
 
