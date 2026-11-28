@@ -1370,8 +1370,10 @@ fn live_passes_do_not_skip_owner_messages_during_catch_up() {
         // Once this room is caught up, live passes advance normally again.
         let after = 950_000_000_000_000_000;
         fake.say(FakeDiscord::message(CH, after, OTHER, "after catch-up"));
+        let after_position = after.to_string();
         hub.until(WAIT, || {
-            (status(&hub)["rooms"][0]["position"] == after.to_string()).then_some(())
+            (status(&hub)["rooms"][0]["position"].as_str() == Some(after_position.as_str()))
+                .then_some(())
         });
         assert!(hub.stop().success());
     }
