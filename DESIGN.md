@@ -489,7 +489,9 @@ relay destinations, or kept locally. Messenger posts never mention anyone and pa
 - **Bridge link.** Same socket: `hello` (protocol version, OMP version, launch token, session ID and file, PID,
   cwd, agent kind, run mode) → role answer with guidance text, tools to show, model pin, shell-rules flag. Then
   events with per-connection sequence numbers, heartbeats every 15 s (45 s = closed), bounded buffering on the
-  bridge side (1,000 events or 1 MiB), snapshot on reconnect (EXT requirements 3-16).
+  bridge side (1,000 events or 1 MiB), snapshot on reconnect (EXT requirements 3-16). An unanswered first hello
+  retries with the same session and private random hello ID; the launch token stays bound to that identity until
+  a subsequent bridge request acknowledges the welcome, without extending the token's original lifetime.
 - **Versioning.** `v` is the control protocol major (starts at 1). Fields are only added within a major;
   unknown fields are ignored; unknown methods answer `unknown_method`. The bridge carries its own extension
   protocol version; a mismatch gets role `none` and an owner notice. The CLI and hub come from one binary, so

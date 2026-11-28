@@ -1,6 +1,6 @@
 // Bridge tests (DESIGN 10.4): a fake OMP extension API and a fake hub connection. Run with
 // `bun test extension/`.
-import { expect, test } from "bun:test";
+import { expect, spyOn, test } from "bun:test";
 import { bridge, type Deps, fingerprint, socketPath, type Wire } from "./cataly";
 import { ctxOf, fakePi, laneCtx, laneHub } from "./fakes";
 
@@ -81,6 +81,173 @@ test("role none leaves the session inert", async () => {
 	expect(connects.n).toBe(1);
 	expect([...pi.handlers.keys()].sort()).toEqual(["session_start", "session_switch"]);
 	expect(pi.tools.length).toBe(0);
+});
+
+test.each(["close", "timeout"])("an unanswered first hello retries after %s with backoff and its launch identity", async failure => {
+	const pi = fakePi();
+	const hellos: Record<string, unknown>[] = [];
+	let helloSent = Promise.withResolvers<void>();
+	const retries: { fn: () => void; ms: number }[] = [];
+	const deadlines = new Map<unknown, { fn: () => void; ms: number }>();
+	// Drive the real request timeout and the context's retry timers without sleeping.
+	const set = spyOn(globalThis, "setTimeout").mockImplementation((fn, ms) => {
+		const timer = { fn: () => fn(), ms: ms ?? 0 };
+		deadlines.set(timer, timer);
+		// Only our clearTimeout sees this opaque fake handle; no native timer is created.
+		return timer as unknown as NodeJS.Timeout;
+	});
+	const clear = spyOn(globalThis, "clearTimeout").mockImplementation(timer => void deadlines.delete(timer));
+	const warnings: string[] = [];
+	let close: () => void = () => {};
+	const b = bridge(pi, {
+		env: { CATALY_LAUNCH: "tok" }, uid: () => 1,
+		connect: async (_path, onLine, onClose) => {
+			close = onClose;
+			return {
+				write(line) {
+					const msg = JSON.parse(line);
+					if (msg.method !== "bridge.hello") return;
+					hellos.push(msg.params);
+					helloSent.resolve();
+					if (hellos.length <= 2) {
+						if (failure === "close") queueMicrotask(onClose);
+					} else queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ok: {
+						role: "lead", key: "accepted", guidance: "GUIDE", tools: [{ name: "cataly_lead" }],
+					} })));
+				},
+				close: onClose,
+			};
+		},
+	});
+	const connect = spyOn(b, "connect");
+	const base = ctxOf(pi);
+	const ctx = { ...base, ui: { ...base.ui, notify: (text: string) => warnings.push(text) },
+		setTimeout: (fn: () => void, ms: number) => (retries.push({ fn, ms }), 0) };
+	const finish = async (pending: Promise<unknown>) => {
+		await helloSent.promise;
+		helloSent = Promise.withResolvers<void>();
+		if (failure === "timeout" && hellos.length <= 2) {
+			expect(deadlines.size).toBe(1);
+			const timer = [...deadlines.values()][0];
+			expect(timer.ms).toBe(5_000);
+			timer.fn();
+		}
+		await pending;
+	};
+	try {
+		await finish(pi.emit("session_start", {}, ctx));
+		for (const delay of [1_000, 2_000]) {
+			expect(retries).toHaveLength(1);
+			expect(b.wired).toBe(false);
+			expect(b.token).toBe("tok");
+			expect(b.wire).toBeUndefined();
+			expect(pi.tools).toHaveLength(0);
+			const retry = retries.shift()!;
+			expect(retry.ms).toBe(delay);
+			retry.fn();
+			await finish(connect.mock.results.at(-1)!.value);
+		}
+		expect(hellos).toHaveLength(3);
+		expect(hellos[0].hello_id).toBeString();
+		expect(String(hellos[0].hello_id).length).toBeGreaterThan(0);
+		for (const hello of hellos) expect(hello).toMatchObject({ token: "tok", session: "s1", hello_id: hellos[0].hello_id });
+		expect(b.token).toBeUndefined();
+		expect(b.role).toBe("lead");
+		expect(b.key).toBe("accepted");
+		expect(b.guidance).toBe("GUIDE");
+		expect(b.wired).toBe(true);
+		expect(b.connecting).toBe(false);
+		expect(b.attempt).toBe(0);
+		expect(pi.tools.map(t => t.name)).toEqual(["cataly_lead"]);
+		expect(pi.entries).toHaveLength(1);
+		expect(warnings).toHaveLength(1);
+		expect(deadlines.size).toBe(0);
+		expect(retries).toHaveLength(0);
+		close();
+		expect(retries.map(t => t.ms)).toEqual([1_000]);
+	} finally {
+		b.shutting = true;
+		set.mockRestore(); clear.mockRestore(); connect.mockRestore();
+	}
+});
+
+test.each(["none", "err"])("an explicit hello %s reply stays inert without retrying", async refusal => {
+	const pi = fakePi();
+	const retries: number[] = [];
+	const b = bridge(pi, { env: { CATALY_LAUNCH: "tok" }, uid: () => 1,
+		connect: async (_path, onLine, onClose) => ({
+			write(line) {
+				const { id } = JSON.parse(line);
+				queueMicrotask(() => onLine(JSON.stringify({ id, ...(refusal === "none"
+					? { ok: { role: "none" } } : { err: { code: "bad_request", message: "refused" } }) })));
+			},
+			close: onClose,
+		}),
+	});
+	await pi.emit("session_start", {}, { ...ctxOf(pi), setTimeout: (_fn: () => void, ms: number) => (retries.push(ms), 0) });
+	expect(b.token).toBeUndefined();
+	expect(b.wire).toBeUndefined();
+	expect(b.connecting).toBe(false);
+	expect(b.wired).toBe(false);
+	expect(b.role).toBe("none");
+	expect(pi.tools).toHaveLength(0);
+	expect(retries).toHaveLength(0);
+});
+
+test.each(["none", "err"])("an accepted session retries a reconnect %s reply without losing its key", async refusal => {
+	const pi = fakePi();
+	const retries: { fn: () => void; ms: number }[] = [];
+	const sent: { method: string; params: Record<string, unknown> }[] = [];
+	let hellos = 0;
+	let close: () => void = () => {};
+	const b = bridge(pi, { env: { CATALY_LAUNCH: "tok" }, uid: () => 1,
+		connect: async (_path, onLine, onClose) => {
+			close = onClose;
+			return {
+				write(line) {
+					const msg = JSON.parse(line);
+					sent.push(msg);
+					if (msg.method !== "bridge.hello") return;
+					hellos += 1;
+					const reply = hellos === 2 ? (refusal === "none"
+						? { ok: { role: "none" } } : { err: { code: "bad_request", message: "refused" } })
+						: { ok: { role: "lane", key: `k${hellos}`, tools: [{ name: "cataly_lane" }] } };
+					queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ...reply })));
+				},
+				close: onClose,
+			};
+		},
+	});
+	const connect = spyOn(b, "connect");
+	try {
+		await pi.emit("session_start", {}, { ...ctxOf(pi),
+			setTimeout: (fn: () => void, ms: number) => (retries.push({ fn, ms }), 0) });
+		close();
+		b.event("turn_end");
+		for (const delay of [1_000, 2_000]) {
+			expect(retries).toHaveLength(1);
+			expect(b.wired).toBe(true);
+			expect(b.key).toBe("k1");
+			expect(b.wire).toBeUndefined();
+			const retry = retries.shift()!;
+			expect(retry.ms).toBe(delay);
+			retry.fn();
+			await connect.mock.results.at(-1)!.value;
+		}
+		expect(sent.filter(m => m.method === "bridge.hello").map(m => m.params.key)).toEqual([undefined, "k1", "k1"]);
+		expect(b.role).toBe("lane");
+		expect(b.key).toBe("k3");
+		expect(b.connecting).toBe(false);
+		expect(b.attempt).toBe(0);
+		expect(b.queue).toHaveLength(0);
+		expect(sent.filter(m => m.method === "bridge.event").map(m => m.params.kind)).toEqual(["snapshot", "turn_end"]);
+		expect(pi.tools.map(t => t.name)).toEqual(["cataly_lane"]);
+		expect(retries).toHaveLength(0);
+	} finally {
+		b.shutting = true;
+		close();
+		connect.mockRestore();
+	}
 });
 
 test("events are buffered while disconnected, oldest dropped first", () => {

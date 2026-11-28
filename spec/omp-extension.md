@@ -127,10 +127,13 @@ logic can move to Rust, leaving the extension as a forwarder.
    connect timeout 1 s) and sends a hello: protocol version, OMP version, launch token if any, session ID, session
    file path, process ID, working directory, agent kind, and run mode (interactive or rpc).
 4. The daemon answers with a role (lead, lane, or none), the lane key if any, the guidance text (EXT-12), the
-   pinned model if any (EXT-14), whether shell rules apply (EXT-31), and the tools to show. "None" makes the
-   extension inert for that session: it closes the connection and behaves as in requirement 1.
-5. A launch token is valid for one hello only. A nested OMP run that inherits the launch flag or environment
-   presents a used token and is told "none". This replaces every process-table check.
+   pinned model if any (EXT-14), whether shell rules apply (EXT-31), and the tools to show. "None" on the first
+   hello makes the extension inert for that session: it closes the connection and behaves as in requirement 1.
+5. A launch token is valid for one hello identity only: the session ID and a random hello ID private to the
+   extension instance, never inherited with the launch environment. Until the reply is acknowledged by a subsequent
+   bridge request, that identity may retry the hello within the token's original lifetime. A nested OMP run that
+   inherits the launch flag or environment presents a used token with a different hello ID and is told "none".
+   Bridges without a hello ID retain single-use token semantics. This replaces every process-table check.
 6. After the daemon accepts a session with role lead or lane, the extension appends the Cataly session marker to
    the session (once per branch) so a later resume by hand is recognised by rule 2(b).
 7. Before sending the hello for a resumed session, the extension appends one small entry and asks OMP to write the
@@ -147,8 +150,12 @@ logic can move to Rust, leaving the extension as a forwarder.
    connection and its hello names the parent session ID from the session header; the daemon applies the parent's
    role for shell rules only. If the parent cannot be determined, the daemon answers "unknown parent" and, when the
    parent lineage has shell rules, every shell call of the worker is blocked (rule 33).
-10. If the daemon is unreachable at hello time, a candidate retries with backoff 1, 2, 4, 8, 16, 30, 30 ... seconds
-    and shows one warning. Until accepted it behaves as a role session with no tools and with shell calls blocked
+10. If the daemon is unreachable at hello time, including a timeout or connection loss before its answer, a
+    candidate retains its launch identity and retries with backoff 1, 2, 4, 8, 16, 30, 30 ... seconds and shows one
+    warning. An explicit error or role-none reply to the first hello is a refusal, not an unreachable daemon,
+    and is not retried. A previously accepted session keeps retrying refused reconnects with its reconnect key;
+    calls remain offline until the daemon accepts it again.
+    Until accepted it behaves as a role session with no tools and with shell calls blocked
     when its marker says lane (fail closed), and as an ordinary session otherwise.
 
 ### Event forwarding (EXT-06, EXT-08, EXT-09, EXT-10)

@@ -115,6 +115,10 @@
   page cannot be missed. Missing or inconsistent counts and incomplete results refuse the merge.
   page cannot be missed. Missing counts and incomplete results refuse the merge; a count that
   changes while the pages are read (CI adding runs) has the list read once more.
+- A session whose first bridge hello timed out or lost its connection could stay disconnected
+  permanently. It now retries with backoff, retaining its launch identity until the hub answers;
+  an explicit refusal on the first hello still leaves it inert. Previously accepted sessions keep
+  retrying a refused reconnect without losing their reconnect key.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

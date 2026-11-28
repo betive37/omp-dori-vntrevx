@@ -155,7 +155,7 @@ export class Bridge {
 	wire: Wire | undefined;
 	connecting = false; shutting = false;
 	next = 1; seq = 0;
-	pending = new Map<number, (v: Json | undefined) => void>();
+	pending = new Map<number, (v: Json | undefined, refused?: boolean) => void>();
 	queue: string[] = [];
 	queued = 0; dropped = 0;
 	lastRx = 0; attempt = 0;
@@ -169,6 +169,7 @@ export class Bridge {
 	forms = new Map<string, (answer: unknown) => void>();
 	token: string | undefined; parent = "";
 	private reportedCapabilities: string | undefined;
+	private helloId: string | undefined; // Private to this bridge, never inherited with the launch token.
 
 	constructor(readonly pi: Pi, readonly deps: Deps) {
 		this.token = deps.env.CATALY_LAUNCH || undefined;
@@ -221,20 +222,21 @@ export class Bridge {
 		if (this.connecting || this.shutting) return;
 		this.connecting = true;
 		this.wire = await this.deps.connect(socketPath(this.deps), line => this.receive(line), () => this.closed()).catch(() => undefined);
-		this.connecting = false;
-		if (!this.wire) return this.retry();
+		if (!this.wire) return void ((this.connecting = false), this.retry());
 		this.lastRx = Date.now();
 		const [cwd, agent, mode] = [this.ctx.cwd ?? "", this.ctx.agent?.kind ?? "main", this.ctx.mode ?? ""].map(String);
 		const ids = { version: VERSION, token: this.token, key: this.key, session: this.session, file: this.file(), parent: this.parent };
-		const caps = { model_resolution_version: MODEL_RESOLUTION };
+		const caps = { model_resolution_version: MODEL_RESOLUTION, hello_id: this.helloId ??= crypto.randomUUID() };
 		const hello = { ext: PROTOCOL, ...ids, ...caps, pid: process.pid, cwd, agent, mode, marker: marked(this.ctx), ...this.facts(this.ctx) };
 		const answer = await this.request("bridge.hello", hello, TOOL_MS, true);
+		// Only a first-hello refusal is inert; an accepted session keeps its reconnect key through a refused retry.
+		if (!answer || (this.wired && answer.role !== "lead" && answer.role !== "lane"))
+			return void (this.wire?.close(), (this.connecting = false), this.retry());
 		this.token = undefined;
-		if (!answer) return this.wire?.close();
 		if (answer.role !== "lead" && answer.role !== "lane") {
 			// Role none: inert for this session (EXT req. 4).
 			[this.role, this.key] = ["none", undefined];
-			return void (this.wire?.close(), (this.wire = undefined));
+			return void (this.wire?.close(), (this.wire = undefined), (this.connecting = false));
 		}
 		[this.attempt, this.key] = [0, String(answer.key ?? "")];
 		owners.set(String(this.ctx.agent?.id), this.parent || this.session);
@@ -245,7 +247,8 @@ export class Bridge {
 		this.reportedCapabilities = undefined; // A new connection needs its own snapshot, including after a hub restart.
 		this.capabilities();
 		this.status(answer.status as string | undefined);
-		this.warned = false;
+		this.warned = this.connecting = false;
+		if (!this.wire) this.retry();
 	}
 
 	apply(answer: Json | undefined): void {
@@ -283,7 +286,7 @@ export class Bridge {
 		this.wire = undefined;
 		for (const resolve of this.pending.values()) resolve(undefined);
 		this.pending.clear();
-		if (this.wired && !this.shutting) this.retry();
+		if (this.wired && !this.connecting && !this.shutting) this.retry();
 	}
 
 	receive(line: string): void {
@@ -291,7 +294,7 @@ export class Bridge {
 		const msg = safe(() => JSON.parse(line) as Json);
 		if (!msg) return;
 		const resolve = this.pending.get(Number(msg.id ?? 0));
-		if (resolve) return resolve(msg.err ? undefined : ((msg.ok as Json) ?? {}));
+		if (resolve) return resolve(msg.err ? undefined : ((msg.ok as Json) ?? {}), Boolean(msg.err));
 		const item = msg.item as Json | undefined;
 		const cmd = item?.cmd as Json | undefined;
 		if (cmd && this.tern && cmd.op === "form") {
@@ -326,13 +329,14 @@ export class Bridge {
 		}
 	}
 
-	/** A request answered by the hub, or `undefined` on timeout or disconnect. */
+	/** A request answered by the hub, or `undefined` on timeout or disconnect. An early hello's explicit error
+	 * is an empty role answer (inert), not an unreachable hub; other requests still fail closed on errors. */
 	request(method: string, params: Json, ms: number, early = false): Promise<Json | undefined> {
 		if (!this.wire || (!early && !this.key)) return Promise.resolve(undefined);
 		const id = this.next++;
 		const { promise, resolve } = Promise.withResolvers<Json | undefined>();
 		const timer = setTimeout(() => this.pending.get(id)?.(undefined), ms);
-		this.pending.set(id, v => (this.pending.delete(id), clearTimeout(timer), resolve(v)));
+		this.pending.set(id, (v, refused) => (this.pending.delete(id), clearTimeout(timer), resolve(refused && early ? {} : v)));
 		this.wire.write(this.line(method, params, id));
 		return promise;
 	}
