@@ -117,7 +117,6 @@ async fn execute_with_clock(
     req: Request,
     mut clock: impl FnMut() -> i64,
 ) -> Result<Vec<EventRecord>, JobsError> {
-    static SEQ: AtomicU64 = AtomicU64::new(0);
     let scheduled_ms = req.scheduled_ms.unwrap_or_else(&mut clock);
     let _slot = ctx
         .command_slots
@@ -131,6 +130,17 @@ async fn execute_with_clock(
     {
         return skip_late(ctx, &req, started_ms).await;
     }
+    execute_in_slot(ctx, &req, scheduled_ms, started_ms).await
+}
+
+/// Records, runs and applies a command while the caller holds its slot and has checked lateness.
+async fn execute_in_slot(
+    ctx: &Ctx,
+    req: &Request,
+    scheduled_ms: i64,
+    started_ms: i64,
+) -> Result<Vec<EventRecord>, JobsError> {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
     let job = &req.job;
     let Work::Command { argv, cwd } = &job.work else {
         return Err(JobsError::Refused(format!(
