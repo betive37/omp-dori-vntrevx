@@ -1228,9 +1228,17 @@ impl<T: Runtime> Intake<T> {
             .await
     }
 
+    /// Whether the row's channel, or a thread's parent, is listed on this connection and watched by
+    /// the config in force. A channel the owner dropped is out once that config is applied, when
+    /// the picker reports the change, not only once [`Self::rewatch`] has followed it.
     fn in_scope(&self, row: &QueueRow) -> bool {
+        let config = Arc::clone(&self.jobs.ctx().config.borrow());
         let scope = self.scope();
-        let listed = |s: &str| Snowflake::parse(s).is_some_and(|c| scope.listed.contains_key(&c));
+        let listed = |s: &str| {
+            Snowflake::parse(s).is_some_and(|c| {
+                scope.listed.contains_key(&c) && config.discord.channels.contains(&c)
+            })
+        };
         listed(&row.room) || row.parent.as_deref().is_some_and(listed)
     }
 
