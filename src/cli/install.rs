@@ -1180,7 +1180,7 @@ async fn service(enable: bool, paths: &Paths) -> Outcome {
         if crate::config::load(&paths.config_file).is_ok_and(|c| !c.setup.service) {
             return Outcome::Done(done);
         }
-        return match super::setup::write_one(paths, "setup", "service", "false") {
+        return match super::setup::write_flag(paths, "setup", "service", false) {
             Ok(()) => Outcome::Done(format!("{done}; setup leaves it off")),
             Err(e) => Outcome::NeedsAttention(format!("{done}; recording it as off: {e}")),
         };
@@ -1212,7 +1212,7 @@ async fn service(enable: bool, paths: &Paths) -> Outcome {
         notes.push(format!("[omp] path set to {value}"));
     }
     if !config.setup.service {
-        match super::setup::write_one(paths, "setup", "service", "true") {
+        match super::setup::write_flag(paths, "setup", "service", true) {
             Ok(()) => notes.push("[setup] service set to true".into()),
             Err(e) => return Outcome::Held(e),
         }

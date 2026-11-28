@@ -993,6 +993,14 @@ pub(super) fn write_one(
     .map(drop)
 }
 
+/// [`write_one`] for a boolean setting (`cataly service disable` records `[setup] service`).
+pub(super) fn write_flag(paths: &Paths, section: &str, key: &str, on: bool) -> Result<(), String> {
+    file::edit(&paths.config_file, NEW_FILE, |text| {
+        Ok(set_rendered(text, section, key, &on.to_string()))
+    })
+    .map(drop)
+}
+
 /// Sets the managed settings the flags name (a new file gets the ones OMP and the hub need).
 pub(super) fn managed(p: &Parsed, mut text: String, creating: bool) -> Result<String, Failure> {
     for (section, key, flag) in MANAGED {
