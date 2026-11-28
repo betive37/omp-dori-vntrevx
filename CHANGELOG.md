@@ -211,6 +211,10 @@
 - Lanes could fill the session cap while the lead slept or was stopped, so the lead then ran past
   the cap. The lead's slot is now reserved while `[lead]` is configured: lanes count it and are
   refused once they would take it, and the cap never refuses a lead start or wake.
+- An approval the lead raised while an owner message was being handed to a lane in its thread
+  could reply to that lane message instead of the lead's request; typing and the lead's answer
+  bookkeeping also counted lane messages. Only messages handed to the lead are now treated as
+  waiting for the lead's answer.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
