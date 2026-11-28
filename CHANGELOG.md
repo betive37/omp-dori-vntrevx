@@ -7,6 +7,13 @@
   set afterwards still renamed the thread `[done]` and, for a completed close, archived it while
   the other lane was working in it. The last lane on the thread marks it done.
 
+## 0.2.8 (2026-11-28)
+
+- The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
+  directory had changed at some point, leaving only `lead start --fresh`, which abandons the
+  conversation. 0.2.8 resumes the newest conversation, and a store already held that way is repaired
+  at start (schema 13, additive; the reader floor stays 11).
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
