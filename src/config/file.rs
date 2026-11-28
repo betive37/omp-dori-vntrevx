@@ -92,12 +92,16 @@ pub(crate) fn set_key(text: &str, section: &str, key: &str, value: &str) -> Stri
     set_rendered(text, section, key, &toml_string(value))
 }
 
-/// [`set_key`] with a value already written as TOML.
+/// [`set_key`] with a value already written as TOML. A table header's trailing comment is kept,
+/// not treated as part of its name.
 pub(crate) fn set_rendered(text: &str, section: &str, key: &str, rendered: &str) -> String {
     let line = format!("{key} = {rendered}");
     let header = format!("[{section}]");
     let mut lines: Vec<String> = text.lines().map(str::to_string).collect();
-    let start = lines.iter().position(|l| l.trim() == header);
+    let start = lines.iter().position(|l| {
+        let l = l.trim();
+        l.starts_with('[') && header_without_comment(l).trim_end() == header
+    });
     let Some(start) = start else {
         let mut out = text.trim_end().to_string();
         if !out.is_empty() {
@@ -132,6 +136,27 @@ pub(crate) fn set_rendered(text: &str, section: &str, key: &str, rendered: &str)
     let mut out = lines.join("\n");
     out.push('\n');
     out
+}
+
+/// A header's `#` starts a comment only outside a quoted key. Backslash escapes apply only to
+/// double-quoted keys, not literal single-quoted keys.
+fn header_without_comment(line: &str) -> &str {
+    let mut quote = None;
+    let mut escaped = false;
+    for (i, byte) in line.bytes().enumerate() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        match (quote, byte) {
+            (Some(b'"'), b'\\') => escaped = true,
+            (Some(q), b) if q == b => quote = None,
+            (None, b'"' | b'\'') => quote = Some(byte),
+            (None, b'#') => return line.split_at(i).0,
+            _ => {}
+        }
+    }
+    line
 }
 
 /// Edits the file as it is now: `change` gets its text (`missing` when there is no file) and
@@ -453,6 +478,57 @@ mod tests {
         );
         let out = set_key("[omp]\n# keep\n\n[hub]\n", "omp", "path", "omp");
         assert_eq!(out, "[omp]\n# keep\npath = \"omp\"\n\n[hub]\n");
+    }
+
+    #[test]
+    fn set_key_reuses_table_headers_with_comments() {
+        for header in [
+            "[lead] # main",
+            " \t[lead]\t# main  ",
+            "[lead]#main",
+            "[lead]\t ",
+        ] {
+            for model in ["model = \"a\"\n", ""] {
+                let text = format!("# mine\n{header}\n{model}\n[omp] # next\npath = \"omp\"\n");
+                let out = set_key(&text, "lead", "model", "b");
+                let parsed: toml::Value = toml::from_str(&out).unwrap();
+                assert_eq!(
+                    parsed.get("lead").unwrap().get("model").unwrap().as_str(),
+                    Some("b")
+                );
+                assert_eq!(out.matches("[lead]").count(), 1);
+                assert_eq!(
+                    out,
+                    format!("# mine\n{header}\nmodel = \"b\"\n\n[omp] # next\npath = \"omp\"\n")
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn set_key_reuses_table_headers_with_quoted_hashes() {
+        for (section, name) in [
+            (r#""lead#main""#, "lead#main"),
+            ("'lead#main'", "lead#main"),
+            (r##""lead\"#main""##, "lead\"#main"),
+            (r#""lead\\#main""#, r"lead\#main"),
+            ("'lead\\#main'", r"lead\#main"),
+            (r#""lead'#main""#, "lead'#main"),
+            ("'lead\"#main'", "lead\"#main"),
+            (r#""주석#main""#, "주석#main"),
+        ] {
+            for comment in ["", " # main", "\t# \"note\"  "] {
+                let header = format!("[{section}]{comment}");
+                let text = format!("{header}\nmodel = \"a\"\n");
+                let out = set_key(&text, section, "model", "b");
+                let parsed: toml::Value = toml::from_str(&out).unwrap();
+                assert_eq!(
+                    parsed.get(name).unwrap().get("model").unwrap().as_str(),
+                    Some("b")
+                );
+                assert_eq!(out, format!("{header}\nmodel = \"b\"\n"));
+            }
+        }
     }
 
     #[test]
