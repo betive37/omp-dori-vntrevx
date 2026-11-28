@@ -3,7 +3,7 @@
 ## Unreleased
 
 - Request notes that would exceed 16 KiB are refused instead of silently truncated while reporting
-  success. A full request log does not block recording an owner question's answer.
+  success. Automatic question notes are skipped when the request's notes are full.
 
 ## 0.2.8 (2026-11-28)
 
