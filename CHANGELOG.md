@@ -4,7 +4,8 @@
 
 - Closing a lane could remove a worktree another open lane was using. Keep it when another lane
   on the same machine works inside it or has registered a path inside it, resolving symlinks, and
-  name that lane in the close receipt.
+  name that lane in the close receipt. Concurrent worktree registration takes the lane's turn before
+  reserving paths, rechecks the run, and reports success only when the registration is stored.
 
 ## 0.2.8 (2026-11-28)
 
