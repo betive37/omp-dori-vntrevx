@@ -361,10 +361,14 @@ the lead session through Cataly commands, and the Cataly OMP extension running i
      fresh lease check, with 1, 2, 4, 8 and 16 s backoff, at most five retries, inside one 300 s recovery episode
      that counts cleanup and waits and survives hub restarts without rolling its deadline forward. Anything else
      (a rejection such as an early exit or a protocol or identity mismatch, an unknown cleanup or lease, the spent
-     episode) holds the lead.
+     episode) holds the lead. An automatic start, wake or restart continues an episode only while it is active
+     and its window is open; one that ended (bound, or a startup recorded fenced) or whose window closed is
+     nobody's recovery, and that start begins a fresh episode. A held or cancelled episode is a hold (105).
 105. A hold stays across hub restarts and updates until the owner acts: a restart finds the hold, names its first
      cause, and starts nothing. `cataly lead start` after fixing the cause resumes the anchor; stop, shutdown and
-     a target change cancel a planned retry and wait for owned cleanup.
+     a target change cancel a planned retry and wait for owned cleanup. Every owner-facing hold text (the hold
+     notice, the update result, `lead status`, `health`) names the cause in plain words in `[hub] language` with
+     what to do; the raw reason stays in the log and `lead status --json`.
 106. Input waits for binding: owner messages and quiet notes stay pending, untouched, while no session of the
      anchor is bound; the first bound wake sends them once in one batch, and the resume note keeps its once-only
      identity. A start attempt never creates a delivery or resends one.
