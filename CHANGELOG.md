@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A backup interrupted after committing could leave that commit local forever when nothing else
+  changed. An unchanged tick now pushes a branch ahead of its upstream even if no pending push
+  was recorded.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

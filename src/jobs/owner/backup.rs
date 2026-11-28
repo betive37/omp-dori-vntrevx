@@ -216,7 +216,8 @@ async fn run(t: &Tick<'_>, b: &Backup, git: &Git<'_, '_>) -> Result<Found, Strin
             .await?,
     );
     if staged.is_empty() && own.is_empty() {
-        let push = if t.dry || t.memory.get(PUSHED, "pending").is_none() {
+        // A stopped tick can leave a commit without recording its pending push.
+        let push = if t.dry || (t.memory.get(PUSHED, "pending").is_none() && !ahead(git).await?) {
             None
         } else {
             Some(push(git, b).await)
@@ -329,6 +330,18 @@ async fn own_files_not_ignored(
         }
     }
     Ok(found)
+}
+
+/// A commit left local by an interrupted tick. No upstream means there is nothing to compare.
+async fn ahead(git: &Git<'_, '_>) -> Result<bool, String> {
+    let done = git
+        .run(&["rev-list", "--count", "@{u}..HEAD"], LOCAL)
+        .await?;
+    Ok(done.success()
+        && String::from_utf8_lossy(&done.stdout)
+            .trim()
+            .parse::<u64>()
+            .is_ok_and(|count| count > 0))
 }
 
 /// Pushes HEAD to the configured branch. Never forced.
@@ -553,6 +566,79 @@ mod tests {
         let commit = ["commit", "-q", "-m", "theirs"];
         git(&other, &[&identity[..], &commit[..]].concat());
         git(&other, &["push", "-q", "origin", "main"]);
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_pushes_without_pending_memory() {
+        let root = crate::sys::fs::tests::scratch("backup-unpushed");
+        let (remote, work) = repos(&root);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-unpushed-ctx");
+        std::fs::write(work.join("notes.md"), "first backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let pushed = git(&remote, &["rev-parse", "main"]);
+
+        // The next tick committed, but stopped before pushing or saving its memory.
+        std::fs::write(work.join("notes.md"), "next backup\n").unwrap();
+        git(&work, &["add", "-A"]);
+        git(
+            &work,
+            &[
+                "-c",
+                "user.name=Backup",
+                "-c",
+                "user.email=b@example.org",
+                "commit",
+                "-q",
+                "-m",
+                "interrupted backup",
+            ],
+        );
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_ne!(head, pushed);
+        assert_eq!(git(&work, &["status", "--porcelain"]), "");
+        let memory = ctx.store.read(|r| r.memory("bk", false)).await.unwrap();
+        assert!(
+            !memory
+                .iter()
+                .any(|(s, c, _)| s == super::PUSHED && c == "pending")
+        );
+
+        // Without an upstream and pending memory, an unchanged tick still does nothing.
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "main"]), pushed);
+        git(&work, &["branch", "--set-upstream-to=origin/main"]);
+
+        // A dry tick must not recover the missing push either.
+        let config = ctx.config();
+        let job = config.jobs.get("bk").unwrap();
+        let crate::config::Work::Owner(owner) = &job.work else {
+            panic!("not a backup job");
+        };
+        assert_eq!(
+            super::super::tick(&ctx, job, owner, true).await.unwrap(),
+            Vec::<crate::store::EventRecord>::new()
+        );
+        assert_eq!(git(&remote, &["rev-parse", "main"]), pushed);
+
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "main"]), head);
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), head, "no extra commit");
+
+        // Once caught up, a clean tick must not attempt another push.
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "origin",
+                root.join("missing.git").to_str().unwrap(),
+            ],
+        );
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
     }
 
     #[tokio::test]
