@@ -65,6 +65,17 @@ impl<R: Runtime> Lanes<R> {
         Ok(())
     }
 
+    /// The lane's startup is recorded: its recovery episode ended, and is nobody's window any more.
+    pub(super) async fn end_episode(&self, key: &str) -> Result<(), String> {
+        let target = format!("lane:{key}");
+        Recovery {
+            store: &self.env.store,
+            target: &target,
+        }
+        .end("bound", None)
+        .await
+    }
+
     pub(super) async fn recovery_hold(&self, rec: &Record) -> Result<Option<String>, String> {
         if rec.state == State::Held
             && (rec.pending_reopen.is_none()
