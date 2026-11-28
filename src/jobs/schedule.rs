@@ -19,7 +19,7 @@ use super::event::{Emit, EventKind, Severity, build};
 use super::{Command, Ctx, JobsError, duration_ms, log_failure};
 
 /// An occurrence this late or later is skipped, never replayed.
-const LATE_MS: i64 = 60_000;
+pub(super) const LATE_MS: i64 = 60_000;
 /// Most skipped occurrences counted per evaluation.
 const SKIP_COUNT_MAX: u64 = 1000;
 /// Longest single sleep.
@@ -369,7 +369,7 @@ fn start_run(ctx: &Arc<Ctx>, job: &Arc<Job>, scheduled_ms: i64, consume: bool) {
     tokio::spawn(async move {
         let dry = job.dry_run;
         let probe = job.trigger.every().is_some();
-        if let Err(e) = super::perform(&ctx, &job, scheduled_ms, dry, consume).await {
+        if let Err(e) = super::perform(&ctx, &job, Some(scheduled_ms), dry, consume).await {
             log_failure("job run failed", &job.name, &e);
         }
         ctx.release(&job.name);

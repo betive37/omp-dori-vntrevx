@@ -1,13 +1,13 @@
-//! Running a job command and applying its outcome (WS req. 59-62, DESIGN 6.2). The order is fixed:
-//! record the run, spawn, record its end, append the run's events, then commit memory and run state.
-//! A crash after the append but before the commit makes start-up apply the run again, so an event may
-//! repeat but is never lost.
+//! Running a job command and applying its outcome (WS req. 56-62, DESIGN 6.2). The order is fixed:
+//! recheck timed occurrences after acquiring a command slot, record the run, spawn, record its end,
+//! append the run's events, then commit memory and run state. A crash after the append but before the
+//! commit makes start-up apply the run again, so an event may repeat but is never lost.
 
 use std::path::Path;
 use std::sync::Arc;
 
 use crate::config::{Fire, Job, Trigger, Work};
-use crate::store::{Apply, EventRecord, RunEnd, RunRecord, RunStart};
+use crate::store::{Apply, EventRecord, JobPatch, RunEnd, RunRecord, RunStart};
 use crate::sys::command::{self, Exit, KILL_GRACE, Output, Spec};
 use crate::sys::fs::{ensure_private_dir, read_private};
 use crate::sys::{now_ms, unique_stem};
@@ -22,7 +22,8 @@ const OUTPUT_CAP: u64 = 1024 * 1024;
 /// One run to perform.
 pub(super) struct Request {
     pub(super) job: Arc<Job>,
-    pub(super) scheduled_ms: i64,
+    /// A scheduler occurrence; `None` for a manual run, which has no lateness limit.
+    pub(super) scheduled_ms: Option<i64>,
     pub(super) dry: bool,
     /// One-shot: consume the job in the same transaction that records the run.
     pub(super) consume: bool,
@@ -107,11 +108,37 @@ fn outcome_text(class: &Class) -> String {
 
 /// Performs one run end to end and returns the events it produced.
 pub(super) async fn execute(ctx: &Ctx, req: Request) -> Result<Vec<EventRecord>, JobsError> {
+    execute_with_clock(ctx, req, now_ms).await
+}
+
+async fn execute_with_clock(
+    ctx: &Ctx,
+    req: Request,
+    mut clock: impl FnMut() -> i64,
+) -> Result<Vec<EventRecord>, JobsError> {
+    let scheduled_ms = req.scheduled_ms.unwrap_or_else(&mut clock);
     let _slot = ctx
         .command_slots
         .acquire()
         .await
         .map_err(|_| JobsError::Stopped)?;
+    let started_ms = clock();
+    if req.scheduled_ms.is_some()
+        && matches!(req.job.trigger, Trigger::Cron { .. } | Trigger::Once { .. })
+        && started_ms.saturating_sub(scheduled_ms) >= super::schedule::LATE_MS
+    {
+        return skip_late(ctx, &req, started_ms).await;
+    }
+    execute_in_slot(ctx, &req, scheduled_ms, started_ms).await
+}
+
+/// Records, runs and applies a command while the caller holds its slot and has checked lateness.
+async fn execute_in_slot(
+    ctx: &Ctx,
+    req: &Request,
+    scheduled_ms: i64,
+    started_ms: i64,
+) -> Result<Vec<EventRecord>, JobsError> {
     let job = &req.job;
     let Work::Command { argv, cwd } = &job.work else {
         return Err(JobsError::Refused(format!(
@@ -122,7 +149,6 @@ pub(super) async fn execute(ctx: &Ctx, req: Request) -> Result<Vec<EventRecord>,
     let probe = matches!(job.trigger, Trigger::Probe { .. });
     let dir = ctx.files_dir.join("runs").join(&job.name);
     ensure_private_dir(&dir).map_err(JobsError::Fs)?;
-    let started_ms = now_ms();
     let stem = unique_stem();
     let stdout_path = dir.join(format!("{stem}.out"));
     let stderr_path = probe.then(|| dir.join(format!("{stem}.err")));
@@ -131,7 +157,7 @@ pub(super) async fn execute(ctx: &Ctx, req: Request) -> Result<Vec<EventRecord>,
         .run_started(RunStart {
             job: job.name.clone(),
             dry: req.dry,
-            scheduled_ms: req.scheduled_ms,
+            scheduled_ms,
             started_ms,
             stdout_path: stdout_path.display().to_string(),
             stderr_path: stderr_path.as_ref().map(|p| p.display().to_string()),
@@ -157,7 +183,7 @@ pub(super) async fn execute(ctx: &Ctx, req: Request) -> Result<Vec<EventRecord>,
     let mut facts = Facts {
         run,
         dry: req.dry,
-        scheduled_ms: req.scheduled_ms,
+        scheduled_ms,
         started_ms,
         exit_code: None,
         signal: None,
@@ -199,6 +225,37 @@ pub(super) async fn execute(ctx: &Ctx, req: Request) -> Result<Vec<EventRecord>,
         return Ok(ctx.stream.append(vec![event]).await?);
     }
     apply(ctx, Some(job), &facts).await
+}
+
+/// Records a late occurrence just as the scheduler does, without creating a run or output files.
+async fn skip_late(ctx: &Ctx, req: &Request, now: i64) -> Result<Vec<EventRecord>, JobsError> {
+    let job = &req.job;
+    let emit = Emit::new(EventKind::RunSkipped, Severity::Info, false, &job.name)
+        .with("job", &job.name)
+        .with("count", 1)
+        .with("reason", "60 s or more late");
+    let event = build(
+        &job.name,
+        emit,
+        &job.templates,
+        req.dry,
+        &job.destinations,
+        now,
+    );
+    let events = ctx.stream.append(vec![event]).await?;
+    ctx.store
+        .patch_job(
+            job.name.clone(),
+            JobPatch {
+                next_due_ms: req.consume.then_some(None),
+                add_skipped: 1,
+                consumed: req.consume.then_some(true),
+                held: req.consume.then_some(true),
+                ..JobPatch::default()
+            },
+        )
+        .await?;
+    Ok(events)
 }
 
 /// Spawns, records the PID, waits; fills `facts` and returns whether the run was broken off by the
@@ -540,6 +597,9 @@ fn kind_of(run: &RunRecord) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use std::future::{Future, poll_fn};
+    use std::task::Poll;
+
     use super::*;
     use crate::jobs::tests::{ctx_in, ctx_with, probe_config};
     use crate::store::Reads;
@@ -639,6 +699,160 @@ mod tests {
         assert_eq!(kind_of(&record), "probe");
     }
 
+    #[tokio::test(start_paused = true)]
+    async fn timed_runs_recheck_lateness_after_waiting_for_a_slot() {
+        let due = "2030-01-01T00:00:00Z"
+            .parse::<jiff::Timestamp>()
+            .unwrap()
+            .as_millisecond();
+        for dry in [false, true] {
+            for (trigger, consume, wait_ms) in [
+                (
+                    "kind = \"once\"\nat = \"2030-01-01T00:00:00Z\"",
+                    true,
+                    60_000,
+                ),
+                (
+                    "kind = \"cron\"\ncron = \"* * * * *\"\nzone = \"UTC\"",
+                    false,
+                    61_000,
+                ),
+            ] {
+                let cfg = format!("[jobs.t]\n{trigger}\nargv = [\"true\"]\ncwd = \"/\"\n");
+                let (ctx, _stop, _dir) = ctx_with(&cfg, "run-slot-late");
+                let job = ctx.config().jobs.get("t").cloned().unwrap();
+                // Cron's next due time is already advanced by the scheduler before it queues a run.
+                let next_due_ms = Some(if consume { due } else { due + 120_000 });
+                ctx.store
+                    .register_job(crate::store::JobRegistration {
+                        name: job.name.clone(),
+                        kind: job.kind(),
+                        trigger: job.trigger.canonical(),
+                        next_due_ms,
+                        now_ms: due,
+                    })
+                    .await
+                    .unwrap();
+                let slots = ctx.command_slots.acquire_many(4).await.unwrap();
+                let queued = tokio::time::Instant::now();
+                let run = execute_with_clock(
+                    &ctx,
+                    Request {
+                        job,
+                        scheduled_ms: Some(due),
+                        dry,
+                        consume,
+                    },
+                    || due + crate::jobs::duration_ms(queued.elapsed()),
+                );
+                tokio::pin!(run);
+                assert!(
+                    poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                tokio::time::advance(std::time::Duration::from_millis(wait_ms)).await;
+                assert!(
+                    poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx)))
+                        .await
+                        .is_pending()
+                );
+                let waiting = ctx.store.read(|r| r.job("t")).await.unwrap().unwrap();
+                assert!(!waiting.held && !waiting.consumed && waiting.skipped == 0);
+                drop(slots);
+                let events = run.await.unwrap();
+                assert_eq!(events.len(), 1);
+                assert_eq!(events[0].kind, "run.skipped");
+                assert!(events[0].text.contains("60 s or more late"));
+                assert_eq!(events[0].dry, dry);
+                assert_eq!(events[0].at_ms, due + i64::try_from(wait_ms).unwrap());
+                assert_eq!(
+                    ctx.store.read(|r| r.events_after(0, 10)).await.unwrap(),
+                    events
+                );
+                assert_eq!(ctx.store.read(Reads::last_runs).await.unwrap(), []);
+                assert!(!ctx.files_dir.join("runs").exists());
+                let skipped = ctx.store.read(|r| r.job("t")).await.unwrap().unwrap();
+                assert_eq!(skipped.skipped, 1);
+                assert_eq!((skipped.held, skipped.consumed), (consume, consume));
+                assert_eq!(
+                    skipped.next_due_ms,
+                    if consume { None } else { next_due_ms }
+                );
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn manual_timed_runs_wait_for_a_slot_without_being_skipped() {
+        for trigger in [
+            "kind = \"once\"\nat = \"2030-01-01T00:00:00Z\"",
+            "kind = \"cron\"\ncron = \"* * * * *\"\nzone = \"UTC\"",
+        ] {
+            let cfg = format!("[jobs.t]\n{trigger}\nargv = [\"echo\", \"ran\"]\ncwd = \"/\"\n");
+            let (ctx, _stop, _dir) = ctx_with(&cfg, "run-manual-slot");
+            let job = ctx.config().jobs.get("t").cloned().unwrap();
+            let before = ctx
+                .store
+                .register_job(crate::store::JobRegistration {
+                    name: job.name.clone(),
+                    kind: job.kind(),
+                    trigger: job.trigger.canonical(),
+                    next_due_ms: Some(now_ms() + 120_000),
+                    now_ms: now_ms(),
+                })
+                .await
+                .unwrap();
+            let slots = ctx.command_slots.acquire_many(4).await.unwrap();
+            tokio::time::pause();
+            let queued = tokio::time::Instant::now();
+            let began = now_ms();
+            let run = execute_with_clock(
+                &ctx,
+                Request {
+                    job,
+                    // Jobs::run_once passes no scheduled occurrence for a manual dry tick.
+                    scheduled_ms: None,
+                    dry: true,
+                    consume: false,
+                },
+                || began + crate::jobs::duration_ms(queued.elapsed()),
+            );
+            tokio::pin!(run);
+            assert!(
+                poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            tokio::time::advance(std::time::Duration::from_secs(61)).await;
+            assert!(
+                poll_fn(|cx| Poll::Ready(run.as_mut().poll(cx)))
+                    .await
+                    .is_pending()
+            );
+            // Only the slot wait uses simulated time; let the real child finish normally.
+            tokio::time::resume();
+            drop(slots);
+            let events = run.await.unwrap();
+            assert_eq!(events.len(), 1);
+            assert_eq!(events[0].kind, "run.done");
+            assert!(events[0].dry);
+            assert_eq!(events[0].body.as_deref(), Some("ran\n"));
+            let runs = ctx.store.read(Reads::last_runs).await.unwrap();
+            assert_eq!(runs.len(), 1);
+            assert!(runs[0].dry);
+            assert_eq!(runs[0].exit_code, Some(0));
+            assert_eq!(runs[0].scheduled_ms, began);
+            assert!(runs[0].started_ms >= began + 61_000);
+            let after = ctx.store.read(|r| r.job("t")).await.unwrap().unwrap();
+            assert_eq!(after.skipped, 0);
+            assert_eq!(
+                after, before,
+                "manual runs leave scheduling state untouched"
+            );
+        }
+    }
+
     #[tokio::test]
     async fn timed_run_reports_output_and_failure() {
         let cfg = "[jobs.t]\nkind = \"once\"\nat = \"2030-01-01T00:00:00Z\"\nargv = [\"sh\", \"-c\", \"echo hello; exit 3\"]\ncwd = \"/\"\n";
@@ -648,7 +862,7 @@ mod tests {
             &ctx,
             Request {
                 job,
-                scheduled_ms: 5,
+                scheduled_ms: Some(now_ms()),
                 dry: false,
                 consume: false,
             },
@@ -679,7 +893,7 @@ mod tests {
         let job = ctx.config().jobs.get("p").cloned().unwrap();
         let req = |job: &Arc<Job>| Request {
             job: Arc::clone(job),
-            scheduled_ms: 1,
+            scheduled_ms: Some(1),
             dry: false,
             consume: false,
         };
@@ -725,7 +939,7 @@ mod tests {
                 &ctx,
                 Request {
                     job,
-                    scheduled_ms: 1,
+                    scheduled_ms: Some(1),
                     dry: false,
                     consume: false,
                 },

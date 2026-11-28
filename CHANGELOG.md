@@ -151,6 +151,10 @@
   changed. An unchanged tick now pushes commits missing from the configured backup remote and
   branch, even without pending-push memory or a branch upstream. A missing remote-tracking ref
   also triggers a push; a repository with no commit is left alone.
+- Scheduled cron and one-shot command jobs could run 60 s or more late after waiting for a command
+  slot. They now recheck the start time after the wait and count the occurrence as skipped; a skipped
+  one-shot stays consumed and on hold, without starting a command. Manual dry runs still wait for a slot
+  and run fully, without changing the scheduled job's skipped count.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
