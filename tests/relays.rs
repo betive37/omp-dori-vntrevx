@@ -374,6 +374,10 @@ fn slack_acks_during_catch_up_without_overtaking_history() {
     let seed = slack.say(DM, fake_slack::OWNER, "catch-up seed", None);
     slack.wait(WAIT, |f| slack_posts_in(f, DM, &seed).pop());
     lead_idle(&hub);
+    // The seed's queue row goes only after its hand-off finishes, which follows the posted answer.
+    hub.until(WAIT, || {
+        (status(&hub, "slack")["counts"]["queued"] == 0).then_some(())
+    });
     assert!(hub.stop().success());
 
     // This message exists only in history when the next connection opens.
@@ -444,6 +448,9 @@ fn slack_catch_up_holds_an_unreadable_thread_and_recovers_later_dms() {
     let seed = slack.say(DM, fake_slack::OWNER, "remember this DM", None);
     slack.wait(WAIT, |f| slack_posts_in(f, DM, &seed).pop());
     lead_idle(&hub);
+    hub.until(WAIT, || {
+        (status(&hub, "slack")["counts"]["queued"] == 0).then_some(())
+    });
     assert!(hub.stop().success());
 
     let missed = slack.say(DM, fake_slack::OWNER, "DM while disconnected", None);
@@ -478,7 +485,10 @@ fn slack_catch_up_holds_an_unreadable_thread_and_recovers_later_dms() {
         requests(&hub, &format!("[slack {GEN}:{root}/{blocked}]")),
         Vec::<String>::new()
     );
-    assert_eq!(status(&hub, "slack")["counts"]["queued"], 1);
+    // Only the held reply stays queued once the answered DM's hand-off finishes.
+    hub.until(WAIT, || {
+        (status(&hub, "slack")["counts"]["queued"] == 1).then_some(())
+    });
     assert!(hub.stop().success());
 
     let failed_reads = slack
@@ -498,7 +508,9 @@ fn slack_catch_up_holds_an_unreadable_thread_and_recovers_later_dms() {
         failed_reads
     );
     assert_eq!(status(&hub, "slack")["counts"]["held"], 1);
-    assert_eq!(status(&hub, "slack")["counts"]["queued"], 1);
+    hub.until(WAIT, || {
+        (status(&hub, "slack")["counts"]["queued"] == 1).then_some(())
+    });
     assert_eq!(
         requests(&hub, &format!("[slack {GEN}:{root}/{blocked}]")),
         Vec::<String>::new()
@@ -516,6 +528,9 @@ fn slack_catch_up_reconnects_after_a_transient_failure() {
     let seed = slack.say(DM, fake_slack::OWNER, "transient catch-up seed", None);
     slack.wait(WAIT, |f| slack_posts_in(f, DM, &seed).pop());
     lead_idle(&hub);
+    hub.until(WAIT, || {
+        (status(&hub, "slack")["counts"]["queued"] == 0).then_some(())
+    });
     assert!(hub.stop().success());
 
     let missed = slack.say(DM, fake_slack::OWNER, "older DM in history", None);
