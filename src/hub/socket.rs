@@ -529,7 +529,8 @@ mod tests {
 
     /// A grant made while the hub still writes the waiting place (an empty slot: the request's own
     /// change wakes the slots task at once) reaches the client. 0.2.7 marked that grant seen after
-    /// the write, and the client waited forever: a granted request is not announced again.
+    /// the write, and the client waited until some other slot change: a granted request is not
+    /// announced again.
     #[tokio::test(start_paused = true)]
     async fn a_grant_made_while_the_place_is_written_reaches_the_client() {
         use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _};

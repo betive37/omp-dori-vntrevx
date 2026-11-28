@@ -2,10 +2,11 @@
 
 ## Unreleased
 
-- A slot request granted while the hub was still writing its queue place now runs its command. The
-  hub marked that grant as already seen, so `cataly slot` kept waiting while the hub counted the
-  slot as held and every later request for that slot queued behind it. A request for a free slot
-  is granted right away and could hit this.
+- A slot request granted while the hub was still writing its queue place now runs its command at
+  once. The hub marked that grant as already seen, so `cataly slot` kept waiting while the hub
+  counted the slot as held, until some other slot request, release or grant on the hub woke it, or
+  until it timed out or was cancelled when none came. A request for a free slot is granted right
+  away and could hit this.
 
 ## 0.2.7 (2026-11-28)
 
