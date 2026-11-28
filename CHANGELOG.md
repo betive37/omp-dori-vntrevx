@@ -16,6 +16,13 @@
   [PR #314](https://github.com/vntrevx/Cataly/pull/314)); the full effect for such messages needs
   both. Discord, Telegram and Slack alike.
 
+## 0.2.8 (2026-11-28)
+
+- The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
+  directory had changed at some point, leaving only `lead start --fresh`, which abandons the
+  conversation. 0.2.8 resumes the newest conversation, and a store already held that way is repaired
+  at start (schema 13, additive; the reader floor stays 11).
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
