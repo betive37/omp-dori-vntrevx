@@ -276,8 +276,9 @@ client) plus the lead's OMP session, and every record has one writer.
     output to a private diagnostic file named in the error. Otherwise the record holds PR, head, verdict, model,
     time and the last 4000 characters of output. The command exits 0 for approve, 1 for reject.
 55. Merge check, against the current head: refuse without a record at that head; refuse unless it approves; refuse
-    when GitHub reports no checks; read all check-run pages (100 per page, at most 30 pages), refusing missing or
-    changing totals and any result that does not match `total_count`; refuse naming every check that is neither
+    when GitHub reports no checks; read all check-run pages (100 per page, at most 30 pages), refusing a missing
+    `total_count` and any result that does not match it; a `total_count` that changes between pages reads the list
+    once more from the first page, and refuses if it changes again; refuse naming every check that is neither
     passed nor skipped; refuse when all were skipped. Then squash-merge pinned to that head. A dry run stops before
     merging. The check is necessary, not sufficient: the lead merges only with the owner's authorisation.
 56. A configured reviewer command (argv template, rule 57) replaces the built-in reviewer and must print the same

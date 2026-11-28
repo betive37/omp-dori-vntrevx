@@ -463,7 +463,7 @@ fn merge_gate_checks_later_pages_and_refuses_incomplete_results() {
         );
     }
     let refused = lane(&hub, "merge", &pr).unwrap_err();
-    assert!(refused.contains("exceeded 30 pages"), "{refused}");
+    assert!(refused.contains("more than 3000 rows"), "{refused}");
     let calls = std::fs::read_to_string(hub.root.join("bin/gh-data/calls.log")).unwrap();
     assert!(calls.contains("per_page=100&page=2"), "{calls}");
     assert!(!calls.contains("page=31"), "{calls}");
