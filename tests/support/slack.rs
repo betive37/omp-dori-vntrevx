@@ -254,6 +254,13 @@ fn arg(query: &str, key: &str) -> Option<String> {
         .map(|v| v.replace("%2E", ".").replace("%20", " "))
 }
 
+async fn wait_for_history(state: &Mutex<State>) {
+    let hold = state.lock().unwrap().history_hold.clone();
+    if let Some(mut hold) = hold {
+        let _ = hold.wait_for(|released| *released).await;
+    }
+}
+
 async fn answer(
     req: Request<Incoming>,
     state: Arc<Mutex<State>>,
@@ -288,10 +295,7 @@ async fn answer(
         tokio::time::sleep(Duration::from_secs(3600)).await;
     }
     if method == "conversations.history" {
-        let hold = state.lock().unwrap().history_hold.clone();
-        if let Some(mut hold) = hold {
-            let _ = hold.wait_for(|released| *released).await;
-        }
+        wait_for_history(&state).await;
     }
     if auth.as_deref().is_none_or(|a| !a.starts_with("Bearer x")) && !method.starts_with("upload/")
     {
