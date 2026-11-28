@@ -469,23 +469,34 @@ fn telegram_retries_unsaved_updates(full: bool) {
     db.busy_timeout(WAIT).unwrap();
     if full {
         // Account for a full queue without allocating 256 MiB; a held room cannot drain it.
+        // The full admission sets catch_up after checking the size. Free the fixture in that
+        // same hub-writer transaction, so this attempt still fails but the retry can succeed.
         db.execute_batch(
             "INSERT INTO positions (relay, room, position, held, updated_ms) \
              VALUES ('telegram', 'full', 0, 'test', 0); \
              INSERT INTO arrival_queue \
              (relay, room, message, seq, position_at, raw, bytes, created_ms) \
-             VALUES ('telegram', 'full', '1', 1, 0, '{}', 268435456, 0);",
+             VALUES ('telegram', 'full', '1', 1, 0, '{}', 268435456, 0); \
+             CREATE TRIGGER free_telegram_queue AFTER INSERT ON relay_flags \
+             WHEN NEW.relay = 'telegram' AND NEW.flag = 'catch_up' \
+             BEGIN DELETE FROM arrival_queue WHERE relay = 'telegram' AND room = 'full'; END;",
         )
         .unwrap();
     } else {
         // Only arrival writes fail: the broken poller can still save its advanced offset.
+        // The preceding policy drop starts a 30 s failure window, shorter than the 60 s retry.
+        // Leave the trigger installed; no outside writer is needed to recover.
         db.execute_batch(
             "CREATE TRIGGER fail_telegram_arrival BEFORE INSERT ON arrival_queue \
              WHEN NEW.relay = 'telegram' AND NEW.message = '12' \
+             AND CAST(strftime('%s', 'now') AS INTEGER) * 1000 < \
+                 (SELECT updated_ms + 30000 FROM relay_state WHERE relay = 'telegram') \
              BEGIN SELECT RAISE(ABORT, 'test arrival write failure'); END;",
         )
         .unwrap();
     }
+    // The hub owns all writes while running; enforce read-only assertions on this connection.
+    db.execute_batch("PRAGMA query_only=ON;").unwrap();
     tg.push(
         "message",
         FakeTelegram::message(11, FakeTelegram::dm(), 8, "not the owner"),
@@ -532,17 +543,8 @@ fn telegram_retries_unsaved_updates(full: bool) {
     );
     assert_eq!(state["guard"].as_array().unwrap().len(), 0);
 
-    if full {
-        db.execute(
-            "DELETE FROM arrival_queue WHERE relay = 'telegram' AND room = 'full'",
-            [],
-        )
-        .unwrap();
-    } else {
-        db.execute_batch("DROP TRIGGER fail_telegram_arrival;")
-            .unwrap();
-    }
-    let polls = tg.wait(Duration::from_secs(90), |f| {
+    // Allow ample scheduling headroom beyond the poller's 60 s save retry.
+    let polls = tg.wait(Duration::from_secs(180), |f| {
         let polls = f.calls("getUpdates");
         (polls.len() >= before + 2).then_some(polls)
     });
