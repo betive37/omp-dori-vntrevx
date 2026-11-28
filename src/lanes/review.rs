@@ -36,6 +36,9 @@ const DIAG_LINES: usize = 200;
 const REVIEW_MAX_COST: f64 = 2.0;
 /// One page of the PR's changed files goes into the review text.
 const REVIEW_FILES: usize = 100;
+/// Match the owner jobs' bounded GitHub paging, but require the reported check count as well.
+const CHECKS_PAGE: usize = 100;
+const CHECKS_PAGES_MAX: usize = 30;
 /// Event commands: four at once, 30 s each (COORD req. 58).
 const EVENT_SLOTS: usize = 4;
 const EVENT_LIMIT: Duration = Duration::from_secs(30);
@@ -408,29 +411,58 @@ impl<R: Runtime> Lanes<R> {
         if !v.approve {
             return Err(format!("refused: the verdict at {head} rejects"));
         }
-        let runs =
-            super::checks::gh(&format!("repos/{repo}/commits/{head}/check-runs"), &cwd).await?;
-        let runs = runs
-            .get("check_runs")
-            .and_then(Value::as_array)
-            .cloned()
-            .unwrap_or_default();
-        if runs.is_empty() {
-            return Err("refused: GitHub reports no checks".into());
-        }
+        let mut total = None;
+        let mut received = 0;
         let mut bad = Vec::new();
         let mut passed = 0;
-        for r in &runs {
-            let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
-            let conclusion = r
-                .get("conclusion")
-                .and_then(Value::as_str)
-                .unwrap_or("pending");
-            match conclusion {
-                "success" | "neutral" => passed += 1,
-                "skipped" => {}
-                other => bad.push(format!("{name} ({other})")),
+        for page in 1..=CHECKS_PAGES_MAX {
+            let answer = super::checks::gh(
+                &format!(
+                    "repos/{repo}/commits/{head}/check-runs?per_page={CHECKS_PAGE}&page={page}"
+                ),
+                &cwd,
+            )
+            .await?;
+            let count = answer
+                .get("total_count")
+                .and_then(Value::as_u64)
+                .ok_or("refused: incomplete checks from GitHub: missing total_count")?;
+            if total.replace(count).is_some_and(|before| before != count) {
+                return Err("refused: incomplete checks from GitHub: total_count changed".into());
             }
+            let runs = answer
+                .get("check_runs")
+                .and_then(Value::as_array)
+                .ok_or("refused: incomplete checks from GitHub: missing check_runs")?;
+            received += runs.len() as u64;
+            if received > count || (runs.len() < CHECKS_PAGE && received < count) {
+                return Err(format!(
+                    "refused: incomplete checks from GitHub: received {received} of {count}"
+                ));
+            }
+            for r in runs {
+                let name = r.get("name").and_then(Value::as_str).unwrap_or("?");
+                let conclusion = r
+                    .get("conclusion")
+                    .and_then(Value::as_str)
+                    .unwrap_or("pending");
+                match conclusion {
+                    "success" | "neutral" => passed += 1,
+                    "skipped" => {}
+                    other => bad.push(format!("{name} ({other})")),
+                }
+            }
+            if received == count {
+                break;
+            }
+        }
+        if total != Some(received) {
+            return Err(format!(
+                "refused: incomplete checks from GitHub: exceeded {CHECKS_PAGES_MAX} pages"
+            ));
+        }
+        if received == 0 {
+            return Err("refused: GitHub reports no checks".into());
         }
         if !bad.is_empty() {
             return Err(format!(

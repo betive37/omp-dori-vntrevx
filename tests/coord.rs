@@ -337,11 +337,11 @@ fn merge_gate_refuses_then_dry_run_passes() {
             .contains("approve")
     );
     let runs = format!("repos_o_r_commits_{HEAD}_check-runs.json");
-    fixture(&runs, json!({ "check_runs": [] }));
+    fixture(&runs, json!({ "total_count": 0, "check_runs": [] }));
     assert!(lane(&hub, "merge", &pr).unwrap_err().contains("no checks"));
     fixture(
         &runs,
-        json!({ "check_runs": [
+        json!({ "total_count": 3, "check_runs": [
         { "name": "test", "conclusion": "success" }, { "name": "lint", "conclusion": "failure" },
         { "name": "slow", "conclusion": null }] }),
     );
@@ -352,12 +352,12 @@ fn merge_gate_refuses_then_dry_run_passes() {
     );
     fixture(
         &runs,
-        json!({ "check_runs": [{ "name": "docs", "conclusion": "skipped" }] }),
+        json!({ "total_count": 1, "check_runs": [{ "name": "docs", "conclusion": "skipped" }] }),
     );
     assert!(lane(&hub, "merge", &pr).unwrap_err().contains("skipped"));
     fixture(
         &runs,
-        json!({ "check_runs": [
+        json!({ "total_count": 2, "check_runs": [
         { "name": "test", "conclusion": "success" }, { "name": "docs", "conclusion": "skipped" }] }),
     );
     assert!(
@@ -378,6 +378,96 @@ fn merge_gate_refuses_then_dry_run_passes() {
             .unwrap_err()
             .contains("no review verdict")
     );
+    assert!(hub.stop().success());
+}
+
+/// The first page cannot hide a later failed check or an incomplete GitHub response.
+#[test]
+fn merge_gate_checks_later_pages_and_refuses_incomplete_results() {
+    let (mut hub, _) =
+        coord_hub("[coord.review]\ncommand = [\"/bin/echo\", \"VERDICT: approve\"]\n");
+    start(&mut hub);
+    let pr = json!({ "pr": "o/r#7", "dry_run": true });
+    let fixture = |name: &str, v: Value| hub.fixture("gh", name, Some(&v.to_string()));
+    fixture("repos_o_r_pulls_7.json", json!({ "head": { "sha": HEAD } }));
+    lane(&hub, "review", &pr).unwrap();
+    let runs = format!("repos_o_r_commits_{HEAD}_check-runs");
+    let first = format!("{runs}.json");
+    let second = format!("{runs}.page-2.json");
+    let successes: Vec<Value> = (0..100)
+        .map(|n| json!({ "name": format!("test-{n}"), "conclusion": "success" }))
+        .collect();
+    let last = json!({ "name": "last-check", "conclusion": "success" });
+    fixture(
+        &first,
+        json!({ "total_count": 101, "check_runs": successes }),
+    );
+    fixture(
+        &second,
+        json!({ "total_count": 101, "check_runs": [
+            { "name": "late-failure", "conclusion": "failure" }
+        ] }),
+    );
+    for dry in [true, false] {
+        let refused = lane(&hub, "merge", &json!({ "pr": "o/r#7", "dry_run": dry })).unwrap_err();
+        assert!(refused.contains("late-failure (failure)"), "{refused}");
+    }
+    for incomplete in [
+        json!({ "total_count": 101, "check_runs": [] }),
+        json!({ "total_count": 102, "check_runs": [last] }),
+        json!({ "total_count": 101, "check_runs": [last, last] }),
+        json!({ "check_runs": [last] }),
+        json!({ "total_count": 101 }),
+        json!([]),
+    ] {
+        fixture(&second, incomplete);
+        let refused = lane(&hub, "merge", &pr).unwrap_err();
+        assert!(refused.contains("incomplete checks"), "{refused}");
+    }
+    fixture(&second, json!({ "total_count": 101, "check_runs": [last] }));
+    assert!(
+        lane(&hub, "merge", &pr)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("dry run")
+    );
+    // A short first page is incomplete, even if all its checks passed.
+    fixture(&first, json!({ "total_count": 101, "check_runs": [last] }));
+    assert!(
+        lane(&hub, "merge", &pr)
+            .unwrap_err()
+            .contains("received 1 of 101")
+    );
+    // An exact full page needs no empty page beyond the reported total.
+    fixture(
+        &first,
+        json!({ "total_count": 100, "check_runs": successes }),
+    );
+    assert!(
+        lane(&hub, "merge", &pr)
+            .unwrap()
+            .as_str()
+            .unwrap()
+            .contains("dry run")
+    );
+    // More than the bounded 30 pages must refuse, not silently use the rows read so far.
+    fixture(
+        &first,
+        json!({ "total_count": 3001, "check_runs": successes }),
+    );
+    for page in 2..=30 {
+        fixture(
+            &format!("{runs}.page-{page}.json"),
+            json!({ "total_count": 3001, "check_runs": successes }),
+        );
+    }
+    let refused = lane(&hub, "merge", &pr).unwrap_err();
+    assert!(refused.contains("exceeded 30 pages"), "{refused}");
+    let calls = std::fs::read_to_string(hub.root.join("bin/gh-data/calls.log")).unwrap();
+    assert!(calls.contains("per_page=100&page=2"), "{calls}");
+    assert!(!calls.contains("page=31"), "{calls}");
+    assert!(!calls.contains("PUT"), "{calls}");
     assert!(hub.stop().success());
 }
 

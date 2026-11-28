@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- The merge check now reads every page of GitHub check runs, so a failing check after the first
+  page cannot be missed. Missing or inconsistent counts and incomplete results refuse the merge.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
