@@ -1,6 +1,6 @@
 //! The hub side of the bridge link (DESIGN 3.5, 8; EXT req. 3-5, 10-18, 41): a control connection
 //! whose first request is `bridge.hello` becomes a bridge connection. The hub assigns the role by
-//! launch token, reconnect key or the lead's session identity; anything else is told `none` and
+//! launch token, reconnect key or a known session identity; anything else is told `none` and
 //! stays inert. Over an accepted connection the bridge sends events, tool calls and the stop
 //! question; the hub sends heartbeats and answers. Headless sessions are never controlled from here.
 //!
@@ -196,7 +196,7 @@ async fn continue_session(hub: &Hub, handle: &str, role: Role, params: &Value) -
     if let Err(error) = &result {
         log::warn(
             "continued session identity not saved",
-            &[("handle", handle), ("error", error)],
+            &[("handle", &handle), ("error", error)],
         );
     }
     result.is_ok()
