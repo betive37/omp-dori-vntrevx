@@ -227,7 +227,9 @@ export class Bridge {
 		const caps = { model_resolution_version: MODEL_RESOLUTION, hello_id: this.helloId ??= crypto.randomUUID() };
 		const hello = { ext: PROTOCOL, ...ids, ...caps, pid: process.pid, cwd, agent, mode, marker: marked(this.ctx), ...this.facts(this.ctx) };
 		const answer = await this.request("bridge.hello", hello, TOOL_MS, true);
-		if (!answer) return void (this.wire?.close(), (this.connecting = false), this.retry());
+		// Only a first-hello refusal is inert; an accepted session keeps its reconnect key through a refused retry.
+		if (!answer || (this.wired && answer.role !== "lead" && answer.role !== "lane"))
+			return void (this.wire?.close(), (this.connecting = false), this.retry());
 		this.token = undefined;
 		if (answer.role !== "lead" && answer.role !== "lane") {
 			// Role none: inert for this session (EXT req. 4).
@@ -282,7 +284,7 @@ export class Bridge {
 		this.wire = undefined;
 		for (const resolve of this.pending.values()) resolve(undefined);
 		this.pending.clear();
-		if (this.wired && !this.connecting && this.role !== "none" && !this.shutting) this.retry();
+		if (this.wired && !this.connecting && !this.shutting) this.retry();
 	}
 
 	receive(line: string): void {

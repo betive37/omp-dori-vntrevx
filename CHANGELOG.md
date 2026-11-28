@@ -4,7 +4,8 @@
 
 - A session whose first bridge hello timed out or lost its connection could stay disconnected
   permanently. It now retries with backoff, retaining its launch identity until the hub answers;
-  an explicit refusal still leaves it inert.
+  an explicit refusal on the first hello still leaves it inert. Previously accepted sessions keep
+  retrying a refused reconnect without losing their reconnect key.
 
 ## 0.2.8 (2026-11-28)
 
