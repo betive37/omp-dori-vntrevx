@@ -117,6 +117,10 @@ pub(crate) trait Relay: Send + Sync + 'static {
     /// Adds the seen mark to an admitted message (MSG-04).
     fn seen(&self, room: &str, message: &str) -> impl Future<Output = Result<(), String>> + Send;
 
+    /// Replaces the seen mark with the done mark once the request's answer was posted (MSG-04):
+    /// the done mark first, then the seen mark removed, so the request never shows neither.
+    fn done(&self, room: &str, message: &str) -> impl Future<Output = Result<(), String>> + Send;
+
     /// Shows that an answer is being written; relays without such a signal say so.
     fn typing(&self, room: &str) -> impl Future<Output = Result<(), String>> + Send;
 

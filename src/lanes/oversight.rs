@@ -14,6 +14,7 @@ use super::evidence::{self, ReportInput};
 use super::record::{Record, State};
 use super::{Lanes, Posted};
 use crate::config::lanes::Oversight;
+use crate::host::dialogs::GoalStatus;
 use crate::host::{Control, Runtime, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
@@ -419,6 +420,7 @@ impl<R: Runtime> Lanes<R> {
         if self.ceilings(rec, now).await {
             return None;
         }
+        self.held_back(rec, &session).await;
         let (k, run) = (rec.key.clone(), rec.run_id.clone());
         let progress = self
             .env
@@ -547,6 +549,53 @@ impl<R: Runtime> Lanes<R> {
             self.alert(&rec.key, "held by a dialog", &set.join(", "), true);
         }
         self.keep(&rec.key, |r| r.watch.dialogs = set).await;
+    }
+
+    /// Messages from the owner or the lead that the lane's goal keeps out (HOST req. 50). A goal
+    /// the lane paused itself is resumed for them and they are delivered ([`Lanes::flush_inbox`]);
+    /// when the goal still refuses (blocked by its budget, or the resume failed) the lead hears
+    /// the real reason once, and again only when it changes (LANE req. 47).
+    async fn held_back(&self, rec: &Record, session: &R::Session) {
+        let goal = || session.snapshot().goal.as_ref().map(|g| g.status);
+        if matches!(goal(), Some(GoalStatus::Paused)) {
+            self.flush_inbox(&rec.key, session, false).await;
+        }
+        let why = match goal() {
+            Some(GoalStatus::Paused)
+                if rec.runtime == crate::config::session::RuntimeKind::Tern =>
+            {
+                Some("the goal is paused in its terminal; pause provenance is unknown")
+            }
+            Some(GoalStatus::Paused) => Some("the goal is paused"),
+            Some(GoalStatus::Blocked) => Some("the goal is blocked by its budget"),
+            _ => None,
+        };
+        let waiting = match why {
+            Some(_) => self.mailbox(&rec.key).list().await.map_or(0, |rows| {
+                rows.iter()
+                    .filter(|(_, row)| super::life::answers(row))
+                    .count()
+            }),
+            None => 0,
+        };
+        let why = why.filter(|_| waiting > 0);
+        if rec.watch.held_back.as_deref() == why {
+            return;
+        }
+        if let Some(why) = why {
+            self.alert(
+                &rec.key,
+                "messages undelivered",
+                &format!(
+                    "{waiting} message(s) from the owner or the lead wait undelivered: {why}. \
+                     Run cataly lane pause --params '{{\"key\":\"{key}\",\"reason\":\"resume terminal goal\"}}', then cataly lane resume --params '{{\"key\":\"{key}\"}}' to resume explicitly; a budget stop needs the owner.",
+                    key = rec.key
+                ),
+                true,
+            );
+        }
+        let why = why.map(str::to_string);
+        self.keep(&rec.key, |r| r.watch.held_back = why).await;
     }
 
     /// Ceilings (WS req. 24-27): reached ones hold the lane; unknown totals warn once per kind.

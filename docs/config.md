@@ -195,10 +195,23 @@ path = "/home/me/.bun/bin/omp"
 
 Settings for every OMP session the hub starts (lead, lanes and helper roles).
 
+Every OMP session the hub launches (lead, lanes, look-only lanes, worker lanes and the built-in PR
+reviewer, in both runtimes) hides and denies `eval`: its overlay sets `eval.py: false`, `eval.js: false`
+and `archive.enabled: false` (the archive prelude in eval's instructions), and `tools.approval.eval: deny`,
+so neither eval nor its helper instructions are advertised. OMP lets `PI_PY` and `PI_JS` outrank that
+overlay and reads them from `.env` files (the working tree's included) when they are unset, so every
+launch sets `PI_PY=0` and `PI_JS=0` last; a Tern tab's inherited values, a `.env` file or a
+`credentials` entry of the same name cannot turn eval back on. A custom `[coord] reviewer` command is
+your own command and gets none of this. Debug and LSP remain offered when enabled in your OMP
+configuration; your approvals still apply. Owner-installed MCP servers and extensions are trusted, and
+their live non-stock tools are reported at startup.
+These controls are not a sandbox: provider credentials and same-user stored OMP authentication remain
+usable by hosted code. See [the safety limits](../DESIGN.md#92-accidental-spend-guards-fallback-allowed).
+
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `cap` | integer | `8` | 1–32 | Live OMP sessions at most, all roles together. |
-| `credentials` | list of strings | `[]` | environment variable names: upper-case letters, digits, `_`, not starting with a digit, not starting with `CATALY_` | Variables passed from the hub's environment to OMP (provider keys). Nothing else is passed. |
+| `credentials` | list of strings | `[]` | environment variable names: upper-case letters, digits, `_`, not starting with a digit, not starting with `CATALY_` | Variables passed from the hub's environment to OMP (provider keys). Nothing else is passed. A name the hosted policy pins (`PI_PY`, `PI_JS`) gets the policy's value instead. |
 | `extra_flags` | list of strings | `[]` | `--name` or `--name=value` only | Extra OMP command-line flags. Refused: flags the hub sets itself (`--mode`, `--session-dir`, `--resume`/`-r`, `--continue`/`-c`, `--restore`, `--fork`, `--print`/`-p`, `--goal`, `--plan`, `--approval-mode`, `--auto-approve`, `--yolo`, `--cwd`, `--config`, `--model`, `--thinking`, `--append-system-prompt`, `--system-prompt`, `--tools`, `--max-cost`, `--no-session`), `--extension`, and anything starting with `approval` or containing `approve`. |
 | `spend_phrases` | list of strings | `[]` | any; matched case-insensitively, blanks dropped | Extra phrases that mark an OMP dialog as an offer to spend money, beside the built-in ones. Such dialogs are never accepted for you. |
 | `runtime` | string | `"headless"` | `headless`, `tern` | Where new sessions run. A stored session keeps the runtime it started with. |
@@ -221,10 +234,10 @@ Present means the hub keeps one standing lead session. Absent means no lead.
 | `model` | string | **required** | `provider/id` | The lead's model. |
 | `thinking` | string | OMP's default | `off`, `minimal`, `low`, `medium`, `high`, `xhigh`, `max`, `auto` | Thinking level. |
 | `cwd` | string | your home folder | absolute path | Working folder of a new lead session. A resumed lead keeps the folder its session recorded (a real folder you own), even when this setting or the default changed since. |
-| `session_id` | string | none | any non-blank | The lead resumes exactly this OMP session. |
+| `session_id` | string | none | any non-blank | The lead resumes exactly this earlier conversation, even behind newer ones; if it cannot, the lead is held, never replaced. `cataly lead start --fresh` is refused while it is set. |
 | `instructions` | string | none | absolute path to an owner-only file | Role instructions appended to the lead's system prompt. |
 | `autostart` | boolean | `true` | | Start the lead when the hub starts. |
-| `idle_sleep` | duration | `"2h"` | `"0s"` (off), or `"5m"` to `"720h"` | Put the lead to sleep after it has been fully idle this long: no turn running, no message waiting for it or in doubt, no open question or approval card, no open owner question and no open lane. Quiet notes that wait for its next turn do not keep it awake; they go with its first turn after it wakes. The hub then stops the lead's OMP the orderly way (never during a turn) and keeps its session. A message that would start a turn (yours, an urgent event, a lane report, `cataly lead send`) resumes the same session and is delivered once it is accepted. `cataly lead stop` and `cataly lead start` work as usual on a sleeping lead, and an update keeps it asleep. |
+| `idle_sleep` | duration | `"2h"` | `"0s"` (off), or `"5m"` to `"720h"` | Put the lead to sleep after it has been fully idle this long: no turn running, no message waiting for it or in doubt, no open question or approval card, no open owner question, no open lane and no message of yours still unanswered with a reminder to come (reminders reach only an awake lead). Quiet notes that wait for its next turn do not keep it awake; they go with its first turn after it wakes. The hub then stops the lead's OMP the orderly way (never during a turn) and keeps its session. A message that would start a turn (yours, an urgent event, a lane report, `cataly lead send`) resumes the same session and is delivered once it is accepted. `cataly lead stop` and `cataly lead start` work as usual on a sleeping lead, and an update keeps it asleep. |
 
 ```toml
 [lead]
@@ -234,11 +247,37 @@ cwd = "/home/me/work"
 idle_sleep = "2h"
 ```
 
+Starting and resuming the lead. These limits are fixed, not settings:
+
+- One start attempt has 60 seconds from launching OMP until its conversation is confirmed (ready,
+  protocol and two matching identity readbacks), plus up to 30 seconds to close an attempt that
+  failed. At 15 seconds a still-starting lead is not a failure yet: you get one message saying so.
+- Only an attempt that ran out of time, whose OMP was proven gone, is tried again, on the same
+  conversation, after 1, 2, 4, 8 and 16 seconds, within one 5-minute recovery that a hub restart
+  continues rather than restarts.
+- Anything else holds the lead: an OMP that exits or answers wrongly before it is ready, a
+  conversation file that is missing or does not pass the resume check, an earlier OMP that may
+  still run, or the 5 minutes spent. The conversation, its work and your waiting messages are
+  kept; nothing is replaced or deleted, and a hold stays over hub restarts and updates. You get
+  one message in your home room, in `[hub] language`, with the reason. After fixing the cause run
+  `cataly lead start` to resume the same conversation; `cataly lead start --fresh` starts a new
+  one only if that is what you want. `cataly lead status` and `cataly health` show the target,
+  the attempt, the last cleanup and lease answer, the inbox counts and, while held, the same text.
+- The lead starts a new conversation by itself only the very first time. After a fresh start you
+  asked for fails, the old conversation stays recorded and held until you choose
+  `cataly lead start --fresh` (try fresh again) or `cataly lead start` (resume the old one).
+- Messages wait, untouched, until the conversation is confirmed, and then go once. A message
+  written to the lead just before its OMP stopped is looked up in the whole conversation file.
+  It is written again, once at most and under its original ID, only when the complete file proves
+  it never arrived; a file that ends mid-entry or cannot be read proves nothing, so the message is
+  reported in doubt instead (`cataly lead inbox` lists it, and you decide).
+
 ## `[fallback]`
 
 What OMP may do when a model fails. Written into OMP's settings for hosted sessions only when set;
-unset keeps OMP's own setting. A fallback only ever moves to another configured model; it never
-redeems a reset, buys credits or turns on overage.
+unset keeps OMP's own setting. Fallback moves to another configured model. Cataly's `NO_REDEEM`
+overlay stops only OMP's automatic reset redemption, not explicit CLI/API redemption. Metered
+fallback and already-enabled overage can still cost money; this is not a hard no-spend guarantee.
 
 | Key | Type | Default | Allowed | What it does | Setup |
 |---|---|---|---|---|---|
@@ -267,7 +306,7 @@ when both `owner` and `channels` are set; setting one without the other is an er
 | `channels` | list of strings | `[]` | Discord IDs, at most 256, duplicates dropped | Watched channels, threads, DMs and forums. Can also be set from the [ops panel](#ops)'s 📡 button; a change applies on the running connection. | `#cataly`, found or created |
 | `follow_threads` | boolean | `true` | | Also take threads under watched channels. Answers go into owner-started threads and lead work threads outside lanes. A lane-owned thread keeps its kickoff first and the lead's pointer in the channel. A definite refusal may move the remaining answer to the channel; an uncertain part stays at its saved destination, even after a restart or closure. Off: answers stay in the channel. | |
 | `home` | string | the one watched channel, if there is exactly one | one of `channels` | Where the lead's questions go when they name no room or thread. | `#cataly` when there are several |
-| `remote_approvals` | boolean | `false` | | Let you approve OMP permission requests by button, on a card in `[hub] language` with the command in a code block. Cataly's own tools and a fixed list of read-only commands (`ls`, `cat`, `grep`, `git status`, `git log`, `git diff` and the like) never ask; anything else still does. | `--approvals on\|off` (setup's default: on) |
+| `remote_approvals` | boolean | `false` | | Let you approve OMP permission requests by button, on a card in `[hub] language` with the command in a code block. Cataly's own tools never ask; other approvals follow your OMP settings. Cataly adds no fixed read-only command list. | `--approvals on\|off` (setup's default: on) |
 | `form_default_after` | duration | `"3m"` | 1s–1h | A question from OMP with one recommended choice takes it after this long. A question the lead records (`question.ask`) never takes its recommended option by itself. | |
 | `profile` | boolean | `true` | | `cataly setup` puts Cataly's avatar and banner on the bot where the bot has none (or still has Cataly's older ones); an image you set yourself is kept. Off: setup leaves the profile alone. | `--profile` re-applies them |
 | `away` | duration | `"3h"` | 1s–720h | You count as back when your message comes this long after your previous one. | |
@@ -442,6 +481,19 @@ Defaults for lanes (worker sessions the lead opens) and the rules they run under
 | `thread_member` | boolean | `true` | | Add you to lane threads the hub creates. |
 | `identities.<owner/name>` | string | none | an email address | The commit identity the policy check expects in that repository. |
 
+A lane that was running comes back on its own conversation after a hub restart, an update or
+its worker reconnecting, with the lead's fixed limits: 60 seconds per start attempt, a notice at
+15 seconds, and retries of a timed-out attempt within 5 minutes. A lane that cannot come back is
+held with the reason, and keeps its record, conversation, messages and worktrees; nothing is
+rolled back. `cataly lane reopen` answers `resumed`, `recovering` (the final result follows in the
+lane's thread) or `held`.
+
+Closing a lane removes a worktree only when nothing in it would be lost. A worktree with
+uncommitted or untracked changes, commits on no remote, or ignored files (build caches and other
+ignored output included) is kept and named in the close receipt, as is one whose check fails.
+Cataly never deletes kept files or caches by itself: disposing of them is your explicit action,
+for example removing the worktree with git once you have looked at it.
+
 `[lanes.oversight]`: when the hub nudges a lane. The reminders and the stall alert must come in
 order: `first_reminder` < `second_reminder` < `stall`.
 
@@ -457,11 +509,12 @@ order: `first_reminder` < `second_reminder` < `stall`.
 | `thread_quiet` | duration | `"20m"` | 1s–24h | A progress report posts to the thread only after this quiet time. |
 
 `[lanes.shell]`: shell rules for lanes. Patterns are regular expressions matched against the whole
-command.
+submitted command. This is an accidental-command guard, not a sandbox: it does not inspect arbitrary
+scripts, subprocesses, debug adapters or language servers.
 
 | Key | Type | Default | What it does |
 |---|---|---|---|
-| `deny` | list of patterns | `[]` | Commands no lane may run. |
+| `deny` | list of patterns | `[]` | Submitted shell commands refused for every lane. |
 | `allow` | list of tables | `[]` | Each `{ lanes = "<glob>", patterns = [...] }` lets lanes whose key matches the glob (only `*` is special; `lanes` is required) run matching commands. |
 
 ```toml
@@ -611,6 +664,19 @@ out like any job post (no mentions) and are not sent to the lead as work. Withou
 they go to your home room: the `[discord]` home channel, else the `[telegram]` group (and topic)
 or your DM. With neither, they stay in the event log; for Slack, name a destination.
 
+**Going back a version.** Some releases upgrade the store so a conversation cannot be lost (0.2.7
+keeps the lead's resume anchor there), and a binary older than that upgrade cannot open it.
+`cataly rollback`, an update or install that switches versions, and `install.sh` over an existing
+install check this first, before the hub is stopped or any file switched: a version that cannot
+read the store is refused (exit status 6). Releases without a reader report use their exact known
+schemas: 0.2.0–0.2.5 read 9 and 0.2.6 reads 10; an unknown release fails closed. The message says which version cannot read the store
+and the way out: stay on the current version, or restore the store copy the hub made in
+`<state>/backup/` before that upgrade (its path is named when one exists; conversation since then
+is not in it). Updates keep no store copy of their own; when the hub made none, the message says
+so. An `install.sh` or a binary already published (0.2.6 and earlier) does not have this check. If
+one of them is used to go back, the older hub refuses to open the store and does not start: nothing
+in the store is lost. Install the current version again to get the hub and the conversation back.
+
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
 | `update.check` | boolean | `true` | | Daily check for a newer stable release; off means no request is ever made. |
@@ -623,19 +689,25 @@ or your DM. With neither, they stay in the event log; for Slack, name a destinat
 Default notice, in `[hub] language` (`ko`, then `en`):
 
 ```text
-새로운 버전이 나왔습니다! 보스. 콘솔 창에 `cataly update` 명령어를 입력해주세요.
+새로운 버전이 나왔습니다, 주인님! 콘솔 창에 `cataly update` 명령어를 입력해주세요.
 {current} -> {latest} {url}
 
-A new version is out, boss. Run `cataly update` in a terminal.
+A new version is out, Master. Run `cataly update` in a terminal.
 {current} -> {latest} {url}
 ```
 
 After an update and after a rollback (`{sessions}` says how the lead came back and which lanes run
-again, such as `lead를 이어서 열었습니다. lane 2개를 이어서 열었습니다: a, b.`; a lead that started
-fresh says so and why, such as `lead는 이전 대화를 이어가지 못해 새로 시작했습니다(...)`; or nothing):
+again, such as `lead를 이어서 열었습니다. lane 2개를 이어서 열었습니다: a, b.`; a lead held for
+you says why and how to resume it; or nothing). The message waits up to a minute for the
+sessions. A lead or lane still recovering then is said to be recovering, never as a final result,
+such as `lead는 이전 대화를 복구하는 중입니다(대화와 작업은 보존됨). 최종 결과는 확정되면 따로
+알려드립니다.`; once it settles (at most one 5-minute recovery later) a second message to the same
+place gives the final result: `{latest} 업데이트 후 세션 최종 결과: {sessions}` (in English,
+`After the update to {latest}: {sessions}`). `cataly update` itself prints the same recovering or
+final line.
 
 ```text
-{latest} 버전으로 업데이트했습니다. 보스, 감사합니다!
+{latest} 버전으로 업데이트했습니다. 주인님, 감사합니다!
 {previous} -> {latest}
 {sessions}
 
@@ -643,7 +715,7 @@ fresh says so and why, such as `lead는 이전 대화를 이어가지 못해 새
 {previous} -> {latest}
 {sessions}
 
-Updated to {latest}. Thanks, boss!
+Updated to {latest}. Thank you, Master!
 {previous} -> {latest}
 {sessions}
 
@@ -685,12 +757,16 @@ minute, like the [board](#coordination-coord). After an uncertain create it is n
 it stays in doubt until the lead names the message it found (board destination
 `ops:<channel id>`).
 Its colour is the worst state: green when all is fine, amber when something is worth a look (host
-busy, a limit of a provider a live session uses at 90 % or more, a job with a failure, the lead in
-error), red when it needs you (host in alert, the lead held by OMP's usage limit or for the owner,
-a job failing twice or waiting for your ack). A spent limit of a provider no live session uses
-does not change the colour. It shows:
+busy or recovering, a limit of a provider a live session uses at 90 % or more, a job with a
+failure, the lead in error), red when it needs you (host in alert, the lead held by OMP's usage
+limit or for the owner, a job failing twice or waiting for your ack). A spent limit of a provider
+no live session uses does not change the colour. Amber and red name every reason after the
+summary, the most serious first (`🔴 확인이 필요해요: 디스크 여유 3 GB · 작업 실패 (github)`,
+`🟡 Worth a look: anthropic limit 100%`). It shows:
 
-- 🖥️ host: load bar and per cent, free memory and disk, live sessions (the lead and the lanes)
+- 🖥️ host: load bar and per cent with the host's state (ready, busy, or in alert for its cause:
+  overloaded, low memory, low disk; recovering once the checks pass again until the pressure
+  job's next tick clears the alert), free memory and disk, live sessions (the lead and the lanes)
   of `max_sessions` (load and memory rounded to 5 %, so noise does not edit the panel);
 - 🔋 usage: one line per provider, by the name OMP reports, with its most used limit, a bar, the
   per cent and the reset time;
@@ -991,8 +1067,8 @@ tick. Without a pressure job, session starts use the same rule with the defaults
 | `disk_path` | string | your home folder | absolute path | File system checked for disk space. |
 | `max_sessions` | integer | `20` | 0–1000; `0` = off | Live sessions, the lead's included, at or above this hold lane starts. |
 
-Events: `pressure.alert` (`reasons`), `pressure.clear`, `pressure.ready` (`load`),
-`pressure.busy` (`load`).
+Events: `pressure.alert` (`reasons`, `cause`: the failing checks among `disk`, `memory`, `load`),
+`pressure.clear`, `pressure.ready` (`load`), `pressure.busy` (`load`).
 
 ```toml
 [jobs.host]

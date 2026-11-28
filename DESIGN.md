@@ -144,7 +144,7 @@ command name for all six commands; `get_state` fields including `model`, `sessio
 | `--mode rpc-ui`, `--approval-mode always-ask`, `--config <overlay>`, `--model provider/id`, `--thinking`, `--session-dir`, `--resume=<path>`, `--append-system-prompt`, `--tools`, `--max-cost`, `--no-session`, `--no-extensions`, `--no-skills`, `--no-rules`, `--no-context-files`, `--no-tools`, `--offline`, `--profile`, `-e` | Launch (section 4), probe, tests | help (rpc-ui, approval-mode, no-* and offline also live) |
 | `omp usage --json` | Quota job, limits view | help (JSON schema unverified: parsed defensively, unknown shape = "unavailable") |
 | `omp session lease --json -- <ids>` → `{held, unknown}` | Crash recovery (HOST-28) | help, docs; rpc `get_session_lease` live |
-| `omp usage reset` | Never run; the shell veto blocks it (9.2) | help |
+| `omp usage reset` | Never run by the hub; recognizable submitted commands are refused by the shell veto (9.2), not sandboxed | help |
 | rpc `ready`, `negotiate_protocol`, `rpc_chunk` reassembly, 1 MiB frame cap | Transport | live (chunk rules docs) |
 | rpc `get_state` (`model`, `thinkingLevel`, `sessionId`, `sessionFile`, `isStreaming`, `isCompacting`, `queuedMessageCount`, `isSettled`, `hasPendingAsyncWork`, `goal`, `usageLimit`) | Status, identity, readback | live (`sessionFile`, `usageLimit` docs) |
 | rpc `prompt` with `streamingBehavior`, `follow_up`, `steer`, `abort` | Delivery, interrupt | docs |
@@ -247,9 +247,21 @@ time with immediate "busy" refusal; delivery receipts keyed by request ID (HOST-
   `rpc`; all five saved-reset keys `no`; `retry.modelFallback: true` and `retry.fallbackRevertPolicy:
   cooldown-expiry` (both OMP's defaults, pinned so an owner config cannot silently differ); `retry.fallbackOn`
   and `retry.fallbackChains` only when set in Cataly's `[fallback]` config (9.2).
+- One hosted-tool policy table generates hiding settings and execution denial across hosted roles:
+  `eval.py: false`, `eval.js: false`, `archive.enabled: false` (eval's archive prelude) and
+  `tools.approval.eval: deny`, without unavailable eval-helper guidance. OMP ranks a setting's own
+  environment variable above `--config` and fills an unset or empty one from `.env` files (the working
+  tree's included), so the table also lists every stock variable bound to a pinned setting (`PI_PY`,
+  `PI_JS` in 19.1.1 and 19.2.1) and each launch sets it to the overlay's value (`PI_PY=0`, `PI_JS=0`),
+  last: headless and reviewer environments, the Tern block's `/usr/bin/env` assignments (the tab otherwise
+  inherits the terminal's environment) and a worker's spawn. Removing the variable would not do: `.env`
+  would refill it. `contract_hosted_env` fails when stock OMP binds a pinned setting the table omits.
+  Debug and LSP remain offered when owner-enabled; offered tools retain owner approvals.
+  Owner-installed MCP and extensions are trusted, and their live non-stock tools are reported at startup.
 - Child environment starts empty: `PATH`, `HOME`, `TMPDIR`, `LANG`, listed provider credentials,
-  `PI_NOTIFICATIONS=off`, `CATALY_LAUNCH=<single-use token>`, `CATALY_SOCKET=<path>`. No relay token, no
-  Cataly secret, nothing secret in argv (HOST-06, req. 21).
+  `PI_NOTIFICATIONS=off`, `CATALY_LAUNCH=<single-use token>`, `CATALY_SOCKET=<path>`, then the policy's
+  pins, which a listed credential of the same name never replaces. No relay token, no Cataly secret,
+  nothing secret in argv (HOST-06, req. 21).
 - Start sequence (HOST req. 23-28): record first, spawn, `ready` within 15 s, two equal `get_state`
   answers bind identity, model readback, bridge hello within the start budget (a lane without its bridge
   cannot have shell rules, so it fails closed), 30 s total (lanes 180 s, LANE-15).
@@ -275,6 +287,10 @@ time with immediate "busy" refusal; delivery receipts keyed by request ID (HOST-
 - Session switches by the user are detected and fenced as in PATCH-01 rules 6-9 and 12-14.
 - Tern lanes support the full lifecycle (open, pause, resume, park, abandon, claim, close, reopen); only remote
   dialog answers are missing. Losing the bridge connection (45 s without heartbeat) marks the lane lost.
+- Automatic goal resume on an owner or lead answer is headless-only and never clears an owner
+  hold, pending reopen, in-doubt input or budget block. Tern cannot prove who paused its goal;
+  it keeps the goal paused and asks for an explicit terminal resume or `lane.pause` followed by
+  `lane.resume`.
 
 ### 4.4 Headless on a worker
 
@@ -434,8 +450,8 @@ relay destinations, or kept locally. Messenger posts never mention anyone and pa
   a daily maintenance job; page cache capped at 2 MiB.
 - **Migrations.** Ordered SQL files embedded in the binary; `PRAGMA user_version` is the schema version. Before
   a migration the hub writes `VACUUM INTO <state>/backup/cataly-v<N>.db`. Each migration declares whether it is
-  additive; the store records the lowest binary version that can still open it. A rollback binary older than
-  that refuses to start and names the backup to restore. No down-migrations.
+  additive; the store records the lowest schema a binary must know to open it (`meta.min_reader`). A binary
+  older than that refuses to start and names the backup to restore. No down-migrations.
 
 ### 7.3 Schema outline
 
@@ -493,13 +509,25 @@ relay destinations, or kept locally. Messenger posts never mention anyone and pa
 - The lead's goal tool may not create goals (the lead idles without one, OPC-36); lane goals are set by the hub
   from the brief and done checks. OMP itself refuses a second goal (docs).
 
-### 9.2 Never spend (fallback allowed)
+The shell veto is an accidental-command guard, not a sandbox. It inspects submitted shell lines,
+including recognizable Cataly mutations and spend commands, but cannot contain arbitrary scripts,
+decoded commands, inherited variables or later subprocesses. Debug adapters and language servers can
+execute without a bash call. Owner-installed MCP and extensions are trusted executable integrations,
+not isolated plugins. The hub's role checks remain necessary, but same-UID code and external brokers
+are outside this accidental-command threat model (section 8).
 
-Owner decision 7: a session may fall back to another configured model when a quota runs out. Redeeming saved
-resets, buying credits and paid overage stay refused, in code:
+### 9.2 Accidental-spend guards (fallback allowed)
 
-- Overlay sets every saved-reset key to `no`; the hub never runs `omp usage reset` and the bridge's shell veto
-  blocks it in every session as a non-overridable rule (OJ-13, OJ requirement 38).
+Owner decision 7 permits fallback to another configured model when a quota runs out. Cataly guards
+against accidental reset redemption, credit purchases and enabling paid overage; these controls do
+not establish a hard no-spend guarantee:
+
+- `NO_REDEEM` pins all five OMP auto-redeem keys to `no`: `codexResets.autoRedeem5h`,
+  `codexResets.autoRedeemWeekly`, `claudeResets.autoRedeem5h`, `claudeResets.autoRedeemWeekly` and
+  `claudeResets.autoRedeemFable`. This stops only OMP's automatic redemption in the configured session.
+  An explicit CLI/API request with usable credentials need not consult those settings. The hub never
+  runs `omp usage reset`; the bridge refuses recognizable submitted reset commands as a non-overridable
+  shell rule (OJ-13, OJ requirement 38), not as containment of other execution paths.
 - Spend-offer dialogs (built-in phrases plus owner phrases) are answered with cancel within 1 s, never with
   "no" or a remembered choice; a dialog that stays is cancelled again, the session is fenced, and the owner is
   alerted. Three offers in 10 minutes fence the session.
@@ -512,8 +540,8 @@ resets, buying credits and paid overage stay refused, in code:
   "on" changes nothing and health shows that as INFO.
 - The hub itself changes a session's model only back to that session's requested model, with readback; it has
   no code path that picks another provider, account or model.
-- A fallback to a metered (API-key) model bills per token. That is ordinary model spend, not credits or
-  overage, and it is bounded by the lane's cost ceiling, which also goes to OMP as `--max-cost` (WS-18).
+- A fallback to a metered (API-key) model bills per token. The lane's cost ceiling also goes to OMP as
+  `--max-cost` (WS-18); it is a session backstop, not a provider billing firewall.
 - Quota exhausted for good (a turn ends with a usage-limit error in `prompt_result`, meaning the chain is
   exhausted or absent) marks the session quota-blocked: no nudges, reminders or deliveries other than owner
   requests; the lead is told once (OPC-58, OPC-64).
@@ -526,8 +554,18 @@ resets, buying credits and paid overage stay refused, in code:
   start, keeping `config.toml.before-0.2.4`), and the status reply keeps an always-open `quota_gate` value
   for `cataly update` of 0.2.3 and older, which requires it; the field is removable once no 0.2.3 hub or CLI
   can still be updating.
-- Voice is the one paid feature: explicit opt-in, owner-entered prices, daily, total and spending caps checked
-  before every call starts, hold after any failure, never a paid retry (VOICE-19, VOICE-20).
+- Voice has its own paid budget: explicit opt-in, owner-entered prices, daily, total and spending caps
+  checked before every call starts, hold after any failure, never a paid retry (VOICE-19, VOICE-20).
+
+`NO_REDEEM` does not disable already-enabled overage, metered fallback, auxiliary model tools or cloud
+scans. Not passing relay secrets is not credential isolation: owner-listed provider variables and
+same-user stored OMP authentication can still authorize requests outside these guards.
+
+A hard no-spend guarantee would require hosted code to have neither readable account credentials nor
+a broad broker token: use a separately protected, endpoint-restricted inference gateway with server-side
+budgets, no reset/billing/account mutations, and provider-side overage disabled. Separate OS identity
+or equivalent filesystem/process isolation must protect owner state and the hub's owner-only control
+path, including remote workers and shared MCP/LSP brokers. This credential isolation is not built.
 
 ### 9.3 Fail closed on uncertain delivery
 
@@ -595,7 +633,7 @@ privacy (`pub(crate)` at most) rather than by packages.
 | --- | --- | --- |
 | `cataly` (one package, `lib` + `bin` targets) | Modules: `cli`, `hub` (start-up, supervision, socket, dispatcher), `proto` (control and bridge messages), `sys` (paths, modes, atomic writes, locks, peer credentials, host readers, signals, sd_notify, stall detector), `log`, `store`, `omp` (rpc-ui client, launch, overlay, probe, session-file reader, usage and lease parsers), `host` (`Runtime` trait, headless, tern, session actors, deliveries, inboxes), `relay` (trait, pipeline, `http`, `text`, `discord`, `telegram`, `slack`), `jobs` (scheduler, events, routing, job kinds), `lanes` (lifecycle, reports, evidence, done checks, oversight, planner, slots, questions, grants, review gate, profile) | The product. The `lib` target exists only so integration tests and the contract suite can call modules directly. |
 | `cataly-voice` (optional dependency behind the `voice` feature) | Discord voice connection, DAVE, Opus, resampling and pacing, realtime model over WebSocket and WebRTC, usage ledger, reply playback queue | (1) **Dependency kept out:** libopus (C), the DAVE/MLS stack and the WebRTC stack compile and link only in voice builds. (2) **Feature gate:** a build without voice contains none of it. (3) **Test seam:** the crate defines a small `VoiceHost` trait (lead delivery with receipt, status read, note post, Gateway voice events in); `cataly` implements it, and voice tests run against a fake host and a fake realtime server. Cargo forbids a dependency cycle, so the narrow trait is enforced by construction. |
-| `extension/cataly.ts` | The bridge, under 600 lines, with its own tests | Not Rust; OMP loads TypeScript. |
+| `extension/cataly.ts` | The bridge, at most 600 code lines (non-blank, non-comment), with its own tests | Not Rust; OMP loads TypeScript. |
 
 Removed boundaries, and why nothing is lost: `proto`, `sys`, `store`, `omp`, `host`, `relay`, `jobs` and `lanes`
 had no feature gate, no dependency that only they use, and no consumer outside the hub, so as crates they
@@ -697,9 +735,9 @@ OMP version under test, `biome` for lint and format.
 
 | Workflow | Runners | Contents |
 | --- | --- | --- |
-| On every pull request and push to `main` | `ubuntu-latest` (x64), `macos-latest` (arm64) | fmt, clippy `-D warnings`, tests with `--locked`, `cargo deny`, bridge type check and tests, release build, contract suite against OMP 19.1.1 (the minimum) and the newest OMP known when the change was made, each downloaded from OMP's official release assets and checked against its published `SHA256SUMS.txt`, memory and latency benchmarks compared with `main` |
-| Nightly | same two | Contract suite and e2e against the latest OMP release resolved at run time; failure notifies the owner through GitHub (IR-38) |
-| Release (tag `v*`) | same two, then publish | Section 11.4 |
+| On every pull request and push to `main` | `ubuntu-latest` (x64), `ubuntu-24.04-arm`, `macos-latest` (arm64), `macos-15-intel` | fmt, clippy `-D warnings`, tests with `--locked`, `cargo deny`, bridge type check and tests, release build, binary size and idle memory; every `contract*` suite against both OMP 19.1.1 (the minimum) and the latest stock release resolved at run time, each verified against its published `SHA256SUMS.txt` |
+| Nightly | same four | The same minimum/latest stock-OMP contract jobs (IR-38) |
+| Release (tag `v*`) | same four, then publish | Full reusable CI, including both stock-OMP contract versions, must succeed before release builds and publication (section 11.4) |
 
 Third-party actions are pinned by commit hash; workflow permissions are read-only except the publish job.
 
@@ -780,6 +818,23 @@ rest on the registry's own integrity check, not on the release signature (11.4).
   answer with the new version, else switch back.
 - Rollback keeps exactly one previous version; its two files are re-hashed against its record before switching.
 - Store compatibility across versions follows 7.2 (migrations, minimum reader version, backup).
+- **Store gate before a switch.** `cataly version --json` reports `store_reader`, the newest schema the binary
+  reads. Reports without it use an exact released-version table: 0.2.0–0.2.5 read schema 9 and 0.2.6
+  reads schema 10; unlisted versions are unknown. Before anything is stopped or switched, `cataly rollback`, an
+  update or install that switches versions, and `install.sh` over an existing install (through the installed
+  binary's `cataly install --preflight <candidate>`) read the store's `meta.min_reader` read-only. A candidate
+  that reads below it, or whose reader capability is unknown, is
+  refused with exit status 6: the store was upgraded for conversation safety, so stay on the current version
+  or restore the copy the hub made before that migration (`<state>/backup/cataly-v<N>.db`, named when one the
+  candidate reads exists; conversation since then is not in it). Updates themselves keep no store copy; the
+  only copies are those the hub writes before migrating. An npm or Bun update never goes back a version.
+  Automatic switch-back also checks the current store floor against the old binary's schema support;
+  if the new hub already migrated beyond that support, the new version remains selected and needs
+  owner attention instead of switching to a hub that cannot open the store.
+- **Limits of the gate.** An `install.sh` or a binary already published (0.2.6 and earlier) cannot be taught
+  this check. When a downgrade goes through one of them, the older hub refuses to open the store and does not
+  start: it fails closed, and the store and the conversation in it are kept, not lost. Recovery is to install
+  the current version again, which opens the store as it was.
 
 ### 11.4 Release verification
 
@@ -817,7 +872,7 @@ From `docs/decisions.md`. These are no longer assumptions.
 | 6 | Helper session | The lead is the only standing session; no `duty` role | C5, part of A26 |
 | 7 | Model fallback | On: overlay pins `retry.modelFallback: true` and `cooldown-expiry` revert; chains from the owner's config; resets, credits and overage refused in code; model job reports instead of repairing (4.2, 6.1, 9.2) | A1 |
 | 8 | Stuck OMP exit | End input, 15 s, SIGTERM, 5 s, SIGKILL, own children only (4.2) | A4 |
-| 9 | Hub restart | Every lane that was running is restarted on its exact session file after the lease shows it free. OMP restores a goal paused; the hub sends `goal resume` only for lanes whose goal was active when the hub stopped, and leaves lanes paused by the lead or owner paused (OPC-34) | A7 |
+| 9 | Hub restart | Running lanes resume their exact session only after writer-exit and free-lease checks. Explicit reopen continues its persisted episode, run, note and step. Owner-paused or held lanes without that intent stay down; no kickoff or reopen note is replayed (OPC-34). | A7 |
 | 10 | Slack senders | Allowlist, default the owner only | part of A20 |
 | 11 | Voice transport | WebSocket and WebRTC behind one `RealtimeLink` (5.2); a gated live test against the real API before release, at a cost the owner approves; CI uses a fake | A21 |
 | 12 | Updates | Notice only; `cataly update` installs; nothing installs by itself (11.3) | part of A28 |
@@ -859,7 +914,7 @@ numbers are kept from the first draft so references stay stable; decided rows mo
 | A10 | Queued launches (LANE Q4), auto close after 5 min (LANE Q7) | Kept; 5-minute window kept | Config. |
 | A11 | systemd scopes per lane (LANE Q5) | Not in the first release | Linux-only addition in the `sys` module. |
 | A12 | Worktrees without a list (LANE Q6) | No migration exists (IR-43), so unrecorded worktrees are always kept | — |
-| A13 | Approval mode for headless sessions (HOST-05) | Owner decision 19 (`docs/decisions.md`): approvals follow the owner's own OMP settings. Sessions start without `--approval-mode` and the overlay sets no `bash.patterns`, so OMP applies the owner's global configuration or its default. Cataly's tools are registered `loadMode: essential` with `policy: allow`, so OMP offers them only as direct calls that never ask; the hub's shell veto refuses a `bash` line naming them, before OMP's approval, with a pointer to the direct call, and rule 0 still refuses `cataly` CLI mutations and spend commands; the overlay denies `eval`. Every dialog OMP does open goes to the lead (LANE-31) and, if enabled, to the owner as a card in the owner's language with owner-only buttons. Review lanes in print mode keep `always-ask`: nobody can answer there, so it fails closed. | Forcing `always-ask` overrode the owner's own OMP choice and made every write ask in Discord; a Cataly read-only list duplicated OMP's own approval configuration. |
+| A13 | Hosted tools and approval mode (HOST-05) | Owner decision 19 (`docs/decisions.md`): approvals follow the owner's OMP settings, with no forced `--approval-mode` or `bash.patterns`. One hosted-tool policy table hides and denies `eval` in every hub-launched session (both kernels disabled, `archive.enabled: false`), removing unavailable helper guidance; the same rendering sets the stock variables bound to those pins (`PI_PY=0`, `PI_JS=0`) last in every launch environment, headless, Tern, worker and reviewer, because they outrank `--config` and `.env` files refill an unset one. Debug and LSP remain offered when owner-enabled, without overriding approvals. Owner-installed MCP and extensions are trusted and their live non-stock tools reported at startup. Cataly's tools remain `loadMode: essential`, `policy: allow`; shell misuse points to direct calls. The shell veto is an accidental-command guard, not a sandbox; `NO_REDEEM` stops only OMP's automatic redemption. Hard no-spend needs credential isolation, which is not built (9.2). Dialogs go to the lead (LANE-31) and, when enabled, owner-only approval cards. Print reviewers keep `always-ask`. Latest-stock-OMP contracts gate PRs and releases alongside the minimum. | Forcing approvals duplicates the owner's OMP configuration; hostile-code containment requires a separate credential and OS boundary, not more tool bans. |
 | A14 | OMP's automatic rotation between the owner's own logged-in accounts | Not controlled by Cataly (no documented switch); allowed like a configured fallback | If the owner counts it as "switching account", keep one login per provider. |
 | A15 | Discord: all-channels mode, lookup, auto resend, busy lead, rejected intents (DISC-IN Q1-5) | Dropped; lookup opt-in and off; auto resend when the file is final; follow-up while busy; intake stays down | Each is a small switch except REST polling, which stays out. |
 | A16 | Hub posts final answers (DISC-OUT Q1) | Yes, lead and lanes | Model-driven replies need the stop-gate machinery as the main path. |
@@ -868,7 +923,7 @@ numbers are kept from the first draft so references stay stable; decided rows mo
 | A19 | Owner language, table rendering (DISC-OUT Q4, Q5) | One configured language; tables always rendered | Config. |
 | A20 | Slack member mode, Telegram send scope (TSV Q1, Q4) | Member via the app's user token; Telegram sends limited to the owner's DM and configured group/topic | Config. |
 | A22 | Voice-note transcription (TSV Q5) | On request; automatic is a config switch | Automatic transcription adds a call per voice note. |
-| A23 | Ceilings hold the lane (WS Q1) | Yes, plus `--max-cost` as OMP-side backstop; also bounds metered fallback spend | Advisory only. |
+| A23 | Ceilings hold the lane (WS Q1) | Yes, plus `--max-cost` as an OMP-session backstop for metered fallback; not a provider billing firewall (9.2) | Advisory only. |
 | A24 | Auto report posting, PR events to threads, limit alerts, broken-off cron (WS Q2, Q4-6) | As C7; PR events to the lead only; quota job alerts on bands; broken-off jobs stay held until acknowledged | Config. |
 | A25 | Personal watch scripts (WS Q3) | Covered by the job kinds of 6.1 plus `probe` and `stream` | A new kind if a script needs carried state. |
 | A26 | Coordination questions (COORD Q2-5) | No usage counts or telemetry at all (owner, 2026-11-26); event commands kept; planner defaults kept; profile kept | Each of the rest is one feature. |

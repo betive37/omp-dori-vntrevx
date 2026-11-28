@@ -8,18 +8,22 @@ export function fakePi() {
 	const tools: any[] = [];
 	const entries: any[] = [];
 	let active = ["read", "bash"];
+	const inventory = ["read", "bash"].map(name => ({ name, sourceInfo: { source: "builtin" } }));
 	return {
 		handlers,
 		tools,
 		entries,
+		inventory,
 		active: () => active,
 		on(name: string, h: Handler) {
 			handlers.set(name, [...(handlers.get(name) ?? []), h]);
 		},
 		registerTool(def: any) {
 			tools.push(def);
+			inventory.push({ name: def.name, sourceInfo: { source: "extension" } });
 		},
 		getActiveTools: () => active,
+		getAllTools: () => inventory,
 		setActiveTools(names: string[]) {
 			active = names;
 		},

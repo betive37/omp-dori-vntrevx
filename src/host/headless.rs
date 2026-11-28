@@ -5,6 +5,13 @@
 //!
 //! The state mutex is only ever held for synchronous updates, never across an await.
 
+#[path = "lead/local_cleanup.rs"]
+mod local_cleanup;
+
+#[cfg(test)]
+#[path = "lead/startup_tests.rs"]
+mod startup_tests;
+
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -13,12 +20,14 @@ use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 use tokio::sync::{Mutex as AsyncMutex, broadcast, mpsc, watch};
-use tokio::time::timeout;
 
+use super::bridge::Links;
 use super::dialogs::{
     self, AnswerFrame, Dialog, Entry, Facts, ReadState, Status, UiFrame, read_state, same_model,
     spend_offer,
 };
+use super::model::{Proof, Resolution};
+use super::startup::{Cleanup, STARTUP_BUDGET, StartupOutcome, StartupStage};
 use super::{
     Control, DeliverOutcome, Delivery, EventPage, Role, Runtime, SessionEvent, Snapshot,
     StartError, StartSpec, Started, StopRecord, Timing,
@@ -30,14 +39,13 @@ use crate::sys::command::{self, Attached, Exit, KILL_GRACE, Step};
 use crate::sys::latency::Latency;
 use crate::sys::now_ms;
 
-/// Ready frame (HOST req. 23).
-const READY_WITHIN: Duration = Duration::from_secs(15);
-/// Whole start, ready to bound identity (HOST req. 28).
-const START_BUDGET: Duration = Duration::from_secs(30);
 /// After end of input before TERM (DESIGN 4.2, decision 8).
 const CLOSE_WAIT: Duration = Duration::from_secs(15);
 /// A forced close waits this long for the interrupted turn to stop (HOST req. 66).
 const FORCE_IDLE_WAIT: Duration = Duration::from_secs(15);
+/// The part of the startup deadline the model query leaves for binding after it: a bridge that
+/// has not connected by then leaves the model unverified instead of failing the start.
+const BIND_MARGIN: Duration = Duration::from_secs(2);
 /// Child stderr kept per session (HOST req. 2).
 const STDERR_CAP: u64 = 1024 * 1024;
 /// Events queued between OMP's reader and the session's event task. A full queue drops frames, which
@@ -85,13 +93,60 @@ impl Runtime for Headless {
         "headless"
     }
 
-    async fn start(&self, spec: StartSpec) -> Result<(Arc<Session>, Started), StartError> {
-        let token = super::random_hex(16);
-        self.links.issue(&token, &spec.handle, spec.role);
-        if let Some(worker) = spec.worker.clone() {
-            return self.start_remote(spec, &worker, &token).await;
+    async fn start_supervised(
+        &self,
+        spec: StartSpec,
+        cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
+        if *cancel.borrow() {
+            return Err(StartError::Startup {
+                stage: StartupStage::Spawn,
+                outcome: StartupOutcome::Cancelled,
+                cleanup: Cleanup::NotSpawned,
+                detail: "startup cancelled before spawn".into(),
+            });
         }
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
+        let deadline = tokio::time::Instant::now() + STARTUP_BUDGET;
+        let token = super::random_hex(16);
+        self.links.issue(&token, &spec);
+        if let Some(worker) = spec.worker.clone() {
+            return self
+                .start_remote(spec, &worker, &token, deadline, cancel)
+                .await;
+        }
+        self.start_local(spec, &token, deadline, cancel).await
+    }
+}
+
+impl Headless {
+    /// What every session of this runtime is bound with: its own deadline, cancellation and
+    /// local ownership, and the hub's spend phrases, latency ring and bridge registry.
+    fn settings(
+        &self,
+        deadline: tokio::time::Instant,
+        cancel: watch::Receiver<bool>,
+        ownership: Option<super::lead::ownership::Ownership>,
+    ) -> Settings {
+        Settings {
+            spend_phrases: self.spend_phrases.clone(),
+            agent_start: self.agent_start.clone(),
+            links: Arc::clone(&self.links),
+            deadline: Some(deadline),
+            cancel: Some(cancel),
+            ownership,
+        }
+    }
+
+    /// The start on this machine: OMP as the hub's own child, with its stderr logged and its PID
+    /// adopted by the session's role. Spawn, the rpc stream and binding spend the one deadline.
+    async fn start_local(
+        &self,
+        spec: StartSpec,
+        token: &str,
+        deadline: tokio::time::Instant,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let argv = Launch {
             exe: &self.exe,
             model: &spec.model,
@@ -101,51 +156,204 @@ impl Runtime for Headless {
             instructions: spec.instructions.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .argv();
-        let env = session_env(&self.credentials, &self.socket, &token);
+        let env = session_env(&self.credentials, &self.socket, token, spec.tool_role());
         let env: Vec<(&str, &str)> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         crate::sys::fs::ensure_private_dir(&self.logs)
             .map_err(|e| StartError::Refused(e.to_string()))?;
         let stderr = self.logs.join(format!("session-{}.err", spec.handle));
-        let mut child = command::attach(&argv, Some(&spec.cwd), &env, Some(&stderr), STDERR_CAP)
-            .map_err(|e| StartError::Refused(e.to_string()))?;
+        let ownership = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
+            .map_err(StartError::Refused)?;
+        ownership
+            .identify(spec.expected_id.as_deref(), None)
+            .map_err(StartError::Refused)?;
+        let mut child =
+            match command::attach(&argv, Some(&spec.cwd), &env, Some(&stderr), STDERR_CAP) {
+                Ok(child) => child,
+                Err(error) => {
+                    ownership
+                        .finished(Cleanup::NotSpawned)
+                        .map_err(StartError::Refused)?;
+                    return Err(StartError::Refused(error.to_string()));
+                }
+            };
+        if let Err(detail) = ownership.spawned(child.pid()).await {
+            return Err(local_cleanup::finish(
+                child,
+                &ownership,
+                local_cleanup::Failure {
+                    stage: StartupStage::Spawn,
+                    outcome: StartupOutcome::Rejected,
+                    detail,
+                },
+            )
+            .await);
+        }
         // Its shell and tools act in this session's role on the control socket (DESIGN 8).
         if let Some(pid) = child.pid() {
             self.links.adopt(pid, &spec.handle, spec.role);
         }
         let (Some(stdin), Some(stdout)) = (child.take_stdin(), child.take_stdout()) else {
-            child.close(CLOSE_WAIT, KILL_GRACE).await;
-            return Err(StartError::Failed("OMP's pipes are not available".into()));
+            return Err(local_cleanup::finish(
+                child,
+                &ownership,
+                local_cleanup::Failure {
+                    stage: StartupStage::Spawn,
+                    outcome: StartupOutcome::Rejected,
+                    detail: "OMP's pipes are not available".into(),
+                },
+            )
+            .await);
         };
         let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let rpc = match Rpc::connect(stdout, stdin, READY_WITHIN, Some(tx)).await {
+        let rpc = match Rpc::connect_supervised(
+            stdout,
+            stdin,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            Some(tx),
+            cancel.clone(),
+        )
+        .await
+        {
             Ok(rpc) => rpc,
             Err(e) => {
-                child.close(CLOSE_WAIT, KILL_GRACE).await;
-                return Err(StartError::Failed(format!("no rpc-ui ready frame: {e}")));
+                let cancelled = *cancel.borrow_and_update();
+                return Err(local_cleanup::finish(
+                    child,
+                    &ownership,
+                    local_cleanup::Failure::rpc(&e, cancelled),
+                )
+                .await);
             }
         };
-        let settings = Settings {
-            spend_phrases: self.spend_phrases.clone(),
-            agent_start: self.agent_start.clone(),
-        };
+        let settings = self.settings(deadline, cancel, Some(ownership));
         Session::bind(rpc, rx, Proc::Child(Box::new(child)), spec, settings).await
     }
-}
 
-impl Headless {
-    /// The same start on a worker (design 2.1): its own OMP, spawned over the worker stream, with
-    /// the overlay and instructions copied to its root, its session under `<root>/sessions`, no hub
-    /// credentials, and its bridge on the worker's socket. No PID is adopted: nothing of a remote
-    /// session acts on this machine.
+    /// The same start on a worker (design 2.1): its own OMP, spawned over the worker stream for the
+    /// spec's handle as its attempt token, with the overlay and instructions copied to its root, its
+    /// session under `<root>/sessions`, no hub credentials, and its bridge on the worker's socket.
+    /// No PID is adopted: nothing of a remote session acts on this machine. The shared deadline and
+    /// cancellation govern it end to end; a failure after the spawn waits for the worker's exit
+    /// acknowledgement, which alone proves the attempt ended.
     async fn start_remote(
         &self,
         spec: StartSpec,
         worker: &str,
         token: &str,
+        deadline: tokio::time::Instant,
+        cancel: watch::Receiver<bool>,
     ) -> Result<(Arc<Session>, Started), StartError> {
+        let owner = super::lead::ownership::Ownership::prepare(&self.state, &spec.handle)
+            .map_err(StartError::Refused)?;
+        owner
+            .identify(spec.expected_id.as_deref(), Some(worker))
+            .map_err(StartError::Refused)?;
+        let result = self
+            .bind_remote(spec, worker, token, deadline, cancel)
+            .await;
+        if let Err(error) = &result {
+            let cleanup = match error {
+                StartError::Startup { cleanup, .. } => *cleanup,
+                StartError::Refused(_) => Cleanup::NotSpawned,
+            };
+            owner.finished(cleanup).map_err(StartError::Refused)?;
+        }
+        result
+    }
+
+    async fn bind_remote(
+        &self,
+        spec: StartSpec,
+        worker: &str,
+        token: &str,
+        deadline: tokio::time::Instant,
+        mut cancel: watch::Receiver<bool>,
+    ) -> Result<(Arc<Session>, Started), StartError> {
+        let not_spawned = |outcome, detail: String| StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome,
+            cleanup: Cleanup::NotSpawned,
+            detail,
+        };
+        // Nothing runs on the worker before `spawn`, so either ends the preparation outright.
+        let prepared = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err(not_spawned(
+                StartupOutcome::Cancelled,
+                "startup cancelled before spawn".into(),
+            )),
+            prepared = tokio::time::timeout_at(deadline, self.prepare_remote(&spec, worker, token)) => {
+                prepared.unwrap_or_else(|_| Err(not_spawned(
+                    StartupOutcome::Timeout,
+                    format!("{worker}: the startup deadline passed before spawn"),
+                )))
+            }
+        };
+        let PreparedRemote { link, argv, env } = prepared?;
+        let cwd = spec.cwd.display().to_string();
+        // Once the request may have reached the worker, a deadline or cancellation is unknown
+        // ownership, not a refusal. The durable token remains available for reconciliation.
+        let unanswered = |outcome| StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome,
+            cleanup: Cleanup::Unknown,
+            detail: format!(
+                "{worker}: spawn of attempt {} was not acknowledged; held for reconciliation",
+                spec.handle
+            ),
+        };
+        let spawned = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err(unanswered(StartupOutcome::Cancelled)),
+            result = tokio::time::timeout_at(deadline, link.spawn(&argv, &cwd, &env, &spec.handle, spec.expected_id.as_deref())) =>
+                result.map_err(|_| unanswered(StartupOutcome::Timeout))?
+                    .map_err(|error| spawn_failed(worker, error)),
+        }?;
+        let crate::worker::link::Spawned {
+            channel,
+            stream,
+            hold,
+            exit,
+        } = spawned;
+        let remote = Remote {
+            worker: worker.to_string(),
+            channel,
+            hold,
+            exit,
+        };
+        let (read, write) = tokio::io::split(stream);
+        let (tx, rx) = mpsc::channel(EVENT_QUEUE);
+        let rpc = match Rpc::connect_supervised(
+            read,
+            write,
+            deadline.saturating_duration_since(tokio::time::Instant::now()),
+            Some(tx),
+            cancel.clone(),
+        )
+        .await
+        {
+            Ok(rpc) => rpc,
+            Err(e) => {
+                let cancelled = *cancel.borrow_and_update();
+                return Err(remote
+                    .finish(local_cleanup::Failure::rpc(&e, cancelled))
+                    .await);
+            }
+        };
+        let settings = self.settings(deadline, cancel, None);
+        Session::bind(rpc, rx, Proc::Remote(Box::new(remote)), spec, settings).await
+    }
+
+    /// What a start on `worker` runs. Nothing runs on the worker yet, so a failure is a refusal.
+    async fn prepare_remote(
+        &self,
+        spec: &StartSpec,
+        worker: &str,
+        token: &str,
+    ) -> Result<PreparedRemote, StartError> {
         let refused = |e: String| StartError::Refused(format!("{worker}: {e}"));
         let link = crate::worker::link::connect(worker)
             .await
@@ -156,7 +364,7 @@ impl Headless {
             root.join("settings")
                 .join(local.file_name().unwrap_or_default())
         };
-        let overlay = crate::omp::launch::overlay_path(&self.state, spec.role == super::Role::Lane);
+        let overlay = crate::omp::launch::overlay_path(&self.state, spec.tool_role());
         let (overlay_there, instructions_there) =
             (there(&overlay), spec.instructions.as_deref().map(there));
         let copies = std::iter::once((&overlay, &overlay_there))
@@ -197,39 +405,55 @@ impl Headless {
             instructions: instructions_there.as_deref(),
             extra: &self.extra_flags,
             max_cost: spec.max_cost,
-            tools: spec.tools.as_deref(),
+            role: spec.tool_role(),
         }
         .argv();
-        // The worker's own OMP profile and logins: nothing of this machine's environment goes along.
-        let env = [
-            ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
-            ("CATALY_LAUNCH".to_string(), token.to_string()),
-        ];
-        let cwd = spec.cwd.display().to_string();
-        let (channel, stream, hold) = link.spawn(&argv, &cwd, &env).await.map_err(refused)?;
-        let (read, write) = tokio::io::split(stream);
-        let (tx, rx) = mpsc::channel(EVENT_QUEUE);
-        let rpc = Rpc::connect(read, write, READY_WITHIN, Some(tx))
-            .await
-            .map_err(|e| StartError::Failed(format!("no rpc-ui ready frame from {worker}: {e}")))?;
-        let settings = Settings {
-            spend_phrases: self.spend_phrases.clone(),
-            agent_start: self.agent_start.clone(),
-        };
-        let remote = Remote {
-            worker: worker.to_string(),
-            channel,
-            hold,
-        };
-        Session::bind(rpc, rx, Proc::Remote(Box::new(remote)), spec, settings).await
+        // The worker's own OMP profile and logins: nothing of this machine's environment goes along,
+        // and the role's policy pins outrank the worker's own `.env` files (DESIGN 12.2 A13).
+        let env = worker_env(token, spec.tool_role());
+        Ok(PreparedRemote { link, argv, env })
+    }
+}
+
+/// A remote start before its spawn: the connection, OMP's argument vector on the worker and its
+/// environment there.
+struct PreparedRemote {
+    link: Arc<crate::worker::link::Link>,
+    argv: Vec<String>,
+    env: Vec<(String, String)>,
+}
+
+/// The start error of a `spawn` that gave no attempt to talk to, with what its answer proves about
+/// a process for the attempt token.
+fn spawn_failed(worker: &str, error: crate::worker::link::SpawnError) -> StartError {
+    use crate::worker::link::SpawnError;
+    match error {
+        SpawnError::Refused(why) => StartError::Refused(format!("{worker}: {why}")),
+        SpawnError::Ended { detail, state } => StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome: StartupOutcome::Rejected,
+            cleanup: super::lead::ownership::worker_cleanup(&state),
+            detail: format!("{worker}: {detail} ({state:?})"),
+        },
+        SpawnError::Unanswered(why) => StartError::Startup {
+            stage: StartupStage::Spawn,
+            outcome: StartupOutcome::Rejected,
+            cleanup: Cleanup::Unknown,
+            detail: format!("{worker}: {why}; only the attempt token can tell whether OMP runs"),
+        },
     }
 }
 
 /// Per-session settings that are not part of the start spec.
-#[derive(Clone, Debug, Default)]
+#[derive(Debug, Default)]
 pub(crate) struct Settings {
     pub(crate) spend_phrases: Vec<String>,
     pub(crate) agent_start: Latency,
+    /// The bridge registry, which carries the session's model query (HOST req. 27).
+    pub(crate) links: Arc<Links>,
+    deadline: Option<tokio::time::Instant>,
+    cancel: Option<watch::Receiver<bool>>,
+    ownership: Option<super::lead::ownership::Ownership>,
 }
 
 #[derive(Default)]
@@ -257,6 +481,8 @@ struct State {
     fallback_report: Option<FallbackReport>,
     /// The model the hub asked for with `set_model`, which replaces the start model as expected.
     asked_model: Option<String>,
+    /// What OMP resolved the expected selector to, as the bridge proved it.
+    resolution: Option<Resolution>,
     /// The unexpected model already reported, so one model is reported once (DESIGN 6.1).
     unexpected: Option<String>,
     /// When the last delivery's line was written, until its turn starts.
@@ -289,6 +515,51 @@ pub(crate) struct Remote {
     channel: u32,
     /// Keeps the worker connection in use while the session lives.
     hold: crate::worker::link::LaneHold,
+    /// The worker's acknowledgement once it reaped the OMP: the only proof it ended.
+    exit: crate::worker::link::ExitWait,
+}
+
+impl Remote {
+    /// How the worker says the OMP ended, its input already closed: the acknowledgement within the
+    /// stop budget (end of input, 15 s, TERM, 5 s, KILL on the worker), else KILL from here and
+    /// [`KILL_GRACE`] more. Returns the state and whether KILL was needed. A disconnect, an EOF or
+    /// silence is never a reap.
+    async fn reaped(&mut self) -> (crate::worker::attempt::AttemptState, bool) {
+        // Reserve the stdin-shutdown second. Signal delivery and the final acknowledgement
+        // consume the same remaining cleanup budget, never independent trailing timers.
+        let until = tokio::time::Instant::now()
+            + super::startup::STARTUP_CLEANUP_BUDGET.saturating_sub(Duration::from_secs(1));
+        let grace = until - KILL_GRACE;
+        if let Ok(state) = tokio::time::timeout_at(grace, self.exit.wait()).await {
+            return (state, false);
+        }
+        let _ = tokio::time::timeout_at(until, self.hold.link().signal(self.channel, "KILL")).await;
+        let state = tokio::time::timeout_at(until, self.exit.wait())
+            .await
+            .unwrap_or_else(|_| crate::worker::attempt::AttemptState::Unknown {
+                reason: format!(
+                    "no exit acknowledgement from {} within the cleanup budget",
+                    self.worker
+                ),
+            });
+        (state, true)
+    }
+
+    /// A startup failure after the spawn, once the worker answered for the attempt.
+    async fn finish(mut self, failure: local_cleanup::Failure) -> StartError {
+        let (state, _) = self.reaped().await;
+        StartError::Startup {
+            stage: failure.stage,
+            outcome: failure.outcome,
+            cleanup: super::lead::ownership::worker_cleanup(&state),
+            detail: format!(
+                "{} on {} (worker cleanup of attempt {}: {state:?})",
+                failure.detail,
+                self.worker,
+                self.exit.attempt()
+            ),
+        }
+    }
 }
 
 /// The view token: changes with every child start (HOST req. 78).
@@ -304,8 +575,6 @@ struct Inner {
     pid: Option<u32>,
     /// The worker the OMP runs on: its session file is recorded as `worker:<name>:<path>`.
     worker: Option<String>,
-    /// Set when OMP's output has ended.
-    output_closed: watch::Sender<bool>,
     rpc: Rpc,
     proc: AsyncMutex<Option<Proc>>,
     state: Mutex<State>,
@@ -368,6 +637,12 @@ fn names_model(selector: &str, model: &str) -> bool {
             .is_some_and(|base| same_model(base, model))
 }
 
+enum BindFailure {
+    Rpc(RpcError),
+    Invalid(String),
+    Cancelled,
+}
+
 impl Session {
     /// Runs the start handshake over a connected rpc stream (HOST req. 23-28) and starts the event
     /// task. On failure the child is closed.
@@ -394,7 +669,6 @@ impl Session {
             view: VIEWS.fetch_add(1, Ordering::Relaxed) + 1,
             pid,
             worker,
-            output_closed: watch::channel(false).0,
             rpc,
             proc: AsyncMutex::new(Some(proc)),
             state: Mutex::new(State {
@@ -411,36 +685,104 @@ impl Session {
         });
         tokio::spawn(event_loop(Arc::clone(&inner), events));
         let session = Arc::new(Self { inner });
-        let elapsed = Duration::from_millis(u64::try_from(now_ms() - now).unwrap_or(0));
-        let budget = START_BUDGET.saturating_sub(READY_WITHIN.min(elapsed));
-        let bound = timeout(budget, session.handshake(&spec))
-            .await
-            .unwrap_or_else(|_| Err("the start took longer than 30 s".into()));
+        let deadline = session
+            .inner
+            .settings
+            .deadline
+            .unwrap_or_else(|| tokio::time::Instant::now() + STARTUP_BUDGET);
+        let (_keep, never_cancel) = watch::channel(false);
+        let mut cancel = session
+            .inner
+            .settings
+            .cancel
+            .clone()
+            .unwrap_or(never_cancel);
+        let bound = tokio::select! {
+            biased;
+            () = super::startup::cancelled(&mut cancel) => Err(BindFailure::Cancelled),
+            result = tokio::time::timeout_at(deadline, session.handshake(&spec, deadline)) => result
+                .unwrap_or(Err(BindFailure::Rpc(RpcError::Timeout("startup deadline")))),
+        };
+        let bound = bound.and_then(|started| {
+            if tokio::time::Instant::now() < deadline {
+                Ok(started)
+            } else {
+                Err(BindFailure::Rpc(RpcError::Timeout("startup deadline")))
+            }
+        });
         match bound {
             Ok(started) => Ok((session, started)),
-            Err(reason) => {
+            Err(failure) => {
+                let (outcome, reason) = match failure {
+                    BindFailure::Rpc(error) => (
+                        if matches!(error, RpcError::Timeout(_)) {
+                            StartupOutcome::Timeout
+                        } else {
+                            StartupOutcome::Rejected
+                        },
+                        error.to_string(),
+                    ),
+                    BindFailure::Invalid(reason) => (StartupOutcome::Rejected, reason),
+                    BindFailure::Cancelled => (
+                        StartupOutcome::Cancelled,
+                        "startup cancelled; owned process closed".into(),
+                    ),
+                };
                 session.inner.fault(&reason);
-                session.inner.end("failed", Some(reason.clone())).await;
-                Err(StartError::Failed(reason))
+                let stopped = session.inner.end("failed", Some(reason.clone())).await;
+                Err(StartError::Startup {
+                    stage: StartupStage::Binding,
+                    outcome,
+                    cleanup: stopped.cleanup,
+                    detail: reason,
+                })
             }
         }
     }
 
-    async fn handshake(&self, spec: &StartSpec) -> Result<Started, String> {
+    async fn handshake(
+        &self,
+        spec: &StartSpec,
+        deadline: tokio::time::Instant,
+    ) -> Result<Started, BindFailure> {
         let inner = &self.inner;
-        // Structured ask dialogs; an OMP without them keeps using select and editor (HOST req. 16).
-        let _ = inner
-            .call("set_ask_dialog", &[("enabled", json!(true))])
-            .await;
-        let first = inner.get_state().await?;
-        let second = inner.get_state().await?;
+        let call = |kind, fields: &[(&str, Value)]| {
+            inner.rpc.call(
+                rpc::command(kind, fields),
+                deadline.saturating_duration_since(tokio::time::Instant::now()),
+            )
+        };
+        let _ = call("set_ask_dialog", &[("enabled", json!(true))]).await;
+        let state = async || {
+            let reply = call("get_state", &[]).await.map_err(BindFailure::Rpc)?;
+            if !reply.success {
+                return Err(BindFailure::Invalid(format!(
+                    "OMP refused get_state: {}",
+                    reply.error.unwrap_or_default()
+                )));
+            }
+            read_state(reply.data.as_ref()).ok_or_else(|| {
+                BindFailure::Invalid("get_state answered without a session identity".into())
+            })
+        };
+        let first = state().await?;
+        let second = state().await?;
         if (first.session_id.as_str(), first.session_file.as_str())
             != (second.session_id.as_str(), second.session_file.as_str())
         {
-            return Err("two get_state answers named different sessions".into());
+            return Err(BindFailure::Invalid(
+                "two get_state answers named different sessions".into(),
+            ));
+        }
+        if first.model != second.model || first.thinking != second.thinking {
+            return Err(BindFailure::Invalid(
+                "two get_state answers named different model/thinking settings".into(),
+            ));
         }
         if !Path::new(&first.session_file).is_absolute() {
-            return Err("OMP reported a transcript path that is not absolute".into());
+            return Err(BindFailure::Invalid(
+                "OMP reported a transcript path that is not absolute".into(),
+            ));
         }
         // A worker's session file is recorded with its worker; the worker resolved its paths.
         let reported_file = inner.recorded(&first.session_file);
@@ -452,39 +794,46 @@ impl Session {
                 reported.is_some() && reported == std::fs::canonicalize(file).ok()
             };
             if &first.session_id != expected || !same {
-                return Err(format!(
+                return Err(BindFailure::Invalid(format!(
                     "OMP resumed a different session: expected {expected} at {}, got {} at {}",
                     file.display(),
                     first.session_id,
                     reported_file
-                ));
+                )));
             }
         }
-        let held = match &first.model {
-            Some(model) if same_model(model, &spec.model) => spec
-                .thinking
-                .as_ref()
-                .filter(|t| first.thinking.as_ref() != Some(*t))
-                .map(|t| {
-                    format!(
-                        "model mismatch: thinking {} requested, OMP reports {}",
-                        t,
-                        first.thinking.as_deref().unwrap_or("none")
-                    )
-                }),
-            Some(model) => Some(format!(
-                "model mismatch: {} requested, OMP reports {model}",
-                spec.model
-            )),
-            None => Some(format!(
-                "model mismatch: {} requested, OMP reports none",
-                spec.model
-            )),
-        };
+        // What OMP makes of the selector, from the session's own bridge, within the same deadline
+        // (HOST req. 23, 27), less the moment binding needs after it. A bridge that cannot tell, or
+        // never connects, leaves the model unverified and the session bound and fenced, never
+        // retried.
+        let left = deadline.saturating_duration_since(tokio::time::Instant::now());
+        let connect_by = deadline - BIND_MARGIN.min(left);
+        let proof = inner
+            .settings
+            .links
+            .resolve_model(
+                &inner.handle,
+                &spec.model,
+                spec.thinking.as_deref(),
+                (connect_by, deadline),
+            )
+            .await
+            .map_err(|e| {
+                if tokio::time::Instant::now() >= deadline {
+                    BindFailure::Rpc(RpcError::Timeout("startup deadline"))
+                } else {
+                    BindFailure::Invalid(format!("model resolution: {e}"))
+                }
+            })?;
+        let held = proof.hold(first.model.as_deref(), first.thinking.as_deref());
         {
             let mut st = inner.lock();
             st.bound = Some((first.session_id.clone(), reported_file.clone()));
             st.held.clone_from(&held);
+            if let Proof::Resolved(r) = proof {
+                inner.settings.links.resolved(&inner.handle, r.clone());
+                st.resolution = Some(r);
+            }
             st.latest = Some(first.clone());
             st.fresh = true;
             inner.publish(&mut st);
@@ -517,11 +866,14 @@ impl Session {
             let st = inner.lock();
             (Inner::status_of(&st).0, ready_for(&st, &d.expected_session))
         };
-        if fresh.is_err() || checks.is_err() {
-            return DeliverOutcome::NotReady(status);
+        if let Err(why) = fresh.map_err(|e| format!("no fresh readback: {e}")) {
+            return DeliverOutcome::NotReady(status, why);
+        }
+        if let Err(why) = checks {
+            return DeliverOutcome::NotReady(status, why);
         }
         if d.text.trim().is_empty() {
-            return DeliverOutcome::NotReady(status);
+            return DeliverOutcome::NotReady(status, "the text is blank".into());
         }
         if d.text.len() > TEXT_MAX {
             return DeliverOutcome::Refused("text over 256 KiB".into());
@@ -532,7 +884,7 @@ impl Session {
             Timing::Any => matches!(status, Status::Idle | Status::Working),
         };
         if !timing_ok {
-            return DeliverOutcome::NotReady(status);
+            return DeliverOutcome::wrong_timing(status);
         }
         // Text starting with "/" would run as an OMP command (HOST req. 53).
         let text = if d.text.trim_start().starts_with('/') {
@@ -575,7 +927,7 @@ impl Session {
             ),
             Err(RpcError::TooLarge) => DeliverOutcome::Refused("over OMP's frame limit".into()),
             Err(e) if written.is_none() && matches!(e, RpcError::Closed) => {
-                DeliverOutcome::NotReady(Status::Error)
+                DeliverOutcome::NotReady(Status::Error, format!("nothing was written: {e}"))
             }
             Err(e) => {
                 let reason = format!("delivery unconfirmed, do not resend: {e}");
@@ -812,7 +1164,7 @@ impl Inner {
             .clone()
             .unwrap_or_else(|| self.requested_model.clone());
         let expected =
-            names_model(&requested, &model) || st.fallback_to.as_deref() == Some(model.as_str());
+            self.expects(st, &model) || st.fallback_to.as_deref() == Some(model.as_str());
         if expected {
             st.unexpected = None;
         } else if st.unexpected.as_deref() != Some(model.as_str()) {
@@ -821,12 +1173,24 @@ impl Inner {
         }
     }
 
+    /// Whether `model` is the one the hub expects: what OMP resolved the selector to once the
+    /// bridge proved it (HOST req. 27), else the selector read as `provider/id[:level]`.
+    fn expects(&self, st: &State, model: &str) -> bool {
+        match &st.resolution {
+            Some(r) => same_model(model, &r.model()),
+            None => names_model(
+                st.asked_model.as_deref().unwrap_or(&self.requested_model),
+                model,
+            ),
+        }
+    }
+
     /// Matches a pending fallback report against the model in use.
     fn settle_fallback(&self, st: &mut State) {
         let Some(model) = st.latest.as_ref().and_then(|s| s.model.clone()) else {
             return;
         };
-        if st.fallback_to.is_some() && same_model(&model, &self.requested_model) {
+        if st.fallback_to.is_some() && self.expects(st, &model) {
             st.fallback_to = None;
             self.emit(
                 st,
@@ -867,45 +1231,70 @@ impl Inner {
         self.lock().stopping = true;
         self.rpc.end_input().await;
         let proc = self.proc.lock().await.take();
-        let (how, detail) = match proc {
+        let (how, detail, cleanup) = match proc {
             Some(Proc::Child(child)) => {
                 let (exit, step) = child.close(CLOSE_WAIT, KILL_GRACE).await;
-                match (step, exit) {
+                let cleanup = if exit == Exit::Unknown {
+                    Cleanup::Unknown
+                } else {
+                    Cleanup::LocalReaped
+                };
+                let (how, detail) = match (step, exit) {
                     (Step::Input, Exit::Code(0)) => (how.to_string(), detail),
                     (Step::Input, exit) => ("exited".into(), Some(format!("{exit:?}"))),
                     (Step::Term, exit) => ("term".into(), Some(format!("needed TERM ({exit:?})"))),
                     (Step::Kill, exit) => ("kill".into(), Some(format!("needed KILL ({exit:?})"))),
-                }
+                };
+                (how, detail, cleanup)
             }
-            Some(Proc::Remote(remote)) => {
-                // The worker closes its OMP by the same rule once its input ended; the output
-                // ends with it.
-                let mut closed = self.output_closed.subscribe();
-                let wait = CLOSE_WAIT + KILL_GRACE + Duration::from_secs(5);
-                let ended = timeout(wait, closed.wait_for(|c| *c)).await.is_ok();
-                if ended {
-                    (how.to_string(), detail)
-                } else {
-                    let _ = remote.hold.link().signal(remote.channel, "KILL").await;
+            Some(Proc::Remote(mut remote)) => {
+                // The worker closes its OMP by the same rule once its input ended and acknowledges
+                // the reap; the end of its output proves no exit.
+                let (state, killed) = remote.reaped().await;
+                let cleanup = super::lead::ownership::worker_cleanup(&state);
+                if !cleanup.confirmed() {
+                    let state = format!("{state:?}");
+                    log::warn(
+                        "remote session exit not acknowledged",
+                        &[
+                            ("handle", &self.handle),
+                            ("attempt", &remote.exit.attempt()),
+                            ("state", &state),
+                        ],
+                    );
+                }
+                if killed {
                     (
                         "kill".into(),
                         Some(format!("needed KILL on {}", remote.worker)),
+                        cleanup,
                     )
+                } else {
+                    (how.to_string(), detail, cleanup)
                 }
             }
             #[cfg(test)]
-            Some(Proc::Fake) => (how.to_string(), detail),
-            None => (how.to_string(), detail),
+            Some(Proc::Fake) => (how.to_string(), detail, Cleanup::LocalReaped),
+            None => (how.to_string(), detail, Cleanup::Unknown),
         };
-        self.record_stop(how, detail)
+        self.record_stop(how, detail, cleanup)
     }
 
-    fn record_stop(&self, how: String, detail: Option<String>) -> StopRecord {
+    fn record_stop(&self, how: String, detail: Option<String>, cleanup: Cleanup) -> StopRecord {
         let mut st = self.lock();
         if let Some(record) = st.stop.clone() {
             return record;
         }
+        if let Some(ownership) = &self.settings.ownership
+            && let Err(error) = ownership.finished(cleanup)
+        {
+            log::warn(
+                "startup ownership receipt not persisted",
+                &[("error", &error)],
+            );
+        }
         let record = StopRecord {
+            cleanup,
             how,
             detail,
             session_id: st.bound.as_ref().map(|(id, _)| id.clone()),
@@ -1176,14 +1565,11 @@ fn ready_for(st: &State, expected: &str) -> Result<(), String> {
     if !st.dialogs.is_empty() {
         return Err("a dialog is pending".into());
     }
-    let goal = st.latest.as_ref().map(|s| s.goal.status);
-    if matches!(
-        goal,
-        Some(dialogs::GoalStatus::Paused | dialogs::GoalStatus::Blocked)
-    ) {
-        return Err("the goal is paused or blocked".into());
+    match st.latest.as_ref().map(|s| s.goal.status) {
+        Some(dialogs::GoalStatus::Paused) => Err("the goal is paused".into()),
+        Some(dialogs::GoalStatus::Blocked) => Err("the goal is blocked by its budget".into()),
+        _ => Ok(()),
     }
-    Ok(())
 }
 
 fn push_ring(st: &mut State, entry: Entry) {
@@ -1199,27 +1585,40 @@ async fn event_loop(inner: Arc<Inner>, mut events: mpsc::Receiver<Value>) {
     while let Some(frame) = events.recv().await {
         inner.on_frame(&frame).await;
     }
-    let _ = inner.output_closed.send(true);
     let asked = inner.lock().stopping;
     if asked {
         return;
     }
     let proc = inner.proc.lock().await.take();
-    let detail = match proc {
+    let (detail, cleanup) = match proc {
         Some(Proc::Child(child)) => {
             let (exit, _) = child.close(Duration::from_secs(1), KILL_GRACE).await;
-            format!("{exit:?}")
+            (
+                format!("{exit:?}"),
+                if exit == Exit::Unknown {
+                    Cleanup::Unknown
+                } else {
+                    Cleanup::LocalReaped
+                },
+            )
         }
-        Some(Proc::Remote(remote)) => format!("output closed on {}", remote.worker),
+        Some(Proc::Remote(mut remote)) => {
+            // The worker reaps an OMP whose output ended, and acknowledges it.
+            let (state, _) = remote.reaped().await;
+            (
+                format!("output closed on {}", remote.worker),
+                super::lead::ownership::worker_cleanup(&state),
+            )
+        }
         #[cfg(test)]
-        Some(Proc::Fake) => "output closed".into(),
-        None => "output closed".into(),
+        Some(Proc::Fake) => ("output closed".into(), Cleanup::LocalReaped),
+        None => ("output closed".into(), Cleanup::Unknown),
     };
     log::warn(
         "session child exited",
         &[("handle", &inner.handle), ("detail", &detail)],
     );
-    inner.record_stop("exited".into(), Some(detail));
+    inner.record_stop("exited".into(), Some(detail), cleanup);
 }
 
 impl Control for Session {
@@ -1293,15 +1692,15 @@ impl Control for Session {
         }
     }
 
-    async fn set_model(&self, selector: &str) -> Result<String, String> {
+    /// Moves the session to what OMP resolves `selector` to (HOST req. 27): the base model, then
+    /// the level its suffix requests, each read back. A bridge that cannot resolve it changes
+    /// nothing.
+    async fn set_model(&self, selector: &str) -> Result<Resolution, String> {
         let _busy = self.begin()?;
         let inner = &self.inner;
         if selector.len() > 256 || !crate::omp::transcript::model_selector(selector) {
             return Err("expected provider/id without spaces, at most 256 characters".into());
         }
-        let Some((provider, id)) = selector.split_once('/') else {
-            return Err("expected provider/id".into());
-        };
         inner.readback().await?;
         let current = {
             let st = inner.lock();
@@ -1311,27 +1710,45 @@ impl Control for Session {
             if !st.latest.as_ref().is_some_and(ReadState::idle) {
                 return Err("the session is not idle".into());
             }
-            st.latest.as_ref().and_then(|s| s.model.clone())
+            st.latest.clone()
         };
-        if current.as_deref().is_some_and(|m| same_model(m, selector)) {
-            return Ok(selector.to_string());
-        }
-        match inner
-            .call(
-                "set_model",
-                &[("provider", json!(provider)), ("modelId", json!(id))],
-            )
-            .await
+        let until = tokio::time::Instant::now() + RESPONSE_TIMEOUT;
+        let r = match inner
+            .settings
+            .links
+            .resolve_model(&inner.handle, selector, None, (until, until))
+            .await?
         {
-            Ok(reply) if reply.success => {}
-            Ok(reply) => {
-                return Err(reply
-                    .error
-                    .unwrap_or_else(|| "OMP refused the model".into()));
+            Proof::Resolved(r) => r,
+            Proof::Unverified(why) => {
+                return Err(format!("model unverified: {why}; nothing was changed"));
             }
-            Err(e) => {
-                inner.fault(&format!("model change unconfirmed: {e}"));
-                return Err("model change unconfirmed; check the current model".into());
+        };
+        let (model, thinking) = current.map_or((None, None), |s| (s.model, s.thinking));
+        let mut calls = Vec::new();
+        if !model.as_deref().is_some_and(|m| same_model(m, &r.model())) {
+            calls.push((
+                "set_model",
+                vec![("provider", json!(r.provider)), ("modelId", json!(r.id))],
+            ));
+        }
+        if let Some(level) = r
+            .requested
+            .as_deref()
+            .filter(|l| thinking.as_deref() != Some(*l))
+        {
+            calls.push(("set_thinking_level", vec![("level", json!(level))]));
+        }
+        for (kind, fields) in calls {
+            match inner.call(kind, &fields).await {
+                Ok(reply) if reply.success => {}
+                Ok(reply) => {
+                    return Err(reply.error.unwrap_or_else(|| format!("OMP refused {kind}")));
+                }
+                Err(e) => {
+                    inner.fault(&format!("model change unconfirmed: {e}"));
+                    return Err("model change unconfirmed; check the current model".into());
+                }
             }
         }
         {
@@ -1340,17 +1757,23 @@ impl Control for Session {
             let mut st = inner.lock();
             st.fallback_report = None;
             st.asked_model = Some(selector.to_string());
+            st.resolution = Some(r.clone());
             st.fresh = false;
             inner.publish(&mut st);
         }
         inner.readback().await?;
-        let now = inner.lock().latest.as_ref().and_then(|s| s.model.clone());
-        match now {
-            Some(m) if same_model(&m, selector) => Ok(m),
-            other => Err(format!(
-                "model readback shows {}",
-                other.unwrap_or_else(|| "none".into())
-            )),
+        let (model, thinking) = inner
+            .lock()
+            .latest
+            .clone()
+            .map_or((None, None), |s| (s.model, s.thinking));
+        match r.judge(model.as_deref(), thinking.as_deref()) {
+            None => {
+                // Only a confirmed change moves the pin the lane barrier holds turns to.
+                inner.settings.links.resolved(&inner.handle, r.clone());
+                Ok(r)
+            }
+            Some(reason) => Err(format!("model readback: {reason}")),
         }
     }
 
@@ -1424,16 +1847,20 @@ impl Control for Session {
         Ok(())
     }
 
+    /// Accepts the model OMP reports after a mismatch or an unverified model: it becomes the
+    /// expected one.
     fn accept_model(&self) -> Result<(), String> {
         let mut st = self.inner.lock();
-        match &st.held {
-            Some(reason) if reason.starts_with("model mismatch") => {
-                st.held = None;
-                self.inner.publish(&mut st);
-                Ok(())
-            }
-            _ => Err("the session is not held for a model mismatch".into()),
+        if !st.held.as_deref().is_some_and(super::model::accepts) {
+            return Err(
+                "the session is not held for a model mismatch or an unverified model".into(),
+            );
         }
+        st.held = None;
+        st.resolution = None;
+        st.asked_model = st.latest.as_ref().and_then(|s| s.model.clone());
+        self.inner.publish(&mut st);
+        Ok(())
     }
 
     async fn close(&self, force: bool) -> Result<StopRecord, String> {
@@ -1497,10 +1924,38 @@ fn note_cancelled(cancelled: &mut VecDeque<String>, id: &str) -> bool {
     false
 }
 
+/// A remote worker's launch environment: nothing of this machine's, then the role's policy pins
+/// last so they outrank the worker's own `.env` files (DESIGN 12.2 A13).
+fn worker_env(token: &str, role: crate::omp::tools::Role) -> Vec<(String, String)> {
+    let mut env = vec![
+        ("PI_NOTIFICATIONS".to_string(), "off".to_string()),
+        ("CATALY_LAUNCH".to_string(), token.to_string()),
+    ];
+    env.extend(
+        crate::omp::launch::policy_env(role)
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v)),
+    );
+    env
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::testing::{Fake, spec};
+
+    #[test]
+    fn worker_env_ends_with_the_policy_pins() {
+        use crate::omp::tools::Role as ToolRole;
+        for role in [ToolRole::Lead, ToolRole::Lane, ToolRole::LookOnly] {
+            let env = worker_env("PI_PY=1", role);
+            let tail: Vec<(&str, &str)> = env[env.len() - 2..]
+                .iter()
+                .map(|(k, v)| (k.as_str(), v.as_str()))
+                .collect();
+            assert_eq!(tail, [("PI_PY", "0"), ("PI_JS", "0")], "{role:?}");
+        }
+    }
 
     #[test]
     fn cancelled_offers_are_bounded_and_repeats_known() {
@@ -1510,6 +1965,99 @@ mod tests {
         }
         assert_eq!(cancelled.len(), CANCELLED_KEEP);
         assert!(note_cancelled(&mut cancelled, "o999"));
+    }
+
+    /// A failed remote spawn says what its answer proves: a refusal started nothing, a recorded
+    /// failure carries the worker's state, and no answer is unknown ownership.
+    #[test]
+    fn remote_spawn_failures_carry_what_they_prove() {
+        use crate::worker::attempt::{AttemptState, Reaped};
+        use crate::worker::link::SpawnError;
+        assert_eq!(
+            spawn_failed("box", SpawnError::Refused("busy".into())),
+            StartError::Refused("box: busy".into())
+        );
+        let ended = |state| SpawnError::Ended {
+            detail: "no pipes".into(),
+            state,
+        };
+        let cleanup = |error| match spawn_failed("box", error) {
+            StartError::Startup {
+                stage: StartupStage::Spawn,
+                cleanup,
+                ..
+            } => cleanup,
+            other => panic!("{other:?}"),
+        };
+        let reaped = |exit| AttemptState::Reaped {
+            exit,
+            lease: super::super::lead::Lease::Unknown,
+        };
+        assert_eq!(
+            cleanup(ended(reaped(Reaped::NotSpawned))),
+            Cleanup::NotSpawned
+        );
+        assert_eq!(
+            cleanup(ended(reaped(Reaped::Signal(9)))),
+            Cleanup::WorkerReaped
+        );
+        let unreaped = AttemptState::Unknown {
+            reason: "the worker could not reap its OMP after KILL".into(),
+        };
+        assert_eq!(cleanup(ended(unreaped)), Cleanup::Unknown);
+        assert_eq!(
+            cleanup(SpawnError::Unanswered("spawn took longer than 30 s".into())),
+            Cleanup::Unknown
+        );
+    }
+
+    /// A remote session's OMP counts as ended only by the worker's acknowledgement of its reap; a
+    /// disconnect before it stays unknown, and is not taken for a timeout needing KILL.
+    #[tokio::test]
+    async fn a_remote_stop_is_proven_only_by_the_workers_acknowledgement() {
+        use crate::worker::attempt::{AttemptState, Reaped};
+        let root = crate::sys::fs::tests::scratch("headless-remote");
+        let cwd = root.display().to_string();
+        let (link, _serving) = crate::worker::link::tests::served(&root);
+        let argv = ["omp".into(), "-c".into(), "exec cat >/dev/null".into()];
+        let spawned = link.spawn(&argv, &cwd, &[], "r1", None).await.unwrap();
+        // The stream's end is the end of the OMP's input, as `end` closes it.
+        drop(spawned.stream);
+        let mut acknowledged = Remote {
+            worker: "box".into(),
+            channel: spawned.channel,
+            hold: spawned.hold,
+            exit: spawned.exit,
+        };
+        let (state, killed) = acknowledged.reaped().await;
+        assert!(!killed);
+        assert!(matches!(
+            state,
+            AttemptState::Reaped {
+                exit: Reaped::Code(0),
+                ..
+            }
+        ));
+        assert_eq!(
+            super::super::lead::ownership::worker_cleanup(&state),
+            Cleanup::WorkerReaped
+        );
+        let argv = ["omp".into(), "-c".into(), "exec sleep 30".into()];
+        let spawned = link.spawn(&argv, &cwd, &[], "r2", None).await.unwrap();
+        let mut dropped = Remote {
+            worker: "box".into(),
+            channel: spawned.channel,
+            hold: spawned.hold,
+            exit: spawned.exit,
+        };
+        link.mux.close();
+        let (state, killed) = dropped.reaped().await;
+        assert!(!killed, "a disconnect answers at once");
+        assert_eq!(
+            super::super::lead::ownership::worker_cleanup(&state),
+            Cleanup::Unknown
+        );
+        drop(spawned.stream);
     }
 
     async fn started(fake: &Fake) -> Arc<Session> {
@@ -1560,7 +2108,29 @@ mod tests {
                 fresh: false,
             })
             .await;
-        assert!(matches!(wrong, DeliverOutcome::NotReady(_)), "{wrong:?}");
+        assert!(matches!(wrong, DeliverOutcome::NotReady(..)), "{wrong:?}");
+    }
+
+    /// A paused goal refuses delivery, and the outcome names the goal, not the idle status.
+    #[tokio::test]
+    async fn a_paused_goal_is_named_as_the_reason() {
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        fake.set(|s| s.goal = Some("paused"));
+        let outcome = session
+            .deliver(Delivery {
+                expected_session: fake.session_id(),
+                text: "x".into(),
+                timing: Timing::Any,
+                steer: false,
+                fresh: false,
+            })
+            .await;
+        assert_eq!(
+            outcome,
+            DeliverOutcome::NotReady(Status::Idle, "the goal is paused".into())
+        );
+        assert_eq!(fake.seen("prompt").len(), 0);
     }
 
     #[tokio::test]
@@ -1610,7 +2180,7 @@ mod tests {
                 fresh: false,
             })
             .await;
-        assert_eq!(idle_only, DeliverOutcome::NotReady(Status::Working));
+        assert_eq!(idle_only, DeliverOutcome::wrong_timing(Status::Working));
     }
 
     /// Acceptance check 6: a transcript switch, a model mismatch at start and an `rpc_frame_error`
@@ -1633,7 +2203,7 @@ mod tests {
         fake.set(|s| s.session_id = "switched".into());
         let outcome = deliver(Arc::clone(&session), fake.session_id()).await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(Status::Error)),
+            matches!(outcome, DeliverOutcome::NotReady(Status::Error, _)),
             "{outcome:?}"
         );
         assert!(
@@ -1652,7 +2222,7 @@ mod tests {
         assert!(bound.held.unwrap().contains("model mismatch"));
         let outcome = deliver(Arc::clone(&session), fake.session_id()).await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(_)),
+            matches!(outcome, DeliverOutcome::NotReady(..)),
             "{outcome:?}"
         );
         assert_eq!(fake.seen("prompt").len(), 0);
@@ -1664,7 +2234,7 @@ mod tests {
         assert!(snapshot.reason.clone().unwrap().contains("rpc_frame_error"));
         let outcome = deliver(Arc::clone(&session), fake.session_id()).await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(Status::Error)),
+            matches!(outcome, DeliverOutcome::NotReady(Status::Error, _)),
             "{outcome:?}"
         );
         assert_eq!(fake.seen("prompt").len(), 0);
@@ -1787,7 +2357,7 @@ mod tests {
             })
             .await;
         assert!(
-            matches!(outcome, DeliverOutcome::NotReady(Status::Error)),
+            matches!(outcome, DeliverOutcome::NotReady(Status::Error, _)),
             "{outcome:?}"
         );
         assert!(
@@ -1861,7 +2431,7 @@ mod tests {
         fake.wait_for(&session, |s| s.recent.iter().any(|e| e.text == "one"))
             .await;
         assert_eq!(
-            session.set_model("fake/backup").await.unwrap(),
+            session.set_model("fake/backup").await.unwrap().model(),
             "fake/backup"
         );
         fake.push(json!({"type": "model_changed"}));
@@ -1898,12 +2468,97 @@ mod tests {
         );
         assert_eq!(fake.seen("abort").len(), 1);
         assert_eq!(
-            session.set_model("fake/primary").await.unwrap(),
+            session.set_model("fake/primary").await.unwrap().model(),
             "fake/primary"
         );
         assert_eq!(fake.seen("set_model").len(), 0);
-        assert_eq!(session.set_model("fake/other").await.unwrap(), "fake/other");
+        assert_eq!(
+            session.set_model("fake/other").await.unwrap().model(),
+            "fake/other"
+        );
         assert!(session.set_model("bad model").await.is_err());
+    }
+
+    /// HOST req. 27 with selectors: `x:high` binds the base model at high; a clamped level
+    /// fences; a bridge older than the hub fences as unverified at once and the owner may accept
+    /// it; a suffixed change sets the base model and the level separately.
+    #[tokio::test]
+    async fn selectors_are_verified_by_what_omp_resolved() {
+        let high = || {
+            let mut s = spec("h1", None);
+            s.model = "fake/primary:high".into();
+            s
+        };
+        let fake = Fake::start();
+        fake.set(|s| s.thinking = Some("high".into()));
+        let (session, bound) = fake.bind(high()).await.unwrap();
+        assert_eq!(bound.held, None);
+        assert!(!session.snapshot().input_blocked);
+
+        let fake = Fake::start();
+        fake.set(|s| s.thinking = Some("medium".into()));
+        let held = fake.bind(high()).await.unwrap().1.held.unwrap();
+        assert!(
+            held.contains("thinking high requested, OMP reports medium"),
+            "{held}"
+        );
+
+        let fake = Fake::start();
+        fake.set(|s| s.resolution_version = None);
+        let began = tokio::time::Instant::now();
+        let (session, bound) = fake.bind(high()).await.unwrap();
+        let held = bound.held.unwrap();
+        assert!(began.elapsed() < Duration::from_secs(5));
+        assert!(
+            held.starts_with("model unverified") && held.contains("older than the hub"),
+            "{held}"
+        );
+        assert!(session.snapshot().input_blocked);
+        session.accept_model().unwrap();
+        assert!(!session.snapshot().input_blocked);
+        let refused = session.set_model("fake/other:low").await.unwrap_err();
+        assert!(refused.contains("nothing was changed"), "{refused}");
+        assert_eq!(fake.seen("set_model"), Vec::<Value>::new());
+
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        assert_eq!(
+            session.set_model("fake/other:low").await.unwrap().model(),
+            "fake/other"
+        );
+        assert_eq!(fake.seen("set_model")[0]["modelId"], "other");
+        assert_eq!(fake.seen("set_thinking_level")[0]["level"], "low");
+    }
+
+    /// The lane model barrier pins what the registry holds: only a change read back as asked
+    /// moves it, so turns on the new model flow and a refused change keeps the old model flowing.
+    #[tokio::test]
+    async fn only_a_confirmed_model_change_moves_the_barrier_pin() {
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        let pin = || {
+            let r = session.inner.settings.links.resolution("h1").unwrap();
+            (r.model(), r.requested)
+        };
+        assert_eq!(pin(), ("fake/primary".to_string(), None));
+        fake.set(|s| s.refuse_model = true);
+        let refused = session.set_model("fake/other").await.unwrap_err();
+        assert!(refused.contains("model not available"), "{refused}");
+        assert_eq!(
+            pin(),
+            ("fake/primary".to_string(), None),
+            "a refused change keeps the old model flowing"
+        );
+        fake.set(|s| s.refuse_model = false);
+        assert_eq!(
+            session.set_model("fake/other:low").await.unwrap().model(),
+            "fake/other"
+        );
+        assert_eq!(
+            pin(),
+            ("fake/other".to_string(), Some("low".to_string())),
+            "turns on the confirmed model flow"
+        );
     }
 
     #[tokio::test]

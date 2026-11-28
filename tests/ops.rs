@@ -104,7 +104,7 @@ fn the_panel_is_one_pinned_embed_with_owner_only_buttons() {
     assert_eq!(refused["data"]["flags"], 64);
     assert_eq!(
         refused["data"]["content"],
-        "이 버튼은 주인만 누를 수 있어요."
+        "이 버튼은 주인님만 누를 수 있어요."
     );
     // The owner's presses: the usage table, a refresh too soon, the mute.
     let usage = press(&fake, OWNER, &message, "ops:usage");

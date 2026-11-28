@@ -556,9 +556,16 @@ impl Jobs {
         Ok(())
     }
 
-    /// Appends one hub event (routed nowhere but the store and the event log).
+    /// Appends one hub event: routed nowhere but the store and the event log, except one for the
+    /// owner ([`Emit::for_owner`]), which also goes to his home room.
     pub(crate) async fn hub_event(&self, emit: Emit) -> Result<(), JobsError> {
-        let event = event::build("hub", emit, &[], false, &[], now_ms());
+        let event = if emit.owner {
+            let config = self.ctx.config();
+            let template = emit.kind.default_wording();
+            event::owner_post(emit, &template, None, &config, now_ms())
+        } else {
+            event::build("hub", emit, &[], false, &[], now_ms())
+        };
         self.ctx.stream.append(vec![event]).await?;
         Ok(())
     }
