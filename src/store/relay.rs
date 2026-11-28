@@ -865,13 +865,15 @@ fn write_marks(tx: &Transaction<'_>, change: &RelayWrite, now: i64) -> rusqlite:
 /// Retention (DISC-IN req. 52, DISC-OUT req. 29, 34).
 pub(super) fn maintain(tx: &Transaction<'_>, now: i64) -> rusqlite::Result<()> {
     let old = now - KEEP_MS;
+    // A lane answers in its own thread, so a lane hand-off's answer stays 'waiting'.
     tx.execute(
         "DELETE FROM handoffs AS h WHERE h.updated_ms < ?1 AND h.state = 'delivered' \
-         AND h.answer NOT IN ('waiting', 'posting') AND NOT EXISTS (SELECT 1 FROM arrival_queue q \
+         AND (h.target <> ?2 OR h.answer NOT IN ('waiting', 'posting')) \
+         AND NOT EXISTS (SELECT 1 FROM arrival_queue q \
          WHERE q.relay = h.relay AND q.room = h.room AND q.message = h.message) \
          AND EXISTS (SELECT 1 FROM positions p WHERE p.relay = h.relay AND p.room = h.room \
          AND p.position >= h.seq)",
-        [old],
+        params![old, inbox::LEAD],
     )?;
     tx.execute(
         "DELETE FROM outbox_parts AS p WHERE p.updated_ms < ?1 AND NOT EXISTS (SELECT 1 FROM \
@@ -1131,10 +1133,11 @@ impl Reads {
                 None,
             )?,
             queued: count("SELECT COUNT(*) FROM arrival_queue WHERE relay = ?1", None)?,
-            answers_waiting: count(
-                "SELECT COUNT(*) FROM handoffs WHERE relay = ?1 AND target = 'lead' \
+            answers_waiting: self.0.query_row(
+                "SELECT COUNT(*) FROM handoffs WHERE relay = ?1 AND target = ?2 \
                  AND answer IN ('waiting', 'posting')",
-                None,
+                params![relay, inbox::LEAD],
+                |r| r.get(0),
             )?,
             owed_open: count(
                 "SELECT COUNT(*) FROM owed_replies WHERE relay = ?1 AND settled_ms IS NULL \
@@ -1227,6 +1230,54 @@ mod tests {
             r(arrive("c", 12)).await.unwrap(),
             RelayDone::Arrived(Arrived::Handled)
         );
+    }
+
+    /// Retention prunes an old delivered lane hand-off, whose answer stays 'waiting', and keeps a
+    /// lead hand-off still waiting for its answer (DISC-IN req. 52).
+    #[tokio::test]
+    async fn retention_prunes_old_lane_hand_offs_only() {
+        let (store, _w, _dir) = open_temp("relay-keep");
+        let r = |w| store.relay(w);
+        r(RelayWrite::Baseline {
+            relay: "discord".into(),
+            room: "c".into(),
+            position: 10,
+            parent: None,
+        })
+        .await
+        .unwrap();
+        for (seq, target) in [(12, "w-1"), (13, inbox::LEAD)] {
+            r(arrive("c", seq)).await.unwrap();
+            r(RelayWrite::Handed {
+                relay: "discord".into(),
+                room: "c".into(),
+                message: seq.to_string(),
+                seq,
+                target: target.into(),
+                request_id: format!("discord:c:{seq}"),
+                digest: "d".into(),
+                owed: None,
+            })
+            .await
+            .unwrap();
+            r(RelayWrite::Finish {
+                relay: "discord".into(),
+                room: "c".into(),
+                message: seq.to_string(),
+                state: Some("delivered".into()),
+            })
+            .await
+            .unwrap();
+        }
+        let later = crate::sys::now_ms() + KEEP_MS + 1;
+        store.maintain(later).await.unwrap();
+        let row = |m: &'static str| store.read(move |q| q.handoff("discord", "c", m));
+        assert!(
+            row("12").await.unwrap().is_none(),
+            "the lane hand-off is pruned"
+        );
+        let lead = row("13").await.unwrap().expect("the lead hand-off is kept");
+        assert_eq!(lead.answer, "waiting");
     }
 
     /// Settling needs the read mark and a confirmed linked first part (DISC-OUT req. 33).
