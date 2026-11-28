@@ -84,6 +84,7 @@ pub(super) fn bound(
 
 /// A continuation replaces the current anchor's identity, never a newer launch's anchor.
 /// The binding and session row move together, including selection by a configured session ID.
+/// The original launch's ownership provenance, runtime and binding time stay unchanged.
 pub(super) fn continued(
     tx: &Transaction<'_>,
     update: &SessionUpdate,
@@ -93,11 +94,10 @@ pub(super) fn continued(
         return Err(rusqlite::Error::InvalidQuery);
     };
     let changed = tx.execute(
-        "UPDATE lead_bindings SET session_id = ?2, session_file = ?3, bound_ms = ?4, \
-         provenance = 'continued by accepted bridge' WHERE handle = ?1 \
+        "UPDATE lead_bindings SET session_id = ?2, session_file = ?3 WHERE handle = ?1 \
          AND EXISTS(SELECT 1 FROM lead_anchor WHERE handle = ?1) \
          AND NOT EXISTS(SELECT 1 FROM lead_bindings WHERE session_id = ?2 AND session_file <> ?3)",
-        params![update.handle, id, file, now],
+        params![update.handle, id, file],
     )?;
     if changed != 1 {
         return Err(rusqlite::Error::InvalidQuery);

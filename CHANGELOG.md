@@ -7,7 +7,8 @@
   control when returning to a known session. New sessions, forks and branch/btw continuations keep
   their role and persist their new identity. Lost continuation replies are replayed on reconnect;
   unrelated resumes drop the old tools and reconnect key. Returning lanes can reconnect by their
-  session marker, and a switch revokes only that connection's process role.
+  session marker, and a switch revokes only that connection's process role. Local transcript aliases
+  resolve to the same canonical path, and continuations retain the original launch ownership evidence.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

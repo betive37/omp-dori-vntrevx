@@ -762,8 +762,17 @@ impl<R: Runtime> Lanes<R> {
         if !rec.open() || rec.handle.as_deref() != Some(handle) {
             return Err("no open lane holds this session".into());
         }
+        let file = if rec.worker.is_none() {
+            crate::sys::fs::canonical_file(std::path::Path::new(file))
+                .map_err(|error| error.to_string())?
+                .into_os_string()
+                .into_string()
+                .map_err(|_| "session transcript path is not UTF-8")?
+        } else {
+            file.into()
+        };
         rec.session_id = Some(session.into());
-        rec.session_file = Some(file.into());
+        rec.session_file = Some(file);
         self.save(&rec, Some(rev), None).await?;
         Ok(())
     }

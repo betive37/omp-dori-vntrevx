@@ -329,6 +329,7 @@ fn a_return_to_the_tern_lead_reattaches_its_port() {
     let pid = block["pid"].as_u64().unwrap();
     let file = work.join("s1.jsonl");
     std::fs::write(&file, "").unwrap();
+    let file = std::fs::canonicalize(file).unwrap();
     let mut bridge = Bridge::connect(&hub.socket());
     assert_eq!(bridge.accept(&hello(token, "s1", &file, pid))["tern"], true);
     hub.until(Duration::from_secs(20), || {
@@ -420,6 +421,7 @@ fn a_pending_continuation_reconnects_before_replaying_its_switch() {
     let pid = block["pid"].as_u64().unwrap();
     let file = work.join("s1.jsonl");
     std::fs::write(&file, "").unwrap();
+    let file = std::fs::canonicalize(file).unwrap();
     let mut bridge = Bridge::connect(&hub.socket());
     let mut key = bridge.accept(&hello(token, "s1", &file, pid))["key"].clone();
     hub.until(Duration::from_secs(20), || {
@@ -428,6 +430,7 @@ fn a_pending_continuation_reconnects_before_replaying_its_switch() {
     for (reason, reached_hub) in [("new", false), ("fork", true), ("session_branch", false)] {
         let file = work.join(format!("{reason}.jsonl"));
         std::fs::write(&file, "").unwrap();
+        let file = std::fs::canonicalize(file).unwrap();
         let change = json!({"session":reason,"file":file,"reason":reason});
         if reached_hub {
             assert_eq!(bridge.request("bridge.switch", &change)["role"], "lead");

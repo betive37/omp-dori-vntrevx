@@ -86,6 +86,40 @@ fn a_continued_identity_moves_the_anchor_and_its_pin_together() {
 }
 
 #[test]
+fn a_continuation_preserves_launch_ownership_evidence() {
+    let mut db = database();
+    attempt(&mut db, "lead", "fresh", 1);
+    bind(&mut db, "lead", "original", 2);
+    let evidence = |db: &Connection| -> (String, String, i64) {
+        db.query_row(
+            "SELECT runtime, provenance, bound_ms FROM lead_bindings WHERE handle = 'lead'",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .unwrap()
+    };
+    let before = evidence(&db);
+    let tx = db.transaction().unwrap();
+    continued(
+        &tx,
+        &SessionUpdate {
+            handle: "lead".into(),
+            session_id: Some("fork".into()),
+            session_file: Some("/sessions/fork.jsonl".into()),
+            ..SessionUpdate::default()
+        },
+        3,
+    )
+    .unwrap();
+    tx.commit().unwrap();
+    assert_eq!(
+        evidence(&db),
+        before,
+        "a continuation is not a new verified launch"
+    );
+}
+
+#[test]
 fn failed_attempt_and_retention_never_replace_the_anchor() {
     let mut db = database();
     attempt(&mut db, "bound", "fresh", 1);

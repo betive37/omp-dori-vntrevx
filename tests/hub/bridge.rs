@@ -189,6 +189,60 @@ fn bridge_lane_returns_by_marker_after_an_unrelated_session() {
 }
 
 #[test]
+fn bridge_role_identity_matches_canonical_transcript_aliases() {
+    let (mut hub, lead) = lead_hub();
+    let lane = open_lane(&hub);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
+    for (role, original) in [("lead", lead), ("lane", lane)] {
+        let file = std::path::Path::new(original["session_file"].as_str().unwrap());
+        let alias = hub.root.join(format!("{role}-alias"));
+        std::os::unix::fs::symlink(file.parent().unwrap(), &alias).unwrap();
+        let aliased = json!({
+            "session_id": original["session_id"],
+            "session_file": alias.join(file.file_name().unwrap()),
+        });
+        let answer = bridge.switch(&aliased, "resume");
+        assert_eq!(answer["role"], role, "{answer}");
+        drop(Bridge::connect(&hub, &aliased, role));
+    }
+    drop(bridge);
+    hub.stop();
+}
+
+#[test]
+fn bridge_continuations_store_canonical_transcript_paths() {
+    let (mut hub, lead) = lead_hub();
+    let lane = open_lane(&hub);
+    let mut bridge = Bridge::connect(&hub, &lead, "lead");
+    let work = hub.root.join("work");
+    let real = std::fs::canonicalize(&work).unwrap();
+    let alias = hub.root.join("work-alias");
+    std::os::unix::fs::symlink(&work, &alias).unwrap();
+    for (role, original) in [("lead", lead), ("lane", lane)] {
+        assert_eq!(bridge.switch(&original, "resume")["role"], role);
+        let name = format!("{role}-fork.jsonl");
+        let continued = json!({"session_id":name,"session_file":alias.join(&name)});
+        // Stock OMP may not create the fresh transcript until its first write.
+        assert!(!alias.join(&name).exists());
+        assert_eq!(bridge.switch(&continued, "fork")["role"], role);
+        let recorded = if role == "lead" {
+            hub.json(&["lead", "status", "--json"])["anchor"].clone()
+        } else {
+            hub.json(&["lane", "list", "--json"])[0].clone()
+        };
+        assert_eq!(recorded["session_id"], name);
+        assert_eq!(
+            recorded["session_file"],
+            json!(real.join(&name)),
+            "{recorded}"
+        );
+        assert_eq!(bridge.switch(&recorded, "resume")["role"], role);
+    }
+    drop(bridge);
+    hub.stop();
+}
+
+#[test]
 fn bridge_switch_to_unrelated_session_revokes_lead_tools() {
     let (mut hub, lead) = lead_hub();
     let unrelated = json!({"session_id":"unrelated","session_file":"/unrelated.jsonl"});

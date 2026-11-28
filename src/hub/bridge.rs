@@ -90,7 +90,12 @@ fn lane_tool() -> Value {
 
 /// Who the hello is, if anyone: the session handle and role, and whether the hub launched it on a
 /// new conversation. A reconnect, a resume and a resume by hand continue one.
-async fn decide(hub: &Hub, hello: &Hello, raw: &Value) -> Result<(String, Role, bool), String> {
+async fn decide(
+    hub: &Hub,
+    hello: &Hello,
+    raw: &Value,
+    worker: Option<&str>,
+) -> Result<(String, Role, bool), String> {
     if hello.ext != PROTOCOL {
         return Err(format!(
             "bridge protocol {} where this hub speaks {PROTOCOL}; install the matching bridge",
@@ -121,7 +126,7 @@ async fn decide(hub: &Hub, hello: &Hello, raw: &Value) -> Result<(String, Role, 
     }
     // A resume by hand carries the marker; the hub decides by the session's identity (EXT-02).
     if hello.marker
-        && let Some((handle, role)) = switched(hub, raw).await
+        && let Some((handle, role)) = switched(hub, raw, worker).await
     {
         return Ok((handle, role, false));
     }
@@ -130,17 +135,37 @@ async fn decide(hub: &Hub, hello: &Hello, raw: &Value) -> Result<(String, Role, 
 
 /// A resume or tree move carries no authority from the previous conversation (EXT req. 8).
 /// Match both the ID and transcript before forwarding the transition to the terminal port.
-async fn switched(hub: &Hub, params: &Value) -> Option<(String, Role)> {
+async fn switched(hub: &Hub, params: &Value, worker: Option<&str>) -> Option<(String, Role)> {
     let session = params.get("session")?.as_str()?.to_string();
-    let file = params.get("file")?.as_str()?.to_string();
+    let file = params.get("file")?.as_str()?;
     if session.is_empty() || file.is_empty() {
         return None;
     }
+    let local = worker.is_none();
+    let file = if local {
+        crate::sys::fs::canonical_file(std::path::Path::new(file))
+            .ok()?
+            .into_os_string()
+            .into_string()
+            .ok()?
+    } else {
+        file.to_string()
+    };
     hub.store
         .read(move |r| {
+            let same_file = |stored: Option<&str>| {
+                stored.is_some_and(|stored| {
+                    if local {
+                        crate::sys::fs::canonical_file(std::path::Path::new(stored))
+                            .is_ok_and(|path| path.to_str() == Some(file.as_str()))
+                    } else {
+                        stored == file
+                    }
+                })
+            };
             if let Some(row) = r.lead_target(None)?.row
                 && row.session_id.as_deref() == Some(session.as_str())
-                && row.session_file.as_deref() == Some(file.as_str())
+                && same_file(row.session_file.as_deref())
             {
                 return Ok(Some((row.handle, Role::Lead)));
             }
@@ -150,7 +175,7 @@ async fn switched(hub: &Hub, params: &Value) -> Option<(String, Role)> {
                     continue;
                 };
                 if rec.session_id.as_deref() == Some(session.as_str())
-                    && rec.session_file.as_deref() == Some(file.as_str())
+                    && same_file(rec.session_file.as_deref())
                     && let Some(handle) = rec.handle
                 {
                     return Ok(Some((handle, Role::Lane)));
@@ -178,19 +203,26 @@ async fn continue_session(hub: &Hub, handle: &str, role: Role, params: &Value) -
         return false;
     };
     let result = match role {
-        Role::Lead => hub
-            .store
-            .host(crate::store::host::HostWrite::ContinueLead(
-                crate::store::host::SessionUpdate {
-                    handle: handle.into(),
-                    session_id: Some(session.into()),
-                    session_file: Some(file.into()),
-                    ..crate::store::host::SessionUpdate::default()
-                },
-            ))
-            .await
-            .map(|_| ())
-            .map_err(|error| error.to_string()),
+        Role::Lead => {
+            let Ok(file) = crate::sys::fs::canonical_file(std::path::Path::new(file)) else {
+                return false;
+            };
+            let Ok(file) = file.into_os_string().into_string() else {
+                return false;
+            };
+            hub.store
+                .host(crate::store::host::HostWrite::ContinueLead(
+                    crate::store::host::SessionUpdate {
+                        handle: handle.into(),
+                        session_id: Some(session.into()),
+                        session_file: Some(file),
+                        ..crate::store::host::SessionUpdate::default()
+                    },
+                ))
+                .await
+                .map(|_| ())
+                .map_err(|error| error.to_string())
+        }
         Role::Lane => hub.lanes.continue_session(handle, session, file).await,
     };
     if let Err(error) = &result {
@@ -304,7 +336,7 @@ pub(crate) async fn serve<R, W>(
             .as_deref()
             .and_then(|key| hub.links.by_key(key))
             .is_some();
-    let decided = match decide(hub, &hello, &raw).await {
+    let decided = match decide(hub, &hello, &raw, worker).await {
         Ok((handle, role, fresh)) => placed(hub, &handle, role, worker)
             .await
             .map(|()| (handle, role, fresh)),
@@ -442,7 +474,7 @@ pub(crate) async fn serve<R, W>(
                     (sub || continue_session(hub, &handle, role, &request.params).await)
                         .then(|| (handle.clone(), role))
                 } else {
-                    switched(hub, &request.params).await
+                    switched(hub, &request.params, worker).await
                 };
                 let next = match next {
                     Some((h, r)) if placed(hub, &h, r, worker).await.is_ok() => {
