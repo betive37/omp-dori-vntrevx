@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Telegram could lose an owner message when its arrival queue was full or its store write failed.
+  It now stops that batch, keeps the offset before the unsaved update and retries after a minute.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
