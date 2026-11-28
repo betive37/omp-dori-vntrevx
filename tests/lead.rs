@@ -1758,3 +1758,120 @@ fn a_lead_whose_bridge_never_connects_is_bound_fenced_and_told_once() {
     assert_eq!(told(&w.hub, "lead.held").len(), 1, "told only once");
     assert!(w.hub.stop().success());
 }
+
+fn store(hub: &TestHub) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    db
+}
+
+fn now_ms() -> i64 {
+    i64::try_from(
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis(),
+    )
+    .unwrap()
+}
+
+/// The lead's episode for `session` as an earlier start left it: `state`, begun two hours ago with
+/// its 300 s window, no retry spent. Returns when it began.
+fn left_episode(db: &rusqlite::Connection, session: &Value, state: &str) -> i64 {
+    let began = now_ms() - 7_200_000;
+    db.execute(
+        "INSERT INTO startup_episodes(target, session_id, started_ms, deadline_ms, state) \
+         VALUES ('lead', ?1, ?2, ?2 + 300000, ?3) ON CONFLICT(target) DO UPDATE SET \
+         session_id = excluded.session_id, state = excluded.state, started_ms = excluded.started_ms, \
+         deadline_ms = excluded.deadline_ms, retries = 0, next_ms = NULL, detail = NULL",
+        rusqlite::params![session.as_str().unwrap(), began, state],
+    )
+    .unwrap();
+    began
+}
+
+fn lead_episode(db: &rusqlite::Connection) -> (String, i64) {
+    db.query_row(
+        "SELECT state, started_ms FROM startup_episodes WHERE target = 'lead'",
+        [],
+        |r| Ok((r.get(0)?, r.get(1)?)),
+    )
+    .unwrap()
+}
+
+/// The owner's 0.2.8 morning: an upgrade's start left the lead's episode active and the hub held
+/// the lead at start; the hold was lifted without an owner start (as migration 0013 does), and the
+/// lead slept on its conversation. Long after that episode's window an owner message wakes it: the
+/// wake begins a fresh episode, resumes the same conversation and delivers the message.
+#[test]
+fn a_wake_after_a_lifted_hold_begins_a_fresh_episode_and_delivers() {
+    let mut hub = sleepy_hub(&[], "2s", "", "");
+    hub.start();
+    let first = live(&hub, &Value::Null);
+    let (session, file) = (
+        first["session"]["session_id"].clone(),
+        first["session"]["session_file"].clone(),
+    );
+    asleep(&hub);
+    assert!(hub.stop().success());
+    let db = store(&hub);
+    db.execute(
+        "UPDATE lead_anchor SET hold = 'ambiguous lead binding history'",
+        [],
+    )
+    .unwrap();
+    let old = left_episode(&db, &session, "active");
+    hub.start();
+    held(&hub, 20);
+    assert!(hub.stop().success());
+    db.execute("UPDATE lead_anchor SET hold = NULL", [])
+        .unwrap();
+    hub.start();
+    asleep(&hub);
+    assert_eq!(lead_episode(&db), ("active".into(), old), "not read yet");
+
+    assert!(
+        hub.cli(&["lead", "send", "WAKE-AFTER-HOLD"])
+            .status
+            .success()
+    );
+    let woke = live(&hub, &first["session"]["pid"]);
+    assert_eq!(woke["session"]["session_id"], session, "{woke}");
+    assert_eq!(woke["session"]["session_file"], file, "{woke}");
+    hub.until(Duration::from_secs(20), || {
+        (user_entries(&file, "WAKE-AFTER-HOLD") == 1).then_some(())
+    });
+    let (state, began) = lead_episode(&db);
+    assert_eq!(state, "bound");
+    assert!(began > old, "a fresh episode");
+    assert!(hub.stop().success());
+}
+
+/// An episode that ended long ago is nobody's recovery: a crash exit of the bound lead retries
+/// normally, whether that episode ended bound or an older start left it active past its window.
+#[test]
+fn a_crash_exit_long_after_the_episode_ended_retries_normally() {
+    for ended in ["bound", "active"] {
+        let mut w = wrapped("", None);
+        w.hub.start();
+        let first = live(&w.hub, &Value::Null);
+        let db = store(&w.hub);
+        let old = left_episode(&db, &first["session"]["session_id"], ended);
+        kill(&first["session"]["pid"]);
+        let again = w.hub.until(Duration::from_secs(20), || {
+            let v = lead_view(&w.hub);
+            assert_ne!(v["phase"], "held", "{ended}: {v}");
+            let pid = &v["session"]["pid"];
+            (v["phase"] == "live" && pid.is_u64() && pid != &first["session"]["pid"]).then_some(v)
+        });
+        assert_eq!(
+            again["session"]["session_id"], first["session"]["session_id"],
+            "{ended}: {again}"
+        );
+        let (state, began) = lead_episode(&db);
+        assert_eq!(state, "bound", "{ended}");
+        assert!(began > old, "{ended}: a fresh episode");
+        assert!(w.hub.stop().success());
+        w.no_orphans();
+    }
+}
