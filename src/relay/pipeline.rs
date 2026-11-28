@@ -214,6 +214,14 @@ struct Target {
     noted: bool,
 }
 
+/// Who takes an owner message ([`Pipeline::lane_for`]).
+enum Route {
+    /// The lane whose thread it is in.
+    Lane(String),
+    /// The lead; with `[lead] lane_threads = "lead"` in a lane's thread, the line that says whose.
+    Lead(Option<String>),
+}
+
 /// The answer room of one request, shared by typing and posting: a found room (or none) is kept,
 /// a failed one is tried again, [`LOOKUP_TRIES`] lookups in all.
 type Lookup = Arc<tokio::sync::Mutex<LookupState>>;
@@ -719,7 +727,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 return Ok(Step::Held("an earlier hand-off failed".into()));
             }
         }
-        let text = self.spill(inbound, self.text_for(inbound).await);
+        let mut text = self.spill(inbound, self.text_for(inbound).await);
         self.remember(&inbound.room, &inbound.message, "owner", &inbound.text)
             .await;
         let request_id = Self::request_id(&row.room, &row.message);
@@ -734,35 +742,16 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 })
                 .collect()
         };
-        // A thread one open lane names goes to that lane; two claimants hold the room (DISC-IN
-        // req. 41-42). Lanes never answer the owner, so no reply is owed for it (OPC-57). A reply
-        // to the lead's own question goes to the lead even there (EVR req. 37).
-        let to_lead = match inbound.reply_to.clone() {
-            Some(target) => {
-                let (room, reply) = (row.room.clone(), row.message.clone());
-                let read = self
-                    .store
-                    .read(move |r| r.question_reply(&room, &target, &reply))
-                    .await;
-                match read {
-                    Ok(bound) => bound,
-                    Err(e) => {
-                        let why = format!("the question ledger could not be read: {e}");
-                        return self.hold(&row.room, &row.message, &why).await;
-                    }
+        let lane = match self.lane_for(row, inbound).await {
+            Ok(Route::Lane(key)) => Some(key),
+            Ok(Route::Lead(note)) => {
+                if let Some(note) = note {
+                    let _ = write!(text, "\n{note}");
                 }
+                None
             }
-            None => false,
+            Err(why) => return self.hold(&row.room, &row.message, &why).await,
         };
-        let route = if to_lead {
-            None
-        } else {
-            self.lanes.route(R::NAME, &row.room).await
-        };
-        if let Some(Err(why)) = &route {
-            return self.hold(&row.room, &row.message, why).await;
-        }
-        let lane = route.and_then(Result::ok);
         let handed = RelayWrite::Handed {
             relay: R::NAME.into(),
             room: row.room.clone(),
@@ -831,7 +820,10 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             // No inbox entry tells of it (the lead's transcript could not be searched): the
             // relay's notice, with its text.
             _ if h.target == inbox::LEAD => {
-                let text = self.spill(inbound, self.text_for(inbound).await);
+                let mut text = self.spill(inbound, self.text_for(inbound).await);
+                if let Some(note) = self.lane_note(&row.room).await {
+                    let _ = write!(text, "\n{note}");
+                }
                 let text = self.answer_notice(row, text);
                 let why = "an earlier attempt could not confirm it";
                 self.tell_lead(&row.room, &row.message, why, &text).await?;
@@ -840,6 +832,47 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
         self.finish(&row.room, &row.message, None).await?;
         Ok(Step::Done)
+    }
+
+    /// Who takes an owner message; `Err` holds it. A thread one open lane names goes to that lane;
+    /// two claimants hold the room (DISC-IN req. 41-42). Lanes never answer the owner, so no reply
+    /// is owed for it (OPC-57). A reply to the lead's own question goes to the lead even there (EVR
+    /// req. 37). With `[lead] lane_threads = "lead"` the lead takes every message, told whose
+    /// thread the room is, and passes a lane its part with `lane.send`.
+    async fn lane_for(&self, row: &QueueRow, inbound: &Inbound) -> Result<Route, String> {
+        if self.config.borrow().lead_takes_lane_threads() {
+            return Ok(Route::Lead(self.lane_note(&row.room).await));
+        }
+        if let Some(target) = inbound.reply_to.clone() {
+            let (room, reply) = (row.room.clone(), row.message.clone());
+            let bound = self
+                .store
+                .read(move |r| r.question_reply(&room, &target, &reply))
+                .await
+                .map_err(|e| format!("the question ledger could not be read: {e}"))?;
+            if bound {
+                return Ok(Route::Lead(None));
+            }
+        }
+        match self.lanes.route(R::NAME, &row.room).await {
+            None => Ok(Route::Lead(None)),
+            Some(Ok(key)) => Ok(Route::Lane(key)),
+            Some(Err(why)) => Err(why),
+        }
+    }
+
+    /// With `[lead] lane_threads = "lead"`, the line telling the lead whose thread `room` is.
+    async fn lane_note(&self, room: &str) -> Option<String> {
+        if !self.config.borrow().lead_takes_lane_threads() {
+            return None;
+        }
+        Some(match self.lanes.route(R::NAME, room).await? {
+            Ok(key) => format!(
+                "[lane] This room is the thread of lane {key}: answer the owner here and pass the \
+                 lane its part with cataly_lead op lane.send."
+            ),
+            Err(why) => format!("[lane] In this room {why}."),
+        })
     }
 
     /// With `[lead] answers = "tool"` the lead's final message is not posted (DISC-OUT req. 21):

@@ -129,6 +129,30 @@ pub(crate) struct LeadSettings {
     pub(crate) idle_sleep: Option<Duration>,
     /// How the lead answers owner messages (DISC-OUT req. 21).
     pub(crate) answers: Answers,
+    /// Who takes the owner's messages in a lane's thread.
+    pub(crate) lane_threads: LaneThreads,
+}
+
+/// `[lead] lane_threads`: who takes the owner's messages in a lane's thread.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(crate) enum LaneThreads {
+    /// The lane that names the thread (DISC-IN req. 41-42).
+    #[default]
+    Lane,
+    /// The lead, told whose thread it is; it passes the lane its part with `lane.send`.
+    Lead,
+}
+
+/// `[lead] lane_threads`: `lane` (the default) or `lead`.
+fn lane_threads(errors: &mut Vec<ConfigError>, l: &mut Section<'_>) -> LaneThreads {
+    match l.string(errors, "lane_threads") {
+        None | Some("lane") => LaneThreads::Lane,
+        Some("lead") => LaneThreads::Lead,
+        Some(_) => {
+            errors.push(l.error("lane_threads", "expected lane or lead"));
+            LaneThreads::Lane
+        }
+    }
 }
 
 /// `[lead] answers`: who posts the lead's answer to an owner message.
@@ -277,48 +301,10 @@ pub(super) fn parse(
         runtime(errors, &mut s, sessions);
         s.finish(errors);
     }
-    if let Some(mut l) = root.table(errors, "lead") {
-        let model = l.required_string(errors, "model").map(str::to_string);
-        if let Some(m) = &model
-            && !model_selector(m)
-        {
-            errors.push(l.error("model", "expected provider/id"));
-        }
-        let thinking = l.string(errors, "thinking").map(str::to_string);
-        if let Some(t) = &thinking
-            && !THINKING.contains(&t.as_str())
-        {
-            errors.push(l.error(
-                "thinking",
-                &format!("expected one of {}", THINKING.join(", ")),
-            ));
-        }
-        let cwd = l
-            .string(errors, "cwd")
-            .and_then(|v| absolute(errors, &l, "cwd", v));
-        let instructions = l
-            .string(errors, "instructions")
-            .and_then(|v| absolute(errors, &l, "instructions", v));
-        let session_id = l
-            .string(errors, "session_id")
-            .filter(|v| !v.trim().is_empty())
-            .map(str::to_string);
-        let autostart = l.bool(errors, "autostart").unwrap_or(true);
-        let idle_sleep = idle_sleep(errors, &mut l);
-        let answers = answers(errors, &mut l);
-        l.finish(errors);
-        if let Some(model) = model.filter(|m| model_selector(m)) {
-            *lead = Some(LeadSettings {
-                model,
-                thinking,
-                cwd,
-                session_id,
-                instructions,
-                autostart,
-                idle_sleep,
-                answers,
-            });
-        }
+    if let Some(l) = root.table(errors, "lead")
+        && let Some(settings) = lead_settings(errors, l)
+    {
+        *lead = Some(settings);
     }
     if let Some(mut f) = root.table(errors, "fallback") {
         if let Some(on) = f.string(errors, "on") {
@@ -347,6 +333,51 @@ pub(super) fn parse(
         }
         f.finish(errors);
     }
+}
+
+/// `[lead]`; `None` without a valid model.
+fn lead_settings(errors: &mut Vec<ConfigError>, mut l: Section<'_>) -> Option<LeadSettings> {
+    let model = l.required_string(errors, "model").map(str::to_string);
+    if let Some(m) = &model
+        && !model_selector(m)
+    {
+        errors.push(l.error("model", "expected provider/id"));
+    }
+    let thinking = l.string(errors, "thinking").map(str::to_string);
+    if let Some(t) = &thinking
+        && !THINKING.contains(&t.as_str())
+    {
+        errors.push(l.error(
+            "thinking",
+            &format!("expected one of {}", THINKING.join(", ")),
+        ));
+    }
+    let cwd = l
+        .string(errors, "cwd")
+        .and_then(|v| absolute(errors, &l, "cwd", v));
+    let instructions = l
+        .string(errors, "instructions")
+        .and_then(|v| absolute(errors, &l, "instructions", v));
+    let session_id = l
+        .string(errors, "session_id")
+        .filter(|v| !v.trim().is_empty())
+        .map(str::to_string);
+    let autostart = l.bool(errors, "autostart").unwrap_or(true);
+    let idle_sleep = idle_sleep(errors, &mut l);
+    let answers = answers(errors, &mut l);
+    let lane_threads = lane_threads(errors, &mut l);
+    l.finish(errors);
+    Some(LeadSettings {
+        model: model.filter(|m| model_selector(m))?,
+        thinking,
+        cwd,
+        session_id,
+        instructions,
+        autostart,
+        idle_sleep,
+        answers,
+        lane_threads,
+    })
 }
 
 #[cfg(test)]
@@ -390,6 +421,16 @@ mod tests {
         let tool = crate::config::parse("[lead]\nmodel = \"p/m\"\nanswers = \"tool\"\n").unwrap();
         assert_eq!(tool.lead.unwrap().answers, Answers::Tool);
         assert!(crate::config::parse("[lead]\nmodel = \"p/m\"\nanswers = \"auto\"\n").is_err());
+        assert_eq!(
+            config.lead.as_ref().unwrap().lane_threads,
+            LaneThreads::Lane
+        );
+        let lead =
+            crate::config::parse("[lead]\nmodel = \"p/m\"\nlane_threads = \"lead\"\n").unwrap();
+        assert_eq!(lead.lead.unwrap().lane_threads, LaneThreads::Lead);
+        assert!(
+            crate::config::parse("[lead]\nmodel = \"p/m\"\nlane_threads = \"both\"\n").is_err()
+        );
         let errors = crate::config::parse(
             "[sessions]\ncap = 99\ncredentials = [\"CATALY_X\"]\n[lead]\nmodel = \"bad\"\n\
              [fallback]\non = \"never\"\n[fallback.chains]\ndefault = [\"x\"]\n",
