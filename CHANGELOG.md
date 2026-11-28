@@ -119,6 +119,9 @@
   permanently. It now retries with backoff, retaining its launch identity until the hub answers;
   an explicit refusal on the first hello still leaves it inert. Previously accepted sessions keep
   retrying a refused reconnect without losing their reconnect key.
+  an explicit refusal still leaves it inert. An accepted session whose reconnect the hub refuses
+  (for one, a session it no longer knows) now goes inert too, instead of retrying for the life of
+  the process; a reconnect that times out or loses its connection still retries.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

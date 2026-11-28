@@ -194,11 +194,10 @@ test.each(["none", "err"])("an explicit hello %s reply stays inert without retry
 	expect(retries).toHaveLength(0);
 });
 
-test.each(["none", "err"])("an accepted session retries a reconnect %s reply without losing its key", async refusal => {
+test.each(["none", "err", "lost"])("an accepted session's reconnect retries only when the answer is lost (%s)", async reply => {
 	const pi = fakePi();
 	const retries: { fn: () => void; ms: number }[] = [];
-	const sent: { method: string; params: Record<string, unknown> }[] = [];
-	let hellos = 0;
+	const keys: unknown[] = [];
 	let close: () => void = () => {};
 	const b = bridge(pi, { env: { CATALY_LAUNCH: "tok" }, uid: () => 1,
 		connect: async (_path, onLine, onClose) => {
@@ -206,13 +205,13 @@ test.each(["none", "err"])("an accepted session retries a reconnect %s reply wit
 			return {
 				write(line) {
 					const msg = JSON.parse(line);
-					sent.push(msg);
 					if (msg.method !== "bridge.hello") return;
-					hellos += 1;
-					const reply = hellos === 2 ? (refusal === "none"
-						? { ok: { role: "none" } } : { err: { code: "bad_request", message: "refused" } })
-						: { ok: { role: "lane", key: `k${hellos}`, tools: [{ name: "cataly_lane" }] } };
-					queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ...reply })));
+					keys.push(msg.params.key);
+					if (keys.length === 2 && reply === "lost") return queueMicrotask(onClose);
+					const answer = keys.length !== 2 ? { ok: { role: "lane", key: `k${keys.length}`, tools: [{ name: "cataly_lane" }] } }
+						: reply === "none" ? { ok: { role: "none", reason: "not a session of this hub" } }
+						: { err: { code: "bad_request", message: "refused" } };
+					queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ...answer })));
 				},
 				close: onClose,
 			};
@@ -223,25 +222,23 @@ test.each(["none", "err"])("an accepted session retries a reconnect %s reply wit
 		await pi.emit("session_start", {}, { ...ctxOf(pi),
 			setTimeout: (fn: () => void, ms: number) => (retries.push({ fn, ms }), 0) });
 		close();
-		b.event("turn_end");
-		for (const delay of [1_000, 2_000]) {
-			expect(retries).toHaveLength(1);
-			expect(b.wired).toBe(true);
-			expect(b.key).toBe("k1");
+		expect(retries.map(r => r.ms)).toEqual([1_000]);
+		retries.shift()!.fn();
+		await connect.mock.results.at(-1)!.value;
+		if (reply !== "lost") {
+			// A definite refusal is final: no reconnect polls a hub that does not know the session.
+			expect(b.role).toBe("none");
 			expect(b.wire).toBeUndefined();
-			const retry = retries.shift()!;
-			expect(retry.ms).toBe(delay);
-			retry.fn();
-			await connect.mock.results.at(-1)!.value;
+			expect(b.connecting).toBe(false);
+			expect(retries).toHaveLength(0);
+			expect(keys).toEqual([undefined, "k1"]);
+			return;
 		}
-		expect(sent.filter(m => m.method === "bridge.hello").map(m => m.params.key)).toEqual([undefined, "k1", "k1"]);
-		expect(b.role).toBe("lane");
-		expect(b.key).toBe("k3");
-		expect(b.connecting).toBe(false);
-		expect(b.attempt).toBe(0);
-		expect(b.queue).toHaveLength(0);
-		expect(sent.filter(m => m.method === "bridge.event").map(m => m.params.kind)).toEqual(["snapshot", "turn_end"]);
-		expect(pi.tools.map(t => t.name)).toEqual(["cataly_lane"]);
+		expect(retries.map(r => r.ms)).toEqual([2_000]);
+		retries.shift()!.fn();
+		await connect.mock.results.at(-1)!.value;
+		expect(keys).toEqual([undefined, "k1", "k1"]);
+		expect([b.role, b.key, b.attempt]).toEqual(["lane", "k3", 0]);
 		expect(retries).toHaveLength(0);
 	} finally {
 		b.shutting = true;
