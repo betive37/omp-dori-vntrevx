@@ -177,13 +177,16 @@ pub(crate) fn lead_check(view: &crate::host::lead::View) -> Check {
         Phase::Starting => check("lead", "ok", "starting", None),
         Phase::NotStarted => check("lead", "info", said("not started"), None),
         Phase::Stopped => check("lead", "info", said("stopped"), None),
+        // The owner's hold text only: the raw reason and startup evidence are in `lead status --json`.
         Phase::Held => check(
             "lead",
             "info",
-            evidence(
-                view.notice
-                    .as_deref()
-                    .map_or_else(|| said("held"), |n| n.lines().collect::<Vec<_>>().join(" ")),
+            format!(
+                "{}; {inbox}",
+                view.notice.as_deref().map_or_else(
+                    || "held".to_string(),
+                    |n| n.lines().collect::<Vec<_>>().join(" ")
+                )
             ),
             Some("fix the cause, then cataly lead start"),
         ),
