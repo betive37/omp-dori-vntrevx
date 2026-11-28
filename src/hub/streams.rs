@@ -60,12 +60,6 @@ struct Spec {
 /// group's TERM can reach the child before the hub. Such an exit is not the job's and not counted.
 const STOP_GRACE: Duration = Duration::from_secs(1);
 
-fn run_id() -> String {
-    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-    let n = N.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    format!("{}-{n}", crate::sys::now_ms())
-}
-
 #[derive(Debug, Clone)]
 struct State {
     phase: &'static str,
@@ -126,7 +120,7 @@ fn spec_of(input: &Value) -> Result<Spec, String> {
         used: 0,
         ended: false,
         last_exit: None,
-        run: run_id(),
+        run: crate::sys::unique_stem(),
     })
 }
 
