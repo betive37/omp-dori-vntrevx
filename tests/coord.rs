@@ -392,8 +392,7 @@ fn planner_failed_start(retain_lane: bool) -> TestHub {
         ),
     ));
     start(&mut hub);
-    let add =
-        json!({ "id": "it-fail", "brief": "b", "checks": [{ "kind": "command", "argv": ["true"] }] });
+    let add = json!({ "id": "it-fail", "brief": "b", "checks": [{ "kind": "command", "argv": ["true"] }] });
     lane(&hub, "item-add", &add).unwrap();
     let first = hub.until(WAIT, || {
         let s = plan(&hub);
