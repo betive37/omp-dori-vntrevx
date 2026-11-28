@@ -323,9 +323,10 @@ in their own areas; this spec only states what lifecycle needs from them.
     the restart follow the session-host delivery rule (107): a batch on a worker whose connection dropped is never
     written again automatically.
     Owner-paused or held lanes without a pending explicit reopen intent stay down. A pending reopen continues
-    its recorded episode and step (65), not a new reopen. Legacy records without startup journals may resume
-    only when no attempt ownership was recorded and a fresh lease check proves the saved session free;
-    recorded unknown ownership holds instead.
+    its recorded episode and step (65), not a new reopen; once that episode's window closed, or a fenced start
+    ended it, the same reopen continues in a fresh episode (session-host 104). Legacy records without startup
+    journals may resume only when no attempt ownership was recorded and a fresh lease check proves the saved
+    session free; recorded unknown ownership holds instead.
 71. On demand the lead can ask for a drift report: lanes whose session is gone, lanes whose live session ID differs
     from the record, tern blocks running OMP that belong to no lane, and lanes with an empty completion condition.
     The report changes nothing.

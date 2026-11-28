@@ -345,6 +345,8 @@ impl Streams {
             }
         }
         if !line.is_empty() {
+            // Only LF makes a pending CR part of a line ending; at EOF it is data.
+            line.flush_cr();
             self.line_ended(spec, filter, line.finish()).await;
         }
         let (exit, _) = child.close(Duration::from_secs(5), KILL_GRACE).await;
@@ -388,6 +390,8 @@ struct Line {
     dir: PathBuf,
     name: String,
     bytes: Vec<u8>,
+    /// Held outside the length and file until another byte or EOF proves it is not CRLF.
+    pending_cr: bool,
     spill: Option<Spill>,
 }
 
@@ -403,15 +407,36 @@ impl Line {
             dir,
             name: name.into(),
             bytes: Vec::new(),
+            pending_cr: false,
             spill: None,
         }
     }
 
     fn is_empty(&self) -> bool {
-        self.bytes.is_empty() && self.spill.is_none()
+        self.bytes.is_empty() && !self.pending_cr && self.spill.is_none()
     }
 
     fn push(&mut self, part: &[u8]) {
+        if part.is_empty() {
+            return;
+        }
+        self.flush_cr();
+        let part = if let Some(prefix) = part.strip_suffix(b"\r") {
+            self.pending_cr = true;
+            prefix
+        } else {
+            part
+        };
+        self.write(part);
+    }
+
+    fn flush_cr(&mut self) {
+        if std::mem::take(&mut self.pending_cr) {
+            self.write(b"\r");
+        }
+    }
+
+    fn write(&mut self, part: &[u8]) {
         if let Some(spill) = &mut self.spill {
             spill.write(part);
             return;
@@ -430,21 +455,33 @@ impl Line {
         }
     }
 
+    /// Ends a line at LF; at EOF the pending CR must be flushed as data first.
     fn finish(&mut self) -> Ended {
+        self.pending_cr = false;
         let Some(spill) = self.spill.take() else {
-            let mut bytes = std::mem::take(&mut self.bytes);
-            if bytes.last() == Some(&b'\r') {
-                bytes.pop();
-            }
+            let bytes = std::mem::take(&mut self.bytes);
             return Ended::Text(String::from_utf8_lossy(&bytes).into_owned());
         };
         let len = spill.len;
-        Ended::Saved(match spill.file {
-            Ok((_, path)) if len > SPILL_MAX => format!(
+        let saved = spill.file.and_then(|(file, path)| {
+            let synced = file
+                .sync_all()
+                .map_err(|e| format!("sync file: {e}"))
+                .and_then(|()| {
+                    crate::sys::fs::sync_dir(&self.dir).map_err(|e| format!("sync directory: {e}"))
+                });
+            if let Err(e) = synced {
+                let _ = std::fs::remove_file(&path);
+                return Err(e);
+            }
+            Ok(path)
+        });
+        Ended::Saved(match saved {
+            Ok(path) if len > SPILL_MAX => format!(
                 "a line of {len} bytes, the first {SPILL_MAX} saved in {}",
                 path.display()
             ),
-            Ok((_, path)) => format!("a line of {len} bytes, saved in {}", path.display()),
+            Ok(path) => format!("a line of {len} bytes, saved in {}", path.display()),
             Err(e) => format!("a line of {len} bytes that could not be saved: {e}"),
         })
     }
@@ -501,6 +538,138 @@ mod tests {
         (note, path)
     }
 
+    #[test]
+    fn a_crlf_line_at_the_limit_stays_text() {
+        let dir = crate::sys::fs::tests::scratch("streams-crlf-limit");
+        let mut input = vec![b'x'; LINE_MAX];
+        input.push(b'\r');
+        for chunk_size in [LINE_MAX, LINE_MAX + 1] {
+            let mut line = Line::new(dir.to_path_buf(), "limit");
+            for part in input.chunks(chunk_size) {
+                line.push(part);
+            }
+            // The next read can start with the LF, giving an empty part before finish.
+            line.push(b"");
+            assert!(line.spill.is_none(), "the CRLF must not force a spill");
+            let Ended::Text(text) = line.finish() else {
+                panic!("the line should still be filtered")
+            };
+            assert_eq!(text.len(), LINE_MAX);
+            assert!(text.bytes().all(|b| b == b'x'));
+            assert!(line.is_empty());
+            line.push(b"next");
+            assert!(matches!(line.finish(), Ended::Text(text) if text == "next"));
+        }
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn a_spilled_crlf_line_drops_only_its_final_cr() {
+        let dir = crate::sys::fs::tests::scratch("streams-crlf-spill");
+        for len in [LINE_MAX + 1, SPILL_MAX] {
+            let mut expected = vec![b'x'; len];
+            expected[LINE_MAX - 1] = b'\r';
+            *expected.last_mut().unwrap() = b'\r';
+            let mut input = expected.clone();
+            input.push(b'\r');
+            for chunk_size in [CHUNK, len, len + 1] {
+                let mut line = Line::new(dir.to_path_buf(), "crlf");
+                for part in input.chunks(chunk_size) {
+                    line.push(part);
+                }
+                line.push(b"");
+                let (note, path) = saved_path(line.finish());
+                assert_eq!(
+                    note,
+                    format!("a line of {len} bytes, saved in {}", path.display())
+                );
+                assert_eq!(std::fs::read(path).unwrap(), expected);
+            }
+        }
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn a_spill_file_sync_failure_is_reported() {
+        let dir = crate::sys::fs::tests::scratch("streams-file-sync");
+        let mut line = Line::new(dir.to_path_buf(), "sync");
+        let len = LINE_MAX + 1;
+        line.push(&vec![b'x'; len]);
+        let (file, path) = line.spill.as_mut().unwrap().file.as_mut().unwrap();
+        let path = path.clone();
+        // A real descriptor whose sync_all fails after the line's writes have succeeded.
+        *file = std::fs::File::open("/dev/null").unwrap();
+        let Ended::Saved(note) = line.finish() else {
+            panic!("the oversized line needs a note")
+        };
+        assert!(
+            note.starts_with(&format!(
+                "a line of {len} bytes that could not be saved: sync file:"
+            )),
+            "{note}"
+        );
+        assert!(!path.exists(), "an unsynced file must not be left behind");
+    }
+
+    #[test]
+    fn a_spill_directory_sync_failure_is_reported() {
+        let dir = crate::sys::fs::tests::scratch("streams-dir-sync");
+        let mut line = Line::new(dir.to_path_buf(), "sync");
+        let len = LINE_MAX + 1;
+        line.push(&vec![b'x'; len]);
+        let path = line
+            .spill
+            .as_ref()
+            .unwrap()
+            .file
+            .as_ref()
+            .unwrap()
+            .1
+            .clone();
+        // The file can be synced, but opening this path for the directory sync fails.
+        line.dir = dir.join("missing");
+        let Ended::Saved(note) = line.finish() else {
+            panic!("the oversized line needs a note")
+        };
+        assert!(
+            note.starts_with(&format!(
+                "a line of {len} bytes that could not be saved: sync directory:"
+            )),
+            "{note}"
+        );
+        assert!(!path.exists(), "an unsynced file must not be left behind");
+    }
+
+    #[tokio::test]
+    async fn a_bare_cr_at_eof_remains_part_of_the_line() {
+        let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-eof-cr");
+        let streams = Streams::new(
+            crate::jobs::tests::jobs_of(&ctx),
+            ctx.store.clone(),
+            dir.to_path_buf(),
+            dir.join("files"),
+        );
+        let spec = spec_of(&json!({
+            "name": "eof",
+            "argv": ["sh", "-c", "printf 'ignored\\r\\ntail\\r'"],
+            "filter": "tail\\r$",
+        }))
+        .unwrap();
+        let filter = regex::Regex::new(&spec.filter).unwrap();
+        let child = command::attach(&spec.argv, Some(&dir), &[], None, 0).unwrap();
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        assert_eq!(
+            streams
+                .watch_output(&spec, &filter, child, &mut stop_rx)
+                .await
+                .as_deref(),
+            Some("status 0")
+        );
+        let events = ctx.store.read(|r| r.events_after(0, 10)).await.unwrap();
+        assert_eq!(events.len(), 1, "{events:?}");
+        assert!(format!("{:?}", events[0]).contains("tail"), "{events:?}");
+    }
+
     /// WS req. 72: the file keeps the first `SPILL_MAX` bytes; the event gives the whole length.
     #[test]
     fn a_long_line_file_is_capped() {
@@ -510,6 +679,7 @@ mod tests {
         for _ in 0..(5 * 1024 * 1024 / CHUNK) {
             line.push(&chunk);
         }
+        line.push(b"\r");
         let (note, path) = saved_path(line.finish());
         assert!(
             note.starts_with("a line of 5242880 bytes, the first 4194304 saved in "),
@@ -588,7 +758,7 @@ mod tests {
         );
 
         let opened = gate.clone();
-        tokio::task::spawn_blocking(move || std::fs::write(opened, b"tail\n"))
+        tokio::task::spawn_blocking(move || std::fs::write(opened, b"tail\r\n"))
             .await
             .unwrap()
             .unwrap();
