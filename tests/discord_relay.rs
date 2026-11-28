@@ -1701,6 +1701,120 @@ fn queue_overflow_during_multi_room_catch_up_is_retried() {
     }
 }
 
+/// Rejects the owner both live and from history, then keeps further history attempts failing
+/// before they can recover it. The handling round can still drain other rooms during backoff.
+fn overflow_backoff(fake: &FakeDiscord, hub: &TestHub) -> String {
+    let path = format!("/channels/{CH}/messages");
+    let reads = fake.calls("GET", &path).len();
+    let release = fake.hold_history(CH);
+    fake.say(FakeDiscord::message(
+        CH,
+        CATCH_UP_POSITION + 1,
+        OWNER,
+        "first rejected during backoff",
+    ));
+    fake.wait(WAIT, |f| {
+        (f.calls("GET", &path).len() > reads).then_some(())
+    });
+    let threads = format!("/guilds/{GUILD}/threads/active");
+    fake.fail_reads(&threads, 503);
+    release.send(()).unwrap();
+    hub.until(WAIT, || {
+        (status(hub)["health"]["last_error"] == "catch-up read: catch-up remains owed")
+            .then_some(())
+    });
+    threads
+}
+
+/// Free capacity cannot let a newer live owner finish past an owner rejected earlier. Deferral
+/// also renews a history snapshot that was already taken, so the new owner is recovered too.
+#[test]
+fn queue_overflow_backoff_keeps_newer_live_owners_behind_history() {
+    for during_read in [false, true] {
+        let (fake, mut hub, db) = overflow_catch_up_hub();
+        let threads = overflow_backoff(&fake, &hub);
+        release_full_queue(&db);
+        let release = if during_read {
+            let path = format!("/channels/{CH}/messages");
+            let reads = fake.calls("GET", &path).len();
+            let release = fake.hold_history(CH);
+            fake.allow_reads(&threads);
+            fake.wait(WAIT, |f| {
+                (f.calls("GET", &path).len() > reads).then_some(())
+            });
+            Some(release)
+        } else {
+            None
+        };
+        fake.say(FakeDiscord::message(
+            CH,
+            CATCH_UP_POSITION + 3,
+            OWNER,
+            "newer owner while recovery is owed",
+        ));
+        if during_read {
+            overflow_gateway_barrier(&hub, &fake, &db);
+        } else {
+            // Its later hand-off proves the drain ran with free capacity and without needing
+            // this room's failed history read to succeed first.
+            fake.say(FakeDiscord::message(
+                CATCH_UP_THREAD,
+                CATCH_UP_POSITION + 4,
+                OWNER,
+                "other room still drains",
+            ));
+            let other = (CATCH_UP_POSITION + 4).to_string();
+            fake.wait(WAIT, |f| {
+                f.creates()
+                    .iter()
+                    .any(|c| reference(c).as_deref() == Some(other.as_str()))
+                    .then_some(())
+            });
+        }
+        let position: i64 = db
+            .query_row(
+                "SELECT position FROM positions WHERE relay = 'discord' AND room = ?1",
+                [CH],
+                |r| r.get(0),
+            )
+            .unwrap();
+        if let Some(release) = release {
+            release.send(()).unwrap();
+        } else {
+            fake.allow_reads(&threads);
+        }
+        catch_up_drained(&hub, &db);
+        let asked = requests(&hub);
+        let expected = if during_read { 2 } else { 3 };
+        assert_eq!(
+            asked.len(),
+            expected,
+            "during_read={during_read}, cursor during backoff={position}, requests={asked:?}"
+        );
+        for text in [
+            "first rejected during backoff",
+            "newer owner while recovery is owed",
+        ] {
+            assert_eq!(asked.iter().filter(|r| r.contains(text)).count(), 1);
+        }
+        let first = asked
+            .iter()
+            .position(|r| r.contains("first rejected during backoff"))
+            .unwrap();
+        let newer = asked
+            .iter()
+            .position(|r| r.contains("newer owner while recovery is owed"))
+            .unwrap();
+        assert!(
+            first < newer,
+            "same-room owners must be handed off oldest first"
+        );
+        assert_eq!(position, i64::try_from(CATCH_UP_POSITION).unwrap());
+        fake.wait_creates(expected, WAIT);
+        assert!(hub.stop().success());
+    }
+}
+
 /// Check 5: a resume URL that is not the test Gateway's is refused and the session identifies again.
 #[test]
 fn bad_resume_url_identifies_again() {

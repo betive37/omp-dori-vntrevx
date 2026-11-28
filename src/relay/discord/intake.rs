@@ -216,6 +216,8 @@ struct Scope {
 struct PendingRoom {
     parent: Option<Snowflake>,
     revision: u64,
+    /// Until history recovers a rejected owner, newer live owners must not finish past it.
+    overflowed: bool,
 }
 
 impl Scope {
@@ -226,6 +228,7 @@ impl Scope {
             PendingRoom {
                 parent,
                 revision: self.revision,
+                overflowed: true,
             },
         );
     }
@@ -233,14 +236,26 @@ impl Scope {
     fn fence_scope(&mut self) {
         self.revision = self.revision.wrapping_add(1);
         let revision = self.revision;
-        self.catching_up.extend(
-            self.listed
-                .iter()
-                .filter(|(_, l)| !l.forum())
-                .map(|(c, _)| (*c, None))
-                .chain(self.threads.iter().map(|(t, p)| (*t, Some(*p))))
-                .map(|(room, parent)| (room, PendingRoom { parent, revision })),
-        );
+        for (room, parent) in self
+            .listed
+            .iter()
+            .filter(|(_, l)| !l.forum())
+            .map(|(c, _)| (*c, None))
+            .chain(self.threads.iter().map(|(t, p)| (*t, Some(*p))))
+        {
+            // A reconnect renews the read, but must not forget an earlier overflow.
+            self.catching_up
+                .entry(room)
+                .and_modify(|pending| {
+                    pending.parent = parent;
+                    pending.revision = revision;
+                })
+                .or_insert(PendingRoom {
+                    parent,
+                    revision,
+                    overflowed: false,
+                });
+        }
     }
 
     fn pending_rooms(&mut self) -> Vec<(Snowflake, PendingRoom)> {
@@ -254,6 +269,7 @@ impl Scope {
             self.catching_up.entry(room).or_insert(PendingRoom {
                 parent,
                 revision: self.revision,
+                overflowed: false,
             });
         }
         // A missing active-thread listing does not discard a pending read under a watched parent.
@@ -1187,6 +1203,16 @@ impl<T: Runtime> Intake<T> {
                 self.alert_held(room, &reason);
             }
             Gate::Owner => {
+                let admission = self.admission.lock().await;
+                if read_at.is_some() {
+                    let mut scope = self.scope();
+                    if scope.catching_up.get(&room).is_some_and(|p| p.overflowed) {
+                        // Leave this owner to history, even after capacity returns. Renew the
+                        // fence because an in-flight history snapshot may not include it yet.
+                        scope.fence(room, parent);
+                        return false;
+                    }
+                }
                 let arrival = Arrival {
                     room: room.to_string(),
                     message: message.to_string(),
@@ -1194,7 +1220,6 @@ impl<T: Runtime> Intake<T> {
                     parent: parent.map(|p| p.to_string()),
                     raw: raw.to_string(),
                 };
-                let admission = self.admission.lock().await;
                 match self.pipeline.arrive(arrival, read_at, &self.wake).await {
                     Ok(Arrived::Full) => {
                         // Renew even an existing fence: an in-progress read cannot finish it.
