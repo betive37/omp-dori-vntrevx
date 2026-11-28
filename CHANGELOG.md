@@ -39,6 +39,11 @@
   req. 21 says. It gave up after an hour with no change in its queue place ("no grant for slot
   … within the timeout") and its command never ran, so a heavy job held for over an hour failed
   every command queued behind it.
+- A slot request granted while the hub was still writing its queue place now runs its command at
+  once. The hub marked that grant as already seen, so `cataly slot` kept waiting while the hub
+  counted the slot as held, until some other slot request, release or grant on the hub woke it, or
+  until it timed out or was cancelled when none came. A request for a free slot is granted right
+  away and could hit this.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
