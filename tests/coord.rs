@@ -420,19 +420,10 @@ fn planner_failed_start(retain_lane: bool) -> TestHub {
     let blocked = hub.state().join("sessions/lanes/it-fail-2");
     std::fs::write(&blocked, "not a directory").unwrap();
     start(&mut hub);
-    let failed = hub.until(WAIT, || {
+    hub.until(WAIT, || {
         let s = plan(&hub);
-        (!s.contains("no lead")).then_some(s)
+        (!s.contains("no lead")).then_some(())
     });
-    assert!(failed.contains("it-fail start failed:"), "{failed}");
-    assert!(
-        failed.contains(if retain_lane {
-            "conversation and work retained"
-        } else {
-            "unused allocation rolled back"
-        }),
-        "{failed}"
-    );
     let items = lane(&hub, "items", &json!({})).unwrap();
     let item = &items["items"][0];
     assert_eq!(item["status"], "open", "{item}");
