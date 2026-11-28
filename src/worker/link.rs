@@ -1645,7 +1645,7 @@ pub(crate) mod tests {
             assert_eq!(std::fs::read_to_string(&pins).unwrap(), all_pins);
             config.workers.remove("alice");
             remove_files(&dir, "bob", &bob, &config).unwrap();
-            assert!(std::fs::read_to_string(&pins).unwrap().is_empty());
+            assert_eq!(std::fs::read_to_string(&pins).unwrap(), "");
         }
     }
 
