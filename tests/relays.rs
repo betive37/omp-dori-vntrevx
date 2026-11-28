@@ -611,7 +611,10 @@ fn slack_redelivery_after_release(state: &str) {
     });
     assert_eq!(status(&hub, "slack")["counts"]["queued"], 1);
     assert!(hub.cli(&["slack", "release", GEN]).status.success());
-    assert_eq!(status(&hub, "slack")["counts"]["queued"], 0);
+    // In-doubt hand-offs stay queued until the relay records their notice and finishes them.
+    hub.until(WAIT, || {
+        (status(&hub, "slack")["counts"]["queued"] == 0).then_some(())
+    });
     assert!(hub.stop().success());
     hub.start();
     ready(&hub, &["slack"]);
