@@ -293,7 +293,8 @@ impl Links {
     /// waits for the bridge to connect and answer until `until`, the caller's deadline. A bridge
     /// whose hello lacks the capability is unverified at once, without a query, and so is a
     /// session whose bridge never connected by `until`. `Err` when a connected bridge gave no
-    /// answer. A bridge that has not connected by `connect_by` counts as never connecting.
+    /// answer. A bridge that has not connected by `connect_by` counts as never connecting. Nothing
+    /// is recorded: the caller records the resolution with `resolved` once OMP runs it.
     pub(crate) async fn resolve_model(
         &self,
         handle: &str,
@@ -341,11 +342,7 @@ impl Links {
             _ => Err(closed),
         };
         self.lock().asked.remove(&n);
-        let proof = Proof::from_reply(&reply?)?;
-        if let Proof::Resolved(r) = &proof {
-            self.resolved(handle, r.clone());
-        }
-        Ok(proof)
+        Proof::from_reply(&reply?)
     }
 
     /// Records what a bridge proved about a session's model (also over a terminal port).
@@ -554,7 +551,7 @@ mod tests {
             (r.model(), r.requested.as_deref()),
             ("p/m".into(), Some("high"))
         );
-        assert_eq!(links.resolution("h1"), Some(r));
+        assert_eq!(links.resolution("h1"), None, "a query records nothing");
 
         let (tx, _rx) = mpsc::channel(8);
         links.open_query(

@@ -203,6 +203,56 @@ fn migration_keeps_the_latest_of_successive_conversations() {
     assert_eq!(selected.row.unwrap().handle, "b2");
 }
 
+fn fault_model_mismatch(db: &Connection, handle: &str) {
+    db.execute(
+        "UPDATE sessions SET fault = 'model mismatch: wanted fake/primary:high, got fake/primary' WHERE handle = ?1",
+        [handle],
+    )
+    .unwrap();
+}
+
+#[test]
+fn migration_binds_conversations_whose_every_start_recorded_a_model_mismatch() {
+    let mut db = database();
+    for (handle, mode, now) in [("a1", "fresh", 1), ("a2", "resume", 2)] {
+        attempt(&mut db, handle, mode, now);
+        bind(&mut db, handle, "A", now);
+        db.execute(
+            "UPDATE sessions SET expected_id = session_id, expected_file = session_file WHERE handle = ?1 AND mode = 'resume'",
+            [handle],
+        )
+        .unwrap();
+        fault_model_mismatch(&db, handle);
+    }
+    migrate_history(&db);
+    let reads = Reads(db);
+    let current = reads.lead_target(None).unwrap();
+    assert!(current.hold.is_none(), "{current:?}");
+    assert!(current.ever_bound);
+    assert_eq!(
+        current.provenance.as_deref(),
+        Some("migrated exact binding; model unverified")
+    );
+    assert_eq!(current.row.unwrap().handle, "a2");
+    let pinned = reads.lead_target(Some("A")).unwrap();
+    assert!(pinned.hold.is_none(), "{pinned:?}");
+    assert_eq!(pinned.row.unwrap().session_id.as_deref(), Some("A"));
+}
+
+#[test]
+fn migration_keeps_a_fresh_switch_recorded_under_a_model_mismatch() {
+    let mut db = database();
+    attempt(&mut db, "a", "fresh", 1);
+    bind(&mut db, "a", "A", 1);
+    attempt(&mut db, "b", "fresh", 2);
+    bind(&mut db, "b", "B", 2);
+    fault_model_mismatch(&db, "b");
+    migrate_history(&db);
+    let current = Reads(db).lead_target(None).unwrap();
+    assert!(current.hold.is_none(), "{current:?}");
+    assert_eq!(current.row.unwrap().session_id.as_deref(), Some("B"));
+}
+
 #[test]
 fn explicit_fresh_intent_lifts_a_migrated_unbound_hold() {
     let mut db = database();

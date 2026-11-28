@@ -1046,6 +1046,56 @@ fn hub_restart_brings_lanes_back_on_their_files() {
     hub.stop();
 }
 
+/// `lane model` pins what OMP resolved the selector to: a literal colon ID stays whole and a level
+/// suffix stays the thinking level, so the lane restarts on exactly that model.
+#[test]
+fn lane_model_keeps_literal_ids_and_levels_over_a_restart() {
+    let (mut hub, _) = lane_hub("");
+    hub.fixture("omp", "literal", Some("ollama/qwen:14b"));
+    start(&mut hub);
+    open(&hub, "mc-1", &json!({}));
+    let file = record(&hub, "mc-1")["session_file"]
+        .as_str()
+        .unwrap()
+        .to_string();
+    let restarted = |hub: &mut TestHub| {
+        hub.stop();
+        let before = std::fs::read_to_string(data(hub).join("argv")).unwrap();
+        start(hub);
+        hub.until(WAIT, || {
+            let argv = std::fs::read_to_string(data(hub).join("argv")).unwrap();
+            let launch = argv[before.len()..]
+                .lines()
+                .find(|l| l.contains(&file))
+                .map(str::to_string)?;
+            (record(hub, "mc-1")["live"] == true).then_some(launch)
+        })
+    };
+    let changed = lane(
+        &hub,
+        "model",
+        &json!({ "key": "mc-1", "model": "ollama/qwen:14b" }),
+    );
+    assert_eq!(changed, Ok(json!("ollama/qwen:14b")));
+    let launch = restarted(&mut hub);
+    assert!(
+        launch.contains("--model=ollama/qwen:14b") && !launch.contains("--thinking"),
+        "{launch}"
+    );
+    let changed = lane(
+        &hub,
+        "model",
+        &json!({ "key": "mc-1", "model": "fake/second:high" }),
+    );
+    assert_eq!(changed, Ok(json!("fake/second")));
+    let launch = restarted(&mut hub);
+    assert!(
+        launch.contains("--model=fake/second ") && launch.contains("--thinking=high"),
+        "{launch}"
+    );
+    hub.stop();
+}
+
 /// Hub CPU time (user plus system clock ticks) from `/proc`.
 fn cpu_ticks(pid: u32) -> u64 {
     let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).unwrap();

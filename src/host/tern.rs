@@ -270,7 +270,7 @@ impl Runtime for Tern {
             }
         };
         match bound {
-            Ok(started) => Ok((Arc::new(Session { port }), started)),
+            Ok(started) => Ok((Session::new(port, &self.links), started)),
             Err(reason) => {
                 self.links.remove_port(&spec.handle);
                 let cleanup = port.confirm_exit(Duration::ZERO).await;
@@ -1049,6 +1049,8 @@ impl Port {
 /// A terminal session.
 pub(crate) struct Session {
     port: Arc<Port>,
+    /// The registry the lane model barrier reads; a confirmed model change is recorded there.
+    links: Arc<super::bridge::Links>,
 }
 
 /// Clears the busy flag when an operation ends.
@@ -1061,6 +1063,13 @@ impl Drop for Busy<'_> {
 }
 
 impl Session {
+    fn new(port: Arc<Port>, links: &Arc<super::bridge::Links>) -> Arc<Self> {
+        Arc::new(Self {
+            port,
+            links: Arc::clone(links),
+        })
+    }
+
     fn begin(&self) -> Result<Busy<'_>, String> {
         if self.port.busy.swap(true, Ordering::AcqRel) {
             return Err("busy: another change is in flight".into());
@@ -1230,7 +1239,7 @@ impl Control for Session {
     /// the base model and the level its suffix requests, and answers with the resolution, which
     /// must match what OMP then runs (a literal colon ID stays whole). A bridge too old to
     /// resolve the selector is not asked to change anything.
-    async fn set_model(&self, selector: &str) -> Result<String, String> {
+    async fn set_model(&self, selector: &str) -> Result<super::model::Resolution, String> {
         let _busy = self.begin()?;
         if self.snapshot().status != Status::Idle {
             return Err("refused while a turn is running".into());
@@ -1261,10 +1270,15 @@ impl Control for Session {
             },
         );
         let mismatch = r.judge(Some(&observed), r.observed.as_deref());
-        st.resolution = Some(r);
+        st.resolution = Some(r.clone());
         self.port.publish(&mut st);
+        drop(st);
         match mismatch {
-            None => Ok(observed),
+            None => {
+                // Only a confirmed change moves the pin the lane barrier holds turns to.
+                self.links.resolved(&self.port.handle, r.clone());
+                Ok(r)
+            }
             Some(reason) => Err(format!("after asking for {selector}: {reason}")),
         }
     }

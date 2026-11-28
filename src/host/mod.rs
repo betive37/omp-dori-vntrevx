@@ -335,7 +335,11 @@ pub(crate) trait Control: Send + Sync + 'static {
     fn refresh(&self) -> impl Future<Output = Result<(), String>> + Send;
     fn deliver(&self, delivery: Delivery) -> impl Future<Output = DeliverOutcome> + Send;
     fn interrupt(&self) -> impl Future<Output = Result<String, String>> + Send;
-    fn set_model(&self, selector: &str) -> impl Future<Output = Result<String, String>> + Send;
+    /// Moves the session to what OMP resolves `selector` to; `Ok` is that resolution, confirmed.
+    fn set_model(
+        &self,
+        selector: &str,
+    ) -> impl Future<Output = Result<model::Resolution, String>> + Send;
     /// One OMP goal operation (`create`, `pause`, `resume`, `drop`, `get`) followed by a fresh
     /// readback; returns the goal the readback shows (HOST-19).
     fn goal(

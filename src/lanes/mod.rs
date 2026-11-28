@@ -1502,12 +1502,12 @@ impl<R: Runtime> Lanes<R> {
     }
 
     /// A control that names the revision it saw (LANE req. 33).
-    async fn control(
+    async fn control<T>(
         &self,
         key: &str,
         revision: Option<&str>,
-        f: impl FnOnce(Arc<R::Session>) -> BoxFut<'static, Result<String, String>>,
-    ) -> Result<String, String> {
+        f: impl FnOnce(Arc<R::Session>) -> BoxFut<'static, Result<T, String>>,
+    ) -> Result<T, String> {
         let _turn = self.turn(key).await?;
         let (rec, rev) = self.load(key).await?;
         if revision.is_some_and(|r| r != revision_text(rev)) || !rec.open() {
@@ -1520,7 +1520,8 @@ impl<R: Runtime> Lanes<R> {
         f(session).await
     }
 
-    /// A lead-approved model change: the pin moves with it (EXT req. 39).
+    /// A lead-approved model change: the pin moves with it (EXT req. 39), to what OMP resolved
+    /// the selector to: a literal colon ID stays whole and a level suffix stays the thinking level.
     async fn set_model(
         &self,
         key: &str,
@@ -1531,13 +1532,18 @@ impl<R: Runtime> Lanes<R> {
             return Err(e);
         }
         let m = model.to_string();
-        let done = self
+        let resolved = self
             .control(key, revision, move |s| {
                 Box::pin(async move { s.set_model(&m).await })
             })
             .await?;
-        let base = model.split(':').next().unwrap_or(model).to_string();
-        self.keep(key, |r| r.model = base).await;
+        let (model, thinking) = (resolved.model(), resolved.requested);
+        let done = model.clone();
+        self.keep(key, |r| {
+            r.model = model;
+            r.thinking = thinking;
+        })
+        .await;
         Ok(done)
     }
 

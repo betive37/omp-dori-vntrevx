@@ -16,10 +16,15 @@ CREATE TABLE lead_anchor (
     intent TEXT NOT NULL DEFAULT 'resume' CHECK (intent IN ('resume', 'fresh', 'fresh_failed')),
     hold TEXT
 ) STRICT;
+-- A 0.2.6 start that recorded a `model mismatch:` fault still proved the conversation identity
+-- (0.2.6 never cleared the fault on accept-model). 0.2.7 re-checks the model at every start and
+-- fences a mismatch, so such rows bind with an unverified model.
 INSERT INTO lead_bindings
-SELECT handle, session_id, session_file, cwd, runtime, 'migrated exact binding', updated_ms
+SELECT handle, session_id, session_file, cwd, runtime,
+    CASE WHEN fault LIKE 'model mismatch:%' THEN 'migrated exact binding; model unverified'
+         ELSE 'migrated exact binding' END,
+    updated_ms
 FROM sessions WHERE role = 'lead' AND session_id IS NOT NULL AND session_file IS NOT NULL
-AND (fault IS NULL OR fault NOT LIKE 'model mismatch:%')
 AND (mode = 'fresh' OR (expected_id = session_id AND expected_file = session_file));
 INSERT INTO lead_anchor(singleton, handle, ever_started, intent, hold)
 VALUES (1,

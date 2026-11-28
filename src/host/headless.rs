@@ -829,6 +829,7 @@ impl Session {
             st.bound = Some((first.session_id.clone(), reported_file.clone()));
             st.held.clone_from(&held);
             if let Proof::Resolved(r) = proof {
+                inner.settings.links.resolved(&inner.handle, r.clone());
                 st.resolution = Some(r);
             }
             st.latest = Some(first.clone());
@@ -1690,7 +1691,7 @@ impl Control for Session {
     /// Moves the session to what OMP resolves `selector` to (HOST req. 27): the base model, then
     /// the level its suffix requests, each read back. A bridge that cannot resolve it changes
     /// nothing.
-    async fn set_model(&self, selector: &str) -> Result<String, String> {
+    async fn set_model(&self, selector: &str) -> Result<Resolution, String> {
         let _busy = self.begin()?;
         let inner = &self.inner;
         if selector.len() > 256 || !crate::omp::transcript::model_selector(selector) {
@@ -1763,7 +1764,11 @@ impl Control for Session {
             .clone()
             .map_or((None, None), |s| (s.model, s.thinking));
         match r.judge(model.as_deref(), thinking.as_deref()) {
-            None => Ok(r.model()),
+            None => {
+                // Only a confirmed change moves the pin the lane barrier holds turns to.
+                inner.settings.links.resolved(&inner.handle, r.clone());
+                Ok(r)
+            }
             Some(reason) => Err(format!("model readback: {reason}")),
         }
     }
@@ -2422,7 +2427,7 @@ mod tests {
         fake.wait_for(&session, |s| s.recent.iter().any(|e| e.text == "one"))
             .await;
         assert_eq!(
-            session.set_model("fake/backup").await.unwrap(),
+            session.set_model("fake/backup").await.unwrap().model(),
             "fake/backup"
         );
         fake.push(json!({"type": "model_changed"}));
@@ -2459,11 +2464,14 @@ mod tests {
         );
         assert_eq!(fake.seen("abort").len(), 1);
         assert_eq!(
-            session.set_model("fake/primary").await.unwrap(),
+            session.set_model("fake/primary").await.unwrap().model(),
             "fake/primary"
         );
         assert_eq!(fake.seen("set_model").len(), 0);
-        assert_eq!(session.set_model("fake/other").await.unwrap(), "fake/other");
+        assert_eq!(
+            session.set_model("fake/other").await.unwrap().model(),
+            "fake/other"
+        );
         assert!(session.set_model("bad model").await.is_err());
     }
 
@@ -2511,11 +2519,42 @@ mod tests {
         let fake = Fake::start();
         let session = started(&fake).await;
         assert_eq!(
-            session.set_model("fake/other:low").await.unwrap(),
+            session.set_model("fake/other:low").await.unwrap().model(),
             "fake/other"
         );
         assert_eq!(fake.seen("set_model")[0]["modelId"], "other");
         assert_eq!(fake.seen("set_thinking_level")[0]["level"], "low");
+    }
+
+    /// The lane model barrier pins what the registry holds: only a change read back as asked
+    /// moves it, so turns on the new model flow and a refused change keeps the old model flowing.
+    #[tokio::test]
+    async fn only_a_confirmed_model_change_moves_the_barrier_pin() {
+        let fake = Fake::start();
+        let session = started(&fake).await;
+        let pin = || {
+            let r = session.inner.settings.links.resolution("h1").unwrap();
+            (r.model(), r.requested)
+        };
+        assert_eq!(pin(), ("fake/primary".to_string(), None));
+        fake.set(|s| s.refuse_model = true);
+        let refused = session.set_model("fake/other").await.unwrap_err();
+        assert!(refused.contains("model not available"), "{refused}");
+        assert_eq!(
+            pin(),
+            ("fake/primary".to_string(), None),
+            "a refused change keeps the old model flowing"
+        );
+        fake.set(|s| s.refuse_model = false);
+        assert_eq!(
+            session.set_model("fake/other:low").await.unwrap().model(),
+            "fake/other"
+        );
+        assert_eq!(
+            pin(),
+            ("fake/other".to_string(), Some("low".to_string())),
+            "turns on the confirmed model flow"
+        );
     }
 
     #[tokio::test]
