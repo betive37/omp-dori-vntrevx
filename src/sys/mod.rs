@@ -37,6 +37,7 @@ pub(crate) mod fault {
 }
 
 use std::fmt;
+use std::sync::atomic::{AtomicU64, Ordering};
 
 /// The one decision class every error carries (DESIGN 9.5).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -76,6 +77,12 @@ pub(crate) fn own_uid() -> u32 {
 /// Milliseconds since the Unix epoch, from the wall clock.
 pub(crate) fn now_ms() -> i64 {
     jiff::Timestamp::now().as_millisecond()
+}
+
+/// `<now_ms>-<n>`, `n` counting up in this process: a file stem no other call here returns.
+pub(crate) fn unique_stem() -> String {
+    static SEQ: AtomicU64 = AtomicU64::new(0);
+    format!("{}-{}", now_ms(), SEQ.fetch_add(1, Ordering::Relaxed))
 }
 
 /// Lower-case hexadecimal of `bytes`.
