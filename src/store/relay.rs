@@ -438,10 +438,11 @@ fn arrive(
     now: i64,
 ) -> rusqlite::Result<Arrived> {
     let (relay, room, message, seq, parent, raw) = w;
-    // A release removes doubtful or failed messages from the queue but retains their hand-offs.
-    // Those terminal records still prevent redelivery from reopening the released room. Without
-    // position dedupe, a hand-off in any state proves the message was admitted: Slack redelivers
-    // an admission that committed after its acknowledgement deadline.
+    // A hand-off in doubt is finished without a resend, and a release gives up a failed one: both
+    // leave the queue but keep their hand-offs, and those terminal records stop a redelivery from
+    // handing the message on again. Without position dedupe, a hand-off in any state proves the
+    // message was admitted: Slack redelivers an admission that committed after its acknowledgement
+    // deadline.
     let handled: bool = tx.query_row(
         "SELECT EXISTS (SELECT 1 FROM handoffs WHERE relay = ?1 AND room = ?2 AND message = ?3 \
              AND (state IN ('delivered', 'in_doubt', 'failed') OR NOT ?4))",

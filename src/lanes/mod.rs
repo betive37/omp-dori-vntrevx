@@ -408,16 +408,11 @@ impl<R: Runtime> Lanes<R> {
             if !fresh {
                 continue;
             }
-            self.emit(
-                Emit::new(EventKind::DeliveryInDoubt, Severity::Warning, true, key)
-                    .with("target", key)
-                    .with("count", rows.len())
-                    .with("reason", &reason),
-            );
             // Owner messages a relay handed on: the lead's notice names each, after the fence. The
             // relay stores the same notice under the same identity before it lets them go, so it is
             // made once.
             if !rows.is_empty() && rows.iter().all(crate::host::inbox::relayed) {
+                self.doubt_event(key, rows.len(), &reason);
                 let notice = Message {
                     sender: HUB_SENDER.into(),
                     text: crate::host::inbox::lane_in_doubt_notice(key, &rows, &reason),
@@ -436,26 +431,23 @@ impl<R: Runtime> Lanes<R> {
                 }
                 continue;
             }
-            self.alert(
-                key,
-                "delivery in doubt",
-                &format!(
-                    "a message to the lane may or may not have reached it ({reason}); it is not \
-                     resent. Read the lane, then lane.release it; lane.send waits until then"
-                ),
-                true,
-            );
+            self.alert_doubt(key, rows.len(), &reason);
         }
     }
 
-    /// Reports a newly uncertain delivery after its fence has been stored.
-    fn alert_doubt(&self, key: &str, count: usize, reason: &str) {
+    /// Records a newly uncertain delivery after its fence has been stored.
+    fn doubt_event(&self, key: &str, count: usize, reason: &str) {
         self.emit(
             Emit::new(EventKind::DeliveryInDoubt, Severity::Warning, true, key)
                 .with("target", key)
                 .with("count", count)
                 .with("reason", reason),
         );
+    }
+
+    /// Reports a newly uncertain delivery after its fence has been stored, and alerts the owner.
+    fn alert_doubt(&self, key: &str, count: usize, reason: &str) {
+        self.doubt_event(key, count, reason);
         self.alert(
             key,
             "delivery in doubt",
