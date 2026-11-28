@@ -209,6 +209,12 @@
 - The ops panel's pictures are sharper: the banner is 1024×341 and the thumbnail (also on job
   notifications) 512×512, cut from the same originals with the same framing, instead of 768×256
   and 160×160 at heavy compression.
+- A channel dropped with the Watched channels picker is out from the moment the picker answers.
+  Before, a message sent there within the next moment, while the running intake had yet to follow
+  the new list, could still reach the lead and be answered.
+- A hub stopped during a voice call waits for the call to finish its accounting before it exits.
+  Before, a ledger write cut off by the exit held voice ("ledger write failed: … was cancelled"),
+  so voice stayed off after the restart or update until `cataly voice restart`.
 
 ## 0.2.6 (2026-11-27)
 
