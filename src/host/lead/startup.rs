@@ -4,6 +4,8 @@ use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
+pub(crate) use crate::store::host::episode::Begin;
+
 pub(crate) const STARTUP_BUDGET: Duration = Duration::from_secs(60);
 pub(crate) const STARTUP_NOTICE: Duration = Duration::from_secs(15);
 // Includes bounded stdin shutdown, input grace, TERM, KILL/reap, and stderr drainage.
@@ -62,13 +64,14 @@ pub(crate) struct Recovery<'a> {
 }
 
 impl Recovery<'_> {
-    /// Waits out a persisted backoff without losing cancellation or the absolute episode cap.
+    /// Waits out a persisted backoff without losing cancellation or the absolute episode cap. An
+    /// automatic start: it continues the live episode, else begins a fresh one (see `Begin::Renew`).
     pub(crate) async fn admit(
         &self,
         session_id: &str,
         mut cancel: tokio::sync::watch::Receiver<bool>,
     ) -> Result<(), String> {
-        let episode = self.begin(session_id, false).await?;
+        let episode = self.begin(session_id, Begin::Renew).await?;
         if let Some(next) = episode.next_ms {
             let wait = Duration::from_millis(
                 u64::try_from(next.saturating_sub(crate::sys::now_ms())).unwrap_or(0),
@@ -78,7 +81,7 @@ impl Recovery<'_> {
                 () = cancelled(&mut cancel) => return Err("startup retry cancelled".into()),
                 () = tokio::time::sleep(wait) => {},
             }
-            self.begin(session_id, false).await?;
+            self.begin(session_id, Begin::Continue).await?;
         }
         Ok(())
     }
@@ -86,12 +89,12 @@ impl Recovery<'_> {
     pub(crate) async fn begin(
         &self,
         session_id: &str,
-        reset: bool,
+        mode: Begin,
     ) -> Result<crate::store::host::episode::Episode, String> {
         self.change(crate::store::host::episode::Change::Begin {
             target: self.target.into(),
             session_id: session_id.into(),
-            reset,
+            mode,
         })
         .await?;
         let episode = self
@@ -217,5 +220,67 @@ mod tests {
         assert_eq!(noticed.get(), Some(Duration::from_secs(15)));
         assert_eq!(result, "bound A");
         assert_eq!(began.elapsed(), Duration::from_secs(59));
+    }
+
+    /// An automatic start continues only a live episode: 250 s into its window, with less left
+    /// than one attempt and its cleanup, it holds (the cap stays). A window that closed long ago,
+    /// or an episode that ended bound, begins a fresh episode; a held or cancelled episode stays
+    /// the hold until the owner's retry.
+    #[tokio::test]
+    async fn an_automatic_start_renews_only_an_ended_or_expired_episode() {
+        let state = crate::sys::fs::tests::scratch("episode-renewal");
+        let db = state.join("store.db");
+        let (store, writer) = crate::store::Store::open(&db, &state.join("backup")).unwrap();
+        let conn = rusqlite::Connection::open(&db).unwrap();
+        let set = |started: i64, state: &str, retries: i64| {
+            conn.execute(
+                "INSERT INTO startup_episodes(target, session_id, started_ms, deadline_ms, retries, state) \
+                 VALUES ('lead', 'A', ?1, ?2, ?3, ?4) ON CONFLICT(target) DO UPDATE SET \
+                 started_ms = excluded.started_ms, deadline_ms = excluded.deadline_ms, \
+                 retries = excluded.retries, state = excluded.state, next_ms = NULL, detail = NULL",
+                rusqlite::params![started, started + 300_000, retries, state],
+            )
+            .unwrap();
+        };
+        let recovery = Recovery {
+            store: &store,
+            target: "lead",
+        };
+        let (_cancel, cancelled) = tokio::sync::watch::channel(false);
+        let now = crate::sys::now_ms();
+
+        set(now - 250_000, "active", 2);
+        let held = recovery.admit("A", cancelled.clone()).await.unwrap_err();
+        assert!(held.contains("300 s recovery episode exhausted"), "{held}");
+        let episode = recovery.read().await.unwrap().unwrap();
+        assert_eq!(
+            (episode.state.as_str(), episode.started_ms, episode.retries),
+            ("held", now - 250_000, 2)
+        );
+
+        for (started, ended) in [(now - 7_200_000, "active"), (now - 86_400_000, "bound")] {
+            set(started, ended, 3);
+            recovery.admit("A", cancelled.clone()).await.unwrap();
+            let episode = recovery.read().await.unwrap().unwrap();
+            assert_eq!(episode.state, "active", "{ended}");
+            assert!(episode.started_ms >= now, "{ended}: {episode:?}");
+            assert_eq!(episode.deadline_ms, episode.started_ms + 300_000);
+            assert_eq!(episode.retries, 0, "{ended}");
+        }
+
+        for hold in ["held", "cancelled"] {
+            set(now - 7_200_000, hold, 5);
+            let refused = recovery.admit("A", cancelled.clone()).await.unwrap_err();
+            assert!(
+                refused.starts_with(&format!("recovery is {hold}")),
+                "{refused}"
+            );
+            let episode = recovery.read().await.unwrap().unwrap();
+            assert_eq!(episode.started_ms, now - 7_200_000, "{hold} stays");
+            recovery.begin("A", Begin::Reset).await.unwrap();
+        }
+        drop(conn);
+        drop(store);
+        writer.join().unwrap().unwrap();
     }
 }

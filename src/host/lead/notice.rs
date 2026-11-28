@@ -10,7 +10,7 @@ use tokio::sync::{mpsc, watch};
 
 use super::{AnchorView, Events, LEAD};
 use crate::config::{Config, Language};
-use crate::jobs::event::{Emit, EventKind, Severity, one_line};
+use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::store::host::episode::Episode;
 use crate::store::{Apply, MemoryWrite, Store};
@@ -21,8 +21,6 @@ const SUBJECT: &str = "notice";
 const HELD: &str = "held";
 const SLOW: &str = "slow";
 const UNVERIFIED: &str = "unverified";
-/// Longest reason quoted to the owner.
-const REASON_MAX: usize = 300;
 
 /// What the notice task is asked to do, in order.
 #[derive(Debug)]
@@ -85,23 +83,266 @@ pub(crate) fn hold(episode: Option<&Episode>, reason: &str) -> (String, String) 
     }
 }
 
-/// The hold text: the reason, what is kept, the command after the fix, and that an update does
-/// not lift the hold.
+/// What a hold is about, as the owner hears it: every hold reason the hub gives is one of these,
+/// told as a plain sentence in his language. The raw reason stays in the log, the hold event's
+/// `reason` and `cataly lead status --json`.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum Cause {
+    /// The 300 s recovery or its five retries were spent.
+    Exhausted,
+    /// A start ended before it was ready (an early exit, a protocol or identity mismatch).
+    Rejected,
+    /// The owner stopped the recovery.
+    Stopped,
+    /// Whether an earlier lead process ended is not known.
+    Ownership,
+    /// More than the restart limit within 10 minutes.
+    Restarts,
+    /// One session ID with more than one transcript.
+    Ambiguous,
+    /// The bound session could not be recorded.
+    Binding,
+    /// The conversation's transcript is missing or did not verify.
+    Transcript,
+    /// A requested fresh conversation did not bind.
+    Fresh,
+    /// Another OMP holds the session, or its lease is unknown.
+    InUse,
+    /// The configured or recorded target changed or conflicts.
+    Target,
+    /// No proven conversation to resume.
+    NoAnchor,
+    /// The conversation's runtime is one this Cataly does not run.
+    Runtime,
+    /// The hub cannot start a session now (memory, session cap, OMP, configuration, stopping).
+    Admission,
+    /// Any reason not recognized above.
+    Other,
+}
+
+impl Cause {
+    #[cfg(test)]
+    const ALL: [Self; 15] = [
+        Self::Exhausted,
+        Self::Rejected,
+        Self::Stopped,
+        Self::Ownership,
+        Self::Restarts,
+        Self::Ambiguous,
+        Self::Binding,
+        Self::Transcript,
+        Self::Fresh,
+        Self::InUse,
+        Self::Target,
+        Self::NoAnchor,
+        Self::Runtime,
+        Self::Admission,
+        Self::Other,
+    ];
+
+    /// The cause of a raw hold reason; checked in order, the first match wins.
+    pub(crate) fn of(reason: &str) -> Self {
+        let has = |part: &str| reason.contains(part);
+        if has("owner stopped recovery") || has("startup retry cancelled") {
+            Self::Stopped
+        } else if has("ownership is") || has("process ownership") || has("(cleanup: Unknown)") {
+            Self::Ownership
+        } else if has("300 s recovery episode")
+            || has("five-retry ceiling")
+            || (has("startup ") && has(" Timeout: "))
+        {
+            Self::Exhausted
+        } else if has("restarts within 10 minutes") {
+            Self::Restarts
+        } else if has("ambiguous lead binding history") || has("proven transcripts") {
+            Self::Ambiguous
+        } else if has("binding could not be committed") || has("binding conflicts") {
+            Self::Binding
+        } else if has("transcript") {
+            Self::Transcript
+        } else if has("fresh") && has("did not bind") {
+            Self::Fresh
+        } else if has("lease") || has("is held by") {
+            Self::InUse
+        } else if has("changed during recovery") || has("conflicts with --fresh") || has("differs")
+        {
+            Self::Target
+        } else if has("no proven") {
+            Self::NoAnchor
+        } else if has("runtime '") {
+            Self::Runtime
+        } else if has("admission")
+            || has("session cap")
+            || has("OMP has not been probed")
+            || has("OMP executable")
+            || has("hub is stopping")
+            || has("[lead]")
+            || has("lead cwd")
+        {
+            Self::Admission
+        } else if has("startup ") || has("refused: ") {
+            Self::Rejected
+        } else {
+            Self::Other
+        }
+    }
+
+    /// What happened, and what the owner does about it.
+    pub(crate) const fn text(self, language: Language) -> (&'static str, &'static str) {
+        match language {
+            Language::Korean => self.korean(),
+            Language::English => self.english(),
+        }
+    }
+
+    const fn korean(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Exhausted => (
+                "lead를 다시 시작하려 했지만 정해진 시간(5분) 안에 되지 않았어요.",
+                "`cataly lead start`로 다시 시도하세요.",
+            ),
+            Self::Rejected => (
+                "lead를 시작했지만 준비되기 전에 멈췄어요.",
+                "`cataly lead status`에서 마지막 시도를 확인하고 원인을 고친 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Stopped => (
+                "요청에 따라 lead 재시작을 멈췄어요.",
+                "다시 시작하려면 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Ownership => (
+                "이전 lead 프로세스가 끝났는지 확인할 수 없어서 새로 시작하지 않았어요.",
+                "남아 있는 OMP가 없는지 확인한 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Restarts => (
+                "lead가 10분 안에 너무 여러 번 종료되었어요.",
+                "`cataly lead status`로 원인을 확인한 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Ambiguous => (
+                "lead 대화 기록이 둘 이상이라 어느 쪽으로 이어갈지 정하지 않았어요.",
+                "`cataly lead start`를 실행하면 마지막으로 확인된 대화로 이어서 시작해요.",
+            ),
+            Self::Binding => (
+                "lead는 시작됐지만 그 대화를 기록하지 못해서 멈췄어요.",
+                "`cataly lead start`로 다시 시도하세요.",
+            ),
+            Self::Transcript => (
+                "lead의 대화 파일이 없거나 확인되지 않았어요.",
+                "대화 파일을 되돌린 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Fresh => (
+                "요청한 새 lead 대화가 시작되지 않았어요.",
+                "새 대화를 다시 시도하려면 `cataly lead start --fresh`, 이전 대화로 돌아가려면 `cataly lead start`를 실행하세요.",
+            ),
+            Self::InUse => (
+                "lead 대화를 다른 OMP가 쓰고 있거나, 쓰고 있는지 확인할 수 없어요.",
+                "그 OMP를 닫은 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Target => (
+                "lead가 이어갈 대화 설정이 바뀌었거나 서로 맞지 않아요.",
+                "설정의 `[lead] session_id`를 확인한 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::NoAnchor => (
+                "이어서 시작할 lead 대화가 확인되지 않았어요.",
+                "`cataly lead start`를 실행하세요.",
+            ),
+            Self::Runtime => (
+                "lead 대화가 이 Cataly에서 실행할 수 없는 방식으로 시작되었어요.",
+                "이 대화를 이어가려면 그 방식을 지원하는 Cataly로 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Admission => (
+                "지금은 lead를 시작할 수 없는 상태예요(메모리, 세션 수, OMP 준비 또는 설정).",
+                "`cataly health`로 확인한 뒤 `cataly lead start`를 실행하세요.",
+            ),
+            Self::Other => (
+                "lead를 시작하지 못했어요.",
+                "자세한 내용은 `cataly lead status --json`에 있어요. 원인을 고친 뒤 `cataly lead start`를 실행하세요.",
+            ),
+        }
+    }
+
+    const fn english(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Exhausted => (
+                "Cataly tried to restart the lead, but it did not come up within the set time (5 minutes).",
+                "Run `cataly lead start` to try again.",
+            ),
+            Self::Rejected => (
+                "The lead was started but stopped before it was ready.",
+                "Check the last attempt with `cataly lead status`, fix the cause, then run `cataly lead start`.",
+            ),
+            Self::Stopped => (
+                "Restarting the lead was stopped, as asked.",
+                "Run `cataly lead start` when you want it back.",
+            ),
+            Self::Ownership => (
+                "Cataly could not confirm that the earlier lead process ended, so it started nothing.",
+                "Make sure no earlier OMP is still running, then run `cataly lead start`.",
+            ),
+            Self::Restarts => (
+                "The lead exited too many times within 10 minutes.",
+                "Check the cause with `cataly lead status`, then run `cataly lead start`.",
+            ),
+            Self::Ambiguous => (
+                "The lead's conversation is recorded in more than one transcript, so Cataly did not pick one.",
+                "Run `cataly lead start` to continue the last confirmed conversation.",
+            ),
+            Self::Binding => (
+                "The lead started, but Cataly could not record its conversation, so it stopped it.",
+                "Run `cataly lead start` to try again.",
+            ),
+            Self::Transcript => (
+                "The lead's conversation file is missing or could not be verified.",
+                "Restore the file, then run `cataly lead start`.",
+            ),
+            Self::Fresh => (
+                "The new lead conversation you asked for did not start.",
+                "Run `cataly lead start --fresh` to try it again, or `cataly lead start` to go back to the earlier one.",
+            ),
+            Self::InUse => (
+                "Another OMP is using the lead's conversation, or Cataly could not tell whether one is.",
+                "Close that OMP, then run `cataly lead start`.",
+            ),
+            Self::Target => (
+                "The conversation the lead should continue changed or conflicts with the settings.",
+                "Check `[lead] session_id` in the settings, then run `cataly lead start`.",
+            ),
+            Self::NoAnchor => (
+                "No confirmed lead conversation was found to continue.",
+                "Run `cataly lead start`.",
+            ),
+            Self::Runtime => (
+                "The lead's conversation was started on a runtime this Cataly cannot run.",
+                "Run `cataly lead start` with a Cataly that runs it to continue this conversation.",
+            ),
+            Self::Admission => (
+                "The lead cannot be started right now (memory, session limit, OMP readiness or settings).",
+                "Check `cataly health`, then run `cataly lead start`.",
+            ),
+            Self::Other => (
+                "The lead could not be started.",
+                "Details are in `cataly lead status --json`; after fixing the cause, run `cataly lead start`.",
+            ),
+        }
+    }
+}
+
+/// The hold text: what happened in plain words, what is kept, what to do, and that an update
+/// does not lift the hold.
 pub(crate) fn held_text(language: Language, reason: &str, anchor: Option<&AnchorView>) -> String {
-    let reason = one_line(reason, REASON_MAX);
+    let (what, todo) = Cause::of(reason).text(language);
     if anchor.is_none() {
         return match language {
             Language::Korean => format!(
-                "Cataly: lead가 보류되어 스스로 시작하지 않습니다.\n원인: {reason}\n\
+                "Cataly: lead가 보류되어 스스로 시작하지 않습니다.\n원인: {what}\n\
                  보존: 기존 대화 파일과 작업, 대기 중인 메시지. 아무것도 교체하거나 삭제하지 않았습니다.\n\
-                 원인을 해결한 뒤 `cataly lead start`를 실행하세요. 이전에 확인된 대화가 없을 때만 최초 시작을 다시 시도합니다. \
+                 {todo} 이전에 확인된 대화가 없을 때만 최초 시작을 다시 시도합니다. \
                  새 대화를 명시적으로 선택하려면 `cataly lead start --fresh`를 쓰세요.\n\
                  업데이트나 허브 재시작만으로는 이 보류가 풀리지 않습니다."
             ),
             Language::English => format!(
-                "Cataly: the lead is held and will not start by itself.\nReason: {reason}\n\
+                "Cataly: the lead is held and will not start by itself.\nReason: {what}\n\
                  Kept: existing transcript files, work and queued messages; nothing was replaced or deleted.\n\
-                 After fixing the cause, run `cataly lead start`; it retries the initial start only if no conversation was ever bound. \
+                 {todo} It retries the initial start only if no conversation was ever bound. \
                  Choose `cataly lead start --fresh` explicitly for a new conversation.\n\
                  An update or a hub restart does not lift this hold by itself."
             ),
@@ -119,17 +360,17 @@ pub(crate) fn held_text(language: Language, reason: &str, anchor: Option<&Anchor
     match language {
         Language::Korean => format!(
             "Cataly: lead가 보류되어 스스로 시작하지 않습니다.\n\
-             원인: {reason}\n\
+             원인: {what}\n\
              보존: 대화{}와 작업, 대기 중인 메시지. 아무것도 교체하거나 삭제하지 않았습니다.\n\
-             원인을 해결한 뒤 `cataly lead start`로 이 대화를 이어서 시작하세요(새 대화를 원할 때만 `cataly lead start --fresh`).\n\
+             {todo} 새 대화를 원할 때만 `cataly lead start --fresh`를 쓰세요.\n\
              업데이트나 허브 재시작만으로는 이 보류가 풀리지 않습니다.",
             which(true)
         ),
         Language::English => format!(
             "Cataly: the lead is held and will not start by itself.\n\
-             Reason: {reason}\n\
+             Reason: {what}\n\
              Kept: the conversation{}, its work and your queued messages; nothing was replaced or deleted.\n\
-             After fixing the cause, run `cataly lead start` to resume this conversation (`cataly lead start --fresh` only if you want a new conversation instead).\n\
+             {todo} Use `cataly lead start --fresh` only if you want a new conversation instead.\n\
              An update or a hub restart does not lift this hold by itself.",
             which(false)
         ),
@@ -320,7 +561,7 @@ mod tests {
         for language in [Language::English, Language::Korean] {
             for bound in [Some(&anchor), None] {
                 let text = held_text(language, "startup Ready Rejected: bad", bound);
-                assert!(text.contains("startup Ready Rejected: bad"), "{text}");
+                assert!(!text.contains("Rejected: bad"), "no raw reason: {text}");
                 assert_eq!(text.contains("s1"), bound.is_some(), "{text}");
                 assert_eq!(text.contains("/x/s1.jsonl"), bound.is_some(), "{text}");
                 assert!(text.contains("`cataly lead start`"), "{text}");
@@ -344,5 +585,86 @@ mod tests {
         assert!(slow.contains("kept") && !slow.contains("--fresh"), "{slow}");
         let slow = slow_text(Language::Korean, Some("s1"), 1);
         assert!(slow.contains("15초") && slow.contains("보존"), "{slow}");
+    }
+
+    /// Every hold reason the hub gives, as each producer words it, has a plain cause told in
+    /// Korean and English that never quotes the raw reason; an unknown reason still gets plain
+    /// words, never the raw text.
+    #[test]
+    fn every_hold_reason_has_a_plain_korean_and_english_text() {
+        // `cause|reason`, one per line, as each producer words its reason.
+        let reasons = "\
+Exhausted|recovery is held (300 s recovery episode has no startup and cleanup budget remaining); explicit owner retry required
+Exhausted|300 s recovery episode has no startup and cleanup budget remaining
+Exhausted|300 s recovery episode exhausted; conversation retained
+Exhausted|startup Ready Timeout: no ready frame within 60 s (cleanup: LocalReaped); 300 s recovery episode or five-retry ceiling exhausted; conversation retained, held
+Exhausted|startup Ready Timeout: no ready frame within 60 s (cleanup: LocalReaped)
+Rejected|startup Ready Rejected: wrong protocol (cleanup: LocalReaped)
+Rejected|startup Spawn Rejected: exited 7 before ready (cleanup: NotSpawned)
+Rejected|refused: the hub refused the start
+Stopped|owner stopped recovery
+Stopped|startup retry cancelled
+Ownership|startup Ready Timeout: no ready frame (cleanup: Unknown)
+Ownership|lead exit ownership is unknown; conversation retained, automatic recovery held
+Ownership|an earlier unbound lead attempt has unknown process ownership; held until its exit is reconciled
+Ownership|lead process ownership is not proven terminated: Ok(Unknown); conversation retained
+Restarts|exited 1; more than 5 restarts within 10 minutes, held until `cataly lead start`
+Ambiguous|ambiguous lead binding history
+Ambiguous|ambiguous lead binding history: lead session s1 is recorded with more than one transcript; conversation retained. `cataly lead start` resumes the anchored transcript /x once it verifies
+Ambiguous|required lead session s1 has 2 proven transcripts; held, never substituted
+Binding|binding could not be committed: lead binding conflicts with previously proven identity; input held; cleanup Ok(..)
+Binding|lead binding conflicts with previously proven identity
+Transcript|the transcript of lead session s1 did not verify for an exact resume: header; conversation retained
+Transcript|the transcript for lead s1 is missing or is not a regular file: /x; retained, never replaced
+Fresh|a fresh lead attempt did not bind; the old conversation is retained and held. Choose `cataly lead start --fresh` to retry fresh or `cataly lead start` to resume old
+Fresh|fresh start did not bind; choose `lead start --fresh` or `lead start` to resume old
+InUse|lead session s1 is held by a running OMP; conversation retained
+InUse|lead session s1 has an unknown lease; conversation retained
+InUse|the lead's session s1 is held by another OMP; not restarted, held for the owner
+InUse|the lead's session s1 has an unknown lease; not restarted, held for the owner
+Target|lead target changed during recovery; scheduled retry cancelled
+Target|lead anchor changed during recovery; held
+Target|session_id=s1 conflicts with --fresh; remove the pin before requesting a different conversation
+Target|required lead identity differs from s1; held
+NoAnchor|required lead session s1 has no proven binding
+NoAnchor|the earlier lead has no proven identity; conversation retained, held for the owner
+NoAnchor|no proven lead anchor; held, never automatically replaced
+NoAnchor|no proven lead binding in migrated history
+NoAnchor|no proven binding of lead session s1 to resume
+Runtime|lead session s1 was started on the runtime 'old', which this Cataly does not run; start a fresh lead with `cataly lead start --fresh`
+Admission|memory admission holds the start: memory
+Admission|the session cap of 1 is reached
+Admission|OMP has not been probed yet
+Admission|the OMP executable was not found
+Admission|the hub is stopping
+Admission|no [lead] section in the config
+Admission|no working directory: set [lead] cwd
+Admission|lead cwd: No such file or directory
+Other|recovery accounting failed: disk I/O error; held";
+        let mut seen = std::collections::BTreeSet::new();
+        for line in reasons.lines() {
+            let (cause, reason) = line.split_once('|').unwrap();
+            assert_eq!(format!("{:?}", Cause::of(reason)), cause, "{reason}");
+            seen.insert(cause.to_string());
+            for language in [Language::Korean, Language::English] {
+                let text = held_text(language, reason, None);
+                assert!(!text.contains(reason), "raw reason in {text}");
+            }
+        }
+        for cause in Cause::ALL {
+            assert!(
+                seen.contains(&format!("{cause:?}")),
+                "{cause:?} has no reason"
+            );
+            let (ko_what, ko_todo) = cause.text(Language::Korean);
+            let (en_what, en_todo) = cause.text(Language::English);
+            for text in [ko_what, ko_todo] {
+                assert!(text.chars().any(|c| ('가'..='힣').contains(&c)), "{text}");
+            }
+            for text in [en_what, en_todo] {
+                assert!(text.is_ascii() && !text.is_empty(), "{text}");
+            }
+            assert!(ko_todo.contains("`cataly ") && en_todo.contains("`cataly "));
+        }
     }
 }
