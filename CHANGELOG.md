@@ -138,6 +138,16 @@
   time the hub restarted. The used restarts and the ended state are now kept with the job; after a
   hub restart an ended job is listed as exhausted, with its last exit, and not run until it is
   stopped and started again. A child that ends while the hub itself stops is not counted.
+- A backup interrupted after committing could leave that commit local forever when nothing else
+  changed. An unchanged tick now compares HEAD with the last successfully pushed commit and its
+  destination in job memory. Changing the push URL or branch triggers a new push. Without that
+  memory, separate fetch and push URLs also trigger a push; only matching URLs allow the configured
+  tracking ref to be used, and a missing ref triggers a push. Fetching from a separate URL cannot
+  hide an unpushed backup or trigger a redundant push to a recorded destination. Moving HEAD back
+  to an ancestor of the recorded commit does not attempt a non-fast-forward push. If that commit
+  object is missing, retry the non-forced push. Destination records hash expanded URLs and the branch
+  instead of retaining URL credentials; direct URLs also honor URL rewrites. No branch upstream is
+  required, and a repository with no HEAD is left alone.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

@@ -1009,6 +1009,18 @@ Stages every change in a git working tree, scans it for secrets (built-in token 
 patterns) and for files over the size limit, and only then commits and pushes. Never force-pushes,
 rewrites history or pulls. A refusal commits nothing and names files and rule, never the matched
 text. The config file and `secrets/` inside the tree are refused unless git ignores them.
+An unchanged tick retries a pending push and also pushes commits missing from the configured backup
+remote and branch, recovering interrupted ticks even when no pending push was recorded. It compares
+HEAD with the last successfully pushed commit saved together with a SHA-256 identifier of its
+expanded push URLs and branch in job memory. URL credentials are not stored in the receipt, and
+URL rewrites also apply to a direct URL remote. HEAD equal to or an ancestor of the recorded commit
+is already backed up, so resetting it backwards does not trigger a non-fast-forward push. If that
+commit object is missing, the job attempts a non-forced push. Changing the destination still
+triggers a new push, even with the same HEAD. Without a recorded destination, separate fetch and push
+URLs also trigger a push; only matching URLs allow `refs/remotes/<remote>/<branch>` to be used. A missing
+tracking ref then triggers a push. Fetches cannot hide an unpushed backup or trigger another push
+to an already-recorded destination. The working branch's upstream is not used and need not be
+configured. A repository with no HEAD has nothing to push.
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|
