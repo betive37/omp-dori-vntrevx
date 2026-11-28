@@ -944,7 +944,7 @@ fn invite_link(app: Option<Snowflake>) -> String {
 /// Why the bot cannot join a voice channel.
 #[derive(Debug, PartialEq, Eq)]
 enum Blocked {
-    /// Its roles lack these permissions server-wide.
+    /// Its roles lack these permissions and no channel overwrite supplies them.
     Server(String),
     /// The channel's overwrites for these holders take these permissions away.
     Overwrite(String, String),
@@ -987,9 +987,6 @@ fn voice_blocked(guild: &Value, member: &Value, bot: &str, overwrites: &Value) -
             .collect();
         list.join(" and ")
     };
-    if lacking(base) != 0 {
-        return Some(Blocked::Server(names(lacking(base))));
-    }
     let list = overwrites.as_array().map_or_default(Vec::as_slice);
     let of = |id: &str| list.iter().find(|o| o["id"] == id);
     // Each step: who it is, its deny, its allow.
@@ -1033,7 +1030,11 @@ fn voice_blocked(guild: &Value, member: &Value, bot: &str, overwrites: &Value) -
         .filter(|(_, deny, _)| deny & missing != 0)
         .map(|(who, _, _)| who.as_str())
         .collect();
-    Some(Blocked::Overwrite(names(missing), by.join(", ")))
+    if by.is_empty() {
+        Some(Blocked::Server(names(missing)))
+    } else {
+        Some(Blocked::Overwrite(names(missing), by.join(", ")))
+    }
 }
 
 /// Whether the application has either Message Content flag.
@@ -1158,6 +1159,43 @@ mod tests {
         let bot = json!([{ "id": "5", "type": 1, "allow": "0", "deny": SPEAK.to_string() }]);
         assert_eq!(
             voice_blocked(&guild(all), &member, "5", &bot),
+            Some(Blocked::Overwrite("Speak".into(), "the bot".into()))
+        );
+    }
+
+    #[test]
+    fn voice_access_accepts_permissions_granted_only_by_channel_overwrites() {
+        let guild = json!({ "id": "1", "owner_id": "9", "roles": [
+            { "id": "1", "name": "@everyone", "permissions": VIEW_CHANNEL.to_string() },
+            { "id": "2", "name": "Cataly", "permissions": "0" },
+        ]});
+        let member = json!({ "roles": ["2"] });
+        // Each overwrite level can grant Connect and Speak absent from all server roles.
+        for (id, kind) in [("1", 0), ("2", 0), ("5", 1)] {
+            let overwrites = json!([
+                { "id": id, "type": kind, "allow": (CONNECT | SPEAK).to_string(), "deny": "0" },
+            ]);
+            assert_eq!(
+                voice_blocked(&guild, &member, "5", &overwrites),
+                None,
+                "overwrite for {id}"
+            );
+        }
+        // A partial grant reports only what is still missing from the effective permissions.
+        let partial = json!([
+            { "id": "5", "type": 1, "allow": CONNECT.to_string(), "deny": "0" },
+        ]);
+        assert_eq!(
+            voice_blocked(&guild, &member, "5", &partial),
+            Some(Blocked::Server("Speak".into()))
+        );
+        // A later member deny still overrides an earlier channel grant.
+        let denied = json!([
+            { "id": "1", "type": 0, "allow": (CONNECT | SPEAK).to_string(), "deny": "0" },
+            { "id": "5", "type": 1, "allow": "0", "deny": SPEAK.to_string() },
+        ]);
+        assert_eq!(
+            voice_blocked(&guild, &member, "5", &denied),
             Some(Blocked::Overwrite("Speak".into(), "the bot".into()))
         );
     }

@@ -419,10 +419,11 @@ creates the voice channel if one is to be made, checks that voice would start wi
 and asks a running hub to reload.
 
 Before it enables voice (or moves it with `--voice-channel`), setup reads the bot's permissions
-in the chosen voice channel: its roles, then the channel's overwrites. If View Channel, Connect or
-Speak is missing, it stops without enabling voice: for permissions the bot's roles lack it prints
-a fresh invite link (inviting the bot again updates its role's permissions), and for an overwrite
-it names the channel and whose overwrite denies them.
+in the chosen voice channel: its roles, then the channel's overwrites. An overwrite may grant
+permissions absent from the server roles. If View Channel, Connect or Speak is still missing, it
+stops without enabling voice: when an overwrite denies a missing permission, it names the channel
+and whose overwrite denies it; otherwise it prints a fresh invite link (inviting the bot again
+updates its role's permissions).
 
 | Key | Type | Default | Allowed | What it does |
 |---|---|---|---|---|

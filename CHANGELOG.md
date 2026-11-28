@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Voice setup no longer rejects a channel whose overwrites grant Connect or Speak when the bot's
+  server roles lack them. It checks effective channel permissions before asking for role changes.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
