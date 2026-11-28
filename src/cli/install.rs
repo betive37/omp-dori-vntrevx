@@ -75,6 +75,12 @@ impl Outcome {
     }
 }
 
+/// The `--help` summary of an install verb in `language`, when it has one other than the command
+/// table's English.
+pub(super) fn help_summary(language: Language, path: &[&str]) -> Option<&'static str> {
+    Say(language).help(path)
+}
+
 /// Handles the install verbs; `None` when `p` is not one of them. `install`, `update` and
 /// `rollback` speak the owner's language; the other verbs speak English.
 pub(crate) fn run(p: &Parsed, paths: &Paths) -> Option<Result<(), Failure>> {
@@ -1878,5 +1884,41 @@ mod tests {
             assert_eq!(said(Outcome::SwitchedBack("x".into())), back);
             assert_eq!(said(Outcome::NeedsAttention("x".into())), attention);
         }
+    }
+
+    /// `--help` of `update` and `rollback` in both languages; other commands keep the table's
+    /// English in both.
+    #[test]
+    fn update_and_rollback_help_follows_the_owner_language() {
+        let spec = |path: &[&str]| {
+            super::super::args::COMMANDS
+                .iter()
+                .find(|c| c.path == path)
+                .unwrap()
+        };
+        let help = |path: &[&str], language| super::super::help(Some(spec(path)), language);
+        assert!(
+            help(&["update"], Language::Korean).starts_with(
+                "cataly update [--from <value>] [--tag <value>] [--prefix <value>] \
+                 [--no-restart]\n  최신 안정 릴리스"
+            ),
+            "{}",
+            help(&["update"], Language::Korean)
+        );
+        assert!(
+            help(&["rollback"], Language::Korean)
+                .contains("\n  이전 버전으로 되돌리고(--expect <버전>으로 어느 버전인지 확인)")
+        );
+        for path in [&["update"][..], &["rollback"]] {
+            assert_eq!(
+                help(path, Language::English),
+                super::super::args::usage(Some(spec(path)))
+            );
+        }
+        assert!(help(&["update"], Language::English).contains("\n  install the latest stable"));
+        assert_eq!(
+            help(&["check"], Language::Korean),
+            super::super::args::usage(Some(spec(&["check"])))
+        );
     }
 }

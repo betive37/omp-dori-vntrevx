@@ -22,7 +22,8 @@
   held, switched-back and needs-attention outcomes (`보류:`, `되돌림:`, `확인 필요:`), the busy wait
   and hold with the busy session named by the hub in that language, and every refusal the owner acts
   on. Errors meant for developers (a file, network or store failure) stay as they were said, inside
-  those sentences. `--help` stays English, as it is for every command.
+  those sentences. Their `--help` follows `[hub] language` too when a config is readable, and is
+  English otherwise; every other command's help stays English.
   The last-attempt line of plain `cataly lead status` and the model-unverified notice no longer
   quote raw internal text either: they say what happened in plain words in `[hub] language`, the
   last attempt with the same causes as the hold texts; the raw detail stays in `--json`.

@@ -223,6 +223,28 @@ fn install_reinstall_and_refusals() {
     );
 }
 
+/// `cataly update --help` and `rollback --help` follow `[hub] language` when a config is
+/// readable, and are English without one.
+#[test]
+fn update_and_rollback_help_follow_the_owner_language() {
+    let hub = sandbox("[hub]\nlanguage = \"ko\"\n");
+    let help = |args: &[&str]| {
+        let out = run(&hub, BIN.as_ref(), args);
+        assert!(out.status.success(), "{}", text(&out));
+        String::from_utf8_lossy(&out.stdout).into_owned()
+    };
+    assert!(
+        help(&["update", "--help"]).contains("\n  최신 안정 릴리스"),
+        "{}",
+        help(&["update", "--help"])
+    );
+    assert!(help(&["rollback", "--help"]).contains("\n  이전 버전으로 되돌리고"));
+    hub.write_config("[hub]\nlanguage = \"en\"\n");
+    assert!(help(&["update", "--help"]).contains("\n  install the latest stable release"));
+    std::fs::remove_file(hub.config_path()).unwrap();
+    assert!(help(&["rollback", "--help"]).contains("\n  switch back to the previous version"));
+}
+
 /// Check 3, the link collision: a foreign file at the command link path of a fresh home is refused
 /// and nothing is created.
 #[test]

@@ -455,4 +455,21 @@ impl Say {
             Language::English => format!("the previous version is {previous}, not {expect}"),
         }
     }
+
+    /// The `--help` summary of `update` or `rollback` (`path`) in this language; `None` for
+    /// English, which is the command table's own summary, and for any other command.
+    pub(super) fn help(self, path: &[&str]) -> Option<&'static str> {
+        match (self.0, path) {
+            (Language::Korean, ["update"]) => Some(
+                "최신 안정 릴리스(또는 --tag로 지정한 릴리스, 또는 --from <폴더>)를 설치하고 실행 \
+                 중인 허브를 그 버전으로 다시 시작합니다. --no-restart를 주면 허브는 다시 시작할 \
+                 때까지 이전 버전으로 동작합니다.",
+            ),
+            (Language::Korean, ["rollback"]) => Some(
+                "이전 버전으로 되돌리고(--expect <버전>으로 어느 버전인지 확인) 실행 중인 허브를 \
+                 그 버전으로 다시 시작합니다. --no-restart를 주면 허브는 그대로 둡니다.",
+            ),
+            _ => None,
+        }
+    }
 }
