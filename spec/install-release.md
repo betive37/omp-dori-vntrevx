@@ -200,7 +200,8 @@ extension's behaviour once loaded belongs to the omp-extension area (EXT-01).
 
 40. An explicit command writes a systemd user unit (Linux) or a launchd agent in `~/Library/LaunchAgents` (macOS)
     that runs the daemon through the command link, restarting on failure with a 5 s delay, and enables it. A matching
-    command disables and removes it. Install and update never do either. Restarting the service after an update is the
+    command disables and removes it and records that the owner turned it off, so setup does not enable it again
+    until the owner turns it on. Install and update never do either. Restarting the service after an update is the
     owner's choice or the restart option's job.
 
 ### G. Building and publishing a release (IR-30 to IR-35)

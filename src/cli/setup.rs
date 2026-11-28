@@ -768,6 +768,11 @@ fn service(
     } else {
         "systemd user service"
     };
+    // An explicit off is remembered, so a plain re-run does not turn the service back on.
+    let record = flag.is_some_and(|on| on != planned.setup.service);
+    if let Some(on) = flag.filter(|_| record) {
+        text = set_rendered(&text, "setup", "service", &on.to_string());
+    }
     let step = match (flag, exists, installed) {
         (Some(false), true, _) => {
             items.push(Item::new(
@@ -778,11 +783,20 @@ fn service(
             ServiceStep::Disable(layout)
         }
         (Some(false), false, _) => {
-            items.push(Item::new("service", "off", false));
+            let value = if record { "off (remembered)" } else { "off" };
+            items.push(Item::new("service", value, record));
             ServiceStep::Keep
         }
         (_, true, _) => {
-            items.push(Item::new("service", format!("on ({manager})"), false));
+            items.push(Item::new("service", format!("on ({manager})"), record));
+            ServiceStep::Keep
+        }
+        (None, false, true) if !planned.setup.service => {
+            items.push(Item::new(
+                "service",
+                "off (you turned it off; `cataly setup --service on` turns it on)",
+                false,
+            ));
             ServiceStep::Keep
         }
         (_, false, true) => {

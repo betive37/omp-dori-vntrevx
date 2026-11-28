@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- After `cataly setup --service off` or `cataly service disable`, a plain `cataly setup` enabled
+  and started the service again. The off is now remembered as `[setup] service = false`; setup
+  leaves the service off until `--service on` or `cataly service enable`.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes

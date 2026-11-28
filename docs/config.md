@@ -85,7 +85,7 @@ Then the defaults, each applied only where the config says nothing yet:
 | Bot profile | Cataly's avatar and banner on the bot (`PATCH /users/@me`) and the avatar as the application's icon (`PATCH /applications/@me`), each only where there is none or still the one Cataly set; your own images are kept | `--profile` re-applies Cataly's |
 | Home backup | to `<gh login>/cataly-home`, private, created if absent, when `gh` is logged in (see [Home backup](#home-backup)) | `--backup on\|off`, `--backup-repo owner/name` |
 | Jobs | `[jobs.health]` and `[jobs.pressure]` with their defaults, notices to `#cataly-ops`, unless a job of that kind exists | |
-| Service | the user service, enabled and started (see [`cataly service enable`](#cataly-service-enable)); only for an installed release | `--service on\|off` |
+| Service | the user service, enabled and started (see [`cataly service enable`](#cataly-service-enable)); only for an installed release, and not once you turned it off (`[setup] service = false`) | `--service on\|off` |
 | Voice | off. `--voice on` turns on the [Discord voice assistant](#voice-and-transcribe) and fills in every `[voice]` key the file does not set (see below); `--voice off` sets `enabled = false` and keeps the rest | `--voice on\|off`, `--voice-channel <id\|name>`, `--voice-daily-minutes <n>`, `--voice-cap-usd <usd>`, `--voice-key-file <path>` |
 
 Setup then shows one short summary (a `+` marks what this run changes) and asks once; nothing
@@ -174,6 +174,7 @@ What `cataly setup` remembers between runs. You rarely edit it by hand.
 | Key | Type | Default | Allowed | What it does | Setup |
 |---|---|---|---|---|---|
 | `backup` | boolean | `true` | | `false` once you turned the [home backup](#home-backup) off before it existed; a plain re-run then leaves it off instead of offering it again. | `--backup off` writes `false`; `--backup on` (or `--backup-repo`) sets it back to `true` and plans the backup |
+| `service` | boolean | `true` | | `false` once you turned the user service off; a plain re-run then leaves it off instead of enabling it again. | `--service off` (or `cataly service disable`) writes `false`; `--service on` (or `cataly service enable`) sets it back to `true` |
 
 ```toml
 [setup]
