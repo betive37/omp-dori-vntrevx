@@ -152,8 +152,10 @@ logic can move to Rust, leaving the extension as a forwarder.
    A new/fork/branch continuation instead keeps its role pending and replays the switch after reconnecting,
    before buffered events. Its hello identifies the pending continuation; only a valid reconnect key and
    the same terminal process permit the new identity. The switch saves the lead binding or lane record
-   before acknowledging it. Local transcript paths are canonicalized for comparison and storage, including
-   a fresh file's existing parent before its first write; worker paths stay in the worker's filesystem.
+   before acknowledging it. A changed session ID or transcript path sends a switch, including a copied
+   transcript whose session ID is unchanged. Local transcript paths are canonicalized for comparison and
+   storage, including a fresh file's existing parent before its first write; worker paths stay in the worker's
+   filesystem.
    A continuation retains the binding's original runtime and ownership provenance. Accepted switches refresh
    the terminal snapshot.
 9. Subagents: in the same process, a subagent's events carry agent kind "sub"; the extension sends them on the

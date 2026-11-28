@@ -170,6 +170,7 @@ export class Bridge {
 	delivered = new Map<string, { key: string; out: Json }>();
 	forms = new Map<string, (answer: unknown) => void>();
 	token: string | undefined; parent = "";
+	private sessionFile = "";
 	private reportedCapabilities: string | undefined;
 	private registered = new Set<string>();
 	private switchTo: Json | undefined;
@@ -185,14 +186,15 @@ export class Bridge {
 		const sub = ctx?.agent?.kind === "sub";
 		if (sub && (this.wired || this.parent)) return;
 		const id = String(ctx.sessionManager?.getSessionId?.() ?? "");
+		const file = String(ctx.sessionManager?.getSessionFile?.() ?? "");
 		if (this.wired && this.role !== "none") {
 			this.ctx = ctx;
 			this.changing = 0;
-			if (id !== this.session) {
+			if (id !== this.session || file !== this.sessionFile) {
 				this.calls.clear(); this.fallbackTo = ""; this.lastAnswer = false;
-				this.session = id;
+				this.session = id; this.sessionFile = file;
 				owners.set(String(ctx.agent?.id), id);
-				const change: Json = this.switchTo = { session: id, file: this.file(), ...transition };
+				const change: Json = this.switchTo = { session: id, file, ...transition };
 				const answer = await this.request("bridge.switch", change, TOOL_MS);
 				if (this.switchTo !== change) return;
 				if (!answer && continuing(change.reason)) return this.wire?.close();
@@ -210,7 +212,7 @@ export class Bridge {
 			this.pi.on("tool_call", (e, c) => this.veto(e, c));
 		} else if (!this.token && !marked(ctx)) return;
 		this.ctx = ctx;
-		this.session = id;
+		this.session = id; this.sessionFile = file;
 		await this.connect();
 	}
 

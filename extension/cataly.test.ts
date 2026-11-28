@@ -133,6 +133,40 @@ test.each(["session_switch", "session_branch", "session_tree"])("a switch replac
 	await expect(leadTool.execute("after-none", {}, undefined, undefined, ctx)).rejects.toThrow("not available");
 });
 
+test.each(["lead", "lane"])("a copied transcript with the same ID is rechecked (%s)", async role => {
+	const pi = fakePi(), sent: any[] = [];
+	let file = "/s/s1.jsonl";
+	const ctx = ctxOf(pi);
+	ctx.sessionManager.getSessionFile = () => file;
+	const connect: Deps["connect"] = async (_path, onLine, onClose) => ({
+		write(line) {
+			const msg = JSON.parse(line);
+			sent.push(msg);
+			const reply = (ok: unknown) => queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ok })));
+			if (msg.method === "bridge.hello") reply({ role, key: "key", tern: true,
+				tools: [{ name: `cataly_${role}`, parameters: { type: "object" } }] });
+			if (msg.method === "bridge.switch") reply({ role: "none" });
+		},
+		close: onClose,
+	});
+	const b = bridge(pi, { env: { CATALY_LAUNCH: "token" }, connect, uid: () => 1 });
+	await pi.emit("session_start", {}, ctx);
+	await b.toolsActive;
+	expect(pi.active()).toContain(`cataly_${role}`);
+	await pi.emit("session_switch", { reason: "resume" }, ctx);
+	expect(sent.filter(m => m.method === "bridge.switch")).toEqual([]);
+	// OMP mutates the same session manager; reading the old context cannot recover its old path.
+	file = "/s/copied.jsonl";
+	await pi.emit("session_switch", { reason: "resume" }, ctx);
+	await b.toolsActive;
+	expect(sent.filter(m => m.method === "bridge.switch")).toMatchObject([
+		{ params: { session: "s1", file, reason: "resume" } },
+	]);
+	expect(b.role).toBe("none");
+	expect(pi.active()).toEqual(["read", "bash"]);
+	await expect(pi.tools[0].execute("copied", {}, undefined, undefined, ctx)).rejects.toThrow("not available");
+});
+
 test.each(["offline", "disconnect"])("a missing switch reply drops authority and cancels queued reconnects (%s)", async mode => {
 	const pi = fakePi();
 	let session = "s1", connections = 0;

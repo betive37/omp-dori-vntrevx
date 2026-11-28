@@ -9,6 +9,7 @@
   unrelated resumes drop the old tools and reconnect key. Returning lanes can reconnect by their
   session marker, and a switch revokes only that connection's process role. Local transcript aliases
   resolve to the same canonical path, and continuations retain the original launch ownership evidence.
+  Copied transcripts with an unchanged session ID are rechecked when their file path changes.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
