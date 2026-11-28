@@ -182,6 +182,8 @@
   the next one starts. Slack finishes admitting an envelope it has already read before stopping,
   then gives its acknowledgement up to 500 ms before closing a stalled connection. Pending
   connections, frame reads and replayable catch-up reads still stop promptly.
+- Telegram could lose an owner message when its arrival queue was full or its store write failed.
+  It now stops that batch, keeps the offset before the unsaved update and retries after a minute.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
