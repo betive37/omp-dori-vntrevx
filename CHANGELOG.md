@@ -162,6 +162,9 @@
 - Large event bodies could make `events` fail with "bad reply". Event pages now fit within the
   control-socket line limit, keeping the newest events in the default view. The CLI reports a
   byte-limited list and prints an `--after` cursor for reading the omitted events.
+- Switching voice to a Discord channel created while the hub is running no longer rejects it as
+  "not a guild voice channel". The voice channel cache now follows channel creations, updates and
+  deletions in the configured guild.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
