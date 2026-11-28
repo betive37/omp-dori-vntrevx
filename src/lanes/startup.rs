@@ -145,14 +145,12 @@ impl<R: Runtime> Lanes<R> {
             .map(|reason| format!("start held: {reason}"));
         let persisted = async {
             rev = self.save(&rec, Some(rev), note).await?;
-            if ownership.identity().is_some() && rec.pending_reopen.is_none() {
-                let target = format!("lane:{}", rec.key);
-                crate::host::startup::Recovery {
-                    store: &self.env.store,
-                    target: &target,
-                }
-                .end("bound", None)
-                .await?;
+            // A start that came up fenced ends its episode like a bound one, also for a reopen
+            // (which otherwise ends it once finished): a later exit gets a fresh window.
+            if ownership.identity().is_some()
+                && (rec.pending_reopen.is_none() || started.held.is_some())
+            {
+                self.end_episode(&rec.key).await?;
             }
             Ok::<(), String>(())
         }
