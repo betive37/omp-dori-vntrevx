@@ -6,6 +6,7 @@
 use rusqlite::{OptionalExtension, Row, Transaction, params};
 
 use super::Reads;
+use crate::host::inbox;
 
 /// The whole arrival queue of one relay is capped at 256 MiB (DISC-IN req. 24).
 pub(crate) const QUEUE_CAP_BYTES: i64 = 256 * 1024 * 1024;
@@ -1000,13 +1001,16 @@ impl Reads {
             .optional()
     }
 
-    /// Hand-offs whose answer is still to be read or posted, oldest first.
+    /// Hand-offs to the lead whose answer is still to be read or posted, oldest first. A lane
+    /// answers in its own thread, so its hand-offs never get a lead answer.
     pub(crate) fn answers_open(&self, relay: &str) -> rusqlite::Result<Vec<HandoffRow>> {
         let mut stmt = self.0.prepare(&format!(
-            "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE relay = ?1 AND answer IN ('waiting', 'posting') \
-             AND state IN ('handed', 'delivered') ORDER BY created_ms, seq"
+            "SELECT {HANDOFF_COLUMNS} FROM handoffs WHERE relay = ?1 AND target = ?2 \
+             AND answer IN ('waiting', 'posting') AND state IN ('handed', 'delivered') \
+             ORDER BY created_ms, seq"
         ))?;
-        stmt.query_map([relay], handoff_from_row)?.collect()
+        stmt.query_map(params![relay, inbox::LEAD], handoff_from_row)?
+            .collect()
     }
 
     /// The newest hand-off to `target` with an answer stored: only the last request's turns can
@@ -1128,7 +1132,8 @@ impl Reads {
             )?,
             queued: count("SELECT COUNT(*) FROM arrival_queue WHERE relay = ?1", None)?,
             answers_waiting: count(
-                "SELECT COUNT(*) FROM handoffs WHERE relay = ?1 AND answer IN ('waiting', 'posting')",
+                "SELECT COUNT(*) FROM handoffs WHERE relay = ?1 AND target = 'lead' \
+                 AND answer IN ('waiting', 'posting')",
                 None,
             )?,
             owed_open: count(

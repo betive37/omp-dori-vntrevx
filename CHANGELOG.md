@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- An approval the lead raised while an owner message was being handed to a lane in its thread
+  could reply to that lane message instead of the lead's request; typing and the lead's answer
+  bookkeeping also counted lane messages. Only messages handed to the lead are now treated as
+  waiting for the lead's answer.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
