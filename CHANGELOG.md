@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Stream jobs: output without line ends (a `\r` progress bar, binary data) no longer grows the hub's
+  memory until the line ends. Past 64 KiB the line continues in its private file as it arrives;
+  one event gives the path and size when it ends.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes

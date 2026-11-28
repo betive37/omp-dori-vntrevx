@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
-use tokio::io::{AsyncBufReadExt, BufReader};
+use tokio::io::AsyncReadExt;
 use tokio::sync::watch;
 
 use crate::jobs::Jobs;
@@ -27,6 +27,8 @@ const LINE_MAX: usize = 64 * 1024;
 const JOBS_MAX: usize = 16;
 const ARGV_MAX: usize = 64;
 const STDERR_CAP: u64 = 256 * 1024;
+/// How much output one read takes; a line in memory never exceeds `LINE_MAX` plus this.
+const CHUNK: usize = 8 * 1024;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Spec {
@@ -299,8 +301,9 @@ impl Streams {
         mut child: command::Attached,
         stopped: &mut watch::Receiver<bool>,
     ) -> Option<String> {
-        let stdout = child.take_stdout()?;
-        let mut lines = BufReader::new(stdout).lines();
+        let mut stdout = child.take_stdout()?;
+        let mut chunk = vec![0u8; CHUNK];
+        let mut line = Line::new(self.files.join("streams"), &spec.name);
         let silence = spec.silence_m.map(|m| Duration::from_secs(m * 60));
         let mut quiet_since = Instant::now();
         let mut alerted = false;
@@ -309,8 +312,8 @@ impl Streams {
                 s.saturating_sub(quiet_since.elapsed())
                     .max(Duration::from_secs(1))
             });
-            let line = tokio::select! {
-                line = lines.next_line() => line,
+            let read = tokio::select! {
+                read = stdout.read(&mut chunk) => read,
                 () = tokio::time::sleep(wait) => {
                     if let Some(s) = silence && !alerted && quiet_since.elapsed() >= s {
                         alerted = true;
@@ -324,37 +327,20 @@ impl Streams {
                     return None;
                 }
             };
-            let Ok(Some(line)) = line else { break };
+            let Ok(n @ 1..) = read else { break };
             quiet_since = Instant::now();
             alerted = false;
-            if line.len() > LINE_MAX {
-                let path = self.files.join("streams").join(format!(
-                    "{}-{}.txt",
-                    spec.name,
-                    crate::sys::now_ms()
-                ));
-                let note = match crate::sys::fs::write_atomic(&path, line.as_bytes()) {
-                    Ok(()) => format!(
-                        "a line of {} bytes, saved in {}",
-                        line.len(),
-                        path.display()
-                    ),
-                    Err(e) => format!(
-                        "a line of {} bytes that could not be saved: {e}",
-                        line.len()
-                    ),
-                };
-                self.emit(EventKind::StreamLine, spec, !spec.low, &note)
-                    .await;
-            } else if filter.is_match(&line) {
-                self.emit(
-                    EventKind::StreamLine,
-                    spec,
-                    !spec.low,
-                    &one_line(&line, 300),
-                )
-                .await;
+            let mut parts = chunk[..n].split(|&b| b == b'\n');
+            if let Some(first) = parts.next() {
+                line.push(first);
             }
+            for part in parts {
+                self.line_ended(spec, filter, line.finish()).await;
+                line.push(part);
+            }
+        }
+        if !line.is_empty() {
+            self.line_ended(spec, filter, line.finish()).await;
         }
         let (exit, _) = child.close(Duration::from_secs(5), KILL_GRACE).await;
         Some(match exit {
@@ -362,6 +348,108 @@ impl Streams {
             Exit::Signal(s) => format!("signal {s}"),
             Exit::Unknown => "unknown status".into(),
         })
+    }
+
+    async fn line_ended(&self, spec: &Spec, filter: &regex::Regex, ended: Ended) {
+        match ended {
+            Ended::Text(text) if filter.is_match(&text) => {
+                self.emit(
+                    EventKind::StreamLine,
+                    spec,
+                    !spec.low,
+                    &one_line(&text, 300),
+                )
+                .await;
+            }
+            Ended::Text(_) => {}
+            Ended::Saved(note) => {
+                self.emit(EventKind::StreamLine, spec, !spec.low, &note)
+                    .await;
+            }
+        }
+    }
+}
+
+/// A line that ended: its text, or the note about the private file a long line went to.
+enum Ended {
+    Text(String),
+    Saved(String),
+}
+
+/// The output line being read. Up to `LINE_MAX` bytes stay in memory; a longer line continues in a
+/// private file (WS req. 72), so output without line ends never grows the hub's memory.
+struct Line {
+    dir: PathBuf,
+    name: String,
+    bytes: Vec<u8>,
+    spill: Option<Spill>,
+}
+
+struct Spill {
+    path: PathBuf,
+    file: Result<std::fs::File, String>,
+    len: usize,
+}
+
+impl Line {
+    fn new(dir: PathBuf, name: &str) -> Self {
+        Self {
+            dir,
+            name: name.into(),
+            bytes: Vec::new(),
+            spill: None,
+        }
+    }
+
+    fn is_empty(&self) -> bool {
+        self.bytes.is_empty() && self.spill.is_none()
+    }
+
+    fn push(&mut self, part: &[u8]) {
+        if let Some(spill) = &mut self.spill {
+            spill.write(part);
+            return;
+        }
+        self.bytes.extend_from_slice(part);
+        if self.bytes.len() > LINE_MAX {
+            let path = self
+                .dir
+                .join(format!("{}-{}.txt", self.name, crate::sys::now_ms()));
+            let file = crate::sys::fs::create_private(&path).map_err(|e| e.to_string());
+            let mut spill = Spill { path, file, len: 0 };
+            spill.write(&std::mem::take(&mut self.bytes));
+            self.spill = Some(spill);
+        }
+    }
+
+    fn finish(&mut self) -> Ended {
+        let Some(spill) = self.spill.take() else {
+            let mut bytes = std::mem::take(&mut self.bytes);
+            if bytes.last() == Some(&b'\r') {
+                bytes.pop();
+            }
+            return Ended::Text(String::from_utf8_lossy(&bytes).into_owned());
+        };
+        Ended::Saved(match spill.file {
+            Ok(_) => format!(
+                "a line of {} bytes, saved in {}",
+                spill.len,
+                spill.path.display()
+            ),
+            Err(e) => format!("a line of {} bytes that could not be saved: {e}", spill.len),
+        })
+    }
+}
+
+impl Spill {
+    fn write(&mut self, part: &[u8]) {
+        use std::io::Write as _;
+        self.len += part.len();
+        if let Ok(file) = &mut self.file
+            && let Err(e) = file.write_all(part)
+        {
+            self.file = Err(e.to_string());
+        }
     }
 }
 
@@ -377,5 +465,77 @@ mod tests {
         assert!(spec_of(&json!({"name": "x", "argv": []})).is_err());
         assert!(spec_of(&json!({"name": "x", "argv": ["a"], "filter": "("})).is_err());
         assert!(spec_of(&json!({"name": "x", "argv": ["a"], "restarts": 101})).is_err());
+    }
+
+    /// WS req. 72: a line without an end goes to its file while it grows, not into memory first.
+    #[tokio::test]
+    async fn a_long_line_goes_to_a_file_before_it_ends() {
+        let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-long-line");
+        let files = dir.join("files");
+        let streams = Streams::new(
+            crate::jobs::tests::jobs_of(&ctx),
+            ctx.store.clone(),
+            dir.to_path_buf(),
+            files.clone(),
+        );
+        crate::sys::fs::ensure_private_dir(&files.join("streams")).unwrap();
+        let gate = dir.join("gate");
+        assert!(
+            std::process::Command::new("mkfifo")
+                .arg(&gate)
+                .status()
+                .unwrap()
+                .success()
+        );
+        // 200 KiB without a line end, then the line stays open until the test opens the gate.
+        let spec = spec_of(&json!({
+            "name": "long",
+            "argv": ["sh", "-c", "head -c 204800 /dev/zero | tr '\\0' x; cat \"$0\"", gate],
+        }))
+        .unwrap();
+        let filter = regex::Regex::new(&spec.filter).unwrap();
+        let child = command::attach(&spec.argv, Some(&dir), &[], None, 0).unwrap();
+        let (_stop_tx, mut stop_rx) = watch::channel(false);
+        let reader = Arc::clone(&streams);
+        let watching = tokio::spawn(async move {
+            reader
+                .watch_output(&spec, &filter, child, &mut stop_rx)
+                .await
+        });
+
+        let mut polls = 0;
+        let saved = loop {
+            let found = std::fs::read_dir(files.join("streams"))
+                .unwrap()
+                .map(|e| e.unwrap().path())
+                .find(|p| std::fs::metadata(p).is_ok_and(|m| m.len() > LINE_MAX as u64));
+            if let Some(path) = found {
+                break path;
+            }
+            assert!(!watching.is_finished(), "the job ended early");
+            polls += 1;
+            assert!(polls < 500, "no file while the line is still open");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        };
+        let events = |ctx: &Arc<crate::jobs::Ctx>| {
+            let store = ctx.store.clone();
+            async move { store.read(|r| r.events_after(0, 10)).await.unwrap() }
+        };
+        assert!(
+            events(&ctx).await.is_empty(),
+            "no event before the line ends"
+        );
+
+        let opened = gate.clone();
+        tokio::task::spawn_blocking(move || std::fs::write(opened, b"tail\n"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(watching.await.unwrap().as_deref(), Some("status 0"));
+        let events = events(&ctx).await;
+        assert_eq!(events.len(), 1, "{events:?}");
+        let note = format!("a line of 204804 bytes, saved in {}", saved.display());
+        assert!(format!("{:?}", events[0]).contains(&note), "{events:?}");
+        assert_eq!(std::fs::metadata(&saved).unwrap().len(), 204_804);
     }
 }
