@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Stream jobs: a job whose restarts were used up started again, with a fresh restart count, every
+  time the hub restarted. The used restarts and the ended state are now kept with the job; after a
+  hub restart an ended job is listed as exhausted and not run until it is stopped and started again.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes

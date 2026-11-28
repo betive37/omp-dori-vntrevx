@@ -1,7 +1,8 @@
 //! The lead's stream jobs (WS-02, WS-04; WS req. 71-75): a long-running command whose output lines
 //! that match a filter become events for the lead. Restart policy with backoff, an optional silence
 //! alert, oversized lines to a private file. The hub owns them: they outlive the lead's OMP process,
-//! are kept in the store and start again with the hub. The lead's tool forwards start, stop and list.
+//! are kept in the store with their used restarts and start again with the hub unless they ended.
+//! The lead's tool forwards start, stop and list.
 
 use std::collections::HashMap;
 use std::fmt::Write as _;
@@ -37,6 +38,12 @@ struct Spec {
     delay_s: u64,
     silence_m: Option<u64>,
     low: bool,
+    /// Restarts used so far, kept so a hub restart continues the count (WS req. 73).
+    #[serde(default)]
+    used: u32,
+    /// The restarts are used up: the job stays listed but the hub does not start it again.
+    #[serde(default)]
+    ended: bool,
 }
 
 #[derive(Debug, Clone)]
@@ -93,6 +100,8 @@ fn spec_of(input: &Value) -> Result<Spec, String> {
         delay_s,
         silence_m,
         low: p::LOW.flag(input),
+        used: 0,
+        ended: false,
     })
 }
 
@@ -111,7 +120,8 @@ impl Streams {
         self.running.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
-    /// Starts the stream jobs kept in the store (WS-04: the hub restores its own jobs).
+    /// Starts the stream jobs kept in the store (WS-04: the hub restores its own jobs). An ended job
+    /// is listed again but not started; a running one continues its restart count.
     pub(crate) async fn resume(self: &Arc<Self>) {
         let kept = self
             .store
@@ -120,6 +130,18 @@ impl Streams {
             .unwrap_or_default();
         for (name, spec) in kept {
             match serde_json::from_str::<Spec>(&spec) {
+                Ok(spec) if spec.ended => {
+                    self.lock().insert(
+                        spec.name,
+                        State {
+                            phase: "exhausted",
+                            restarts: spec.used,
+                            last_exit: None,
+                            next_restart: None,
+                            stop: watch::channel(true).0,
+                        },
+                    );
+                }
                 Ok(spec) => self.spawn(spec),
                 Err(e) => log::warn("stream job not restored", &[("job", &name), ("error", &e)]),
             }
@@ -203,7 +225,7 @@ impl Streams {
             spec.name.clone(),
             State {
                 phase: "running",
-                restarts: 0,
+                restarts: spec.used,
                 last_exit: None,
                 next_restart: None,
                 stop,
@@ -236,8 +258,26 @@ impl Streams {
         }
     }
 
+    /// Keeps the restarts used and the ended mark with the job, so the hub's next start honours them.
+    async fn keep_progress(&self, spec: &Spec) {
+        let write = serde_json::to_string(spec).map(|saved| LeadWrite::StreamProgress {
+            name: spec.name.clone(),
+            spec: saved,
+        });
+        let result = match write {
+            Ok(write) => self.store.lead(write).await.map_err(|e| e.to_string()),
+            Err(e) => Err(e.to_string()),
+        };
+        if let Err(e) = result {
+            log::warn(
+                "stream job progress not kept",
+                &[("job", &spec.name), ("error", &e)],
+            );
+        }
+    }
+
     /// Runs the command until it is stopped or its restarts are used up (WS req. 73).
-    async fn run(self: Arc<Self>, spec: Spec, mut stopped: watch::Receiver<bool>) {
+    async fn run(self: Arc<Self>, mut spec: Spec, mut stopped: watch::Receiver<bool>) {
         let Ok(filter) = regex::RegexBuilder::new(&spec.filter)
             .size_limit(1 << 20)
             .build()
@@ -249,7 +289,7 @@ impl Streams {
             .join("streams")
             .join(format!("{}.err", spec.name));
         let _ = crate::sys::fs::ensure_private_dir(&self.files.join("streams"));
-        let mut attempt: u32 = 0;
+        let mut attempt = spec.used;
         loop {
             let ended = match command::attach(
                 &spec.argv,
@@ -267,6 +307,8 @@ impl Streams {
             self.update(&spec.name, |s| s.last_exit = Some(exit.clone()));
             if attempt >= spec.restarts {
                 self.update(&spec.name, |s| s.phase = "exhausted");
+                spec.ended = true;
+                self.keep_progress(&spec).await;
                 let reason = format!("exited ({exit}) and no restart is left");
                 self.emit(EventKind::StreamEnded, &spec, !spec.low, &reason)
                     .await;
@@ -275,6 +317,8 @@ impl Streams {
             let wait =
                 Duration::from_secs(spec.delay_s.saturating_mul(1 << attempt.min(10)).min(3600));
             attempt += 1;
+            spec.used = attempt;
+            self.keep_progress(&spec).await;
             self.update(&spec.name, |s| {
                 s.restarts = attempt;
                 s.phase = "waiting";
@@ -377,5 +421,61 @@ mod tests {
         assert!(spec_of(&json!({"name": "x", "argv": []})).is_err());
         assert!(spec_of(&json!({"name": "x", "argv": ["a"], "filter": "("})).is_err());
         assert!(spec_of(&json!({"name": "x", "argv": ["a"], "restarts": 101})).is_err());
+    }
+
+    /// WS req. 73: an exhausted job stays ended when the hub starts again.
+    #[tokio::test]
+    async fn an_exhausted_job_is_not_started_again_with_the_hub() {
+        let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-exhausted");
+        let hub = |ctx: &Arc<crate::jobs::Ctx>| {
+            Streams::new(
+                crate::jobs::tests::jobs_of(ctx),
+                ctx.store.clone(),
+                dir.to_path_buf(),
+                dir.join("files"),
+            )
+        };
+        let first = hub(&ctx);
+        first
+            .start(&json!({"name": "once", "argv": ["sh", "-c", "exit 1"], "restarts": 0}))
+            .await
+            .unwrap();
+        let mut polls = 0;
+        while !first.list().contains("exhausted") {
+            polls += 1;
+            assert!(polls < 500, "the job did not end: {}", first.list());
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+        let ended = |ctx: &Arc<crate::jobs::Ctx>| {
+            let store = ctx.store.clone();
+            async move {
+                store
+                    .read(|r| r.events_after(0, 10))
+                    .await
+                    .unwrap()
+                    .into_iter()
+                    .filter(|e| e.kind == "stream.ended")
+                    .count()
+            }
+        };
+        let mut polls = 0;
+        while ended(&ctx).await == 0 {
+            polls += 1;
+            assert!(polls < 500, "no stream.ended event");
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The hub starts again: the job is listed as ended and no child runs for it.
+        let second = hub(&ctx);
+        second.resume().await;
+        let list = second.list();
+        assert!(
+            list.starts_with("- once: exhausted, 0 restart(s)"),
+            "{list}"
+        );
+        assert_eq!(ended(&ctx).await, 1);
+        second.stop("once").await.unwrap();
+        let kept = ctx.store.read(crate::store::Reads::stream_jobs).await.unwrap();
+        assert!(kept.is_empty(), "{kept:?}");
     }
 }
