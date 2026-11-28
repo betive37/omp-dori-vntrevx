@@ -1039,36 +1039,35 @@ mod receipt_cap {
             })
             .await
             .unwrap();
-        for (session, total) in [("h1", RECEIPT_CAP + 2), ("h2", 1)] {
-            for n in 0..total {
-                let request_id = format!("{session}-{n}");
-                let fence = format!("steering {request_id}");
-                store
-                    .host(HostWrite::SteerReceipt {
-                        target: "lead".into(),
-                        request_id: request_id.clone(),
-                        digest: "same-text".into(),
-                        session: session.into(),
-                        fence: fence.clone(),
-                    })
-                    .await
-                    .unwrap();
+        let reserve = |session: &str, n: i64| HostWrite::SteerReceipt {
+            target: "lead".into(),
+            request_id: format!("{session}-{n}"),
+            digest: "same-text".into(),
+            session: session.into(),
+            fence: format!("steering {session}-{n}"),
+        };
+        let settle = |session: &str, n: i64| HostWrite::SettleSteer {
+            target: "lead".into(),
+            request_id: format!("{session}-{n}"),
+            session: session.into(),
+            fence: format!("steering {session}-{n}"),
+            refused: false,
+        };
+        // Filling to the cap evicts nothing. Each reservation and its settlement are queued in order
+        // at once, so the writer commits them as batches instead of one durable write each.
+        let fill = (0..RECEIPT_CAP).flat_map(|n| [reserve("h1", n), settle("h1", n)]);
+        host_all(&store, fill.collect()).await;
+        assert_eq!(store.read(|r| count(r, "h1")).await.unwrap(), RECEIPT_CAP);
+        for (session, from, to) in [("h1", RECEIPT_CAP, RECEIPT_CAP + 2), ("h2", 0, 1)] {
+            for n in from..to {
+                store.host(reserve(session, n)).await.unwrap();
                 if n >= RECEIPT_CAP {
                     assert_eq!(
                         store.read(move |r| count(r, session)).await.unwrap(),
                         RECEIPT_CAP
                     );
                 }
-                store
-                    .host(HostWrite::SettleSteer {
-                        target: "lead".into(),
-                        request_id,
-                        session: session.into(),
-                        fence,
-                        refused: false,
-                    })
-                    .await
-                    .unwrap();
+                store.host(settle(session, n)).await.unwrap();
             }
         }
         assert_eq!(store.read(|r| count(r, "h1")).await.unwrap(), RECEIPT_CAP);
