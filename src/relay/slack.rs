@@ -11,7 +11,9 @@
 //!   threads the account posted in (thread memory: one room per thread, `<channel>:<root ts>`, whose
 //!   position is the seen timestamp). Every envelope is acknowledged within 3 s, after the event was
 //!   admitted or dropped. After start and every reconnect, remembered threads and DMs are read from
-//!   their positions (200 at most, oldest first). Own and bot messages are dropped; a reply whose
+//!   their positions (200 at most, oldest first), alongside socket reads and durable admission.
+//!   Each recovering room waits for its history before hand-off; other rooms keep running.
+//!   Own and bot messages are dropped; a reply whose
 //!   channel or root disagrees with where it was read stops that read. Only allowlisted senders are
 //!   admitted (owner decision 10: the owner alone by default).
 //! - Posts (SLACK req. 45-47): a post answers in the request's thread and records that thread; the
@@ -20,6 +22,7 @@
 //!   before any byte is sent. The seen mark is the `eyes` reaction, replaced by `white_check_mark`
 //!   once the answer is posted (SLACK req. 48).
 
+use std::collections::HashSet;
 use std::fmt::Write as _;
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, PoisonError};
@@ -887,6 +890,8 @@ async fn start<T: Runtime>(
         env.store.clone(),
         Arc::clone(&env.lead),
     ));
+    // A queue retained across restart must not overtake history either.
+    round.recovering(None).await;
     let (tx, rx) = tokio::sync::oneshot::channel();
     {
         let socket = Socket {
@@ -993,6 +998,7 @@ impl<T: Runtime> Socket<T> {
     }
 
     async fn connect(&self) -> Down {
+        self.round.recovering(None).await;
         let opened = match self
             .api
             .call("apps.connections.open", &json!({}), Kind::Once, true)
@@ -1015,9 +1021,34 @@ impl<T: Runtime> Socket<T> {
             Err(e) => return Down::Again(e),
         };
         let established = Instant::now();
-        let mut caught_up = false;
+        let mut greeted = false;
+        let mut catching_up = false;
+        let catch_up = async {
+            let result = self.catch_up().await;
+            self.round.recovering(Some(HashSet::new())).await;
+            result
+        };
+        tokio::pin!(catch_up);
         loop {
-            let frame = match ws.next().await {
+            let frame = tokio::select! {
+                frame = ws.next() => frame,
+                result = &mut catch_up, if catching_up => {
+                    catching_up = false;
+                    match result {
+                        Ok(()) => {
+                            self.shared.catch_up_latency.record(established.elapsed());
+                            self.shared.set(|h| h.caught_up = true);
+                        }
+                        Err(e) => {
+                            log::warn("Slack catch-up read failed", &[("error", &e)]);
+                            self.shared
+                                .set(|h| h.last_error = Some(format!("catch-up read: {e}")));
+                        }
+                    }
+                    continue;
+                }
+            };
+            let frame = match frame {
                 Some(Ok(f)) => f,
                 Some(Err(e)) => return Down::Again(format!("socket read: {e}")),
                 None => return Down::Again("socket closed".into()),
@@ -1038,19 +1069,9 @@ impl<T: Runtime> Socket<T> {
                         h.connected_ms = Some(now_ms());
                         h.reason = None;
                     });
-                    if !caught_up {
-                        caught_up = true;
-                        match self.catch_up().await {
-                            Ok(()) => {
-                                self.shared.catch_up_latency.record(established.elapsed());
-                                self.shared.set(|h| h.caught_up = true);
-                            }
-                            Err(e) => {
-                                log::warn("Slack catch-up read failed", &[("error", &e)]);
-                                self.shared
-                                    .set(|h| h.last_error = Some(format!("catch-up read: {e}")));
-                            }
-                        }
+                    if !greeted {
+                        greeted = true;
+                        catching_up = true;
                     }
                 }
                 Some("disconnect") => {
@@ -1164,6 +1185,20 @@ impl<T: Runtime> Socket<T> {
             .map_err(|e| e.to_string())?;
         let threads = positions.iter().filter(|p| p.room.contains(':')).count();
         self.shared.set(|h| h.followed_threads = threads);
+        self.round
+            .recovering(Some(
+                positions
+                    .iter()
+                    .filter(|p| {
+                        p.held.is_none()
+                            && room_of(&p.room).is_some_and(|(channel, root)| {
+                                root.is_some() || channel.starts_with('D')
+                            })
+                    })
+                    .map(|p| p.room.clone())
+                    .collect(),
+            ))
+            .await;
         for p in positions.iter().filter(|p| p.held.is_none()) {
             let Some((channel, root)) = room_of(&p.room) else {
                 continue;
@@ -1209,12 +1244,14 @@ impl<T: Runtime> Socket<T> {
                     "Slack read stopped: inconsistent thread data",
                     &[("room", &p.room)],
                 );
+                self.round.recovered(&p.room).await;
                 continue;
             }
             let now = Instant::now();
             for m in &messages {
                 self.take(channel, m, root.is_none(), now).await;
             }
+            self.round.recovered(&p.room).await;
         }
         Ok(())
     }

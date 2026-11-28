@@ -38,6 +38,7 @@ struct State {
     history: HashMap<String, Vec<Value>>,
     next_ts: u64,
     hang: bool,
+    history_delay: Duration,
     upload_url: String,
     connections: usize,
     socket: Option<mpsc::UnboundedSender<Value>>,
@@ -136,6 +137,11 @@ impl FakeSlack {
 
     pub fn set_hang(&self, on: bool) {
         self.state.lock().unwrap().hang = on;
+    }
+
+    /// Delays only DM history responses, leaving the socket and other Web API calls live.
+    pub fn set_history_delay(&self, delay: Duration) {
+        self.state.lock().unwrap().history_delay = delay;
     }
 
     pub fn set_upload_url(&self, url: &str) {
@@ -277,6 +283,10 @@ async fn answer(
     };
     if hang {
         tokio::time::sleep(Duration::from_secs(3600)).await;
+    }
+    if method == "conversations.history" {
+        let delay = state.lock().unwrap().history_delay;
+        tokio::time::sleep(delay).await;
     }
     if auth.as_deref().is_none_or(|a| !a.starts_with("Bearer x")) && !method.starts_with("upload/")
     {

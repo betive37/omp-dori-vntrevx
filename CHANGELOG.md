@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Slow Slack catch-up reads no longer delay Socket Mode acknowledgements. Live messages are
+  queued durably while history loads, and each room waits for its older messages before hand-off.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
