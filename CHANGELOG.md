@@ -3,7 +3,10 @@
 ## Unreleased
 
 - Cron jobs with a step in a day field, like `0 0 */2 * *` or `0 0 * * */2`, ran every day; they now
-  run only on the stepped days, combining the two day fields the way standard cron does.
+  run only on the stepped days, combining the two day fields the way standard cron does: when either
+  day field starts with `*`, both must match. So `0 0 */2 * mon` now fires only on odd-day Mondays,
+  fewer days than before. A next run already saved for a day the new rule excludes moves to the next
+  valid day instead of firing.
 
 ## 0.2.7 (2026-11-28)
 

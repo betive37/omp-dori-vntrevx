@@ -8,8 +8,9 @@ use jiff::Timestamp;
 use jiff::civil::{Date, DateTime};
 use jiff::tz::{AmbiguousOffset, TimeZone};
 
-/// Days searched for the next occurrence; eight years always include a 29 February.
-const SEARCH_DAYS: u32 = 366 * 8;
+/// Days searched for the next occurrence. Weekdays and dates repeat every 28 years within a century, so
+/// any satisfiable expression (even 29 February on a given weekday) fires within this window.
+const SEARCH_DAYS: u32 = 366 * 28;
 
 /// A parsed five-field cron expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -178,7 +179,7 @@ impl Cron {
         }
     }
 
-    /// The first occurrence strictly after `after`, in `tz`; `None` if none exists within eight years.
+    /// The first occurrence strictly after `after`, in `tz`; `None` if none exists within 28 years.
     pub(crate) fn next_after(&self, tz: &TimeZone, after: Timestamp) -> Option<Timestamp> {
         let start = after.to_zoned(tz.clone()).datetime();
         let mut date = start.date();
@@ -331,6 +332,16 @@ mod tests {
         assert_eq!(
             next_n(&every, &utc, ts("2026-01-01T00:00:00Z"), 2),
             ["2026-01-02T00:00:00Z", "2026-01-03T00:00:00Z"]
+        );
+    }
+
+    #[test]
+    fn rare_day_and_weekday_is_found() {
+        // 29 February on a Sunday: after 2032 the next is 2060.
+        let c = parse("0 0 29 2 */7").unwrap();
+        assert_eq!(
+            next_n(&c, &TimeZone::UTC, ts("2033-01-01T00:00:00Z"), 1),
+            ["2060-02-29T00:00:00Z"]
         );
     }
 
