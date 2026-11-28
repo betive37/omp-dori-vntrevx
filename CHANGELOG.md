@@ -3,8 +3,11 @@
 ## Unreleased
 
 - An open Discord confirmation or choice-only question no longer consumes ordinary owner messages
-  as invalid answers. They reach the lead; only questions accepting free text take plain messages,
-  and explicit replies to question cards still work.
+  as answers. They reach the lead; plain messages answer only a single-question Ask card or a
+  single-field free-text form. For a multi-question Ask card, use a Discord reply even for the last
+  remaining free-text part; a plain message becomes a new lead request. In text-only mode, a plain
+  `1` to Confirm or Select also becomes a new request; use a Discord reply to answer.
+  Explicit replies to question cards still work.
 
 ## 0.2.8 (2026-11-28)
 
