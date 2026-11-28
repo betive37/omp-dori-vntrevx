@@ -267,7 +267,9 @@ lane lifecycle area consumes the completion checker, the step records and the pu
     reason. All commit and file pages are read; their totals must match the pull request's commit and changed-file
     counts, or the check fails as incomplete. Pull requests with more than 250 commits are refused because GitHub
     lists at most 250 commits. The head, description and both counts are read before and after; any change fails
-    with "moved while being checked". More than 3000 files in a commit or the pull request fails.
+    with "moved while being checked". Both snapshots and every page share one 120 s read deadline: each call gets
+    only the remaining time, and expiry fails with a deadline reason. More than 3000 files in a commit or the
+    pull request fails.
     A repository without a configured identity fails.
 
 ### Message from the lead to a lane (EVR-33, EVR-34)

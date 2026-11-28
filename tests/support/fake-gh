@@ -5,6 +5,7 @@
 #   gh api [-H h] PATH    -> gh-data/<PATH without query, leading / dropped, / as _>.json
 #                            later pages use <PATH>.page-N.json, or [] when absent
 #                            a missing first-page fixture answers HTTP 404
+#   <response file>.delay -> sleep this many seconds before returning the response
 #   gh repo create O/N --private -> writes repos_O_N.json as a private repository
 dir=$(cd "$(dirname "$0")" && pwd)/gh-data
 printf '%s\n' "$*" >> "$dir/calls.log"
@@ -43,6 +44,9 @@ api)
     ;;
 esac
 if [ -f "$file" ]; then
+    if [ -f "$file.delay" ]; then
+        sleep "$(cat "$file.delay")"
+    fi
     cat "$file"
 else
     case "$1" in
