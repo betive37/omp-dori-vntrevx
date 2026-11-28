@@ -1818,7 +1818,9 @@ mod tests {
         .unwrap();
         let text = local_notice(&dialog, false);
         assert!(
-            text.contains(&format!(r": {padding} \[masked\] (remote approvals are off).")),
+            text.contains(&format!(
+                r": {padding} \[masked\] (remote approvals are off)."
+            )),
             "{text}"
         );
         assert_eq!(dialog.message.as_deref(), Some(token.as_str()));

@@ -217,7 +217,10 @@ mod tests {
         let token = format!("ghp_{}", "a".repeat(36));
         let prompt = format!("{padding} {token}");
         let card = text(&prompt, Language::English);
-        assert_eq!(card, format!("**Permission asked**\n{padding} \\[masked\\]"));
+        assert_eq!(
+            card,
+            format!("**Permission asked**\n{padding} \\[masked\\]")
+        );
     }
 
     #[test]
