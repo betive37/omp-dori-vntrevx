@@ -190,6 +190,10 @@
   a message already handed off (its admission committed after the deadline) is not admitted again.
   Redelivering a doubtful or failed hand-off given up by a room release no longer queues it again
   or blocks the released room.
+- Slow Slack catch-up reads no longer delay Socket Mode acknowledgements. Live messages are
+  queued durably while history loads, and each room waits for its older messages before hand-off.
+  Temporary read failures reconnect; a permanently unreadable room is held without delaying
+  catch-up or live messages in other rooms.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
