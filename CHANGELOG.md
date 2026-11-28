@@ -50,9 +50,14 @@
   ([PR #299](https://github.com/vntrevx/Cataly/pull/299), @Momentum96).
 - Explicit fresh intent clears a migrated anchor hold. Ordinary A-to-B conversation histories
   resume their newest proven binding, and an owner retry of a first failed start needs no
-  `--fresh` when no conversation ever bound. Startup model mismatch keeps the process open and
-  input fenced until `lead accept-model` durably commits the accepted identity.
-  A model fence also prevents idle sleep, so the session stays available for that decision.
+  `--fresh` when no conversation ever bound. A 0.2.6 binding recorded with a model-mismatch
+  fault (as a suffixed model such as `x:high` left on every start) migrates as a binding with
+  its model unverified; the model is checked again at the next start. A 0.2.6 start left
+  `starting` by a crash, with no startup journal, is failed as 0.2.6 did, not held. Startup
+  model mismatch keeps the process open and input fenced until `lead accept-model` durably
+  commits the accepted identity; the fenced start ends its recovery episode, so a later exit
+  gets a fresh retry window. A model fence also prevents idle sleep, so the session stays
+  available for that decision.
 - The owner hears directly, in `[hub] language`, when the lead is still starting at 15 s (once
   per recovery) and once per hold, with the reason, what is kept, `cataly lead start` after the
   fix, and that an update does not lift the hold. A hold found again after a hub restart or an
@@ -83,9 +88,12 @@
   `anthropic/claude-opus-5-5:high` is checked against what OMP itself resolves it to: the base
   model at that thinking level. The hub asks the session's bridge with a read-only query within
   the startup deadline; an ID with a colon part of its own (`ollama/qwen:14b`) stays whole, and a
-  level OMP clamped is still a mismatch. The lead, lanes, the lane model barrier, `lead model` and
-  terminal sessions all use the resolution; a terminal `lead model` no longer splits the selector
-  at its first colon. A bridge older than the hub cannot answer: the session stays open and fenced
+  level OMP clamped is still a mismatch. The lead, lanes, the lane model barrier, `lead model`,
+  `lane model` and terminal sessions all use the resolution; neither a terminal `lead model` nor
+  `lane model` splits the selector at its first colon, and `lane model x:high` keeps its level
+  for the lane's next start. The lane model barrier moves to a new model only once the change is
+  confirmed; a refused change leaves the old model flowing. A bridge older than the hub cannot
+  answer: the session stays open and fenced
   as "model unverified" at once. A session whose extension never connects is not a failed start
   either: at the end of the startup deadline it binds, fenced the same way. The owner hears once
   (not on every restart) to run `cataly update` or restart the session, or to keep the model with

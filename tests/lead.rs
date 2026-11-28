@@ -1470,6 +1470,34 @@ fn a_startup_model_mismatch_keeps_the_session_fenced_until_owner_acceptance() {
     assert!(w.hub.stop().success());
 }
 
+/// A resume fenced for a model mismatch is a recorded startup: its recovery episode ends, so a
+/// later exit of the fenced lead gets a fresh retry window instead of the old one.
+#[test]
+fn a_fenced_resume_ends_its_recovery_episode() {
+    let mut w = wrapped("", None);
+    let first = original(&mut w);
+    assert!(w.hub.cli(&["lead", "stop"]).status.success());
+    w.hub.fixture("omp", "model", Some("fake/other"));
+    let out = w.hub.cli(&["lead", "start"]);
+    assert!(out.status.success(), "{out:?}");
+    let fenced = live(&w.hub, &first["session"]["pid"]);
+    assert!(
+        fenced["session"]["input_blocked"].as_bool().unwrap(),
+        "{fenced}"
+    );
+    let db = rusqlite::Connection::open(w.hub.state().join("cataly.db")).unwrap();
+    db.busy_timeout(Duration::from_secs(10)).unwrap();
+    let episode: String = db
+        .query_row(
+            "SELECT state FROM startup_episodes WHERE target = 'lead'",
+            [],
+            |r| r.get(0),
+        )
+        .unwrap();
+    assert_eq!(episode, "bound");
+    assert!(w.hub.stop().success());
+}
+
 /// HOST req. 27 with a thinking suffix: a fresh install whose bridge matches the hub verifies
 /// `fake/primary:high` (OMP runs `fake/primary` at high) and delivers. A bridge older than the hub
 /// fences the session as unverified at once, without a retry; the owner is told once, in his

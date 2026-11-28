@@ -88,7 +88,11 @@ async fn bound(answer: impl Fn(&Value) -> Value + Send + 'static) -> (Session, S
         (started.session_id.as_str(), started.pid, started.held),
         ("s1", Some(42), None)
     );
-    (Session { port }, seen)
+    // As a hub start does: the bridge's link is accepted and the bound resolution shared.
+    let links = Arc::new(super::super::bridge::Links::default());
+    links.connect("t1", Role::Lane, "k1", "s1");
+    port.share_resolution(&links);
+    (Session { port, links }, seen)
 }
 
 fn delivery(text: &str, steer: bool) -> Delivery {
@@ -314,7 +318,7 @@ async fn interrupt_model_goal_and_shutdown_are_bridge_commands() {
     .await;
     assert_eq!(session.interrupt().await.unwrap(), "idle");
     assert_eq!(
-        session.set_model("fake/second:high").await.unwrap(),
+        session.set_model("fake/second:high").await.unwrap().model(),
         "fake/second"
     );
     assert_eq!(session.snapshot().model.as_deref(), Some("fake/second"));
@@ -536,7 +540,10 @@ async fn a_suffixed_selector_verifies_and_an_old_bridge_is_unverified_at_once() 
         held.starts_with("model unverified") && held.contains("older than the hub"),
         "{held}"
     );
-    let session = Session { port: old };
+    let session = Session {
+        port: old,
+        links: Arc::default(),
+    };
     assert!(session.snapshot().input_blocked);
     session.accept_model().unwrap();
     assert!(!session.snapshot().input_blocked);
@@ -566,12 +573,51 @@ async fn a_model_change_keeps_literal_ids_and_reports_a_clamped_level() {
     })
     .await;
     assert_eq!(
-        session.set_model("ollama/qwen:14b").await.unwrap(),
+        session.set_model("ollama/qwen:14b").await.unwrap().model(),
         "ollama/qwen:14b"
     );
     let clamped = session.set_model("fake/plain:high").await.unwrap_err();
     assert!(
         clamped.contains("thinking high requested, OMP reports medium"),
         "{clamped}"
+    );
+}
+
+/// The lane model barrier pins what the registry holds: a confirmed change moves it there, so
+/// turns on the new model flow; a refused or mismatched change leaves the old model the pin.
+#[tokio::test]
+async fn only_a_confirmed_model_change_moves_the_barrier_pin() {
+    let (session, _) = bound(|cmd| match cmd["model"].as_str() {
+        Some("fake/busy") => json!({ "refused": "busy" }),
+        Some(selector) if selector.starts_with("fake/plain") => {
+            let mut reply = resolution(selector, Some("medium"));
+            reply["model"] = json!("fake/plain");
+            reply
+        }
+        Some(selector) => {
+            let mut reply = resolution(selector, None);
+            reply["model"] = json!(selector.split(':').next().unwrap());
+            reply
+        }
+        None => json!({}),
+    })
+    .await;
+    let pin = |session: &Session| {
+        let r = session.links.resolution("t1").unwrap();
+        (r.model(), r.requested)
+    };
+    assert_eq!(pin(&session), ("fake/primary".into(), None));
+    session.set_model("fake/second:high").await.unwrap();
+    assert_eq!(
+        pin(&session),
+        ("fake/second".into(), Some("high".into())),
+        "turns on the confirmed model flow"
+    );
+    session.set_model("fake/busy").await.unwrap_err();
+    session.set_model("fake/plain:high").await.unwrap_err();
+    assert_eq!(
+        pin(&session),
+        ("fake/second".into(), Some("high".into())),
+        "a refused or mismatched change keeps the old model flowing"
     );
 }

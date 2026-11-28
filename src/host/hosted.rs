@@ -96,7 +96,7 @@ impl Control for Hosting {
         each!(self, s => s.interrupt().await)
     }
 
-    async fn set_model(&self, selector: &str) -> Result<String, String> {
+    async fn set_model(&self, selector: &str) -> Result<super::model::Resolution, String> {
         each!(self, s => s.set_model(selector).await)
     }
 

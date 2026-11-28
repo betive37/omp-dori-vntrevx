@@ -32,7 +32,8 @@
 #   model selectors              as stock OMP: `--model=p/id:<level>` runs p/id at that thinking level
 #                               (an explicit --thinking wins) unless omp-data/literal lists the whole
 #                               selector as a catalogue ID; omp-data/clamp (a level) is the level the
-#                               session then runs instead. get_state reports `thinkingLevel`.
+#                               session then runs instead. get_state reports `thinkingLevel`;
+#                               set_model and set_thinking_level change what it reports.
 #   the bridge (read-only)       an rpc-ui session with a launch token says hello on CATALY_SOCKET as the
 #                               Cataly extension does, with model_resolution_version 1 (none with
 #                               omp-data/old-bridge), writes its reconnect key to omp-data/bridge-<id>,
@@ -279,9 +280,7 @@ rpc() {
             done
         ) &
     fi
-    [ -n "$thinking" ] && state=$(printf '%s,"thinkingLevel":"%s"' "$state" "$thinking")
-    state=$(printf '%s,"isStreaming":false,"isCompacting":false,"queuedMessageCount":0,"isSettled":true,"goal":null,"model":{"provider":"%s","id":"%s"}' \
-        "$state" "${model%%/*}" "${model#*/}")
+    state=$(printf '%s,"isStreaming":false,"isCompacting":false,"queuedMessageCount":0,"isSettled":true,"goal":null' "$state")
     echo '{"type":"ready","protocolVersion":1,"supportedProtocolVersions":[1]}'
     while IFS= read -r line; do
         cid=$(printf '%s' "$line" | sed -n 's/.*"id":"\([^"]*\)".*/\1/p')
@@ -293,7 +292,17 @@ rpc() {
             [ -f "$dir/busy" ] && streaming=true
             goal=null
             [ -s "$gfile" ] && goal=$(printf '{"goal":{"status":"%s","objective":"o"}}' "$(cat "$gfile")")
-            data=$(printf '{%s}' "$state" | sed "s/\"isStreaming\":false/\"isStreaming\":$streaming/; s/\"goal\":null/\"goal\":$goal/") ;;
+            current=$state
+            [ -n "$thinking" ] && current=$(printf '%s,"thinkingLevel":"%s"' "$current" "$thinking")
+            current=$(printf '%s,"model":{"provider":"%s","id":"%s"}' "$current" "${model%%/*}" "${model#*/}")
+            data=$(printf '{%s}' "$current" | sed "s/\"isStreaming\":false/\"isStreaming\":$streaming/; s/\"goal\":null/\"goal\":$goal/") ;;
+        set_model)
+            model=$(printf '%s' "$line" | sed -n 's/.*"provider":"\([^"]*\)".*/\1/p')/$(printf '%s' "$line" | sed -n 's/.*"modelId":"\([^"]*\)".*/\1/p')
+            data='{}' ;;
+        set_thinking_level)
+            thinking=$(printf '%s' "$line" | sed -n 's/.*"level":"\([^"]*\)".*/\1/p')
+            [ -f "$dir/clamp" ] && thinking=$(cat "$dir/clamp")
+            data='{}' ;;
         get_session_lease) data='{"held":[],"unknown":[]}' ;;
         goal)
             op=$(printf '%s' "$line" | sed -n 's/.*"op":"\([a-z]*\)".*/\1/p')

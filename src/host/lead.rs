@@ -396,6 +396,32 @@ fn binding_file(file: &Path, how: LeadStart) -> Result<PathBuf, String> {
     }
 }
 
+/// The recovery of a lead row the hub left starting with no session ID. Every start journals its
+/// ownership before it spawns, and an unconfirmed journal is never pruned, so no journal proves
+/// nothing was spawned: a 0.2.6 row (it wrote none and marked such rows failed) or a crash before
+/// the spawn. That row fails like 0.2.6's (the B1 legacy rule); otherwise only a confirmed exit
+/// fails it and anything else holds.
+async fn interrupted_startup(state: &Path, handle: &str) -> SessionUpdate {
+    let (outcome, detail) = if ownership::recorded(state, handle) == Ok(false) {
+        (
+            "failed",
+            "hub stopped during startup; no startup journal, so nothing was spawned".to_string(),
+        )
+    } else {
+        let cleanup = ownership::reconcile_attempt(state, handle, None).await;
+        let confirmed = cleanup.as_ref().is_ok_and(|c| c.confirmed());
+        (
+            if confirmed { "failed" } else { "held" },
+            format!("hub stopped during startup; ownership reconciliation: {cleanup:?}"),
+        )
+    };
+    SessionUpdate {
+        state: Some(outcome.into()),
+        stop: Some(("failed".into(), Some(detail))),
+        ..SessionUpdate::default()
+    }
+}
+
 /// The note for a resume after anything but a clean close; a sleep records how its close went.
 fn unclean(row: &SessionRow) -> Option<String> {
     match (
@@ -696,21 +722,7 @@ impl<R: Runtime> Lead<R> {
         };
         for row in rows {
             let update = match &row.session_id {
-                None => {
-                    let cleanup =
-                        ownership::reconcile_attempt(&self.env.state_dir, &row.handle, None).await;
-                    let confirmed = cleanup.as_ref().is_ok_and(|c| c.confirmed());
-                    SessionUpdate {
-                        state: Some(if confirmed { "failed" } else { "held" }.into()),
-                        stop: Some((
-                            "failed".into(),
-                            Some(format!(
-                                "hub stopped during startup; ownership reconciliation: {cleanup:?}"
-                            )),
-                        )),
-                        ..SessionUpdate::default()
-                    }
-                }
+                None => interrupted_startup(&self.env.state_dir, &row.handle).await,
                 Some(id) => match self.lease(id).await {
                     Lease::Free => SessionUpdate {
                         state: Some("lost".into()),
@@ -1150,6 +1162,7 @@ impl<R: Runtime> Lead<R> {
             self.set_phase(Phase::Held, Some(reason.clone()));
             return Err(reason);
         }
+        self.fenced_startup_recorded(started.held.as_deref()).await;
         let _ = self.came.set(how);
         *self.current.lock().unwrap_or_else(PoisonError::into_inner) = Some(Arc::clone(&session));
         self.closing.store(false, Ordering::Release);
@@ -1352,6 +1365,18 @@ impl<R: Runtime> Lead<R> {
         super::startup::Recovery {
             store: &self.env.store,
             target: LEAD,
+        }
+    }
+
+    /// A fenced session is recorded unbound, but its startup succeeded: the episode ends, so a
+    /// later exit gets a fresh retry window. A bound one ended it with the binding.
+    async fn fenced_startup_recorded(&self, held: Option<&str>) {
+        let Some(reason) = held else {
+            return;
+        };
+        let detail = format!("startup session recorded, fenced: {reason}");
+        if let Err(failure) = self.recovery().end("bound", Some(detail)).await {
+            log::warn("fenced startup episode not ended", &[("error", &failure)]);
         }
     }
 
@@ -1988,7 +2013,7 @@ impl<R: Runtime> Lead<R> {
     }
 
     pub(crate) async fn set_model(&self, selector: &str) -> Result<String, String> {
-        self.live()?.set_model(selector).await
+        self.live()?.set_model(selector).await.map(|r| r.model())
     }
 
     pub(crate) async fn accept_model(&self) -> Result<(), String> {
@@ -2240,5 +2265,17 @@ mod tests {
             restarts.plan(later, session()),
             Some((Duration::from_secs(16), 5))
         );
+    }
+
+    /// A row left starting with no session ID and no startup journal (a 0.2.6 start the hub
+    /// crashed in) fails as 0.2.6 marked it; a journaled start of unknown ownership holds.
+    #[tokio::test]
+    async fn an_unjournaled_interrupted_start_fails_and_a_journaled_one_holds() {
+        let dir = crate::sys::fs::tests::scratch("lead-interrupted");
+        let legacy = interrupted_startup(&dir, "legacy").await;
+        assert_eq!(legacy.state.as_deref(), Some("failed"), "{legacy:?}");
+        let _journal = ownership::Ownership::prepare(&dir, "journaled").unwrap();
+        let unknown = interrupted_startup(&dir, "journaled").await;
+        assert_eq!(unknown.state.as_deref(), Some("held"), "{unknown:?}");
     }
 }

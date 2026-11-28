@@ -43,6 +43,8 @@ pub(crate) struct FakeState {
     pub(crate) thinking: Option<String>,
     /// The `model_resolution_version` of the bridge's hello; `None` is a bridge older than it.
     pub(crate) resolution_version: Option<u64>,
+    /// Refuse `set_model`, as OMP refuses a model it cannot run.
+    pub(crate) refuse_model: bool,
 }
 
 pub(crate) struct Fake {
@@ -87,6 +89,7 @@ impl Fake {
             goal: None,
             thinking: None,
             resolution_version: Some(super::model::VERSION),
+            refuse_model: false,
         });
         fake.dir = Some(dir);
         fake
@@ -269,6 +272,8 @@ fn answer(command: &Value, state: &Arc<Mutex<FakeState>>) -> Vec<Value> {
             st.streaming = false;
             vec![response(id, kind, json!({}))]
         }
+        "set_model" if st.refuse_model => vec![json!({"type": "response", "id": id,
+            "command": kind, "success": false, "error": "model not available"})],
         "set_model" => {
             st.model = (
                 command["provider"].as_str().unwrap_or_default().into(),
@@ -333,6 +338,7 @@ pub(crate) fn bridged(handle: &str) -> Arc<Links> {
         goal: None,
         thinking: None,
         resolution_version: Some(super::model::VERSION),
+        refuse_model: false,
     };
     bridge(&links, handle, Arc::new(Mutex::new(state)));
     links
