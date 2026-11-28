@@ -144,8 +144,12 @@ pub(crate) enum LaneDone {
         number: i64,
         new_items: i64,
     },
-    /// A step: `true` when it was stored now, `false` when the same step was recorded before.
-    Step(bool),
+    /// A step: `stored` when it was stored now (false when the same step was recorded before), and
+    /// how many attached items were new.
+    Step {
+        stored: bool,
+        new_items: i64,
+    },
     Refused(String),
 }
 
@@ -309,7 +313,10 @@ pub(crate) fn write(tx: &Transaction<'_>, w: &LaneWrite, now: i64) -> rusqlite::
                 .optional()?;
             if let Some((r, e, rc)) = earlier {
                 return Ok(if (&r, &e, &rc) == (result, evidence, &receipts_json) {
-                    LaneDone::Step(false)
+                    LaneDone::Step {
+                        stored: false,
+                        new_items: 0,
+                    }
                 } else {
                     LaneDone::Refused(format!("step '{name}' is recorded with other content"))
                 });
@@ -334,7 +341,10 @@ pub(crate) fn write(tx: &Transaction<'_>, w: &LaneWrite, now: i64) -> rusqlite::
                  VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
                 params![key, name, run_id, now, result, evidence, receipts_json, new_items],
             )?;
-            LaneDone::Step(true)
+            LaneDone::Step {
+                stored: true,
+                new_items,
+            }
         }
         LaneWrite::Journal {
             source,
@@ -614,10 +624,23 @@ mod tests {
             result: "pushed".into(),
             evidence: "link".into(),
             receipts: vec![receipt.into()],
-            items: vec![],
+            items: vec![("file:/y".into(), "h1".into())],
         };
-        assert_eq!(lanes(step("push", "c1")).await, LaneDone::Step(true));
-        assert_eq!(lanes(step("push", "c1")).await, LaneDone::Step(false));
+        // The step's new items are reported, so oversight can start a new round (COORD req. 7).
+        assert_eq!(
+            lanes(step("push", "c1")).await,
+            LaneDone::Step {
+                stored: true,
+                new_items: 1
+            }
+        );
+        assert_eq!(
+            lanes(step("push", "c1")).await,
+            LaneDone::Step {
+                stored: false,
+                new_items: 0
+            }
+        );
         assert!(matches!(
             lanes(step("push", "c2")).await,
             LaneDone::Refused(_)

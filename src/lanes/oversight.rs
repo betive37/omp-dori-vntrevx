@@ -153,18 +153,7 @@ impl<R: Runtime> Lanes<R> {
             .with("report", &id)
             .with("text", &shown),
         );
-        if new_items > 0 {
-            // New evidence starts a new progress round (COORD req. 7).
-            self.keep(&rec.key, |x| {
-                x.watch.round_ms = now_ms();
-                x.watch.reminders = 0;
-                x.watch.alerted = false;
-                if x.watch.stuck {
-                    x.watch.stuck = false;
-                }
-            })
-            .await;
-        }
+        self.new_round(&rec.key, new_items).await;
         let row = ReportRow {
             key: rec.key.clone(),
             number,
@@ -189,6 +178,19 @@ impl<R: Runtime> Lanes<R> {
             "report {id} recorded at {}; {attached}",
             crate::jobs::instant_text(row.at_ms)
         ))
+    }
+
+    /// New evidence from a report or a step starts a new progress round (COORD req. 7).
+    async fn new_round(&self, key: &str, new_items: i64) {
+        if new_items > 0 {
+            self.keep(key, |x| {
+                x.watch.round_ms = now_ms();
+                x.watch.reminders = 0;
+                x.watch.alerted = false;
+                x.watch.stuck = false;
+            })
+            .await;
+        }
     }
 
     /// Posts a report to the lane's thread by policy (EVR req. 19-24); each report at most once.
@@ -329,14 +331,23 @@ impl<R: Runtime> Lanes<R> {
             .await
             .map_err(|e| e.to_string())?
         {
-            LaneDone::Step(true) => {
+            LaneDone::Step {
+                stored: true,
+                new_items,
+            } => {
+                if !unverified {
+                    // Only a step of the current run moves the last-progress mark.
+                    self.new_round(&rec.key, new_items).await;
+                }
                 self.nudge.notify_one();
                 Ok(format!(
                     "step '{name}' recorded{}",
                     if unverified { " (run unverified)" } else { "" }
                 ))
             }
-            LaneDone::Step(false) => Ok(format!("step '{name}' unchanged (recorded before)")),
+            LaneDone::Step { stored: false, .. } => {
+                Ok(format!("step '{name}' unchanged (recorded before)"))
+            }
             LaneDone::Refused(why) => Err(why),
             other => Err(format!("step not stored: {other:?}")),
         }

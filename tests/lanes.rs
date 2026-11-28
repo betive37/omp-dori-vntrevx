@@ -972,6 +972,36 @@ fn oversight_reminds_alerts_once_and_holds_at_the_ceiling() {
     hub.stop();
 }
 
+/// A step with new evidence starts a new round (COORD req. 7): after one stall alert, a lane that
+/// moves on only through steps is alerted again when it stalls again.
+#[test]
+fn a_step_with_new_evidence_starts_a_new_round() {
+    let (mut hub, work) = lane_hub(
+        "[lanes.oversight]\nfirst_reminder = \"1s\"\nsecond_reminder = \"2s\"\nstall = \"3s\"\nsweep = \"1s\"\n",
+    );
+    start(&mut hub);
+    open(&hub, "s-1", &json!({}));
+    let rec = record(&hub, "s-1");
+    let stalls = |hub: &TestHub| {
+        events_of(hub, "lane.alert")
+            .into_iter()
+            .filter(|e| e["text"].as_str().unwrap().contains(" stall: "))
+            .count()
+    };
+    hub.until(WAIT, || (stalls(&hub) == 1).then_some(()));
+    std::fs::write(work.join("built.txt"), "result").unwrap();
+    let (mut b, _) = hello(&hub, &rec);
+    let step = b.lane_tool(
+        "c1",
+        &rec["session_id"],
+        json!({ "op": "step", "name": "build", "result": "built", "evidence": "built.txt",
+                "files": ["built.txt"] }),
+    );
+    assert_eq!(step["text"], "step 'build' recorded", "{step}");
+    hub.until(WAIT, || (stalls(&hub) == 2).then_some(()));
+    hub.stop();
+}
+
 /// Check 9: stuck and finished reports post to the thread at once, progress by the quiet rule;
 /// paths are cleaned; each report posts at most once.
 #[test]

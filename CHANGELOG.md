@@ -70,6 +70,9 @@
   Explicit service commands refuse absolute non-UTF-8 XDG homes rather than silently using defaults.
 - Repeating a recorded lane step could fail if its evidence file was removed or its tool facts were
   unavailable. Identical steps now return unchanged without reading their evidence again.
+- A lane step with new evidence now starts a new progress round, as a report with new evidence
+  does: after one stall alert, a lane that moved on only through steps was never reminded or
+  alerted again; now it is when it stalls again.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
