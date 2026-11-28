@@ -1083,3 +1083,39 @@ fn unknown_capability_and_install_sh_downgrades_are_refused() {
     let (_, s) = status_install(&hub);
     assert_eq!(s["current"]["version"], CAPABILITY_LESS_VERSION);
 }
+
+/// An install leaves its version folders read-only. The sandbox holding one still goes when its
+/// test ends, also when the test fails (unless `CATALY_TEST_KEEP=1` keeps it for debugging).
+#[test]
+fn a_sandbox_with_an_installed_layout_leaves_nothing_in_tmp() {
+    let installed = |root: &Path| {
+        let version = root.join("home/.local/share/cataly/versions/0.2.5");
+        std::fs::create_dir_all(&version).unwrap();
+        std::fs::write(version.join("cataly"), "x").unwrap();
+        std::fs::set_permissions(&version, std::fs::Permissions::from_mode(0o555)).unwrap();
+    };
+    let hub = TestHub::new("");
+    let root = hub.root.clone();
+    installed(&root);
+    drop(hub);
+    assert!(!root.exists(), "{} left behind", root.display());
+
+    let temp = support::TempRoot::new("cy-guard");
+    let root = temp.to_path_buf();
+    installed(&root);
+    drop(temp);
+    assert!(!root.exists(), "{} left behind", root.display());
+
+    let hub = TestHub::new("");
+    let root = hub.root.clone();
+    let failed = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+        installed(&hub.root);
+        panic!("a failing test");
+    }));
+    assert!(failed.is_err());
+    let kept = std::env::var_os("CATALY_TEST_KEEP").is_some_and(|v| v == "1");
+    assert_eq!(root.exists(), kept, "{}", root.display());
+    if kept {
+        support::release(&root);
+    }
+}
