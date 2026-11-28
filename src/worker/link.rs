@@ -1737,8 +1737,10 @@ pub(crate) mod tests {
         link.signal(killed.channel, "KILL").await.unwrap();
         assert_eq!(killed.exit.wait().await, reaped(Reaped::Signal(9)));
 
+        // `cat` keeps its output open: the worker ends a child whose output ended, so a child that
+        // closed it (`>/dev/null`) would be reaped and acknowledged before the drop.
         let mut dropped = link
-            .spawn(&sh("exec cat >/dev/null"), &cwd, &[], "a3", None)
+            .spawn(&sh("exec cat"), &cwd, &[], "a3", None)
             .await
             .unwrap();
         let live = link.attempts(&["a3"]).await.unwrap();
