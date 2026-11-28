@@ -28,7 +28,7 @@ use crate::relay::pipeline::{Arrival, Pipeline, Step};
 use crate::relay::text::{self, Checks, DISCORD_LIMIT};
 use crate::relay::{Facts, Inbound, PartOutcome, Relay};
 use crate::store::Store;
-use crate::store::relay::{QueueRow, RelayDone, RelayWrite};
+use crate::store::relay::{Arrived, QueueRow, RelayDone, RelayWrite};
 use crate::sys::now_ms;
 
 /// The relay's store key.
@@ -1127,9 +1127,17 @@ impl<T: Runtime> Intake<T> {
                     parent: parent.map(|p| p.to_string()),
                     raw: raw.to_string(),
                 };
-                if let Err(e) = self.pipeline.arrive(arrival, read_at, &self.wake).await {
-                    log::warn("owner message not queued", &[("error", &e)]);
-                    self.flag(true).await;
+                match self.pipeline.arrive(arrival, read_at, &self.wake).await {
+                    Ok(Arrived::Full) => {
+                        // The store already marked catch-up owed; fence before the next live pass,
+                        // even if refreshing threads fails before this room's history is read.
+                        self.scope().catching_up.insert(room);
+                    }
+                    Err(e) => {
+                        log::warn("owner message not queued", &[("error", &e)]);
+                        self.flag(true).await;
+                    }
+                    Ok(_) => {}
                 }
             }
         }

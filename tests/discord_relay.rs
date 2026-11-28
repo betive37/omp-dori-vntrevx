@@ -19,7 +19,7 @@ use std::time::Duration;
 
 use serde_json::{Value, json};
 use support::TestHub;
-use support::discord::{BOT, FakeDiscord, Gw};
+use support::discord::{BOT, FakeDiscord, GUILD, Gw};
 
 const OWNER: &str = "400000000000000001";
 const OTHER: &str = "400000000000000002";
@@ -1377,6 +1377,121 @@ fn live_passes_do_not_skip_owner_messages_during_catch_up() {
         });
         assert!(hub.stop().success());
     }
+}
+
+/// A held item fills the real queue byte accounting without allocating a 256 MiB payload.
+fn full_arrival_queue(hub: &TestHub, room: &str, message: u64) -> rusqlite::Connection {
+    let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
+    db.execute(
+        "UPDATE positions SET held = 'capacity fixture' WHERE relay = 'discord' AND room = ?1",
+        [room],
+    )
+    .unwrap();
+    let raw = FakeDiscord::message(room, message, OWNER, "held elsewhere").to_string();
+    let seq = i64::try_from(message).unwrap();
+    db.execute(
+        "INSERT INTO arrival_queue (relay, room, message, seq, position_at, raw, bytes, created_ms) \
+         VALUES ('discord', ?1, ?2, ?3, 0, ?4, 256 * 1024 * 1024, 0)",
+        rusqlite::params![room, message.to_string(), seq, raw],
+    )
+    .unwrap();
+    db
+}
+
+/// DISC-IN req. 24, 29: overflow fences its room immediately, even when a failing thread listing
+/// prevents catch-up from reaching history. Once capacity returns, REST recovers the owner message.
+#[test]
+fn queue_overflow_fences_live_passes_until_catch_up_recovers() {
+    let fake = FakeDiscord::start();
+    let mut hub = relay_hub(&fake, &[], "");
+    let blocked = "700000000000000101";
+    fake.thread(blocked, CH);
+    let baseline = 800_000_000_000_000_100;
+    fake.put(FakeDiscord::message(CH, baseline, OTHER, "already read"));
+    hub.start();
+    ready(&hub);
+    recap_delivered(&hub);
+    // Another room's queued item cannot protect this room through the store's lower-ID check.
+    let db = full_arrival_queue(&hub, blocked, baseline + 100);
+    let threads = format!("/guilds/{GUILD}/threads/active");
+    fake.fail_reads(&threads, 503);
+    fake.say(FakeDiscord::message(
+        CH,
+        baseline + 1,
+        OWNER,
+        "rejected by the full queue",
+    ));
+    hub.until(WAIT, || {
+        status(&hub)["health"]["last_error"]
+            .as_str()
+            .is_some_and(|e| e.starts_with("catch-up read:"))
+            .then_some(())
+    });
+    assert_eq!(queued(&hub, baseline + 1), 0, "overflow was not queued");
+    fake.say(FakeDiscord::message(
+        CH,
+        baseline + 2,
+        OTHER,
+        "not the owner",
+    ));
+    let mut bot = FakeDiscord::message(CH, baseline + 3, BOT, "a bot notification");
+    bot["author"]["bot"] = json!(true);
+    fake.say(bot);
+    // This ordered Gateway event commits a position without needing any arrival-queue space.
+    let barrier = "700000000000000102";
+    fake.gw(Gw::Dispatch(
+        "THREAD_CREATE",
+        json!({"id": barrier, "parent_id": CH}),
+    ));
+    hub.until(WAIT, || {
+        db.query_row(
+            "SELECT EXISTS (SELECT 1 FROM positions WHERE relay = 'discord' AND room = ?1)",
+            [barrier],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+        .then_some(())
+    });
+    let held_position: i64 = db
+        .query_row(
+            "SELECT position FROM positions WHERE relay = 'discord' AND room = ?1",
+            [CH],
+            |r| r.get(0),
+        )
+        .unwrap();
+    db.execute(
+        "DELETE FROM arrival_queue WHERE relay = 'discord' AND room = ?1",
+        [blocked],
+    )
+    .unwrap();
+    db.execute(
+        "UPDATE positions SET held = NULL WHERE relay = 'discord' AND room = ?1",
+        [blocked],
+    )
+    .unwrap();
+    fake.allow_reads(&threads);
+    hub.until(WAIT, || {
+        db.query_row(
+            "SELECT NOT EXISTS (SELECT 1 FROM relay_flags WHERE relay = 'discord' AND flag = 'catch_up') \
+             AND NOT EXISTS (SELECT 1 FROM arrival_queue WHERE relay = 'discord')",
+            [],
+            |r| r.get::<_, bool>(0),
+        )
+        .unwrap()
+        .then_some(())
+    });
+    let asked = requests(&hub);
+    assert_eq!(
+        asked.len(),
+        1,
+        "cursor while discovery failed={held_position}, requests={asked:?}"
+    );
+    assert!(asked[0].contains("rejected by the full queue"));
+    assert_eq!(held_position, i64::try_from(baseline).unwrap());
+    let creates = fake.wait_creates(1, WAIT);
+    assert_eq!(reference(&creates[0]), Some((baseline + 1).to_string()));
+    settled(&hub);
+    assert!(hub.stop().success());
 }
 
 /// Check 5: a resume URL that is not the test Gateway's is refused and the session identifies again.

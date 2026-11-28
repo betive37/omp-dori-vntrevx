@@ -137,7 +137,9 @@ operator who configures the daemon (in practice the same person).
 24. Each queued item holds the raw owner message (at most 1 MiB), the conversation's read
     position at the moment of queueing, and the parent channel if the message came from a
     followed thread. The whole queue is capped at 256 MiB; when full, a new live event is not
-    queued, a catch-up read is marked owed (req. 23), and that read recovers the message.
+    queued, a catch-up read is marked owed (req. 23), and that read recovers the message. The
+    rejected message's conversation immediately stops advancing past live non-owner messages
+    (req. 29), including while thread discovery fails before the catch-up history read begins.
 25. The queue is keyed by (channel ID, message ID). A second copy of the same key is ignored;
     the first copy wins, including its queue position. A later copy with different content is
     logged once and otherwise ignored; it never halts intake.

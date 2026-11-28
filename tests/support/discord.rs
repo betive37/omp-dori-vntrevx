@@ -331,6 +331,11 @@ impl FakeDiscord {
             .insert(path.into(), (status, None));
     }
 
+    /// Stops the scripted failure of reads at `path`.
+    pub fn allow_reads(&self, path: &str) {
+        self.state.lock().unwrap().failing_reads.remove(path);
+    }
+
     /// The next `times` GETs of `path` get `status`; later ones are answered as usual.
     pub fn fail_reads_times(&self, path: &str, status: u16, times: usize) {
         self.state
