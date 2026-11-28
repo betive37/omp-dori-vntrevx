@@ -383,8 +383,7 @@ fn intake_restart_recovers_only_recent_lead_work() {
             "the interrupted wait",
         ));
         hub.until(WAIT, || {
-            (handoffs(&hub) == 1 && queued(&hub, 800_000_000_000_000_023) == 0)
-                .then_some(())
+            (handoffs(&hub) == 1 && queued(&hub, 800_000_000_000_000_023) == 0).then_some(())
         });
         // A renewal after confirmation proves an answer round observed the busy lead.
         let typing = format!("/channels/{CH}/typing");
@@ -398,8 +397,7 @@ fn intake_restart_recovers_only_recent_lead_work() {
         // keeps the final answer held. The old pipeline remembers work; the new one needs mtime.
         hub.fixture("omp", "hold-idle", Some(""));
         hub.until(WAIT, || {
-            (hub.json(&["lead", "status", "--json"])["session"]["status"] == "idle")
-                .then_some(())
+            (hub.json(&["lead", "status", "--json"])["session"]["status"] == "idle").then_some(())
         });
         let file = session_file(&hub);
         let age = Duration::from_secs(if recent { 60 } else { 31 * 60 });
