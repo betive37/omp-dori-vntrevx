@@ -341,34 +341,58 @@ fn a_return_to_the_tern_lead_reattaches_its_port() {
         "[omp]\npath = \"{}\"\n[sessions]\nruntime = \"headless\"\ntern = \"{}\"\n\
          [lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n\
          [lanes]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n",
-        hub.root.join("bin/omp").display(), hub.root.join("bin/tern").display(),
-        work.display(), work.display(),
+        hub.root.join("bin/omp").display(),
+        hub.root.join("bin/tern").display(),
+        work.display(),
+        work.display(),
     ));
     assert!(hub.cli(&["config", "reload"]).status.success());
     let params = json!({"key":"switch-lane","title":"Switch lane","brief":"Inspect only.",
-        "look_only":true,"checks":[{"kind":"command","argv":["true"]}]}).to_string();
+        "look_only":true,"checks":[{"kind":"command","argv":["true"]}]})
+    .to_string();
     hub.json(&["lane", "open", "--params", &params, "--json"]);
     let lane = hub.until(Duration::from_secs(20), || {
         let lanes = hub.json(&["lane", "list", "--json"]);
-        lanes.as_array().unwrap().iter().find(|lane| lane["session_id"].is_string()).cloned()
+        lanes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|lane| lane["session_id"].is_string())
+            .cloned()
     });
-    let away = bridge.request("bridge.switch", &json!({
-        "session": lane["session_id"], "file": lane["session_file"], "reason": "resume",
-    }));
+    let away = bridge.request(
+        "bridge.switch",
+        &json!({
+            "session": lane["session_id"], "file": lane["session_file"], "reason": "resume",
+        }),
+    );
     assert_eq!(away["role"], "lane", "{away}");
     assert_eq!(away["tern"], false, "{away}");
-    let back = bridge.request("bridge.switch", &json!({
-        "session": "s1", "file": file, "reason": "resume",
-    }));
+    let back = bridge.request(
+        "bridge.switch",
+        &json!({
+            "session": "s1", "file": file, "reason": "resume",
+        }),
+    );
     assert_eq!(back["role"], "lead", "{back}");
     assert_eq!(back["tern"], true, "{back}");
 
     let idle = json!({"idle":true,"session":"s1","file":file});
-    let mut sending = hub.command(&["lead", "send", "after return"]).spawn().unwrap();
+    let mut sending = hub
+        .command(&["lead", "send", "after return"])
+        .spawn()
+        .unwrap();
     let cmd = bridge.command(&idle);
     assert_eq!(cmd["op"], "deliver", "{cmd}");
-    assert!(cmd["text"].as_str().unwrap().contains("after return"), "{cmd}");
-    write_entry(&file, cmd["text"].as_str().unwrap(), cmd["id"].as_str().unwrap());
+    assert!(
+        cmd["text"].as_str().unwrap().contains("after return"),
+        "{cmd}"
+    );
+    write_entry(
+        &file,
+        cmd["text"].as_str().unwrap(),
+        cmd["id"].as_str().unwrap(),
+    );
     bridge.reply(&cmd, json!({"sent":true}));
     bridge.event("s1", "agent_start", &json!({}));
     bridge.event("s1", "agent_end", &json!({"will_continue":false}));
@@ -377,7 +401,9 @@ fn a_return_to_the_tern_lead_reattaches_its_port() {
         let status = hub.json(&["lead", "status", "--json"]);
         (status["sent"] == 0 && status["waiting"] == 0).then_some(())
     });
-    let _ = std::process::Command::new("kill").arg(pid.to_string()).status();
+    let _ = std::process::Command::new("kill")
+        .arg(pid.to_string())
+        .status();
 }
 
 /// A compaction's recap waits for a delivery still in flight to the lead, whose reply only the

@@ -504,7 +504,10 @@ mod tests {
             links.place(&[60, 50, 40, 1]),
             Some(("h2".into(), Some(Role::Lane)))
         );
-        assert_eq!(links.place(&[41, 40]), Some(("h1".into(), Some(Role::Lead))));
+        assert_eq!(
+            links.place(&[41, 40]),
+            Some(("h1".into(), Some(Role::Lead)))
+        );
         assert_eq!(links.place(&[41, 1]), None);
     }
 
@@ -514,19 +517,32 @@ mod tests {
         links.connect("lead", Role::Lead, "lead-key", "lead-session");
         links.adopt(40, "lead", Role::Lead);
         links.revoke("lead", "stale-key");
-        assert_eq!(links.place(&[41, 40]), Some(("lead".into(), Some(Role::Lead))));
+        assert_eq!(
+            links.place(&[41, 40]),
+            Some(("lead".into(), Some(Role::Lead)))
+        );
 
         links.revoke("lead", "lead-key");
         assert_eq!(links.by_key("lead-key"), None);
         assert_eq!(links.place(&[41, 40]), Some(("lead".into(), None)));
         links.connect("lane", Role::Lane, "lane-key", "lane-session");
         links.adopt(40, "lane", Role::Lane);
-        assert_eq!(links.place(&[41, 40]), Some(("lane".into(), Some(Role::Lane))));
+        assert_eq!(
+            links.place(&[41, 40]),
+            Some(("lane".into(), Some(Role::Lane)))
+        );
         links.revoke("lead", "lead-key");
-        assert_eq!(links.place(&[41, 40]), Some(("lane".into(), Some(Role::Lane))));
+        assert_eq!(
+            links.place(&[41, 40]),
+            Some(("lane".into(), Some(Role::Lane)))
+        );
         links.revoke("lane", "lane-key");
         assert_eq!(links.place(&[41, 40]), Some(("lane".into(), None)));
-        assert_eq!(links.place(&[99]), None, "only a non-session process may be owner");
+        assert_eq!(
+            links.place(&[99]),
+            None,
+            "only a non-session process may be owner"
+        );
     }
 
     /// A hello is a connection, not a new conversation: only a new conversation, or the lead's

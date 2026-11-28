@@ -406,9 +406,8 @@ pub(crate) async fn serve<R, W>(
                         if r == Role::Lane && pin.is_none() {
                             None
                         } else {
-                            let target = (h != handle && !sub)
-                                .then(|| hub.links.port(&h))
-                                .flatten();
+                            let target =
+                                (h != handle && !sub).then(|| hub.links.port(&h)).flatten();
                             let attached = target.as_ref().is_none_or(|port| {
                                 let mut hello = raw.clone();
                                 if let Some(map) = hello.as_object_mut() {
