@@ -6,7 +6,8 @@
   run only on the stepped days, combining the two day fields the way standard cron does: when either
   day field starts with `*`, both must match. So `0 0 */2 * mon` now fires only on odd-day Mondays,
   fewer days than before. A next run already saved for a day the new rule excludes moves to the next
-  valid day instead of firing.
+  valid day instead of firing. The search covers 40-year gaps between rare date-and-weekday matches,
+  such as leap-day Sundays from 2088 to 2128 across the non-leap year 2100.
 
 ## 0.2.8 (2026-11-28)
 

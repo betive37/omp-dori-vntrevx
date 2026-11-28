@@ -8,9 +8,9 @@ use jiff::Timestamp;
 use jiff::civil::{Date, DateTime};
 use jiff::tz::{AmbiguousOffset, TimeZone};
 
-/// Days searched for the next occurrence. Weekdays and dates repeat every 28 years within a century, so
-/// any satisfiable expression (even 29 February on a given weekday) fires within this window.
-const SEARCH_DAYS: u32 = 366 * 28;
+/// Days searched for the next occurrence. A date-and-weekday pair can be 40 years apart:
+/// 29 February falls on a Sunday in 2088 and next in 2128 because 2100 is not a leap year.
+const SEARCH_DAYS: u32 = 366 * 40;
 
 /// A parsed five-field cron expression.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,7 +179,7 @@ impl Cron {
         }
     }
 
-    /// The first occurrence strictly after `after`, in `tz`; `None` if none exists within 28 years.
+    /// The first occurrence strictly after `after`, in `tz`; `None` if none exists within 40 years.
     pub(crate) fn next_after(&self, tz: &TimeZone, after: Timestamp) -> Option<Timestamp> {
         let start = after.to_zoned(tz.clone()).datetime();
         let mut date = start.date();
@@ -342,6 +342,15 @@ mod tests {
         assert_eq!(
             next_n(&c, &TimeZone::UTC, ts("2033-01-01T00:00:00Z"), 1),
             ["2060-02-29T00:00:00Z"]
+        );
+    }
+
+    #[test]
+    fn leap_day_sunday_across_non_leap_century_is_found() {
+        let c = parse("0 0 29 2 */7").unwrap();
+        assert_eq!(
+            c.next_after(&TimeZone::UTC, ts("2088-02-29T00:00:00Z")),
+            Some(ts("2128-02-29T00:00:00Z"))
         );
     }
 
