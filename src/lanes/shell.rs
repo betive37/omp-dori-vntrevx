@@ -2,7 +2,8 @@
 //! built-in rule 0 every session's shell obeys (the lead's, each lane's and their subagents'), and
 //! for lanes the snapshot taken at open, the verdict on one command and one-attempt grants. Rule 0
 //! cannot be granted: no `omp usage reset`, no `omp config set` of a reset setting, and no `cataly`
-//! verb beyond the read-only ones. A line that runs the session's own bridge tool by name
+//! verb beyond the read-only ones and `slot`, whose command after `--` must pass rule 0 itself
+//! (LANE req. 21, COORD req. 5). A line that runs the session's own bridge tool by name
 //! (`cataly_lead`, `cataly_lane`), which OMP offers only as a direct call, is refused with a pointer
 //! to that call. Rule 0 guards against mistakes, not against deliberate escape; the control socket's
 //! roles are the boundary (DESIGN 8).
@@ -11,7 +12,8 @@ use std::collections::HashMap;
 
 use super::record::Grant;
 
-/// `cataly` verbs a session's shell may run (DESIGN 8).
+/// `cataly` verbs a session's shell may run (DESIGN 8). `slot` may run too when the command it
+/// wraps passes rule 0 (`segment_blocked`).
 const READ_ONLY: [&str; 5] = ["status", "events", "stats", "version", "help"];
 /// `cataly` verbs that change something; after a command word the hub cannot resolve, one of them
 /// fails closed.
@@ -189,7 +191,30 @@ fn segment_blocked(raw: &[String], words: &[Option<String>], depth: usize) -> bo
         return nested || unknown_blocked(0);
     };
     let any_position = RUNNERS.contains(&base(command)) || command.starts_with(['<', '>']);
+    // `cataly slot` at `s` runs the command after the first literal `--` without a shell: that
+    // command is judged as its own segment. A word before `--` the hub cannot resolve, or one with
+    // spaces, may expand to `--` and a command, so it fails closed. Without `--` nothing runs.
+    let slot_blocked = |s: usize| {
+        let after = words.get(s + 1..).unwrap_or_default();
+        let dash = after
+            .iter()
+            .position(|w| w.as_deref() == Some("--"))
+            .unwrap_or(after.len());
+        let (head, tail) = after.split_at(dash);
+        let wrapped = tail.get(1..).unwrap_or_default();
+        head.iter()
+            .any(|w| w.as_ref().is_none_or(|w| w.chars().any(char::is_whitespace)))
+            || (!tail.is_empty()
+                && segment_blocked(
+                    raw.get(raw.len() - wrapped.len()..).unwrap_or_default(),
+                    wrapped,
+                    depth + 1,
+                ))
+    };
     let blocked_here = |i: usize, word: &str| match base(word) {
+        "cataly" if words.get(i + 1).is_some_and(|w| w.as_deref() == Some("slot")) => {
+            slot_blocked(i + 1)
+        }
         "cataly" => cataly_writes(&rest(i + 1)),
         "omp" => omp_spends(&rest(i + 1)),
         _ => false,
@@ -225,7 +250,7 @@ fn blocked_at(command: &str, depth: usize) -> bool {
 }
 
 /// The built-in rule 0 (DESIGN 9.2): whether `command` would spend a saved reset or run a `cataly`
-/// verb that changes anything.
+/// verb that changes anything; `cataly slot` is judged by the command it wraps.
 pub(crate) fn rule_zero(command: &str) -> bool {
     blocked_at(command, 0)
 }
@@ -448,6 +473,44 @@ mod tests {
         ] {
             assert!(!rule_zero(cmd), "{cmd}");
         }
+    }
+
+    /// A session may wait for a slot (LANE req. 21, COORD req. 5); the command after `--` is judged
+    /// as its own line, and a word before `--` the hub cannot see through fails closed.
+    #[test]
+    fn a_slot_is_judged_by_the_command_it_wraps() {
+        let deny = [re("git push")];
+        let mut grants = Vec::new();
+        for cmd in [
+            "cataly slot build -- cargo test",
+            "cataly slot b --lane k --priority 3 -- make -j4",
+            "/usr/bin/cataly slot b -- true",
+            "cataly slot b -- cataly status",
+            "env cataly slot b -- make",
+            "cataly slot --help",
+        ] {
+            assert!(!rule_zero(cmd), "{cmd}");
+            assert!(judge(cmd, &deny, &[], &mut grants).allowed, "{cmd}");
+        }
+        for cmd in [
+            "cataly slot b -- cataly lane close x",
+            "cataly slot b -- omp usage reset",
+            "cataly slot b -- sh -c 'cataly lead send hi'",
+            "cataly slot b -- env cataly job disable a",
+            "cataly slot b -- $TOOL lane close x",
+            "cataly slot b -- cataly slot c -- cataly lead stop",
+            "cataly slot $UNSET -- make",
+            "x='-- cataly lane close x'; cataly slot b $x",
+            "env cataly slot b -- cataly hub stop",
+        ] {
+            assert!(rule_zero(cmd), "{cmd}");
+            assert_eq!(judge(cmd, &deny, &[], &mut grants).rules, [0], "{cmd}");
+        }
+        // Configured deny rules still see the wrapped command.
+        assert_eq!(
+            judge("cataly slot b -- git push", &deny, &[], &mut grants).rules,
+            [1]
+        );
     }
 
     #[test]

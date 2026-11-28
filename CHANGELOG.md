@@ -1,5 +1,13 @@
 # Changelog
 
+## Unreleased
+
+- A lane (or the lead) can wrap a heavy command in `cataly slot <name> -- <command>`, as LANE
+  req. 21 and COORD req. 5 allow. Built-in shell rule 0 refused every `cataly slot` line, so a lane
+  had no way to queue for a slot. The command after `--` is now judged by rule 0 as its own line:
+  `cataly slot b -- cargo test` runs, `cataly slot b -- omp usage reset` is still refused, and a
+  word before `--` the hub cannot resolve fails closed.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
