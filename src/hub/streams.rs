@@ -69,6 +69,8 @@ struct State {
     last_exit: Option<String>,
     next_restart: Option<Instant>,
     stop: watch::Sender<bool>,
+    /// The start this state belongs to; a stopped start's task never touches a later one.
+    run: String,
 }
 
 /// Running stream jobs.
@@ -165,6 +167,7 @@ impl Streams {
                             last_exit: spec.last_exit,
                             next_restart: None,
                             stop: watch::channel(true).0,
+                            run: spec.run,
                         },
                     );
                 }
@@ -255,15 +258,21 @@ impl Streams {
                 last_exit: None,
                 next_restart: None,
                 stop,
+                run: spec.run.clone(),
             },
         );
         let me = Arc::clone(self);
         tokio::spawn(async move { me.run(spec, stopped).await });
     }
 
-    fn update(&self, name: &str, f: impl FnOnce(&mut State)) {
-        if let Some(s) = self.lock().get_mut(name) {
-            f(s);
+    /// Changes the job's state if it still belongs to this start; false when it does not.
+    fn update(&self, spec: &Spec, f: impl FnOnce(&mut State)) -> bool {
+        match self.lock().get_mut(&spec.name) {
+            Some(s) if s.run == spec.run => {
+                f(s);
+                true
+            }
+            _ => false,
         }
     }
 
@@ -303,11 +312,17 @@ impl Streams {
         }
     }
 
-    /// Whether the hub is stopping, waiting `STOP_GRACE` for its stop to show.
-    async fn hub_stopping(&self) -> bool {
+    /// Whether the hub or this job is stopping, waiting `STOP_GRACE` for either stop to show.
+    async fn stopping(&self, stopped: &mut watch::Receiver<bool>) -> bool {
         let mut shutdown = self.shutdown.clone();
-        let _ = tokio::time::timeout(STOP_GRACE, shutdown.wait_for(|stop| *stop)).await;
-        *shutdown.borrow()
+        let _ = tokio::time::timeout(STOP_GRACE, async {
+            tokio::select! {
+                _ = shutdown.wait_for(|stop| *stop) => {}
+                _ = stopped.wait_for(|stop| *stop) => {}
+            }
+        })
+        .await;
+        *shutdown.borrow() || *stopped.borrow()
     }
 
     /// Runs the command until it is stopped or its restarts are used up (WS req. 73).
@@ -338,13 +353,16 @@ impl Streams {
             let Some(exit) = ended else {
                 return;
             };
-            if self.hub_stopping().await {
+            if self.stopping(&mut stopped).await
+                || !self.update(&spec, |s| s.last_exit = Some(exit.clone()))
+            {
                 return;
             }
-            self.update(&spec.name, |s| s.last_exit = Some(exit.clone()));
             spec.last_exit = Some(exit.clone());
             if attempt >= spec.restarts {
-                self.update(&spec.name, |s| s.phase = "exhausted");
+                if !self.update(&spec, |s| s.phase = "exhausted") {
+                    return;
+                }
                 spec.ended = true;
                 self.keep_progress(&spec).await;
                 let reason = format!("exited ({exit}) and no restart is left");
@@ -357,7 +375,7 @@ impl Streams {
             attempt += 1;
             spec.used = attempt;
             self.keep_progress(&spec).await;
-            self.update(&spec.name, |s| {
+            self.update(&spec, |s| {
                 s.restarts = attempt;
                 s.phase = "waiting";
                 s.next_restart = Some(Instant::now() + wait);
@@ -366,7 +384,7 @@ impl Streams {
                 () = tokio::time::sleep(wait) => {}
                 _ = stopped.changed() => return,
             }
-            self.update(&spec.name, |s| {
+            self.update(&spec, |s| {
                 s.phase = "running";
                 s.next_restart = None;
             });
@@ -600,5 +618,34 @@ mod tests {
         new.used = 2;
         streams.keep_progress(&new).await;
         assert_eq!(kept_specs(&ctx).await[0].used, 2);
+    }
+
+    /// The late exit of a stopped start changes nothing of the job started again under its name.
+    #[tokio::test]
+    async fn a_stopped_start_does_not_touch_the_new_job() {
+        let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-late-exit");
+        let streams = Streams::new(
+            crate::jobs::tests::jobs_of(&ctx),
+            ctx.store.clone(),
+            dir.to_path_buf(),
+            dir.join("files"),
+            watch::channel(false).1,
+        );
+        streams
+            .start(&json!({"name": "same", "argv": ["sleep", "1000"]}))
+            .await
+            .unwrap();
+        let old = spec_of(&json!({"name": "same", "argv": ["sh", "-c", "exit 1"], "restarts": 0}))
+            .unwrap();
+        let (_old_stop, stopped) = watch::channel(false);
+        Arc::clone(&streams).run(old, stopped).await;
+        let list = streams.list();
+        assert!(
+            list.starts_with("- same: running, 0 restart(s), last exit none"),
+            "{list}"
+        );
+        let events = ctx.store.read(|r| r.events_after(0, 10)).await.unwrap();
+        assert!(events.is_empty(), "{events:?}");
+        streams.stop("same").await.unwrap();
     }
 }
