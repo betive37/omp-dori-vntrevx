@@ -188,7 +188,7 @@ export class Bridge {
 				this.session = id;
 				owners.set(String(ctx.agent?.id), id);
 				const answer = await this.request("bridge.switch", { session: id, file: this.file(), ...transition }, TOOL_MS);
-				this.apply(answer);
+				this.apply(answer ?? { role: "none" });
 				this.capabilities();
 			}
 			return;
@@ -284,7 +284,7 @@ export class Bridge {
 		}
 		const wait = BACKOFF_S[Math.min(this.attempt, BACKOFF_S.length - 1)] * 1000;
 		this.attempt += 1;
-		this.timer(() => void this.connect(), wait, false);
+		this.timer(() => { if (!this.wired || this.role !== "none") void this.connect(); }, wait, false);
 	}
 
 	closed(): void {

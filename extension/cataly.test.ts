@@ -133,6 +133,40 @@ test.each(["session_switch", "session_branch", "session_tree"])("a switch replac
 	await expect(leadTool.execute("after-none", {}, undefined, undefined, ctx)).rejects.toThrow("not available");
 });
 
+test.each(["offline", "disconnect"])("a missing switch reply drops authority and cancels queued reconnects (%s)", async mode => {
+	const pi = fakePi();
+	let session = "s1", connections = 0;
+	let disconnect: (() => void) | undefined;
+	const retries: (() => void)[] = [];
+	const connect: Deps["connect"] = async (_path, onLine, onClose) => {
+		connections += 1;
+		disconnect = onClose;
+		return {
+			write(line) {
+				const msg = JSON.parse(line);
+				if (msg.method === "bridge.hello") queueMicrotask(() => onLine(JSON.stringify({ id: msg.id, ok: {
+					role: "lead", key: "old-key", tools: [{ name: "cataly_lead", parameters: { type: "object" } }],
+				} })));
+				if (msg.method === "bridge.switch") onClose();
+			},
+			close: onClose,
+		};
+	};
+	const ctx = { ...ctxOf(pi), setTimeout: (fn: () => void) => { retries.push(fn); return 0; } };
+	ctx.sessionManager.getSessionId = () => session;
+	const b = bridge(pi, { env: { CATALY_LAUNCH: "token" }, connect, uid: () => 1 });
+	await pi.emit("session_start", {}, ctx);
+	if (mode === "offline") disconnect?.();
+	session = "unrelated";
+	await pi.emit("session_switch", { reason: "resume" }, ctx);
+	await b.toolsActive;
+	expect([b.role, b.key, b.wire]).toEqual(["none", undefined, undefined]);
+	expect(pi.active()).toEqual(["read", "bash"]);
+	for (const retry of retries) retry();
+	expect(connections).toBe(1);
+	await expect(pi.tools[0].execute("after-lost-switch", {}, undefined, undefined, ctx)).rejects.toThrow("not available");
+});
+
 test("events are buffered while disconnected, oldest dropped first", () => {
 	const pi = fakePi();
 	const b = bridge(pi, { env: {}, connect: fakeHub("lead", [], { n: 0 }), uid: () => 1 });

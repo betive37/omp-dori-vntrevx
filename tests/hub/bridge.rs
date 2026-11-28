@@ -88,6 +88,47 @@ fn lead_hub() -> (TestHub, Value) {
     (hub, session)
 }
 
+fn open_lane(hub: &TestHub) -> Value {
+    let params = json!({"key":"switch-lane","title":"Switch lane","brief":"Inspect only.",
+        "look_only":true,"checks":[{"kind":"command","argv":["true"]}]})
+    .to_string();
+    hub.json(&["lane", "open", "--params", &params, "--json"]);
+    hub.until(Duration::from_secs(20), || {
+        let lanes = hub.json(&["lane", "list", "--json"]);
+        lanes
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|lane| lane["session_id"].is_string())
+            .cloned()
+    })
+}
+
+#[test]
+fn bridge_switch_keeps_branch_and_fork_roles() {
+    let (mut hub, lead) = lead_hub();
+    let lane = open_lane(&hub);
+    let mut bridge = Bridge::lead(&hub, &lead);
+    for (role, original) in [("lead", &lead), ("lane", &lane)] {
+        assert_eq!(bridge.switch(original, "resume")["role"], role);
+        for (reason, branch) in [
+            ("session_branch", "rewind"),
+            ("session_branch", "btw"),
+            ("fork", "fork"),
+        ] {
+            let fresh = json!({
+                "session_id": format!("{role}-{branch}"),
+                "session_file": format!("/{role}-{branch}.jsonl"),
+            });
+            let answer = bridge.switch(&fresh, reason);
+            assert_eq!(answer["role"], role, "{role} {branch}: {answer}");
+            assert_eq!(answer["tools"][0]["name"], format!("cataly_{role}"));
+        }
+    }
+    drop(bridge);
+    hub.stop();
+}
+
 #[test]
 fn bridge_switch_to_unrelated_session_revokes_lead_tools() {
     let (mut hub, lead) = lead_hub();
@@ -117,19 +158,7 @@ fn bridge_switch_rechecks_lead_and_lane_identity_except_for_new() {
     assert_eq!(bridge.switch(&fresh, "new")["role"], "lead");
     assert_eq!(bridge.switch(&lead, "resume")["role"], "lead");
 
-    let params = json!({"key":"switch-lane","title":"Switch lane","brief":"Inspect only.",
-        "look_only":true,"checks":[{"kind":"command","argv":["true"]}]})
-    .to_string();
-    hub.json(&["lane", "open", "--params", &params, "--json"]);
-    let lane = hub.until(Duration::from_secs(20), || {
-        let lanes = hub.json(&["lane", "list", "--json"]);
-        lanes
-            .as_array()
-            .unwrap()
-            .iter()
-            .find(|lane| lane["session_id"].is_string())
-            .cloned()
-    });
+    let lane = open_lane(&hub);
     let answer = bridge.switch(&lane, "resume");
     assert_eq!(answer["role"], "lane", "{answer}");
     assert_eq!(answer["tools"][0]["name"], "cataly_lane");

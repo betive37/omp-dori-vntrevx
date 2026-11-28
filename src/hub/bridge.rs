@@ -130,7 +130,7 @@ async fn decide(hub: &Hub, hello: &Hello) -> Result<(String, Role, bool), String
     Err("not a session of this hub".into())
 }
 
-/// A switch without `reason: new` carries no authority from the previous conversation (EXT req. 8).
+/// A resume or tree move carries no authority from the previous conversation (EXT req. 8).
 /// Match both the ID and transcript before forwarding the transition to the terminal port.
 async fn switched(hub: &Hub, params: &Value) -> Option<(String, Role)> {
     let session = params.get("session")?.as_str()?.to_string();
@@ -286,6 +286,7 @@ pub(crate) async fn serve<R, W>(
         Ok(found) => found,
         Err(reason) => return refuse(hub, &mut writer, id, hello.ext != PROTOCOL, reason).await,
     };
+    let mut adopted_pid = None;
     if let Some(pid) = pid.and_then(|p| u32::try_from(p).ok()) {
         // A process that started the hub (one of its ancestors) is the owner's environment, which
         // every owner command shares, not a session's: it is never placed in the session's role.
@@ -296,6 +297,7 @@ pub(crate) async fn serve<R, W>(
             .contains(&pid)
         {
             hub.links.adopt(pid, &handle, role);
+            adopted_pid = Some(pid);
         }
     }
     if !sub {
@@ -386,7 +388,10 @@ pub(crate) async fn serve<R, W>(
                     .unwrap_or_default();
                 let next = if current.is_empty() {
                     None
-                } else if request.params.get("reason").and_then(Value::as_str) == Some("new") {
+                } else if matches!(
+                    request.params.get("reason").and_then(Value::as_str),
+                    Some("new" | "fork" | "session_branch")
+                ) {
                     Some((handle.clone(), role))
                 } else {
                     switched(hub, &request.params).await
@@ -398,11 +403,28 @@ pub(crate) async fn serve<R, W>(
                         } else {
                             None
                         };
-                        (r != Role::Lane || pin.is_some()).then_some((h, r, pin))
+                        if r == Role::Lane && pin.is_none() {
+                            None
+                        } else {
+                            let target = (h != handle && !sub)
+                                .then(|| hub.links.port(&h))
+                                .flatten();
+                            let attached = target.as_ref().is_none_or(|port| {
+                                let mut hello = raw.clone();
+                                if let Some(map) = hello.as_object_mut() {
+                                    map.insert("session".into(), json!(current));
+                                    if let Some(file) = request.params.get("file") {
+                                        map.insert("file".into(), file.clone());
+                                    }
+                                }
+                                port.attach(&hello, &key, tx.clone()).is_ok()
+                            });
+                            attached.then_some((h, r, pin, target))
+                        }
                     }
                     _ => None,
                 };
-                let answer = if let Some((next_handle, next_role, pin)) = next {
+                let answer = if let Some((next_handle, next_role, pin, target)) = next {
                     if next_handle != handle {
                         hub.links.revoke(&handle, &key);
                         if let Some(old) = port.take() {
@@ -410,13 +432,19 @@ pub(crate) async fn serve<R, W>(
                         }
                         handle = next_handle;
                         role = next_role;
+                        port = target;
+                        if let Some(pid) = adopted_pid {
+                            hub.links.adopt(pid, &handle, role);
+                        }
                         if !sub {
                             hub.links.connect(&handle, role, &key, current);
-                            let mut hello = raw.clone();
-                            if let Some(map) = hello.as_object_mut() {
-                                map.insert("session".into(), json!(current));
+                            if port.is_none() {
+                                let mut hello = raw.clone();
+                                if let Some(map) = hello.as_object_mut() {
+                                    map.insert("session".into(), json!(current));
+                                }
+                                hub.links.open_query(&handle, &key, &hello, tx.clone());
                             }
-                            hub.links.open_query(&handle, &key, &hello, tx.clone());
                         }
                     }
                     current.clone_into(&mut session);

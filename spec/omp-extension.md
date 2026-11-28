@@ -139,12 +139,15 @@ logic can move to Rust, leaving the extension as a forwarder.
    carries the ID observed after the flush. If the flush fails, the extension does not connect and shows one
    warning.
 8. On session switch, branch move and tree move, the extension sends a transition event with the new session ID
-   and file. The daemon answers with the role for the new session (rule 4). A switch caused by the new-session
-   command keeps the previous role: the extension re-appends the marker to the fresh session and the daemon links
-   the new session ID to the same lane or lead record (lane-lifecycle requirement 38). Other reasons
-   are resolved against the stored lead anchor or an open lane's current session ID and transcript
-   file, not the connection's previous role. An unrelated session loses its reconnect key and tools;
-   subsequent calls on the old connection are refused.
+   and file. The daemon answers with the role for the new session (rule 4). New-session and fork commands,
+   and session branches (including rewind and btw promotion), mint a continuing session and keep the previous
+   role: the extension re-appends the marker and the daemon links the new ID to the same lane or lead record
+   (lane-lifecycle requirement 38). Resumes and tree moves are resolved against the stored lead anchor or an
+   open lane's current session ID and transcript file, not the connection's previous role. Returning to a
+   terminal session reattaches its port only after the normal process-ID and session checks. An unrelated
+   session loses its reconnect key, tools and process role; its CLI children remain unplaced, never owner.
+   Subsequent calls on the old connection are refused. A missing switch reply also clears the extension's
+   role and key and cancels queued reconnects with the old authority.
 9. Subagents: in the same process, a subagent's events carry agent kind "sub"; the extension sends them on the
    parent's connection, tagged with the subagent ID. A subagent running as a separate worker opens its own
    connection and its hello names the parent session ID from the session header; the daemon applies the parent's
