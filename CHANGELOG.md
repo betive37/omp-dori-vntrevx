@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A slot waiter started without `--timeout` waits until it is granted or cancelled, as LANE
+  req. 21 says. It gave up after an hour with no change in its queue place ("no grant for slot
+  … within the timeout") and its command never ran, so a heavy job held for over an hour failed
+  every command queued behind it.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
