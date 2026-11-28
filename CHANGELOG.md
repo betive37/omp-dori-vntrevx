@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Korean or other multi-byte text from the hub could reach the OMP extension with U+FFFD in it
+  when a character was split between two socket reads. The extension now decodes the stream
+  across reads, so the text arrives intact.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
