@@ -613,7 +613,9 @@ export class Bridge {
 		const async = (result?.details as Json | undefined)?.async as Json | undefined;
 		if (!call?.running || !async || async.state === "running") return;
 		[call.running, call.error] = [false, async.state !== "completed"];
-		call.fingerprint = call.error ? undefined : fingerprint(call.tool, result);
+		// Job bookkeeping is not part of the foreground result's evidence identity.
+		const { async: _, ...details } = result?.details as Json;
+		call.fingerprint = call.error ? undefined : fingerprint(call.tool, { ...result, details });
 		this.event("tool_job_end", { call: id, tool: e.toolName, job: async.jobId, state: async.state });
 	}
 

@@ -5,7 +5,8 @@
 - A lane could cite a build or test that OMP had moved to the background after 60 s, and the
   still-running call counted as evidence. The extension now reports such a call as running, and the
   hub refuses it until OMP reports its job finished; a completed job then counts with its final
-  result, a failed or cancelled one stays refused.
+  result and the same evidence identity as the equivalent foreground result, without job
+  bookkeeping. A failed or cancelled one stays refused.
 
 ## 0.2.8 (2026-11-28)
 
