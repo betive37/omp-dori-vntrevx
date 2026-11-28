@@ -422,6 +422,32 @@ async fn check(
     }
 }
 
+/// A policy list, bounded by the PR's advertised count. The caller checks the final snapshot
+/// and count too: a short page (including GitHub's commit-list cap) is not proof of completeness.
+async fn policy_list(path: &str, count: usize, cwd: &Path) -> Result<Vec<Value>, String> {
+    const PAGE: usize = 100;
+    let mut rows = Vec::new();
+    for page in 1..=count.div_ceil(PAGE).max(1) {
+        let answer = gh(&format!("{path}?per_page={PAGE}&page={page}"), cwd).await?;
+        let Value::Array(batch) = answer else {
+            return Err(format!("{path}: not a list"));
+        };
+        let n = batch.len();
+        rows.extend(batch);
+        if n < PAGE {
+            break;
+        }
+    }
+    Ok(rows)
+}
+
+fn policy_count(pr: &Value, field: &str) -> Result<usize, String> {
+    pr.get(field)
+        .and_then(Value::as_u64)
+        .and_then(|n| usize::try_from(n).ok())
+        .ok_or_else(|| format!("missing or invalid PR {field} count"))
+}
+
 /// The pull-request policy (EVR req. 58).
 async fn policy(
     repo: &str,
@@ -436,33 +462,38 @@ async fn policy(
         .ok_or("the repository has no configured identity")?;
     let path = format!("repos/{repo}/pulls/{number}");
     let before = gh(&path, cwd).await?;
-    let commits = gh(
-        &format!("repos/{repo}/pulls/{number}/commits?per_page=100"),
-        cwd,
-    )
-    .await?;
-    let files = gh(
-        &format!("repos/{repo}/pulls/{number}/files?per_page=100"),
-        cwd,
-    )
-    .await?;
+    let commit_count = policy_count(&before, "commits")?;
+    let file_count = policy_count(&before, "changed_files")?;
+    if file_count > FILES_MAX {
+        return Err("more than 3000 files".into());
+    }
+    let commits = policy_list(&format!("{path}/commits"), commit_count, cwd).await?;
+    let files = policy_list(&format!("{path}/files"), file_count, cwd).await?;
     let after = gh(&path, cwd).await?;
-    let marks = |v: &Value| {
-        (
-            v.pointer("/head/sha").cloned(),
-            v.get("body").cloned(),
-            v.get("commits").cloned(),
-        )
-    };
-    if marks(&before) != marks(&after) {
+    if before.pointer("/head/sha") != after.pointer("/head/sha")
+        || ["body", "commits", "changed_files"]
+            .iter()
+            .any(|key| before.get(key) != after.get(key))
+    {
         return Err("moved while being checked".into());
     }
-    let files = files.as_array().cloned().unwrap_or_default();
     if files.len() > FILES_MAX {
         return Err("more than 3000 files".into());
     }
+    for (name, rows, field) in [
+        ("commits", &commits, "commits"),
+        ("files", &files, "changed_files"),
+    ] {
+        let expected = policy_count(&after, field)?;
+        if rows.len() != expected {
+            return Err(format!(
+                "incomplete {name}: read {}, expected {expected}",
+                rows.len()
+            ));
+        }
+    }
     let mut fix = false;
-    for c in commits.as_array().cloned().unwrap_or_default() {
+    for c in commits {
         let email = |who: &str| {
             c.pointer(&format!("/commit/{who}/email"))
                 .and_then(Value::as_str)

@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- A lane's pull-request policy check could pass after reading only the first 100 commits or files.
+  It now reads every page, refuses incomplete lists, and rejects pull requests with over 3000 files.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

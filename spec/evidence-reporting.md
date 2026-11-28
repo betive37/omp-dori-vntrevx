@@ -264,9 +264,10 @@ lane lifecycle area consumes the completion checker, the step records and the pu
 58. Policy pass: every commit's author and committer email equals the repository's configured identity (case
     insensitive), except that a merge commit's committer may be GitHub's no-reply address; and if any fix-type commit
     changes source files, the pull request adds or changes a test file or its description gives an explicit no-test
-    reason. The pull request head, description and commit count are read before and after; any change fails with
-    "moved while being checked". More than 3000 files in a commit or the pull request fails. A repository without a
-    configured identity fails.
+    reason. All commit and file pages are read; their totals must match the pull request's commit and changed-file
+    counts, or the check fails as incomplete. The head, description and both counts are read before and after;
+    any change fails with "moved while being checked". More than 3000 files in a commit or the pull request fails.
+    A repository without a configured identity fails.
 
 ### Message from the lead to a lane (EVR-33, EVR-34)
 
