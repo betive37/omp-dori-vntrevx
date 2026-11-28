@@ -11,10 +11,12 @@
 //!   threads the account posted in (thread memory: one room per thread, `<channel>:<root ts>`, whose
 //!   position is the seen timestamp). Every envelope is acknowledged within 3 s, after the event was
 //!   admitted or dropped. After start and every reconnect, remembered threads and DMs are read from
-//!   their positions (200 at most, oldest first). A failed catch-up read reconnects before taking
-//!   live events, so their hand-off cannot skip unread messages. Own and bot messages are dropped;
-//!   a reply whose channel or root disagrees with where it was read stops that read. Only allowlisted
-//!   senders are admitted (owner decision 10: the owner alone by default).
+//!   their positions (200 at most, oldest first). A transient catch-up failure reconnects before
+//!   taking live events, so their hand-off cannot skip unread messages. A permanent read failure
+//!   holds only that room until released, preserving its position while other rooms continue.
+//!   Own and bot messages are dropped; a reply whose channel or root disagrees with where it was read
+//!   stops that read. Only allowlisted senders are admitted (owner decision 10: the owner alone by
+//!   default).
 //! - Posts (SLACK req. 45-47): a post answers in the request's thread and records that thread; the
 //!   answer must carry the channel and a `digits.digits` timestamp, else it is uncertain. Uploads
 //!   allocate a ticket whose URL must be https on exactly `files.slack.com` under Slack's upload path
@@ -119,6 +121,15 @@ pub(crate) struct ApiError {
     /// Slack's error code, or a transport reason.
     pub(crate) why: String,
     pub(crate) uncertain: bool,
+}
+
+impl ApiError {
+    /// Transport, server and rate-limit failures may pass without changing the room or credentials.
+    fn retryable_read(&self) -> bool {
+        self.status.is_none_or(|s| matches!(s, 408 | 429 | 500..=599))
+            || UNCERTAIN_ERRORS.contains(&self.why.as_str())
+            || self.why == "ratelimited"
+    }
 }
 
 impl std::fmt::Display for ApiError {
@@ -1177,11 +1188,26 @@ impl<T: Runtime> Socket<T> {
                 ),
                 None => continue,
             };
-            let v = self
-                .api
-                .call(method, &args, Kind::Read, false)
-                .await
-                .map_err(|e| e.to_string())?;
+            let v = match self.api.call(method, &args, Kind::Read, false).await {
+                Ok(v) => v,
+                Err(e) if e.retryable_read() => return Err(e.to_string()),
+                Err(e) => {
+                    let reason = format!("catch-up read: {e}");
+                    log::warn(
+                        "Slack catch-up read refused",
+                        &[("room", &p.room), ("error", &reason)],
+                    );
+                    self.store
+                        .relay(RelayWrite::Hold {
+                            relay: NAME.into(),
+                            room: p.room.clone(),
+                            reason: Some(reason),
+                        })
+                        .await
+                        .map_err(|e| e.to_string())?;
+                    continue;
+                }
+            };
             let mut messages: Vec<Value> = v
                 .get("messages")
                 .and_then(Value::as_array)
@@ -1241,6 +1267,36 @@ mod tests {
         assert!(socket_url("wss://evil.example/link", false).is_none());
         assert!(socket_url("ws://127.0.0.1:9/link", true).is_some());
         assert!(socket_url("ws://127.0.0.1:9/link", false).is_none());
+    }
+
+    #[test]
+    fn catch_up_errors_retry_only_when_transient() {
+        let retryable = |status, why: &str| {
+            ApiError {
+                status,
+                why: why.into(),
+                uncertain: false,
+            }
+            .retryable_read()
+        };
+        for status in [None, Some(408), Some(429), Some(500), Some(503)] {
+            assert!(retryable(status, "transport failure"));
+        }
+        for why in UNCERTAIN_ERRORS.into_iter().chain(["ratelimited"]) {
+            assert!(retryable(Some(200), why), "{why}");
+        }
+        for why in [
+            "thread_not_found",
+            "channel_not_found",
+            "not_in_channel",
+            "missing_scope",
+            "invalid_auth",
+        ] {
+            assert!(!retryable(Some(200), why), "{why}");
+        }
+        for status in [400, 401, 403, 404] {
+            assert!(!retryable(Some(status), "refused"));
+        }
     }
 
     #[test]

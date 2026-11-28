@@ -2,8 +2,10 @@
 
 ## Unreleased
 
-- Slack reconnects and retries failed catch-up reads before taking live messages, so a newer
-  message cannot move the saved position past requests missed while disconnected.
+- Slack reconnects and retries transient catch-up failures before taking live messages, so a
+  newer message cannot move the saved position past requests missed while disconnected. A
+  permanently unreadable room is held with its position preserved until released, without
+  stopping messages in other rooms.
 
 ## 0.2.8 (2026-11-28)
 
