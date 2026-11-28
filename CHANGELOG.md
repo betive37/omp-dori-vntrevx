@@ -222,13 +222,12 @@
   message that reaches the lead still ends the wait, and a message with no answer is given up only
   once both it and the last write to the lead's session file (the end of its last turn) are 30
   minutes old, also across intake and hub restarts. A lead that faulted, or whose goal is blocked
-  by its budget, runs no turn and keeps nothing waiting. Limits: a message whose line in the lead's
-  session file is pushed out of the last 8 MiB read, or whose session file changed, waits until the
-  lead has been idle for 30 minutes and is then given up; a resume that writes to the session file
-  gives an old request another 30-minute window. A message queued behind a long turn can still go
-  in doubt when its delivery is not confirmed within 30 seconds (a separate cause, fixed by
-  [PR #314](https://github.com/vntrevx/Cataly/pull/314)); the full effect for such messages needs
-  both. Discord, Telegram and Slack alike.
+  by its budget, runs no turn and keeps nothing waiting. Limits: a message whose session file
+  changed waits until the lead has been idle for 30 minutes and is then given up; a resume that
+  writes to the session file gives an old request another 30-minute window. A message queued
+  behind a long turn can still go in doubt when its delivery is not confirmed within 30 seconds (a
+  separate cause, fixed by [PR #314](https://github.com/vntrevx/Cataly/pull/314)); the full effect
+  for such messages needs both. Discord, Telegram and Slack alike.
 - Relay answers are no longer lost when more than 8 MiB of transcript follows their request.
   The reader searches beyond the tail when needed and remembers request positions and searched
   prefixes. Missing tags do not repeatedly rescan old entries, and a slow head search does not
