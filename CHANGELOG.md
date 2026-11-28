@@ -173,6 +173,9 @@
   even if the affected thread disappears from the active-thread listing. Newer live owner messages
   in an overflowed room wait for history too, so free queue space during backoff cannot let them
   finish past the rejected owner; already admitted messages still drain to free capacity.
+- Slack: a long answer to a request at the top of a channel, or the lead's later turn, posted only
+  its first part in the request's thread and the rest at the channel's top level. Every part and
+  every later turn now goes into the request's thread.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
