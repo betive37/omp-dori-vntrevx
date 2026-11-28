@@ -20,7 +20,7 @@ mod sleep;
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, OnceLock, PoisonError};
 use std::time::{Duration, Instant};
 
@@ -450,6 +450,15 @@ impl Restarts {
     }
 }
 
+/// Counts a launch attempt when it ends, whichever way it ended.
+struct Launched<'a>(&'a AtomicU64);
+
+impl Drop for Launched<'_> {
+    fn drop(&mut self) {
+        self.0.fetch_add(1, Ordering::AcqRel);
+    }
+}
+
 /// The standing lead.
 pub(crate) struct Lead<R: Runtime> {
     env: Env<R>,
@@ -457,6 +466,8 @@ pub(crate) struct Lead<R: Runtime> {
     current: Mutex<Option<Arc<R::Session>>>,
     status: Mutex<(Phase, Option<String>)>,
     starting: AsyncMutex<()>,
+    /// Launch attempts ended, so a start that waited for `starting` sees whether one ran meanwhile.
+    launched: AtomicU64,
     startup_cancel: watch::Sender<bool>,
     flushing: AsyncMutex<()>,
     wake: Notify,
@@ -497,6 +508,7 @@ impl<R: Runtime> Lead<R> {
             current: Mutex::new(None),
             status: Mutex::new((Phase::NotStarted, None)),
             starting: AsyncMutex::new(()),
+            launched: AtomicU64::new(0),
             startup_cancel: watch::channel(false).0,
             flushing: AsyncMutex::new(()),
             wake: Notify::new(),
@@ -817,6 +829,7 @@ impl<R: Runtime> Lead<R> {
     /// Starts the lead (COORD req. 2): refused when a lead runs; resume or fresh by [`plan`]. Earlier
     /// automatic restarts no longer count.
     pub(crate) async fn start(self: &Arc<Self>, fresh: bool) -> Result<View, String> {
+        let launched = self.launched.load(Ordering::Acquire);
         let _one = if let Ok(lock) = self.starting.try_lock() {
             lock
         } else {
@@ -826,7 +839,9 @@ impl<R: Runtime> Lead<R> {
                 self.startup_cancel.send_replace(true);
             }
             let lock = self.starting.lock().await;
-            if !fresh {
+            // A start that ran meanwhile answers this one; a stop or the supervisor's own check
+            // held the lock without starting anything, and this start goes ahead.
+            if !fresh && self.launched.load(Ordering::Acquire) != launched {
                 return Err(self
                     .refusal()
                     .unwrap_or_else(|| "a lead is already running".into()));
@@ -879,6 +894,7 @@ impl<R: Runtime> Lead<R> {
         fresh: bool,
         again: Option<(String, PathBuf)>,
     ) -> Result<View, String> {
+        let _ended = Launched(&self.launched);
         self.startup_cancel.send_replace(false);
         if self.shutting_down.load(Ordering::Acquire) {
             return Err("the hub is stopping".into());

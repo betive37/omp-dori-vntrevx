@@ -56,6 +56,8 @@ const GOAL_BUSY_WAIT: Duration = Duration::from_secs(10);
 const GOAL_BUSY_STEP: Duration = Duration::from_millis(200);
 /// After a shutdown request, how long the hub waits for OMP to go (DESIGN 4.2 close wait).
 const CLOSE_WAIT: Duration = Duration::from_secs(15);
+/// How long OMP that shut down (or was asked to) has to exit before Tern closes its block.
+const EXIT_GRACE: Duration = Duration::from_secs(5);
 /// A link without any line for this long is lost (DESIGN 4.3, EXT req. 15).
 const LOST_AFTER: Duration = Duration::from_secs(45);
 /// The bridge takes at most this much text per delivery; longer text goes to a file (EXT req. 25).
@@ -271,7 +273,7 @@ impl Runtime for Tern {
             Ok(started) => Ok((Arc::new(Session { port }), started)),
             Err(reason) => {
                 self.links.remove_port(&spec.handle);
-                let cleanup = port.confirm_exit().await;
+                let cleanup = port.confirm_exit(Duration::ZERO).await;
                 port.record_stop("failed".into(), Some(reason.clone()));
                 Err(StartError::Startup {
                     stage: super::startup::StartupStage::Binding,
@@ -540,7 +542,8 @@ impl Port {
         }
     }
 
-    async fn confirm_exit(&self) -> super::startup::Cleanup {
+    /// Confirms the block's OMP gone, giving it `grace` to exit by itself first.
+    async fn confirm_exit(&self, grace: Duration) -> super::startup::Cleanup {
         let owner = self
             .ownership
             .lock()
@@ -549,7 +552,7 @@ impl Port {
         let Some(owner) = owner else {
             return super::startup::Cleanup::Unknown;
         };
-        match owner.close_terminal().await {
+        match owner.close_terminal(grace).await {
             Ok(cleanup) => {
                 if let Some(record) = &mut self.lock().stop {
                     record.cleanup = cleanup;
@@ -838,7 +841,7 @@ impl Port {
                 {
                     let port = Arc::clone(self);
                     tokio::spawn(async move {
-                        port.confirm_exit().await;
+                        port.confirm_exit(EXIT_GRACE).await;
                         port.record_stop(
                             how.into(),
                             Some("OMP in the Tern block shut down".into()),
@@ -1362,7 +1365,7 @@ impl Control for Session {
     async fn close(&self, force: bool) -> Result<StopRecord, String> {
         let stopped = self.port.lock().stop.clone();
         if let Some(mut record) = stopped {
-            record.cleanup = self.port.confirm_exit().await;
+            record.cleanup = self.port.confirm_exit(EXIT_GRACE).await;
             return Ok(record);
         }
         let _busy = self.begin()?;
@@ -1396,7 +1399,7 @@ impl Control for Session {
         let detail = gone
             .is_err()
             .then(|| "OMP did not go within 15 s".to_string());
-        self.port.confirm_exit().await;
+        self.port.confirm_exit(EXIT_GRACE).await;
         Ok(self.port.record_stop("clean".into(), detail))
     }
 }

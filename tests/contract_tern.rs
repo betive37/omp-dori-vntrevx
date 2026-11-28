@@ -263,11 +263,18 @@ fn tern_lead_in_stock_omp() {
     // the bridge active (hub-hosted tern lead) and with OMP's extensions off.
     let file = PathBuf::from(live["session"]["session_file"].as_str().unwrap());
     // The last wake's turn may still run, and `lead stop` refuses a working lead.
-    settled(&hub);
+    let pid = settled(&hub)["session"]["pid"]
+        .as_u64()
+        .unwrap()
+        .to_string();
     let out = hub.cli(&["lead", "stop"]);
     assert!(out.status.success(), "{out:?}");
+    // The stop answers once OMP is gone, so the start finds its session free.
+    let running = Command::new("kill").args(["-0", &pid]).status().unwrap();
+    assert!(!running.success(), "OMP {pid} still runs after the stop");
     let input = typing(&hub);
-    assert!(hub.cli(&["lead", "start"]).status.success());
+    let out = hub.cli(&["lead", "start"]);
+    assert!(out.status.success(), "{out:?}");
     let mut input = input.join().unwrap();
     let live = settled(&hub);
     assert_eq!(live["session"]["session_file"], file.display().to_string());

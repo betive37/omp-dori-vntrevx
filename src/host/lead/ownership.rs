@@ -2,12 +2,18 @@
 //! start on a worker is reconciled by its attempt token there; a disconnect alone proves nothing.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 use crate::host::startup::Cleanup;
 use crate::sys::fs;
 use crate::worker::attempt::{AttemptState, Reaped, birth};
+
+/// How long a process Tern closed has to exit before its cleanup stays unconfirmed.
+const CLOSED_EXIT: Duration = Duration::from_secs(5);
+/// How often an expected exit is checked.
+const EXIT_POLL: Duration = Duration::from_millis(50);
 
 #[derive(Debug, Deserialize, Serialize)]
 struct Evidence {
@@ -126,8 +132,34 @@ impl Ownership {
         process_exit(pid, saved.as_deref(), reaped).await
     }
 
-    pub(crate) async fn close_terminal(&self) -> Result<Cleanup, String> {
-        let proof = self.exited().await?;
+    /// The recorded process's exit, polled for at most `wait`; at once without its identity.
+    async fn exit_within(&self, wait: Duration) -> Result<Cleanup, String> {
+        let deadline = tokio::time::Instant::now() + wait;
+        loop {
+            let proof = self.exited().await?;
+            if proof.confirmed() || !self.identified() || tokio::time::Instant::now() >= deadline {
+                return Ok(proof);
+            }
+            tokio::time::sleep(EXIT_POLL).await;
+        }
+    }
+
+    /// The process and its birth identity are recorded, so its exit can be proven.
+    fn identified(&self) -> bool {
+        let evidence = self
+            .evidence
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        evidence.pid.is_some() && evidence.birth.is_some()
+    }
+
+    /// Proves the terminal session's OMP gone: its own exit within `grace` (it was asked to shut
+    /// down, or did), else Tern's close of its block and then the process's exit. Tern's close
+    /// only asks the block to end, so a recorded process still running after it stays unconfirmed:
+    /// a stop must not answer while OMP still holds the session it shut down. A block that never
+    /// named its process has only the close as evidence.
+    pub(crate) async fn close_terminal(&self, grace: Duration) -> Result<Cleanup, String> {
+        let proof = self.exit_within(grace).await?;
         if proof.confirmed() {
             self.finished(proof)?;
             return Ok(proof);
@@ -150,19 +182,25 @@ impl Ownership {
             argv: &argv,
             cwd: None,
             env: &[],
-            timeout: std::time::Duration::from_secs(10),
+            timeout: Duration::from_secs(10),
             kill_grace: crate::sys::command::KILL_GRACE,
             output_cap: 64 * 1024,
             output: crate::sys::command::Output::Capture,
         })
         .await
         .map_err(|e| e.to_string())?;
-        if result.success() {
-            self.finished(Cleanup::LocalReaped)?;
-            Ok(Cleanup::LocalReaped)
-        } else {
-            Ok(Cleanup::Unknown)
+        if !result.success() {
+            return Ok(Cleanup::Unknown);
         }
+        let proof = if self.identified() {
+            self.exit_within(CLOSED_EXIT).await?
+        } else {
+            Cleanup::LocalReaped
+        };
+        if proof.confirmed() {
+            self.finished(proof)?;
+        }
+        Ok(proof)
     }
 
     pub(crate) fn finished(&self, cleanup: Cleanup) -> Result<(), String> {
@@ -186,12 +224,22 @@ pub(crate) fn recorded(state: &Path, handle: &str) -> Result<bool, String> {
         .map_err(|e| e.to_string())
 }
 
+/// Reconciles attempt `handle` from its journal here. A Tern block whose process identity was never
+/// recorded (the hub stopped before the bridge hello) has only a confirmed close of the recorded
+/// block as evidence, as at a failed start; without it the attempt would stay held for good.
 pub(crate) async fn reconcile(state: &Path, handle: &str) -> Result<Cleanup, String> {
     let path = state.join("startup").join(format!("{handle}.json"));
     let Some(bytes) = fs::read_private(&path, 4096).map_err(|e| e.to_string())? else {
         return Ok(Cleanup::Unknown);
     };
     let evidence: Evidence = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if !evidence.reaped && evidence.birth.is_none() && evidence.terminal.is_some() {
+        let owner = Ownership {
+            path,
+            evidence: std::sync::Mutex::new(evidence),
+        };
+        return owner.close_terminal(Duration::ZERO).await;
+    }
     process_exit(evidence.pid, evidence.birth.as_deref(), evidence.reaped).await
 }
 
