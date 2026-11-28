@@ -905,7 +905,7 @@ fn read_record(state_dir: &Path, me: &Value) -> serde_json::Map<String, Value> {
 
 /// Whether `config` names no `cataly-ops` destination, so setup may set it (and create the channel).
 pub(super) fn ops_unset(config: &Config) -> bool {
-    config.destinations.get(OPS).is_none()
+    !config.destinations.contains_key(OPS)
 }
 
 /// The config with the guild, owner, the lead's channel and the `cataly-ops` destination; a
