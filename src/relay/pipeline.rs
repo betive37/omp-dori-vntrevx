@@ -1025,7 +1025,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             }
             // A batch that mixes relayed messages with other lane input is the lanes' to report:
             // `relay_doubt` above fences the lane and raises its "delivery in doubt" alert, which
-            // has the lead read the lane and release it, so a notice from here would only repeat it.
+            // has the lead read the lane and release it; a notice from here would only repeat it.
             if !relayed {
                 return Ok(());
             }
