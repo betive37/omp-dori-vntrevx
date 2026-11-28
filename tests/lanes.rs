@@ -1740,6 +1740,68 @@ fn the_lead_delegates_to_a_lane_in_a_thread_and_a_split_opens_another() {
     hub.stop();
 }
 
+/// The lead's answer can be ready while `lane.open` is still making the thread from the request:
+/// the thread exists, the lane's record does not yet (on a worker it waits for a push). The
+/// answer stays in the channel and the kickoff comes first in the thread.
+#[test]
+fn an_answer_while_its_lane_thread_is_made_stays_in_the_channel() {
+    let fake = FakeDiscord::start();
+    let (mut hub, work) = lane_hub("");
+    let token = hub.private_file("token", "fake-token");
+    fake.channel(CH, 0, None);
+    let config = std::fs::read_to_string(hub.config_path()).unwrap();
+    hub.write_config(&format!(
+        "{config}[lead]\nmodel = \"fake/primary\"\ncwd = \"{}\"\n{}",
+        work.display(),
+        fake.config(&token, OWNER, &[CH])
+    ));
+    start(&mut hub);
+    hub.until(WAIT, || {
+        (hub.json(&["discord", "status", "--json"])["healthy"] == true).then_some(())
+    });
+    let (mut b, meta) = lead_bridge(&hub);
+    let lead_file = hub.json(&["lead", "status", "--json"])["session"]["session_file"].clone();
+    std::fs::write(data(&hub).join("hold"), "start the work").unwrap();
+    let asked = 800_000_000_000_000_101u64;
+    fake.say(FakeDiscord::message(CH, asked, OWNER, "start the work"));
+    hub.until(WAIT, || holds(&lead_file, "start the work").then_some(()));
+    // Discord makes the thread, but the open has no answer yet.
+    fake.hold_thread_starts(true);
+    let open = json!({
+        "op": "lane.open", "key": "work-1", "title": "Work", "brief": "Do the work.",
+        "checks": [{ "kind": "command", "argv": ["true"] }],
+        "thread_from": format!("discord:{CH}/{asked}"),
+        "kickoff": "Working; done when the check true passes.",
+        "cwd": work,
+    });
+    let session = meta["session"].clone();
+    let opening = std::thread::spawn(move || lead_tool(&mut b, &session, "l1", open));
+    let made = format!("/channels/{CH}/messages/{asked}/threads");
+    fake.wait(WAIT, |f| (!f.calls("POST", &made).is_empty()).then_some(()));
+    // Meanwhile the lead's turn ends with its answer.
+    std::fs::write(data(&hub).join("release"), "").unwrap();
+    let thread = asked.to_string();
+    let answer = fake.wait(WAIT, |f| {
+        let mut posted = f.bot_messages(CH);
+        posted.extend(f.bot_messages(&thread));
+        posted.into_iter().find(|m| m["content"] == "ok")
+    });
+    fake.hold_thread_starts(false);
+    let (text, err) = opening.join().unwrap();
+    assert!(!err && text.contains("started"), "{text}");
+    assert_eq!(
+        answer["channel_id"], CH,
+        "the lead's pointer stays in the channel"
+    );
+    assert_eq!(answer["message_reference"]["message_id"], thread);
+    let first = fake.wait(WAIT, |f| f.bot_messages(&thread).first().cloned());
+    assert_eq!(
+        first["content"], "Working; done when the check true passes.",
+        "the kickoff comes first in the lane's thread"
+    );
+    hub.stop();
+}
+
 /// A lane the owner opened while the lead sleeps: its start and a progress report are quiet and
 /// leave the lead asleep; a stuck report wakes it on the same session, and both reports reach that
 /// session (the quiet one with the first turn after the wake).

@@ -1660,6 +1660,28 @@ impl<R: Runtime> Lanes<R> {
         }
     }
 
+    /// Whether thread `room` of `relay`, started from the message `source` in `parent`, is a
+    /// lane's: an open lane names it, or a lane being opened (or queued for its worker) created it.
+    /// The open journals the creation before it saves the lane record, which waits for the worktree
+    /// (on a worker, after a push) or for the worker, so the record alone would let the lead's answer
+    /// into the thread before the kickoff.
+    pub(crate) async fn claims_thread(
+        &self,
+        relay: &str,
+        room: &str,
+        parent: &str,
+        source: &str,
+    ) -> bool {
+        if self.route(relay, room).await.is_some() {
+            return true;
+        }
+        let origin = format!("{relay}:{parent}/{source}");
+        let Ok(Some(journal)) = self.env.store.read(move |r| r.journal(&origin)).await else {
+            return false;
+        };
+        matches!(self.row(&journal.lane).await, Ok(None))
+    }
+
     /// Hands an owner message from a lane's thread to that lane (DISC-IN req. 42).
     pub(crate) async fn hand_off(
         &self,

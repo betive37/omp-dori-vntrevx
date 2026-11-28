@@ -1419,10 +1419,14 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 }
             }
         }
-        // Typing can find the thread before lane.open claims it. The kickoff stays first there
-        // and the lead's pointer stays visible in the channel.
+        // Typing, or the answer while lane.open creates the thread, can find the thread before the
+        // lane's record claims it. The kickoff stays first there and the lead's pointer stays
+        // visible in the channel.
         if let Some(thread) = &state.room
-            && self.lanes.route(R::NAME, thread).await.is_some()
+            && self
+                .lanes
+                .claims_thread(R::NAME, thread, room, source)
+                .await
         {
             state.room = None;
         }

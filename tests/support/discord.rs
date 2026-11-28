@@ -5,8 +5,9 @@
 //! Gateway WebSocket server. It records
 //! every request, deduplicates creates by their enforced nonce as Discord does, keeps a history per
 //! channel, answers a reply with message type 19 and its reference, and lets a test script the next
-//! create statuses, fail every read of a path, start a thread from a message, push dispatches, and
-//! send op 7, op 9 or a close code. With a token set, any other token gets 401.
+//! create statuses, fail every read of a path, start a thread from a message, hold the reply to a
+//! thread start, push dispatches, and send op 7, op 9 or a close code. With a token set, any other
+//! token gets 401.
 
 use std::collections::{HashMap, VecDeque};
 use std::sync::{Arc, Mutex};
@@ -95,6 +96,8 @@ struct State {
     /// Setup's permission check: the server's `@everyone` permissions (View Channel, Send
     /// Messages, Connect and Speak when unset).
     everyone: Option<u64>,
+    /// A thread start is made at once but its reply waits while this is set.
+    hold_thread_starts: bool,
 }
 
 pub struct FakeDiscord {
@@ -188,6 +191,12 @@ impl FakeDiscord {
     /// Drops the statuses still scripted for one channel.
     pub fn unscript_in(&self, channel: &str) {
         self.state.lock().unwrap().scripted_in.remove(channel);
+    }
+
+    /// While `on`, a thread start is made at once (its message names it, the active list has it)
+    /// but its reply waits until this is turned off: the hub does not know the thread yet.
+    pub fn hold_thread_starts(&self, on: bool) {
+        self.state.lock().unwrap().hold_thread_starts = on;
     }
 
     /// Sets `locked` on a thread started with [`Self::start_thread`], as Discord shows it.
@@ -777,44 +786,60 @@ async fn answer(
     let content_type = req.headers().get("content-type").cloned();
     let bytes = req.into_body().collect().await.unwrap().to_bytes();
     let (body, files) = decode(content_type.as_ref().and_then(|v| v.to_str().ok()), &bytes);
+    let (response, held) = respond(&state, &method, &path, &query, authorization, &body, files);
+    while held && state.lock().unwrap().hold_thread_starts {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    Ok(response)
+}
+
+/// The reply to one request, and whether it waits (a thread start while they are held).
+fn respond(
+    state: &Mutex<State>,
+    method: &str,
+    path: &str,
+    query: &str,
+    authorization: Option<String>,
+    body: &Value,
+    files: Vec<(String, usize)>,
+) -> (Response<Full<Bytes>>, bool) {
     let mut s = state.lock().unwrap();
     let refused = s
         .token
         .as_ref()
         .is_some_and(|t| authorization.as_deref() != Some(format!("Bot {t}").as_str()));
     s.seen.push(Seen {
-        method: method.clone(),
-        path: path.clone(),
-        query: query.clone(),
+        method: method.to_string(),
+        path: path.to_string(),
+        query: query.to_string(),
         authorization,
         body: body.clone(),
         files,
     });
     let parts: Vec<&str> = path.trim_matches('/').split('/').collect();
     if refused {
-        return Ok(reply(
-            401,
-            &json!({ "message": "401: Unauthorized", "code": 0 }),
-        ));
+        let why = json!({ "message": "401: Unauthorized", "code": 0 });
+        return (reply(401, &why), false);
     }
     // The live archived-thread API requires 2; message history permits 1.
-    let invalid = match (method.as_str(), parts.as_slice()) {
-        ("GET", ["channels", _, "threads", "archived", "public"]) => invalid_limit(&query, 2),
-        ("GET", ["channels", _, "messages"]) => invalid_limit(&query, 1),
+    let invalid = match (method, parts.as_slice()) {
+        ("GET", ["channels", _, "threads", "archived", "public"]) => invalid_limit(query, 2),
+        ("GET", ["channels", _, "messages"]) => invalid_limit(query, 1),
         _ => None,
     };
     if let Some(r) = invalid {
-        return Ok(r);
+        return (r, false);
     }
-    let failed = failed_read(&mut s, &method, &path);
+    let failed = failed_read(&mut s, method, path);
     if let Some(r) = failed
-        .or_else(|| setup_route(&mut s, &method, &parts, &body))
-        .or_else(|| access(&s, &method, &parts))
+        .or_else(|| setup_route(&mut s, method, &parts, body))
+        .or_else(|| access(&s, method, &parts))
     {
-        return Ok(r);
+        return (r, false);
     }
     let unknown = json!({ "message": "Unknown Message", "code": 10008 });
-    let response = match (method.as_str(), parts.as_slice()) {
+    let mut held = false;
+    let response = match (method, parts.as_slice()) {
         ("GET", ["applications", "@me"]) => reply(200, &application(&s)),
         ("GET", ["gateway"]) => {
             let url = s
@@ -833,11 +858,11 @@ async fn answer(
                 .unwrap_or(json!({ "id": id, "type": 0, "guild_id": GUILD }));
             reply(200, &channel)
         }
-        ("PATCH", ["channels", id]) => patch_channel(&mut s, id, &body),
+        ("PATCH", ["channels", id]) => patch_channel(&mut s, id, body),
         ("GET", ["guilds", _, "threads", "active"]) => {
             reply(200, &json!({ "threads": s.threads, "members": [] }))
         }
-        ("GET", ["channels", id, "messages"]) => history_page(&s, id, &query),
+        ("GET", ["channels", id, "messages"]) => history_page(&s, id, query),
         ("GET", ["channels", id, "messages", mid]) => {
             match s
                 .history
@@ -848,9 +873,12 @@ async fn answer(
                 None => reply(404, &unknown),
             }
         }
-        ("POST", ["channels", id, "messages"]) => create(&mut s, id, &body),
-        ("POST", ["channels", id, .., "threads"]) => start_thread(&mut s, id, &parts, &body),
-        ("PATCH", ["channels", id, "messages", mid]) => edit_message(&mut s, id, mid, &body),
+        ("POST", ["channels", id, "messages"]) => create(&mut s, id, body),
+        ("POST", ["channels", id, .., "threads"]) => {
+            held = s.hold_thread_starts;
+            start_thread(&mut s, id, &parts, body)
+        }
+        ("PATCH", ["channels", id, "messages", mid]) => edit_message(&mut s, id, mid, body),
         (
             "PUT",
             ["channels", _, "messages", _, "reactions", _, "@me"]
@@ -863,7 +891,7 @@ async fn answer(
         }
         _ => reply(404, &json!({ "message": "Unknown", "code": 0 })),
     };
-    Ok(response)
+    (response, held)
 }
 
 /// One page of a channel's history, newest first, as `limit` and `before` ask.

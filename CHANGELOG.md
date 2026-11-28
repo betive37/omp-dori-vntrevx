@@ -65,11 +65,21 @@
   conversation, so it adds none.
 - Tern startup journals retain the block ID and process birth identity; confirmed block close
   or disappearance of that exact process proves termination. Unknown exits remain held.
+  A stopped Tern lead or lane is confirmed only once its OMP process is gone: OMP gets 5 s to exit
+  after it shut down, then Tern closes the block, and the stop answers when that process has
+  ended (5 s more at most; a process still running stays unconfirmed). Before, `lead stop`
+  answered while OMP still ran, and a `lead start` right after it could find the session held.
+  A hub stopped during a Tern start before the bridge's hello, with no process recorded yet,
+  reconciles that attempt by a confirmed close of its recorded block instead of holding the lead
+  for good.
   Settled startup receipts are pruned only after no anchor, recovery episode or lane references
   them; current and uncertain attempts are never discarded merely because they are old.
   Maintenance collapses only superseded duplicate binding tuples, retaining the current anchor
   and latest evidence for every pinnable identity. A crash before receipt pruning leaves a
   harmless retained receipt that the next prune can remove.
+- `lead start` right after `lead stop` is no longer refused with the stop's own reason ("stopped:
+  clean") when the hub's supervisor was just checking the lead; only a start that actually ran
+  meanwhile answers a waiting one.
 - A written message is resent after a restart only when the whole transcript proves it absent.
   The marker search now covers the entire file instead of its newest 8 MiB, and a partial,
   unparsable, oversized or unreadable transcript (or a search out of time) leaves the message in
@@ -128,6 +138,10 @@
   after, so a goal entered while the extension was still activating its tool dropped it, and the
   lane could not report. The extension now finishes activating its tools before it runs any hub
   command.
+- The lead's answer no longer lands in a lane's new thread before the kickoff when it is ready
+  while `lane.open` is still making that thread from your message (on a worker, during the push).
+  The thread is the lane's from the moment its creation is recorded, not only once the lane's
+  record is saved, so the answer stays in the channel as the lead's pointer.
 
 ### Answers and messages
 
