@@ -180,6 +180,10 @@ in their own areas; this spec only states what lifecycle needs from them.
     (default 20, at most 40); follow events from a cursor, with an explicit gap marker when events were lost; send a
     message with a caller ID, either queued for the next turn or as steering of the current turn, and look up its
     receipt by ID (a lost reply is never answered by sending again); interrupt the current turn; switch model.
+    Steering records its receipt and in-doubt fence in one commit before submission. Reusing its ID with
+    different text is refused. Only a definite result clears the fence; refusal also removes the receipt so
+    the ID can be retried. An uncertain result, including a restart before settlement, retains the receipt
+    and fence until released, without resending. Settled steering receipts share the per-session receipt cap.
     Every control names the revision it saw and is refused if the lane's session changed since.
 34. Observe and answer: the lead may read a lane's live state and pending dialog and answer it with one of: cancel,
     yes/no, a text value, or per-question selected options with optional free text. Answers over 64 KiB are refused.

@@ -100,6 +100,11 @@
   now opens a lane under a fresh key (`<id>-2`, `<id>-3`, ...) and the item remembers it; an item
   added again waits while its earlier lane is still open. Failed starts also remember the attempted
   key, so a retained lane blocks another start; a rolled-back allocation frees its key for a retry.
+- Retrying a lane steering message with the same caller ID no longer steers twice; reusing the ID
+  with different text is refused. Its receipt and in-doubt fence are stored together before sending,
+  so a crash before the result is recorded also blocks further messages until released. A definite
+  refusal allows retry; release never resends the original. Settled steering receipts obey the same
+  per-session cap as queued messages.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,

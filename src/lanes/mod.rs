@@ -385,22 +385,27 @@ impl<R: Runtime> Lanes<R> {
             if !fresh {
                 continue;
             }
-            self.emit(
-                Emit::new(EventKind::DeliveryInDoubt, Severity::Warning, true, key)
-                    .with("target", key)
-                    .with("count", rows.len())
-                    .with("reason", &reason),
-            );
-            self.alert(
-                key,
-                "delivery in doubt",
-                &format!(
-                    "a message to the lane may or may not have reached it ({reason}); it is not \
-                     resent. Read the lane, then lane.release it; lane.send waits until then"
-                ),
-                true,
-            );
+            self.alert_doubt(key, rows.len(), &reason);
         }
+    }
+
+    /// Reports a newly uncertain delivery after its fence has been stored.
+    fn alert_doubt(&self, key: &str, count: usize, reason: &str) {
+        self.emit(
+            Emit::new(EventKind::DeliveryInDoubt, Severity::Warning, true, key)
+                .with("target", key)
+                .with("count", count)
+                .with("reason", reason),
+        );
+        self.alert(
+            key,
+            "delivery in doubt",
+            &format!(
+                "a message to the lane may or may not have reached it ({reason}); it is not \
+                 resent. Read the lane, then lane.release it; lane.send waits until then"
+            ),
+            true,
+        );
     }
 
     /// Both lane profiles, written once per hub run; workers use these same files.
@@ -1455,11 +1460,17 @@ impl<R: Runtime> Lanes<R> {
                 self.env.store.read(move |r| r.receipt(&t, &i)).await
             }
         {
+            if steer && found.digest != crate::host::inbox::digest("steer", text) {
+                return Err("this request ID was used before with different text".into());
+            }
             let state = match found.inbox_id {
                 Some(row) => mailbox.receipt(Some(id.to_string()), row).await.state,
                 None => ReceiptState::Duplicate,
             };
             return Ok(format!("message {id} earlier: {state:?}"));
+        }
+        if steer {
+            return self.steer(&rec, session.as_ref(), text, id).await;
         }
         let message = Message {
             sender: "lead".into(),
@@ -1469,22 +1480,6 @@ impl<R: Runtime> Lanes<R> {
             identity: None,
             request_id: id.map(str::to_string),
         };
-        if steer {
-            let snap = session.snapshot();
-            if snap.status != Status::Working {
-                return Err("steering needs a running turn".into());
-            }
-            let out = session
-                .deliver(crate::host::Delivery {
-                    expected_session: rec.session_id.clone().unwrap_or_default(),
-                    text: text.to_string(),
-                    timing: crate::host::Timing::Working,
-                    steer: true,
-                    fresh: false,
-                })
-                .await;
-            return Ok(format!("{out:?}"));
-        }
         self.resume_for_answer(key, &session, true, true).await;
         let (receipt, _, notes) = mailbox.deliver(&message, Some(&*session), false).await?;
         drop(turn);
@@ -1495,6 +1490,68 @@ impl<R: Runtime> Lanes<R> {
         };
         self.nudge.notify_one();
         Ok(format!("{state:?}").to_lowercase())
+    }
+
+    /// Steers once with a durable receipt. The caller holds the lane's turn (LANE req. 33).
+    async fn steer(
+        &self,
+        rec: &Record,
+        session: &R::Session,
+        text: &str,
+        id: Option<&str>,
+    ) -> Result<String, String> {
+        use crate::host::DeliverOutcome;
+        use crate::store::host::HostWrite;
+
+        let key = rec.key.as_str();
+        let snap = session.snapshot();
+        if snap.status != Status::Working {
+            return Err("steering needs a running turn".into());
+        }
+        let delivery = id.map_or_else(|| crate::host::random_hex(16), str::to_string);
+        let fence = format!("steering {delivery}: outcome not yet confirmed");
+        // The receipt and fence commit together, including when the caller gave no ID.
+        self.env
+            .store
+            .host(HostWrite::SteerReceipt {
+                target: key.to_string(),
+                request_id: delivery.clone(),
+                digest: crate::host::inbox::digest("steer", text),
+                session: snap.handle.clone(),
+                fence: fence.clone(),
+            })
+            .await
+            .map_err(|e| e.to_string())?;
+        #[cfg(debug_assertions)]
+        crate::sys::fault::point("steer_reserved");
+        let out = session
+            .deliver(crate::host::Delivery {
+                expected_session: rec.session_id.clone().unwrap_or_default(),
+                text: text.to_string(),
+                timing: crate::host::Timing::Working,
+                steer: true,
+                fresh: false,
+            })
+            .await;
+        #[cfg(debug_assertions)]
+        crate::sys::fault::point("steer_written");
+        match &out {
+            DeliverOutcome::InDoubt(reason) => self.alert_doubt(key, 1, reason),
+            definite => {
+                self.env
+                    .store
+                    .host(HostWrite::SettleSteer {
+                        target: key.to_string(),
+                        request_id: delivery,
+                        session: snap.handle.clone(),
+                        fence,
+                        refused: !matches!(definite, DeliverOutcome::Delivered { .. }),
+                    })
+                    .await
+                    .map_err(|e| e.to_string())?;
+            }
+        }
+        Ok(format!("{out:?}"))
     }
 
     /// Lifts the in-doubt fence; never resends, never decides what happened (EVR req. 62).
