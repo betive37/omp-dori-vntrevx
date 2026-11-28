@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A session whose first bridge hello timed out or lost its connection could stay disconnected
+  permanently. It now retries with backoff, retaining its launch identity until the hub answers;
+  an explicit refusal still leaves it inert.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
