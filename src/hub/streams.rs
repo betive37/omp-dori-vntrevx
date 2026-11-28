@@ -56,10 +56,6 @@ struct Spec {
     run: String,
 }
 
-/// How long an ended child waits for the hub's own stop to show: under systemd the control
-/// group's TERM can reach the child before the hub. Such an exit is not the job's and not counted.
-const STOP_GRACE: Duration = Duration::from_secs(1);
-
 #[derive(Debug, Clone)]
 struct State {
     phase: &'static str,
@@ -310,17 +306,11 @@ impl Streams {
         }
     }
 
-    /// Whether the hub or this job is stopping, waiting `STOP_GRACE` for either stop to show.
-    async fn stopping(&self, stopped: &mut watch::Receiver<bool>) -> bool {
-        let mut shutdown = self.shutdown.clone();
-        let _ = tokio::time::timeout(STOP_GRACE, async {
-            tokio::select! {
-                _ = shutdown.wait_for(|stop| *stop) => {}
-                _ = stopped.wait_for(|stop| *stop) => {}
-            }
-        })
-        .await;
-        *shutdown.borrow() || *stopped.borrow()
+    /// Whether the hub or this job is stopping. A stop's TERM reaches the hub alone (systemd
+    /// `KillMode=mixed`, launchd), and the hub marks itself stopping before it ends any child, so
+    /// an exit seen before either mark is the child's own.
+    fn stopping(&self, stopped: &watch::Receiver<bool>) -> bool {
+        *self.shutdown.borrow() || *stopped.borrow()
     }
 
     /// Runs the command until it is stopped or its restarts are used up (WS req. 73).
@@ -351,8 +341,7 @@ impl Streams {
             let Some(exit) = ended else {
                 return;
             };
-            if self.stopping(&mut stopped).await
-                || !self.update(&spec, |s| s.last_exit = Some(exit.clone()))
+            if self.stopping(&stopped) || !self.update(&spec, |s| s.last_exit = Some(exit.clone()))
             {
                 return;
             }
@@ -924,8 +913,8 @@ mod tests {
             .unwrap();
     }
 
-    /// WS-04: a child that ends while the hub stops (systemd's TERM to the whole control group) is
-    /// not counted against the job, so it starts again with the hub.
+    /// WS-04: a child that ends once the hub has marked itself stopping is not counted against the
+    /// job, so it starts again with the hub.
     #[tokio::test]
     async fn an_exit_while_the_hub_stops_is_not_counted() {
         let (ctx, _stop, dir) = crate::jobs::tests::ctx_with("", "streams-hub-stop");
