@@ -679,6 +679,170 @@ fn found_message_takes_the_edits(hub: &TestHub, fake: &FakeDiscord) {
     assert_eq!(board_calls(fake, BOARD_B).0.len(), TRIES);
 }
 
+fn pr_policy_fixture(hub: &TestHub, suffix: &str, value: &Value) {
+    hub.fixture(
+        "gh",
+        &format!("repos_o_r_pulls_7{suffix}.json"),
+        Some(&value.to_string()),
+    );
+}
+
+fn pr_policy_counts(hub: &TestHub, commits: usize, files: usize) {
+    pr_policy_fixture(
+        hub,
+        "",
+        &json!({ "head": { "sha": HEAD }, "body": "", "commits": commits, "changed_files": files }),
+    );
+}
+
+fn pr_policy_hub(commits: usize, files: usize) -> (TestHub, Value) {
+    let (mut hub, _) = coord_hub("[lanes.identities]\n\"o/r\" = \"owner@example.com\"\n");
+    // The lane's empty working directory is not a checkout, even on hosts without git.
+    let git = hub.root.join("bin/git");
+    std::fs::write(&git, "#!/bin/sh\nexit 128\n").unwrap();
+    std::fs::set_permissions(&git, std::os::unix::fs::PermissionsExt::from_mode(0o700)).unwrap();
+    let commit = json!({ "commit": {
+        "author": { "email": "owner@example.com" },
+        "committer": { "email": "owner@example.com" },
+        "message": "fix: handle the edge case"
+    }, "parents": [{ "sha": HEAD }] });
+    pr_policy_counts(&hub, commits, files);
+    pr_policy_fixture(&hub, "_commits", &json!([commit]));
+    pr_policy_fixture(&hub, "_files", &json!([{ "filename": "README.md" }]));
+    start(&mut hub);
+    let mut params = open_params("policy");
+    params["checks"] = json!([{ "kind": "pr_policy", "repo": "o/r", "number": 7 }]);
+    lane(&hub, "open", &params).unwrap();
+    hub.until(WAIT, || {
+        (record(&hub, "policy")["state"] == "running").then_some(())
+    });
+    (hub, commit)
+}
+
+/// EVR req. 58: a bad author or committer on page two cannot hide behind the first 100 commits.
+#[test]
+fn pr_policy_checks_later_commits() {
+    let (mut hub, commit) = pr_policy_hub(101, 1);
+    pr_policy_fixture(&hub, "_commits", &json!(vec![commit.clone(); 100]));
+    for who in ["author", "committer"] {
+        let mut bad = commit.clone();
+        bad["commit"][who]["email"] = json!("other@example.com");
+        pr_policy_fixture(&hub, "_commits.page-2", &json!([bad]));
+        let refused = lane(&hub, "close", &json!({ "key": "policy" })).unwrap_err();
+        assert!(
+            refused.contains("identity is not the configured one"),
+            "{refused}"
+        );
+    }
+    pr_policy_fixture(&hub, "_commits.page-2", &json!([commit]));
+    lane(&hub, "close", &json!({ "key": "policy" })).unwrap();
+    assert_eq!(record(&hub, "policy")["state"], "closed");
+    assert!(hub.stop().success());
+}
+
+/// EVR req. 58: source and test files on later pages both participate in the policy decision.
+#[test]
+fn pr_policy_checks_later_files() {
+    let (mut hub, _) = pr_policy_hub(1, 101);
+    let docs: Vec<Value> = (0..100)
+        .map(|n| json!({ "filename": format!("docs/{n}.md") }))
+        .collect();
+    pr_policy_fixture(&hub, "_files", &json!(docs));
+    pr_policy_fixture(
+        &hub,
+        "_files.page-2",
+        &json!([{ "filename": "src/fix.rs" }]),
+    );
+    let refused = lane(&hub, "close", &json!({ "key": "policy" })).unwrap_err();
+    assert!(
+        refused.contains("without a test or a no-test reason"),
+        "{refused}"
+    );
+    pr_policy_counts(&hub, 1, 102);
+    pr_policy_fixture(
+        &hub,
+        "_files.page-2",
+        &json!([
+            { "filename": "src/fix.rs" }, { "filename": "tests/fix.rs" }
+        ]),
+    );
+    lane(&hub, "close", &json!({ "key": "policy" })).unwrap();
+    assert_eq!(record(&hub, "policy")["state"], "closed");
+    assert!(hub.stop().success());
+}
+
+/// Truncated/malformed lists fail closed; exactly 3000 files are allowed, but 3001 are not.
+#[test]
+fn pr_policy_requires_complete_lists_and_enforces_file_limit() {
+    let (mut hub, commit) = pr_policy_hub(1, 101);
+    let docs: Vec<Value> = (0..100)
+        .map(|n| json!({ "filename": format!("docs/{n}.md") }))
+        .collect();
+    pr_policy_fixture(&hub, "_files", &json!(docs));
+    let close = || lane(&hub, "close", &json!({ "key": "policy" }));
+    let refused = close().unwrap_err();
+    assert!(
+        refused.contains("incomplete files: read 100, expected 101"),
+        "{refused}"
+    );
+    pr_policy_fixture(&hub, "_files.page-2", &json!({}));
+    let refused = close().unwrap_err();
+    assert!(refused.contains("not a list"), "{refused}");
+
+    pr_policy_counts(&hub, 101, 100);
+    pr_policy_fixture(&hub, "_commits", &json!(vec![commit; 100]));
+    let refused = close().unwrap_err();
+    assert!(
+        refused.contains("incomplete commits: read 100, expected 101"),
+        "{refused}"
+    );
+    pr_policy_fixture(&hub, "_commits.page-2", &json!({}));
+    let refused = close().unwrap_err();
+    assert!(refused.contains("not a list"), "{refused}");
+
+    for missing in ["commits", "changed_files"] {
+        let mut pull =
+            json!({ "head": { "sha": HEAD }, "body": "", "commits": 100, "changed_files": 100 });
+        pull.as_object_mut().unwrap().remove(missing);
+        pr_policy_fixture(&hub, "", &pull);
+        let refused = close().unwrap_err();
+        assert!(
+            refused.contains(&format!("missing or invalid PR {missing} count")),
+            "{refused}"
+        );
+    }
+    pr_policy_counts(&hub, 100, 3001);
+    let refused = close().unwrap_err();
+    assert!(refused.contains("more than 3000 files"), "{refused}");
+
+    pr_policy_counts(&hub, 100, 3000);
+    for page in 1..=30 {
+        let mut files: Vec<Value> = (0..100)
+            .map(|n| json!({ "filename": format!("docs/{page}-{n}.md") }))
+            .collect();
+        if page == 2 {
+            files[0] = json!({ "filename": "src/fix.rs" });
+        }
+        if page == 30 {
+            files[99] = json!({ "filename": "tests/fix.rs" });
+        }
+        let suffix = if page == 1 {
+            "_files".into()
+        } else {
+            format!("_files.page-{page}")
+        };
+        pr_policy_fixture(&hub, &suffix, &json!(files));
+    }
+    hub.fixture("gh", "calls.log", Some(""));
+    close().unwrap();
+    let calls = std::fs::read_to_string(hub.root.join("bin/gh-data/calls.log")).unwrap();
+    assert!(calls.contains("files?per_page=100&page=30"), "{calls}");
+    assert!(!calls.contains("files?per_page=100&page=31"), "{calls}");
+    assert!(!calls.contains("commits?per_page=100&page=2"), "{calls}");
+    assert_eq!(record(&hub, "policy")["state"], "closed");
+    assert!(hub.stop().success());
+}
+
 /// Today's local date as the hub sees it (the snapshot name).
 fn jiff_today(hub: &TestHub) -> String {
     let out = hub.command(&["status", "--json"]).output().unwrap();
