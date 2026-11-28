@@ -7,7 +7,7 @@ use tokio::sync::watch;
 
 use super::Lanes;
 use super::record::Record;
-use crate::host::startup::{self, Cleanup, Recovery, StartupOutcome, StartupStage};
+use crate::host::startup::{self, Begin, Cleanup, Recovery, StartupOutcome, StartupStage};
 use crate::host::{Control, Runtime, StartError, StartSpec, Started};
 use crate::store::lanes::Revision;
 
@@ -153,6 +153,20 @@ impl<R: Runtime> Lanes<R> {
                 .await
                 .map_err(|detail| rejected(detail, Cleanup::Unknown))?
                 .ok_or_else(|| rejected("recovery episode disappeared".into(), Cleanup::Unknown))?;
+            // A pending reopen owns the episode it continues; an expired or ended one was renewed.
+            if let Some(pending) = launch.record.pending_reopen.as_mut()
+                && pending.episode_ms != episode.started_ms
+            {
+                pending.episode_ms = episode.started_ms;
+                *launch.revision = self
+                    .save(
+                        launch.record,
+                        Some(*launch.revision),
+                        Some("reopen continues in a fresh recovery episode".into()),
+                    )
+                    .await
+                    .map_err(|detail| rejected(detail, Cleanup::Unknown))?;
+            }
             let prior = self
                 .previous_exit(launch.record)
                 .await
@@ -192,7 +206,7 @@ impl<R: Runtime> Lanes<R> {
             })?;
         // Ownership/lease reads and durable handle writes consume the same episode budget.
         if let (Some(recovery), Some(id)) = (recovery, &launch.spec.expected_id)
-            && let Err(detail) = recovery.begin(id, false).await
+            && let Err(detail) = recovery.begin(id, Begin::Continue).await
         {
             launch.record.startup_cleanup = Some(Cleanup::NotSpawned);
             return Err(rejected(detail, Cleanup::NotSpawned));
