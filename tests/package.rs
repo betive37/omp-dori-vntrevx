@@ -135,8 +135,7 @@ fn term_reaches_the_binary(runtime: &str, launcher: &Path, preload: Option<&Path
 
 #[test]
 fn the_launcher_runs_the_platform_binary_under_node_and_bun() {
-    let root = PathBuf::from(format!("/tmp/cy-launch-{}", std::process::id()));
-    let _ = std::fs::remove_dir_all(&root);
+    let root = support::TempRoot::new("cy-launch");
     let script = "#!/bin/sh\nprintf 'args:%s|' \"$@\"\necho\necho to-stderr >&2\n\
                   case \"$1\" in\nexit) exit \"$2\" ;;\nsignal) kill -TERM $$ ;;\n\
                   wait) trap 'echo got-term; exit 3' TERM; echo ready; while :; do sleep 0.05; done ;;\n\
@@ -179,7 +178,6 @@ fn the_launcher_runs_the_platform_binary_under_node_and_bun() {
             "{runtime}: {said}"
         );
     }
-    let _ = std::fs::remove_dir_all(&root);
 }
 
 /// The sandbox's PATH with the fake tools in `<root>/bin` first.

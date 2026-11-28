@@ -458,8 +458,7 @@ mod tests {
     #[test]
     fn snapshot_refuses_a_group_readable_file_like_the_hub() {
         use std::os::unix::fs::PermissionsExt as _;
-        let dir = std::env::temp_dir().join(format!("cataly-setup-perm-{}", std::process::id()));
-        let _ = std::fs::create_dir_all(&dir);
+        let dir = crate::sys::fs::tests::scratch("setup-perm");
         let path = dir.join("config.toml");
         assert!(std::fs::write(&path, "[hub]\n").is_ok());
         assert!(std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).is_ok());
@@ -468,6 +467,5 @@ mod tests {
         assert!(read_private(&path, FILE_MAX).is_err());
         assert!(std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600)).is_ok());
         assert!(snapshot(&path).is_ok());
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }
