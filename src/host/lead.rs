@@ -15,7 +15,7 @@
 //! 300-second episode. A lead idle for `[lead] idle_sleep` is woken on the same session
 //! when a message needs it ([`sleep`]).
 
-mod notice;
+pub(crate) mod notice;
 pub(crate) mod ownership;
 mod sleep;
 
@@ -155,11 +155,11 @@ impl View {
                     ));
                 }
                 "bound" => {}
+                // The held text below says why in plain words; the raw cause is in `--json`.
                 state => lines.push(format!(
-                    "recovery {state} after {} retr{}: {}",
+                    "recovery {state} after {} retr{}",
                     e.retries,
                     if e.retries == 1 { "y" } else { "ies" },
-                    e.detail.as_deref().unwrap_or("-")
                 )),
             }
         }
