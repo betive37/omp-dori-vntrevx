@@ -315,7 +315,10 @@ impl<R: Runtime> Lanes<R> {
                 stored: true,
                 new_items,
             } => {
-                self.new_round(&rec.key, new_items).await;
+                if !unverified {
+                    // Only a step of the current run moves the last-progress mark.
+                    self.new_round(&rec.key, new_items).await;
+                }
                 self.nudge.notify_one();
                 Ok(format!(
                     "step '{name}' recorded{}",

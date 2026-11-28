@@ -916,10 +916,7 @@ fn a_step_with_new_evidence_starts_a_new_round() {
         json!({ "op": "step", "name": "build", "result": "built", "evidence": "built.txt",
                 "files": ["built.txt"] }),
     );
-    assert!(
-        step["text"].as_str().unwrap().contains("recorded"),
-        "{step}"
-    );
+    assert_eq!(step["text"], "step 'build' recorded", "{step}");
     hub.until(WAIT, || (stalls(&hub) == 2).then_some(()));
     hub.stop();
 }
