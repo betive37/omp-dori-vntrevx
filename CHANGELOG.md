@@ -12,6 +12,13 @@
   but did not end in time". The hub's stop answer now names the call's wind-down bound, and the
   update waits that long plus a margin, saying so once ("음성 통화를 정리하는 중이에요 (최대
   90초)"); a wind-down beyond the bound holds the update with nothing changed and says why.
+- Worker PCs older than the hub are named: after a successful `cataly update` or `rollback`, and in
+  `cataly status` and `cataly health`, each configured worker whose last `hello` reported an older
+  worker protocol or version is listed in the owner's language ("다른 PC box는 아직 0.2.6이에요.
+  그 PC에서 `cataly update`를 실행하세요."); `health` warns when its lanes are held. The hub keeps
+  the `hello` of a worker it refused as incompatible, so it knows which version that PC runs. An
+  unreachable or never-reached worker is reported as unknown, never as outdated. Nothing is asked
+  of, or installed on, a worker for this.
 
 ## 0.2.8 (2026-11-28)
 

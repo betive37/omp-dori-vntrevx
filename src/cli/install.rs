@@ -11,7 +11,7 @@ use serde_json::json;
 
 use super::args::Parsed;
 use super::client::{Client, ClientError};
-use super::{Failure, exit, out};
+use super::{Failure, exit, out, owner_language};
 use crate::config::{Config, Language};
 use crate::proto::{Status, method};
 use crate::sys::command::{KILL_GRACE, Output, Spec};
@@ -218,6 +218,23 @@ async fn sessions_note(paths: &Paths, say: Say) -> String {
             STOP_WAIT.as_secs()
         ),
     }
+}
+
+/// The lines `cataly update` and `cataly rollback` add about each worker PC older than the new hub,
+/// or of unknown version, from what that hub already knows of it; no worker is asked.
+fn workers_note(paths: &Paths, say: Say) -> String {
+    let Some(status) = hub_status(paths) else {
+        return String::new();
+    };
+    status
+        .workers
+        .iter()
+        .filter_map(|w| w.standing_note(&status.version, say.0))
+        .fold(String::new(), |mut text, (_, note)| {
+            text.push('\n');
+            text.push_str(&note);
+            text
+        })
 }
 
 /// `omp --version` as `(a, b, c)`, or `None` when OMP is absent or says nothing usable.
@@ -468,8 +485,9 @@ async fn restart_switch(
             let answered = closed.elapsed().as_millis();
             let sessions = sessions_note(paths, say).await;
             Outcome::Done(format!(
-                "{}{sessions}",
-                say.switched(was, version, answered)
+                "{}{sessions}{}",
+                say.switched(was, version, answered),
+                workers_note(paths, say)
             ))
         }
         Err(why) => {
@@ -591,11 +609,6 @@ fn hub_gone(paths: &Paths) -> bool {
         }
         Err(_) => false,
     }
-}
-
-/// The owner's language from the config file; the default when it is absent or invalid.
-fn owner_language(paths: &Paths) -> Language {
-    loaded(paths).map_or(Config::default().hub.language, |c| c.hub.language)
 }
 
 /// The config file, when it exists and is valid.
@@ -925,8 +938,9 @@ async fn package_update(
             let answered = closed.elapsed().as_millis();
             let sessions = sessions_note(paths, say).await;
             Outcome::Done(format!(
-                "{}{sessions}",
-                say.switched(current, &version, answered)
+                "{}{sessions}{}",
+                say.switched(current, &version, answered),
+                workers_note(paths, say)
             ))
         }
         Err(why) => {

@@ -186,7 +186,7 @@ fn execute(p: &Parsed, paths: &Paths) -> Result<(), Failure> {
             if as_json {
                 out::json(&reply);
             } else {
-                print_status(&decode(reply)?);
+                print_status(&decode(reply)?, owner_language(paths));
             }
         }
         ["stats"] => {
@@ -446,7 +446,13 @@ fn duration_text(seconds: i64) -> String {
     }
 }
 
-fn print_status(s: &Status) {
+/// The owner's language from the config file; the default when it is absent or invalid.
+pub(super) fn owner_language(paths: &Paths) -> config::Language {
+    config::load(&paths.config_file)
+        .map_or(config::Config::default().hub.language, |c| c.hub.language)
+}
+
+fn print_status(s: &Status, language: config::Language) {
     out::line(&format!(
         "hub {} running, pid {}, up {}",
         s.version,
@@ -492,6 +498,11 @@ fn print_status(s: &Status) {
     }
     for w in &s.workers {
         out::line(&format!("worker   {}", worker::describe(w)));
+    }
+    for w in &s.workers {
+        if let Some((_, note)) = w.standing_note(&s.version, language) {
+            out::line(&note);
+        }
     }
 }
 
