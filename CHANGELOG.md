@@ -186,7 +186,8 @@
   It now stops that batch, keeps the offset before the unsaved update and retries after a minute.
 - Slack no longer acknowledges messages when the arrival queue is full, a queue write fails, or
   admission times out, leaving them eligible for Slack's bounded redelivery window. An older
-  redelivery is admitted even if a newer message has already advanced the room's position.
+  redelivery is admitted even if a newer message has already advanced the room's position, while
+  a message already handed off (its admission committed after the deadline) is not admitted again.
   Redelivering a doubtful or failed hand-off given up by a room release no longer queues it again
   or blocks the released room.
 
