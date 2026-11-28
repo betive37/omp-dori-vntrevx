@@ -377,9 +377,9 @@ pub(crate) struct Link {
     pending: AtomicUsize,
     /// Remote lanes running on it; a [`LaneHold`] counts one.
     pub(crate) lanes: AtomicUsize,
-    /// Channels of spawned OMP children the worker opened, with their exit acknowledgements, until
-    /// their `spawn` answer takes them.
-    spawned: Mutex<HashMap<u32, (DuplexStream, oneshot::Receiver<Value>)>>,
+    /// Active spawn waiters, keyed by attempt, and any channel waiting for its answer. Removing a
+    /// waiter drops its channel; a channel arriving without a waiter is dropped by `accept`.
+    spawned: Mutex<HashMap<String, Option<Accepted>>>,
     spawned_ready: tokio::sync::Notify,
 }
 
@@ -479,6 +479,49 @@ impl Drop for LaneHold {
     }
 }
 
+/// One request's hold on the connection, released even when its future is cancelled.
+struct PendingRequest<'a>(&'a Link);
+
+impl Drop for PendingRequest<'_> {
+    fn drop(&mut self) {
+        self.0.pending.fetch_sub(1, Ordering::AcqRel);
+        self.0.touch();
+    }
+}
+
+/// A spawn owns its unclaimed channel only while its caller still waits for it.
+struct WaitingSpawn<'a> {
+    link: &'a Link,
+    attempt: &'a str,
+}
+
+impl<'a> WaitingSpawn<'a> {
+    fn new(link: &'a Link, attempt: &'a str) -> Result<Self, SpawnError> {
+        let mut spawned = link.spawned.lock().unwrap_or_else(PoisonError::into_inner);
+        match spawned.entry(attempt.to_string()) {
+            std::collections::hash_map::Entry::Vacant(entry) => {
+                entry.insert(None);
+            }
+            std::collections::hash_map::Entry::Occupied(_) => {
+                return Err(SpawnError::Unanswered(format!(
+                    "a spawn is already waiting for attempt {attempt}"
+                )));
+            }
+        }
+        Ok(Self { link, attempt })
+    }
+}
+
+impl Drop for WaitingSpawn<'_> {
+    fn drop(&mut self) {
+        self.link
+            .spawned
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+            .remove(self.attempt);
+    }
+}
+
 impl Link {
     /// Starts `ssh`, the stream and `hello`. The channels the worker opens arrive on the receiver.
     pub(crate) async fn connect(
@@ -557,16 +600,22 @@ impl Link {
     }
 
     /// Takes a channel the worker opened: a spawned OMP's waits, with its exit acknowledgement, for
-    /// its `spawn` answer; any other is handed back.
+    /// its `spawn` answer, or is dropped if that caller no longer waits; any other is handed back.
     fn accept(&self, channel: Accepted) -> Option<Accepted> {
         if channel.header.get("kind").and_then(Value::as_str) != Some("spawn") {
             return Some(channel);
         }
-        self.spawned
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .insert(channel.channel, (channel.stream, channel.exit));
-        self.spawned_ready.notify_waiters();
+        let mut spawned = self.spawned.lock().unwrap_or_else(PoisonError::into_inner);
+        if let Some(slot) = channel
+            .header
+            .get("attempt")
+            .and_then(Value::as_str)
+            .and_then(|attempt| spawned.get_mut(attempt))
+            && slot.is_none()
+        {
+            *slot = Some(channel);
+            self.spawned_ready.notify_waiters();
+        }
         None
     }
 
@@ -590,10 +639,8 @@ impl Link {
         limit: Duration,
     ) -> Result<Value, CallError> {
         self.pending.fetch_add(1, Ordering::AcqRel);
-        let out = self.client.call(name, params, limit).await;
-        self.pending.fetch_sub(1, Ordering::AcqRel);
-        self.touch();
-        out
+        let _pending = PendingRequest(self);
+        self.client.call(name, params, limit).await
     }
 
     fn touch(&self) {
@@ -673,6 +720,7 @@ impl Link {
         attempt: &str,
         session: Option<&str>,
     ) -> Result<Spawned, SpawnError> {
+        let _waiting = WaitingSpawn::new(self, attempt)?;
         let env: HashMap<&str, &str> = env.iter().map(|(k, v)| (k.as_str(), v.as_str())).collect();
         let reply = self
             .request(
@@ -722,20 +770,26 @@ impl Link {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let ready = self.spawned_ready.notified();
-            if let Some((stream, rx)) = self
+            if let Some(opened) = self
                 .spawned
                 .lock()
                 .unwrap_or_else(PoisonError::into_inner)
-                .remove(&channel)
+                .get_mut(attempt)
+                .and_then(Option::take)
             {
+                if opened.channel != channel {
+                    return Err(SpawnError::Unanswered(
+                        "the spawn answer names a different channel".into(),
+                    ));
+                }
                 self.lanes.fetch_add(1, Ordering::AcqRel);
                 return Ok(Spawned {
                     channel,
-                    stream,
+                    stream: opened.stream,
                     hold: LaneHold(Arc::clone(self)),
                     exit: ExitWait {
                         attempt: attempt.to_string(),
-                        rx,
+                        rx: opened.exit,
                         got: None,
                     },
                 });
@@ -1512,6 +1566,8 @@ impl Check {
 
 #[cfg(test)]
 pub(crate) mod tests {
+    use std::task::{Context, Waker};
+
     use super::*;
 
     #[test]
@@ -1646,6 +1702,95 @@ pub(crate) mod tests {
                 .unwrap()
                 .contains("bridge protocol 2")
         );
+    }
+
+    /// A connected link whose peer leaves requests unanswered.
+    fn unanswered() -> (Arc<Link>, DuplexStream) {
+        let (hub, worker) = tokio::io::duplex(256 * 1024);
+        let (read, write) = tokio::io::split(hub);
+        let (mux, control, _) = Mux::start(read, write, Timing::STANDARD);
+        (
+            Link::assemble("box", Hello::default(), mux, Client::start(control), None),
+            worker,
+        )
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_requests_release_the_link() {
+        let (link, _worker) = unanswered();
+        let mut cx = Context::from_waker(Waker::noop());
+        {
+            let request = link.request(method::STATUS, json!({}), Duration::from_secs(30));
+            tokio::pin!(request);
+            assert!(request.as_mut().poll(&mut cx).is_pending());
+            assert_eq!(link.pending.load(Ordering::Acquire), 1);
+            assert!(!link.idle_for(Duration::ZERO));
+        }
+        assert_eq!(link.pending.load(Ordering::Acquire), 0);
+        assert!(link.idle_for(Duration::ZERO));
+        link.mux.close();
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn cancelled_spawns_close_unclaimed_channels() {
+        use tokio::io::AsyncReadExt as _;
+
+        // Cancel before the reply, with the channel already accepted or still to arrive, and
+        // after the reply while waiting for its channel. None may keep the child's input open.
+        for (channel_first, reply_first) in [(false, false), (true, false), (false, true)] {
+            let (link, _worker) = unanswered();
+            let mut cx = Context::from_waker(Waker::noop());
+            let argv = ["omp".to_string()];
+            let (stream, mut input) = tokio::io::duplex(64);
+            let (_exit, exit) = oneshot::channel();
+            let mut channel = Some(Accepted {
+                channel: 1,
+                header: json!({"kind": "spawn", "attempt": "cancelled"}),
+                stream,
+                exit,
+            });
+            {
+                let spawning = link.spawn(&argv, "/", &[], "cancelled", None);
+                tokio::pin!(spawning);
+                assert!(spawning.as_mut().poll(&mut cx).is_pending());
+                assert_eq!(link.pending.load(Ordering::Acquire), 1);
+                if channel_first {
+                    assert!(link.accept(channel.take().unwrap()).is_none());
+                }
+                if reply_first {
+                    // Deliver the fake worker's reply before polling the channel wait.
+                    link.client
+                        .pending
+                        .lock()
+                        .unwrap()
+                        .remove(&1)
+                        .unwrap()
+                        .send(Response::ok(
+                            1,
+                            json!({"channel": 1, "attempt": "cancelled"}),
+                        ))
+                        .unwrap();
+                    assert!(spawning.as_mut().poll(&mut cx).is_pending());
+                    assert_eq!(link.pending.load(Ordering::Acquire), 0);
+                }
+            }
+            if let Some(channel) = channel {
+                assert!(link.accept(channel).is_none());
+            }
+            assert!(link.spawned.lock().unwrap().is_empty());
+            let mut byte = [0];
+            assert_eq!(
+                tokio::time::timeout(Duration::from_secs(1), input.read(&mut byte))
+                    .await
+                    .unwrap()
+                    .unwrap(),
+                0,
+                "channel_first={channel_first}, reply_first={reply_first}"
+            );
+            assert_eq!(link.pending.load(Ordering::Acquire), 0);
+            assert!(link.idle_for(Duration::ZERO));
+            link.mux.close();
+        }
     }
 
     /// The real `serve` in this process over an in-memory stream, with `/bin/sh` as its OMP, and

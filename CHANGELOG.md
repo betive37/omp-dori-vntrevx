@@ -1,5 +1,10 @@
 # Changelog
 
+## Unreleased
+
+- Cancelling a worker request no longer keeps its SSH connection busy forever. A cancelled lane
+  start closes its unclaimed OMP channel, including one that arrives after cancellation.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
