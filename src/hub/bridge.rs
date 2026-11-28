@@ -681,6 +681,7 @@ mod tests {
         store
             .relay(RelayWrite::Arrive {
                 relay: "telegram".into(),
+                position_dedupe: true,
                 room: "c".into(),
                 message: "12".into(),
                 seq: 12,
