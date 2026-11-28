@@ -1024,10 +1024,7 @@ impl<T: Runtime> Intake<T> {
         }
         self.post_parts(&dialog.id, channel, &stamp, pages).await;
         if let Some(index) = recommended {
-            let me = Arc::clone(self);
-            let id = dialog.id.clone();
-            let timer = tokio::spawn(async move { me.recommended_after(&id, index).await });
-            self.cards.timer(&dialog.id, timer);
+            self.arm_recommended(&dialog.id, index);
         }
     }
 
@@ -1062,6 +1059,14 @@ impl<T: Runtime> Intake<T> {
         {
             log::warn("approval not denied", &[("error", &e)]);
         }
+    }
+
+    /// Starts a posted card's recommended-answer timer; it ends with the card or with intake.
+    fn arm_recommended(self: &Arc<Self>, dialog: &str, index: usize) {
+        let me = Arc::clone(self);
+        let id = dialog.to_string();
+        let timer = tokio::spawn(async move { me.recommended_after(&id, index).await });
+        self.cards.timer(dialog, timer);
     }
 
     /// The single recommended choice after the quiet time, submitted explicitly (DESIGN 12.2 C11).
