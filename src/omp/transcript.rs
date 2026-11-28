@@ -2,9 +2,10 @@
 //! session file may be resumed exactly and which model OMP will restore from it, and the search for
 //! a delivery marker in a user entry. Session files belong to OMP; the hub only reads them, with
 //! no symlink followed, no FIFO opened, a 64 KiB header (1 MiB for a reopen check), and 2 s for a
-//! reply read from retained request offsets or the last 8 MiB, searching the rest for missing tags.
-//! Marker searches read the whole file within 10 s. Nothing over 64 MiB is read. Every read here
-//! blocks; callers use the async wrappers, which run on the blocking pool.
+//! reply read from retained request/search offsets or the last 8 MiB. Missing tags resume beyond
+//! searched prefixes; a spent head-search budget leaves complete tail results usable. Marker searches
+//! read the whole file within 10 s. Nothing over 64 MiB is read. Every read here blocks; callers use
+//! the async wrappers, which run on the blocking pool.
 
 use std::collections::{HashMap, HashSet};
 use std::fmt;
@@ -712,18 +713,65 @@ fn said(entry: &Value, offset: u64) -> Option<Said> {
     })
 }
 
-/// Request positions for one relay's current session file. Only tags still being read are kept;
-/// a replaced or shortened file discards all positions. No transcript text is cached.
+/// Request positions and searched prefixes for one relay's current session file. Only tags still
+/// being read are kept; a replaced or shortened file discards all positions. No text is cached.
 #[derive(Debug, Default)]
 pub(crate) struct ReplyOffsets {
     identity: Option<(u64, u64)>,
     length: u64,
-    tags: HashMap<String, u64>,
+    tags: HashMap<String, ReplyPosition>,
 }
 
-/// Reads from retained request positions or the newest 8 MiB, then searches the unread head once
-/// if a tag is missing. Both parts share the 2 s budget and the file's bounded length. `None` means
-/// the file is missing or the budget ran out, not that the tag is absent.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReplyPosition {
+    Request(u64),
+    /// No complete entry through this offset carries the tag; `complete` means the rest of the
+    /// current file was checked too, apart from an unfinished last line.
+    Searched { through: u64, complete: bool },
+}
+
+impl ReplyPosition {
+    fn start(self, tail: u64) -> u64 {
+        match self {
+            Self::Request(at) => at,
+            Self::Searched { through, complete } => {
+                if complete {
+                    through
+                } else {
+                    through.max(tail)
+                }
+            }
+        }
+    }
+
+    fn through(self) -> u64 {
+        match self {
+            Self::Request(_) => 0,
+            Self::Searched { through, .. } => through,
+        }
+    }
+}
+
+impl ReplyOffsets {
+    fn remember(&mut self, tag: &str, position: ReplyPosition) {
+        if let Some(old) = self.tags.get_mut(tag) {
+            *old = position;
+        } else {
+            self.tags.insert(tag.to_string(), position);
+        }
+    }
+}
+
+struct MessageScan {
+    entries: Vec<Said>,
+    /// The first byte of an unfinished last entry, or the end of the scanned range.
+    through: u64,
+    complete: bool,
+}
+
+/// Reads from retained request/search positions or the newest 8 MiB, then searches unread prefixes
+/// for missing tags. Both parts share the 2 s budget and the file's bounded length. `None` means the
+/// file is missing or the initial read ran out of time; a head timeout holds only unresolved tags.
 fn message_entries(
     path: &Path,
     tags: &[String],
@@ -753,12 +801,11 @@ fn message_entries(
     offsets.length = info.len();
     offsets.tags.retain(|tag, _| tags.contains(tag));
     let tail = info.len().saturating_sub(SEARCH_TAIL);
-    let cached = offsets.tags.values().min().copied();
-    let mut start = if tags.iter().all(|tag| offsets.tags.contains_key(tag)) {
-        cached.unwrap_or(tail)
-    } else {
-        cached.map_or(tail, |at| at.min(tail))
-    };
+    let mut start = tags
+        .iter()
+        .map(|tag| offsets.tags.get(tag).map_or(tail, |p| p.start(tail)))
+        .min()
+        .unwrap_or(tail);
     let mut reader = BufReader::new(file);
     if start > 0 {
         // Include a line beginning exactly at the offset, even at the tail boundary. If a cached
@@ -770,41 +817,102 @@ fn message_entries(
                 .take(info.len() - start + 1)
                 .skip_until(b'\n')? as u64;
     }
-    let Some(mut entries) = message_lines(
+    let tail = message_lines(
         &mut reader.by_ref().take(info.len() - start),
         start,
         started,
-    )?
-    else {
+        None,
+    )?;
+    if !tail.complete {
         return Ok(None);
-    };
-    if start > 0
-        && tags.iter().any(|tag| {
-            !entries
+    }
+    finish_messages(&mut reader, start, tail, tags, offsets, started).map(Some)
+}
+
+/// A head search may be incomplete without invalidating any complete tail results. Keep only a
+/// matching request and its following entries, and retain search progress for every missing tag.
+fn finish_messages(
+    reader: &mut (impl std::io::BufRead + std::io::Seek),
+    start: u64,
+    mut tail: MessageScan,
+    tags: &[String],
+    offsets: &mut ReplyOffsets,
+    started: Instant,
+) -> Result<Vec<Said>> {
+    let missing: Vec<&str> = tags
+        .iter()
+        .filter(|tag| {
+            !tail
+                .entries
                 .iter()
                 .any(|entry| entry.user && entry.text.contains(tag.as_str()))
         })
-    {
-        reader.seek(SeekFrom::Start(0))?;
-        let Some(mut head) = message_lines(&mut reader.take(start), 0, started)? else {
-            return Ok(None);
-        };
-        head.append(&mut entries);
-        entries = head;
+        .map(String::as_str)
+        .collect();
+    if missing.is_empty() {
+        return Ok(tail.entries);
     }
-    Ok(Some(entries))
+    let from = missing
+        .iter()
+        .map(|tag| offsets.tags.get(*tag).map_or(0, |p| p.through()))
+        .min()
+        .unwrap_or(start)
+        .min(start);
+    let mut head = if from < start {
+        reader.seek(SeekFrom::Start(from))?;
+        message_lines(&mut reader.take(start - from), from, started, Some(&missing))?
+    } else {
+        MessageScan {
+            entries: Vec::new(),
+            through: start,
+            complete: true,
+        }
+    };
+    for tag in missing {
+        let position = if let Some(request) = head
+            .entries
+            .iter()
+            .rfind(|entry| entry.user && entry.text.contains(tag))
+        {
+            ReplyPosition::Request(request.offset)
+        } else {
+            let previous = offsets.tags.get(tag).map_or(0, |p| p.through());
+            let complete = head.complete || previous >= start;
+            ReplyPosition::Searched {
+                through: if complete {
+                    tail.through
+                } else {
+                    previous.max(head.through)
+                },
+                complete,
+            }
+        };
+        offsets.remember(tag, position);
+    }
+    if head.complete {
+        head.entries.append(&mut tail.entries);
+        Ok(head.entries)
+    } else {
+        Ok(tail.entries)
+    }
 }
 
 fn message_lines(
     reader: &mut impl std::io::BufRead,
     mut offset: u64,
     started: Instant,
-) -> Result<Option<Vec<Said>>> {
+    after: Option<&[&str]>,
+) -> Result<MessageScan> {
     let mut line = Vec::new();
-    let mut out = Vec::new();
+    let mut out = MessageScan {
+        entries: Vec::new(),
+        through: offset,
+        complete: false,
+    };
+    let mut keeping = after.is_none();
     loop {
         if started.elapsed() > SEARCH_BUDGET {
-            return Ok(None);
+            return Ok(out);
         }
         line.clear();
         let n = reader
@@ -812,20 +920,28 @@ fn message_lines(
             .take(SEARCH_TAIL + 1)
             .read_until(b'\n', &mut line)? as u64;
         if n == 0 {
-            return Ok(Some(out));
+            out.complete = true;
+            return Ok(out);
         }
         let at = offset;
         offset += n;
-        // An unfinished last line is read again next time; an oversized entry is skipped whole.
+        // Do not advance the searched prefix past an unfinished entry: an append may complete it.
         if line.last() != Some(&b'\n') {
             offset += reader.skip_until(b'\n')? as u64;
             continue;
         }
+        out.through = offset;
         trim_newline(&mut line);
         if let Ok(entry) = serde_json::from_slice::<Value>(&line)
             && let Some(s) = said(&entry, at)
         {
-            out.push(s);
+            if !keeping {
+                keeping = s.user
+                    && after.is_some_and(|tags| tags.iter().any(|tag| s.text.contains(*tag)));
+            }
+            if keeping {
+                out.entries.push(s);
+            }
         }
     }
 }
@@ -851,8 +967,17 @@ pub(crate) fn replies(
     let Some(entries) = message_entries(path, tags, offsets)? else {
         return Ok(vec![Reply::Pending; tags.len()]);
     };
-    Ok(tags
-        .iter()
+    Ok(replies_from_entries(&entries, tags, prefix, settled, offsets))
+}
+
+fn replies_from_entries(
+    entries: &[Said],
+    tags: &[String],
+    prefix: &str,
+    settled: bool,
+    offsets: &mut ReplyOffsets,
+) -> Vec<Reply> {
+    tags.iter()
         .map(|tag| {
             let Some((at, request)) = entries
                 .iter()
@@ -860,8 +985,15 @@ pub(crate) fn replies(
                 .rev()
                 .find(|(_, e)| e.user && e.text.contains(tag.as_str()))
             else {
-                offsets.tags.remove(tag);
-                return Reply::NotFound;
+                return match offsets.tags.get(tag) {
+                    Some(
+                        ReplyPosition::Request(_)
+                        | ReplyPosition::Searched {
+                            complete: false, ..
+                        },
+                    ) => Reply::Pending,
+                    _ => Reply::NotFound,
+                };
             };
             let later_request = request
                 .text
@@ -876,10 +1008,8 @@ pub(crate) fn replies(
             let end = span.iter().position(|e| e.user);
             if end.is_some() {
                 offsets.tags.remove(tag);
-            } else if let Some(offset) = offsets.tags.get_mut(tag) {
-                *offset = request.offset;
             } else {
-                offsets.tags.insert(tag.clone(), request.offset);
+                offsets.remember(tag, ReplyPosition::Request(request.offset));
             }
             let turns = span.get(..end.unwrap_or(span.len())).unwrap_or_default();
             // A final message counts once anything follows it or the session is idle.
@@ -908,7 +1038,7 @@ pub(crate) fn replies(
                 open: end.is_none(),
             }
         })
-        .collect())
+        .collect()
 }
 
 /// [`replies`] on the blocking pool.
@@ -1323,7 +1453,10 @@ mod tests {
                 open: true,
             }]
         );
-        assert_eq!(offsets.tags.get("[d old]"), Some(&request_at));
+        assert_eq!(
+            offsets.tags.get("[d old]"),
+            Some(&ReplyPosition::Request(request_at))
+        );
         let entries = message_entries(&path, &tags, &mut offsets)
             .unwrap()
             .unwrap();
@@ -1361,6 +1494,132 @@ mod tests {
     }
 
     #[test]
+    fn reply_search_resumes_after_absence() {
+        use std::io::Write as _;
+
+        let dir = crate::sys::fs::tests::scratch("reply-missing-tag");
+        let path = dir.join("s.jsonl");
+        let mut file = std::io::BufWriter::new(File::create(&path).unwrap());
+        let filler = serde_json::json!({
+            "type": "message",
+            "message": {"role": "toolResult", "content": "x".repeat(64 * 1024)}
+        })
+        .to_string();
+        for _ in 0..144 {
+            writeln!(file, "{filler}").unwrap();
+        }
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"assistant","content":"earlier answer","stopReason":"stop"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        let tags = ["[d queued]".into()];
+        let mut offsets = ReplyOffsets::default();
+        assert_eq!(
+            replies(&path, &tags, "[d ", true, &mut offsets).unwrap(),
+            vec![Reply::NotFound]
+        );
+        assert!(
+            message_entries(&path, &tags, &mut offsets)
+                .unwrap()
+                .unwrap()
+                .is_empty(),
+            "an unchanged transcript is not searched again for an absent tag"
+        );
+        file.write_all(b"{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d que")
+            .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            replies(&path, &tags, "[d ", true, &mut offsets).unwrap(),
+            vec![Reply::NotFound]
+        );
+        file.write_all(b"ued] request\"}}\n").unwrap();
+        writeln!(
+            file,
+            r#"{{"type":"message","message":{{"role":"assistant","content":"new answer","stopReason":"stop"}}}}"#
+        )
+        .unwrap();
+        file.flush().unwrap();
+        assert_eq!(
+            replies(&path, &tags, "[d ", true, &mut offsets).unwrap(),
+            vec![Reply::Answer {
+                text: "new answer".into(),
+                more: Vec::new(),
+                open: true,
+            }],
+            "a partial entry is searched again after it is completed"
+        );
+    }
+
+    #[test]
+    fn reply_search_keeps_tail_answers_when_head_budget_expires() {
+        let head = "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d old]\"}}\n";
+        let tail = concat!(
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d ready]\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"ready answer\",\"stopReason\":\"stop\"}}\n"
+        );
+        let text = format!("{head}{tail}");
+        let mut reader = std::io::Cursor::new(text.as_bytes());
+        let start = head.len() as u64;
+        reader.set_position(start);
+        let tail = message_lines(&mut reader, start, Instant::now(), None).unwrap();
+        assert!(tail.complete);
+        let tags = ["[d old]".into(), "[d ready]".into(), "[d absent]".into()];
+        let mut offsets = ReplyOffsets::default();
+        offsets.remember(
+            "[d absent]",
+            ReplyPosition::Searched {
+                through: text.len() as u64,
+                complete: true,
+            },
+        );
+        let expired = Instant::now()
+            .checked_sub(SEARCH_BUDGET + Duration::from_millis(1))
+            .unwrap();
+        let entries = finish_messages(&mut reader, start, tail, &tags, &mut offsets, expired)
+            .unwrap();
+        assert_eq!(
+            replies_from_entries(&entries, &tags, "[d ", true, &mut offsets),
+            vec![
+                Reply::Pending,
+                Reply::Answer {
+                    text: "ready answer".into(),
+                    more: Vec::new(),
+                    open: true,
+                },
+                Reply::NotFound,
+            ],
+            "only the tag whose head search is unfinished waits"
+        );
+        assert_eq!(
+            offsets.tags.get("[d old]"),
+            Some(&ReplyPosition::Searched {
+                through: 0,
+                complete: false,
+            })
+        );
+    }
+
+    #[test]
+    fn reply_search_keeps_only_matched_head_entries() {
+        let text = concat!(
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"unrelated request\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"unrelated answer\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"user\",\"content\":\"[d wanted]\"}}\n",
+            "{\"type\":\"message\",\"message\":{\"role\":\"assistant\",\"content\":\"wanted answer\"}}\n"
+        );
+        let mut reader = std::io::Cursor::new(text);
+        let scan = message_lines(&mut reader, 0, Instant::now(), Some(&["[d wanted]"]))
+            .unwrap();
+        assert!(scan.complete);
+        assert_eq!(scan.through, text.len() as u64);
+        assert_eq!(scan.entries.len(), 2);
+        assert_eq!(scan.entries[0].text, "[d wanted]");
+        assert_eq!(scan.entries[1].text, "wanted answer");
+    }
+
+    #[test]
     fn reply_offsets_reset_when_the_file_changes_or_requests_leave() {
         let dir = crate::sys::fs::tests::scratch("reply-offsets");
         let path = dir.join("s.jsonl");
@@ -1373,7 +1632,10 @@ mod tests {
             replies(&path, &tags, "[d ", false, &mut offsets).unwrap(),
             vec![Reply::Pending]
         );
-        assert_eq!(offsets.tags.get("[d a]"), Some(&(header.len() as u64)));
+        assert_eq!(
+            offsets.tags.get("[d a]"),
+            Some(&ReplyPosition::Request(header.len() as u64))
+        );
 
         fs::write(&path, user).unwrap();
         let entries = message_entries(&path, &tags, &mut offsets)
@@ -1427,8 +1689,10 @@ mod tests {
             Err(TranscriptError::TooLarge)
         );
         let mut input = std::io::Cursor::new(b"{}\n");
-        let started = Instant::now().checked_sub(SEARCH_BUDGET).unwrap();
-        assert!(message_lines(&mut input, 0, started).unwrap().is_none());
+        let started = Instant::now()
+            .checked_sub(SEARCH_BUDGET + Duration::from_millis(1))
+            .unwrap();
+        assert!(!message_lines(&mut input, 0, started, None).unwrap().complete);
     }
 
     #[test]

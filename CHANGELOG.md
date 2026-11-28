@@ -3,7 +3,9 @@
 ## Unreleased
 
 - Relay answers are no longer lost when more than 8 MiB of transcript follows their request.
-  The reader searches beyond the tail when needed and remembers each pending request's position.
+  The reader searches beyond the tail when needed and remembers request positions and searched
+  prefixes. Missing tags do not repeatedly rescan old entries, and a slow head search does not
+  hold answers already found in the tail.
 
 ## 0.2.8 (2026-11-28)
 
