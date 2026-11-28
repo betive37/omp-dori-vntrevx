@@ -1205,6 +1205,12 @@ async fn service(enable: bool, paths: &Paths) -> Outcome {
         }
         notes.push(format!("[omp] path set to {value}"));
     }
+    if !config.setup.service {
+        match super::setup::write_flag(paths, "setup", "service", true) {
+            Ok(()) => notes.push("[setup] service set to true".into()),
+            Err(e) => return Outcome::Held(e),
+        }
+    }
     match enable_service(&l, paths, &config).await {
         Ok((file, more)) => {
             notes.extend(more);

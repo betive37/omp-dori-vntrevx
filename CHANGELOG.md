@@ -46,6 +46,16 @@
   away and could hit this.
 - `cataly setup` no longer resets a `[destinations.cataly-ops]` you pointed elsewhere to the
   `#cataly-ops` channel, and no longer creates that channel when the destination is already set.
+### Upgrade notes
+
+- `cataly setup --service off` now writes `[setup] service = false`. A 0.2.7 hub (after a
+  rollback) refuses that key; remove it from the config before going back.
+
+### Fixes
+
+- After `cataly setup --service off`, a plain `cataly setup` enabled and started the service
+  again. The off is now remembered as `[setup] service = false`; setup leaves the service off
+  until `--service on` or `cataly service enable`.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
