@@ -353,19 +353,18 @@ fn intake_restart_recovers_only_recent_lead_work() {
         let mut hub = relay_hub(&fake, &[], "");
         hub.start();
         ready(&hub);
-        recap_delivered(&hub);
         assert!(hub.stop().success());
-        // Install the aging rule with the hub stopped: only its own writer changes the hand-off
-        // while it runs. Confirmation means the held turn has reached the transcript already.
+        // Install the aging rule with the hub stopped: only its own writer changes the hand-off.
+        // The release that restarts intake ages it after the original pipeline observed work.
         {
             let db = rusqlite::Connection::open(hub.state().join("cataly.db")).unwrap();
             db.execute_batch(
-                "CREATE TRIGGER age_confirmed_request AFTER UPDATE OF state ON handoffs
-                 WHEN NEW.relay = 'discord' AND NEW.message = '800000000000000023'
-                   AND OLD.state = 'handed' AND NEW.state = 'delivered'
+                "CREATE TRIGGER age_restarted_request AFTER UPDATE OF held ON positions
+                 WHEN NEW.relay = 'discord' AND NEW.held IS NULL
                  BEGIN
                    UPDATE handoffs SET created_ms = created_ms - 31 * 60 * 1000
-                   WHERE relay = NEW.relay AND room = NEW.room AND message = NEW.message;
+                   WHERE relay = NEW.relay AND room = NEW.room
+                     AND message = '800000000000000023' AND state = 'delivered';
                  END;",
             )
             .unwrap();
@@ -374,7 +373,6 @@ fn intake_restart_recovers_only_recent_lead_work() {
         hub.fixture("omp", "hold-busy", Some(""));
         hub.start();
         ready(&hub);
-        recap_delivered(&hub);
         hub.fixture("omp", "answer.json", Some(r#""the late answer""#));
         fake.say(FakeDiscord::message(
             CH,
