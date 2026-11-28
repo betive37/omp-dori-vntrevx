@@ -19,7 +19,7 @@ use std::time::Instant;
 
 use serde::Serialize;
 
-use super::{Control, DeliverOutcome, Delivery, Snapshot, Status, Timing};
+use super::{Control, DeliverOutcome, Delivery, Status, Timing};
 use crate::omp::transcript::{self, Found};
 use crate::store::host::{Admit, Admitted, DeliveryRow, HostDone, HostWrite, InboxRow};
 use crate::store::{Store, StoreError};
@@ -242,18 +242,11 @@ enum Check {
     Misdelivered(String),
 }
 
-/// Whether the session is in a turn or waits on a dialog: OMP writes a follow-up's entry only once
-/// the running tool call or the dialog is over, however long that takes. A faulted session is not
-/// busy, nor is a turn start the state read back as idle since.
-fn busy(s: &Snapshot) -> bool {
-    s.status != Status::Error
-        && (s.busy().is_some() || (s.turn_started_ms.is_some() && s.status != Status::Idle))
-}
-
 /// A written batch with no entry in the file of the same process (PATCH-01 rules 4 and 10). While
-/// the session is busy it waits, up to [`BUSY_KEEP_MS`] after it was written. Once the session is
-/// idle it has [`CONFIRM_WITHIN_MS`]: a follow-up, which waited behind the running turn, from the
-/// end of the last turn (`turn_ended_ms`), a wake from its write.
+/// the session is busy ([`super::Snapshot::in_turn`]; OMP writes a follow-up's entry only once the
+/// running tool call or the dialog is over) it waits, up to [`BUSY_KEEP_MS`] after it was written.
+/// Once the session is idle it has [`CONFIRM_WITHIN_MS`]: a follow-up, which waited behind the
+/// running turn, from the end of the last turn (`turn_ended_ms`), a wake from its write.
 fn unconfirmed(
     sent_ms: i64,
     follow_up: bool,
@@ -816,7 +809,7 @@ impl Mailbox {
                 Check::Failed("its session was not current again within 24 h".into())
             } else {
                 let follow_up = d.kind == "follow_up";
-                unconfirmed(d.sent_ms, follow_up, now, busy(s), s.turn_ended_ms)
+                unconfirmed(d.sent_ms, follow_up, now, s.in_turn(), s.turn_ended_ms)
             };
         }
         // The process that held the batch is gone, so its file is final. On a worker it ended with

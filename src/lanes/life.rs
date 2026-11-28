@@ -790,7 +790,8 @@ impl<R: Runtime> Lanes<R> {
             };
             if !armed {
                 armed = true;
-                beat.as_mut().reset(tokio::time::Instant::now() + CONFIRM_BEAT);
+                beat.as_mut()
+                    .reset(tokio::time::Instant::now() + CONFIRM_BEAT);
             }
             let event = match got {
                 Ok((_, e)) => e,
