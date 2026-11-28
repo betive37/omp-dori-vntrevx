@@ -2,10 +2,11 @@
 
 ## Unreleased
 
-- The user service now keeps absolute `XDG_STATE_HOME` and `XDG_DATA_HOME` values from the shell
-  when enabled or refreshed, instead of using the default store or program folder. On macOS this
-  also preserves `XDG_CONFIG_HOME`. A shell-only custom `XDG_CONFIG_HOME` remains unsupported on
-  Linux: the shell and systemd user manager must agree on the config home to find the unit.
+- The user service now keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME`
+  values from the shell when enabled or refreshed, instead of using the default config, store or
+  program folder. The Linux unit also carries `XDG_CONFIG_HOME`, but a shell-only custom value
+  remains unsupported: the shell and systemd user manager must agree on the config home to find
+  the unit. OMP child processes now also follow the shell's XDG homes.
   Explicit service commands refuse absolute non-UTF-8 XDG homes rather than silently using defaults.
 
 ## 0.2.8 (2026-11-28)

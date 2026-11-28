@@ -137,10 +137,11 @@ does not see your shell's environment, so it:
 - writes one `PATH=` line into the unit, made of the folders where `omp`, `bun`, `gh`, `git` and
   the Tern executable are found now, then `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
   repeats and folders with `:`, `"`, `\` or control characters are left out. The line is printed;
-- keeps absolute `XDG_STATE_HOME` and `XDG_DATA_HOME` values from the current environment in the
-  unit or agent, so the hub uses the same store and program folder. On macOS this also preserves
-  `XDG_CONFIG_HOME`. Unset, empty and relative values are ignored; explicit service commands
-  refuse absolute non-UTF-8 values before writing the definition. Refresh captures these values again;
+- keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` values from the current
+  environment in both the systemd unit and launchd agent, so the hub uses the same config, store
+  and program folder. OMP child processes also follow these XDG homes from the shell.
+  Unset, empty and relative values are ignored; explicit service commands refuse absolute non-UTF-8
+  values before writing the definition. Refresh captures these values again;
 - reads provider keys from `secrets/service.env` next to the config file (owner-only, mode `600`).
   A new file gets each `[sessions] credentials` name found in your current environment as
   `NAME=value`, and the others as commented lines to fill in. An existing file is never changed;
