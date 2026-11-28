@@ -1023,6 +1023,9 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                 let (d, r) = (delivery.to_string(), reason.to_string());
                 self.lanes.relay_doubt(target, d, rows.clone(), r).await;
             }
+            // A batch that mixes relayed messages with other lane input is the lanes' to report:
+            // `relay_doubt` above fences the lane and raises its "delivery in doubt" alert, which
+            // has the lead read the lane and release it, so a notice from here would only repeat it.
             if !relayed {
                 return Ok(());
             }
