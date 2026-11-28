@@ -41,6 +41,49 @@ pub(crate) fn titled(current: &str, word: &str) -> Option<String> {
     (!base.trim().is_empty() && title.chars().count() <= TITLE_MAX).then_some(title)
 }
 
+/// Where a lane thread from a message in `room` goes: `None` for a thread on the message itself in a
+/// listed channel, else the listed parent beside the source thread and whether it is a forum.
+async fn beside(
+    rest: &Rest,
+    config: &Config,
+    room: Snowflake,
+) -> Result<Option<(Snowflake, bool)>, (bool, String)> {
+    // The source channel's type is always looked up, listed or not (DISC-OUT req. 49). A
+    // message inside a thread under a listed channel: Discord nests no threads, so the new
+    // thread starts beside it in that listed channel without a starter message; a forum or
+    // media parent takes a post with a starter message instead.
+    let channel = rest.channel(room).await.map_err(|e| (false, e.why))?;
+    let thread = matches!(channel.get("type").and_then(Value::as_u64), Some(11 | 12));
+    if thread {
+        let parent = channel
+            .get("parent_id")
+            .and_then(Value::as_str)
+            .and_then(Snowflake::parse)
+            .filter(|p| config.discord.channels.contains(p))
+            .ok_or((
+                false,
+                "the source message's channel is not in scope".to_string(),
+            ))?;
+        let home = rest.channel(parent).await.map_err(|e| (false, e.why))?;
+        let forum = matches!(home.get("type").and_then(Value::as_u64), Some(15 | 16));
+        // REQUIRE_TAG (1 << 4): the product never picks a tag itself.
+        if forum && home.get("flags").and_then(Value::as_u64).unwrap_or(0) & (1 << 4) != 0 {
+            return Err((
+                false,
+                "the forum requires a tag on every post; no lane thread was made".into(),
+            ));
+        }
+        Ok(Some((parent, forum)))
+    } else if config.discord.channels.contains(&room) {
+        Ok(None)
+    } else {
+        Err((
+            false,
+            "the source message's channel is not in scope".to_string(),
+        ))
+    }
+}
+
 impl DiscordThreads {
     fn client(&self) -> Result<(Arc<Rest>, Arc<Config>), String> {
         let config = Arc::clone(&self.config.borrow());
@@ -117,40 +160,7 @@ impl DiscordThreads {
             .discord
             .owner
             .ok_or((false, "no [discord] owner".to_string()))?;
-        // The source channel's type is always looked up, listed or not (DISC-OUT req. 49). A
-        // message inside a thread under a listed channel: Discord nests no threads, so the new
-        // thread starts beside it in that listed channel without a starter message; a forum or
-        // media parent takes a post with a starter message instead.
-        let channel = rest.channel(room).await.map_err(|e| (false, e.why))?;
-        let thread = matches!(channel.get("type").and_then(Value::as_u64), Some(11 | 12));
-        let beside = if thread {
-            let parent = channel
-                .get("parent_id")
-                .and_then(Value::as_str)
-                .and_then(Snowflake::parse)
-                .filter(|p| config.discord.channels.contains(p))
-                .ok_or((
-                    false,
-                    "the source message's channel is not in scope".to_string(),
-                ))?;
-            let home = rest.channel(parent).await.map_err(|e| (false, e.why))?;
-            let forum = matches!(home.get("type").and_then(Value::as_u64), Some(15 | 16));
-            // REQUIRE_TAG (1 << 4): the product never picks a tag itself.
-            if forum && home.get("flags").and_then(Value::as_u64).unwrap_or(0) & (1 << 4) != 0 {
-                return Err((
-                    false,
-                    "the forum requires a tag on every post; no lane thread was made".into(),
-                ));
-            }
-            Some((parent, forum))
-        } else if config.discord.channels.contains(&room) {
-            None
-        } else {
-            return Err((
-                false,
-                "the source message's channel is not in scope".to_string(),
-            ));
-        };
+        let beside = beside(&rest, &config, room).await?;
         // Proof of source (DISC-IN req. 59): the exact message, written by the owner.
         let source = rest
             .message(room, message)
