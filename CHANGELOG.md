@@ -87,6 +87,11 @@
 - A worker lane's report or step with `files` read those files on the hub, at the worker's path:
   a file only on the worker was refused as missing, and a hub file at the same path was recorded
   instead. They are now read on the worker (at most 8 MiB per file there).
+- A lane could cite a build or test that OMP had moved to the background after 60 s, and the
+  still-running call counted as evidence. The extension now reports such a call as running, and the
+  hub refuses it until OMP reports its job finished; a completed job then counts with its final
+  result and the same evidence identity as the equivalent foreground result, without job
+  bookkeeping. A failed or cancelled one stays refused.
 
 - A lead whose hold was lifted without `cataly lead start` (as 0.2.8's repair of the false
   "ambiguous lead binding history" does) could be held again by the first message that woke it,
