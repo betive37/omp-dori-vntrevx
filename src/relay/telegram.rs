@@ -735,25 +735,17 @@ async fn start<T: Runtime>(
         env.store.clone(),
         Arc::clone(&env.lead),
     ));
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let poller = Poller {
-            api,
-            settings: settings.clone(),
-            shared: Arc::clone(&shared),
-            round: Arc::clone(&round),
-            store: env.store.clone(),
-            state,
-        };
-        let stop = shutdown.clone();
-        tokio::spawn(async move {
-            let end = poller.run(stop).await;
-            let _ = tx.send(end);
-        });
-    }
+    let poller = Poller {
+        api,
+        settings: settings.clone(),
+        shared: Arc::clone(&shared),
+        round: Arc::clone(&round),
+        store: env.store.clone(),
+        state,
+    };
     round
         .serve(
-            rx,
+            |stop| poller.run(stop),
             env.config.clone(),
             |c| c.telegram.clone(),
             &shared.kick,

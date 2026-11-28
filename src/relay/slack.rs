@@ -887,26 +887,18 @@ async fn start<T: Runtime>(
         env.store.clone(),
         Arc::clone(&env.lead),
     ));
-    let (tx, rx) = tokio::sync::oneshot::channel();
-    {
-        let socket = Socket {
-            api,
-            account,
-            senders: settings.senders(),
-            shared: Arc::clone(&shared),
-            round: Arc::clone(&round),
-            store: env.store.clone(),
-            loopback: settings.api_base.as_ref().is_some_and(Base::is_loopback),
-        };
-        let stop = shutdown.clone();
-        tokio::spawn(async move {
-            let end = socket.run(stop).await;
-            let _ = tx.send(end);
-        });
-    }
+    let socket = Socket {
+        api,
+        account,
+        senders: settings.senders(),
+        shared: Arc::clone(&shared),
+        round: Arc::clone(&round),
+        store: env.store.clone(),
+        loopback: settings.api_base.as_ref().is_some_and(Base::is_loopback),
+    };
     round
         .serve(
-            rx,
+            |stop| socket.run(stop),
             env.config.clone(),
             |c| c.slack.clone(),
             &shared.kick,

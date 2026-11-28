@@ -1,5 +1,12 @@
 # Changelog
 
+## Unreleased
+
+- A Telegram or Slack intake restart (a config change, `release` or `reset`) left the old poller or
+  socket running beside the new one: Telegram got two long polls (409 and offset races) and Slack
+  kept admitting senders removed from `allow`. The old source is now stopped and waited for before
+  the next one starts.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
