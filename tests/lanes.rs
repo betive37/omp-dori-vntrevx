@@ -1645,7 +1645,11 @@ fn a_completed_lane_leaves_a_thread_another_lane_uses_open() {
         let e = ending(f);
         (!e.is_empty()).then_some(e)
     });
-    assert_eq!(done[0].body["name"], "[done] Shared work", "{:?}", done[0].body);
+    assert_eq!(
+        done[0].body["name"], "[done] Shared work",
+        "{:?}",
+        done[0].body
+    );
     assert_eq!(done[0].body["archived"], true, "{:?}", done[0].body);
     hub.stop();
 }
