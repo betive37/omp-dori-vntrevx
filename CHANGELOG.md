@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Discord questions could still use a recommended answer on the old timer after intake restarted,
+  even after the waiting time was increased or intake was disabled. Removing the card or ending
+  intake now cancels its timer; a restarted intake uses the new waiting time.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
