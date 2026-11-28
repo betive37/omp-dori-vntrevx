@@ -1,5 +1,15 @@
 # Changelog
 
+## Unreleased
+
+- New `[lead] lane_threads = "lead"`: your messages in a lane's Discord thread go to the lead
+  like any other message, with a line naming the lane, instead of straight to the lane. The lead
+  answers you there, the reply is owed like any other, and the lead passes the lane its part with
+  `lane.send`. Before, a lane busy with a long task left such a message unanswered until its turn
+  ended. Two lanes claiming one thread no longer hold the message in this mode; the lead is told
+  both. Replies and presses answering the lead's questions go to the lead as before. The default,
+  `"lane"`, keeps today's routing.
+
 ## 0.2.6 (2026-11-27)
 
 - The npm/Bun `cataly` launcher now takes signals before it starts the binary. On a busy machine a

@@ -225,6 +225,7 @@ Present means the hub keeps one standing lead session. Absent means no lead.
 | `instructions` | string | none | absolute path to an owner-only file | Role instructions appended to the lead's system prompt. |
 | `autostart` | boolean | `true` | | Start the lead when the hub starts. |
 | `idle_sleep` | duration | `"2h"` | `"0s"` (off), or `"5m"` to `"720h"` | Put the lead to sleep after it has been fully idle this long: no turn running, no message waiting for it or in doubt, no open question or approval card, no open owner question and no open lane. Quiet notes that wait for its next turn do not keep it awake; they go with its first turn after it wakes. The hub then stops the lead's OMP the orderly way (never during a turn) and keeps its session. A message that would start a turn (yours, an urgent event, a lane report, `cataly lead send`) resumes the same session and is delivered once it is accepted. `cataly lead stop` and `cataly lead start` work as usual on a sleeping lead, and an update keeps it asleep. |
+| `lane_threads` | string | `"lane"` | `lane`, `lead` | Who takes your messages in a lane's Discord thread. `lane`: the lane that owns the thread; two lanes claiming it hold the message. `lead`: the lead, like any other message, with a line naming the lane; it answers you there (the reply is owed like any other) and passes the lane its part with `lane.send`, so a lane busy with long work never leaves you without an answer. Replies and presses answering the lead's questions go to the lead either way. |
 
 ```toml
 [lead]
