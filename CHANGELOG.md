@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- A headless session showed `unknown` for its whole turn after it started, so follow-ups waited
+  for the turn to end, steering was refused, and stop and update did not see it as busy. The
+  session now reads its state back when a turn starts and shows `working`.
+
 ## 0.2.7 (2026-11-28)
 
 ### Upgrade notes
