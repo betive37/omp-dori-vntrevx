@@ -26,6 +26,7 @@ use crate::log;
 use crate::relay::Inbound;
 use crate::relay::text::DISCORD_LIMIT;
 use crate::store::relay::{QueueRow, RelayWrite};
+use crate::sys::secrets;
 
 mod approval;
 pub(crate) mod ledger;
@@ -166,8 +167,10 @@ impl Cards {
     }
 }
 
-/// Keeps text from mentioning anyone, opening code spans or forming Markdown (DISC-OUT req. 63).
+/// Masks credentials before escaping could hide their shape, then prevents mentions, code spans
+/// and Markdown (OPC-86, DISC-OUT req. 63). Only displayed text goes through this, not answer values.
 pub(crate) fn neutral(text: &str) -> String {
+    let text = secrets::mask(text);
     let mut out = String::with_capacity(text.len());
     for c in text.chars() {
         match c {
@@ -571,12 +574,13 @@ fn buttons(
         let components: Vec<Value> = chunk
             .iter()
             .map(|(i, label)| {
+                let label = secrets::mask(label);
                 let label = if !approval && Some(*i) == recommended {
-                    marked(label, mark, LABEL_MAX)
+                    marked(&label, mark, LABEL_MAX)
                 } else if label.chars().count() > LABEL_MAX {
                     format!("Option {}", i + 1)
                 } else {
-                    (*label).clone()
+                    label.into_owned()
                 };
                 let style = match (approval, *i) {
                     (true, 0) => 3,
@@ -1398,6 +1402,44 @@ mod tests {
             items,
             extra: Vec::new(),
         }
+    }
+
+    #[test]
+    fn question_secrets_are_masked_without_changing_answers() {
+        let body_token = format!("ghp_{}", "a".repeat(36));
+        let label_token = format!("ghp_{}", "b".repeat(36));
+        let value = format!("ghp_{}", "c".repeat(36));
+        let prefix = "x".repeat(50);
+        let label = format!("{prefix} {label_token}");
+        let html = format!(
+            r#"<form><p>Use {body_token}?</p><label><input type="radio" name="color" value="{value}" checked> {label}</label><label><input type="radio" name="color" value="no"> No</label></form>"#
+        );
+        let dialog = dialog_of(&json!({"id": "f", "method": "form", "html": html})).unwrap();
+        let card = card(&dialog);
+        assert!(card.body.contains(r"Use \[masked\]?"), "{}", card.body);
+        let choices = choice_lines(&card.choices, Some(0), " (recommended)");
+        assert!(
+            choices.contains(&format!(r"1. {prefix} \[masked\]")),
+            "{choices}"
+        );
+        for recommended in [None, Some(0)] {
+            let buttons = buttons("s", &card.choices, recommended, false, " (recommended)");
+            let mark = if recommended.is_some() {
+                " (recommended)"
+            } else {
+                ""
+            };
+            assert_eq!(
+                buttons[0]["components"][0]["label"],
+                format!("{prefix} [masked]{mark}")
+            );
+            assert_eq!(buttons[0]["components"][0]["custom_id"], "cy:s:0");
+        }
+        assert_eq!(card.choices[0], label);
+        let expected = json!({"data": {"color": value}});
+        assert_eq!(answer_of(&card, &dialog, 0).unwrap(), expected);
+        assert_eq!(typed_answer(&card, "1").unwrap(), expected);
+        assert_eq!(neutral("token: 3"), "token: 3");
     }
 
     #[test]

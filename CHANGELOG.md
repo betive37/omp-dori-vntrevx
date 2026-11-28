@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Questions could expose credential-shaped strings in their text and choice labels on Discord.
+  Mask them before formatting or shortening, including when a question closes, while keeping
+  the original option values for answers.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working
