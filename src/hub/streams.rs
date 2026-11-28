@@ -475,7 +475,11 @@ mod tests {
         );
         assert_eq!(ended(&ctx).await, 1);
         second.stop("once").await.unwrap();
-        let kept = ctx.store.read(crate::store::Reads::stream_jobs).await.unwrap();
+        let kept = ctx
+            .store
+            .read(crate::store::Reads::stream_jobs)
+            .await
+            .unwrap();
         assert!(kept.is_empty(), "{kept:?}");
     }
 }
