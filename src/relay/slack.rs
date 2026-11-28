@@ -11,7 +11,8 @@
 //!   threads the account posted in (thread memory: one room per thread, `<channel>:<root ts>`, whose
 //!   position is the seen timestamp). Envelopes are acknowledged within 3 s only after durable
 //!   admission or a deliberate drop; failed or timed-out admissions remain unacknowledged for Slack
-//!   to redeliver. After start and every reconnect, remembered threads and DMs are read from
+//!   to redeliver. Dedupe uses the message's queue or hand-off record, not a newer room position.
+//!   After start and every reconnect, remembered threads and DMs are read from
 //!   their positions (200 at most, oldest first). Own and bot messages are dropped; a reply whose
 //!   channel or root disagrees with where it was read stops that read. Only allowlisted senders are
 //!   admitted (owner decision 10: the owner alone by default).
@@ -687,6 +688,7 @@ impl Relay for SlackRelay {
     const NAME: &'static str = NAME;
     const REPEATABLE: bool = false;
     const LIVE_ONCE: bool = false;
+    const POSITION_DEDUPE: bool = false;
 
     fn parts(&self, answer: &str) -> Result<Vec<String>, String> {
         let answer = answer.trim();

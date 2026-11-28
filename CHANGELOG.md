@@ -3,7 +3,8 @@
 ## Unreleased
 
 - Slack no longer acknowledges messages when the arrival queue is full, a queue write fails, or
-  admission times out. They remain eligible for redelivery instead of being silently lost.
+  admission times out, leaving them eligible for Slack's bounded redelivery window. An older
+  redelivery is admitted even if a newer message has already advanced the room's position.
 
 ## 0.2.8 (2026-11-28)
 

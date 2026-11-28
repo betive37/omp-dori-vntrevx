@@ -363,9 +363,25 @@ fn slack_threads_allowlist_acks_and_uploads() {
     assert!(hub.stop().success());
 }
 
+fn slack_message_stored(hub: &TestHub, ts: &str) -> bool {
+    let db = rusqlite::Connection::open_with_flags(
+        hub.state().join("cataly.db"),
+        rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY,
+    )
+    .unwrap();
+    db.query_row(
+        "SELECT EXISTS (SELECT 1 FROM arrival_queue \
+         WHERE relay = 'slack' AND room = ?1 AND message = ?2 UNION ALL \
+         SELECT 1 FROM handoffs WHERE relay = 'slack' AND room = ?1 AND message = ?2)",
+        [GEN, ts],
+        |r| r.get(0),
+    )
+    .unwrap()
+}
+
 /// Uses a later policy-dropped envelope as a socket barrier: once it is acknowledged, an earlier
 /// failed admission must already have finished. No negative assertion depends on a sleep.
-fn slack_retries_unadmitted(setup: &str, recover: &str) {
+fn slack_retries_unadmitted(setup: &str, recover: &str, newer_first: bool) {
     let slack = FakeSlack::start();
     let mut hub = relay_hub(None, Some(&slack), "");
     hub.start();
@@ -412,11 +428,37 @@ fn slack_retries_unadmitted(setup: &str, recover: &str) {
     hub.start();
     ready(&hub, &["slack"]);
 
+    if newer_first {
+        let newer = slack.say(
+            GEN,
+            fake_slack::OWNER,
+            &format!("<@{}> a newer request", fake_slack::ACCOUNT),
+            None,
+        );
+        slack.wait(WAIT, |f| slack_posts_in(f, GEN, &newer).pop());
+        // B's hand-off moves the cursor beyond A. A is still eligible for redelivery, even
+        // after the restart above discarded all volatile knowledge of its failed admission.
+        let position = newer.replace('.', "");
+        hub.until(WAIT, || {
+            let s = status(&hub, "slack");
+            s["rooms"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .any(|r| r["room"] == GEN && r["position"] == position)
+                .then_some(())
+        });
+    }
+
     // Slack can redeliver the same message after recovery; a subsequent duplicate is safe to ack.
     let retried = slack.push(event.clone());
     slack.wait(WAIT, |f| {
         f.acks().iter().any(|(id, _)| id == &retried).then_some(())
     });
+    assert!(
+        slack_message_stored(&hub, &ts),
+        "redelivered message {ts} was acked without a durable record"
+    );
     slack.wait(WAIT, |f| slack_posts_in(f, GEN, &ts).pop());
     let duplicate = slack.push(event);
     slack.wait(WAIT, |f| {
@@ -436,6 +478,18 @@ fn slack_does_not_ack_a_failed_arrival_write() {
          WHEN NEW.relay = 'slack' AND NEW.room = 'C0GEN' \
          BEGIN SELECT RAISE(FAIL, 'test admission failure'); END;",
         "DROP TRIGGER fail_slack_arrival;",
+        false,
+    );
+}
+
+#[test]
+fn slack_redelivers_an_older_unadmitted_message_after_a_newer_one() {
+    slack_retries_unadmitted(
+        "CREATE TRIGGER fail_slack_arrival BEFORE INSERT ON arrival_queue \
+         WHEN NEW.relay = 'slack' AND NEW.room = 'C0GEN' \
+         BEGIN SELECT RAISE(FAIL, 'test admission failure'); END;",
+        "DROP TRIGGER fail_slack_arrival;",
+        true,
     );
 }
 
@@ -451,6 +505,7 @@ fn slack_does_not_ack_a_full_arrival_queue() {
          VALUES ('slack', 'D0FULL', '1.000001', 1000001, 0, '{}', 268435456, 0);",
         "DELETE FROM arrival_queue WHERE relay = 'slack' AND room = 'D0FULL'; \
          DELETE FROM positions WHERE relay = 'slack' AND room = 'D0FULL';",
+        false,
     );
 }
 
