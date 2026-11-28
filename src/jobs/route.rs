@@ -471,7 +471,11 @@ mod tests {
         let recovered = ctx.store.recover(0).await.unwrap();
         assert_eq!(recovered.uncertain_deliveries, 0);
         let waiting = ctx.store.read(|r| r.waiting_deliveries(300)).await.unwrap();
-        assert_eq!(waiting.len(), 300, "unstarted deliveries must remain queued");
+        assert_eq!(
+            waiting.len(),
+            300,
+            "unstarted deliveries must remain queued"
+        );
     }
 
     #[tokio::test]
