@@ -15,6 +15,10 @@ use crate::sys::now_ms;
 
 /// The recap is at most this long (EVR req. 48).
 const RECAP_MAX: usize = 8 * 1024;
+/// A `requests` or `questions` reply is at most this long before its "and N more" line. Open lists
+/// are not capped by count, so a large open set must not outgrow the bridge's 1 MiB reply line
+/// even when every byte needs a six-byte JSON escape.
+const LIST_MAX: usize = 64 * 1024;
 /// The owner notes are capped (OPC req. 55, COORD req. 51).
 pub(crate) const PROFILE_MAX: usize = crate::jobs::notes::MAX;
 
@@ -131,7 +135,7 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
                 .read(move |r| r.requests(!all))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(list_requests(&rows, usize::MAX))
+            Ok(list_requests(&rows, LIST_MAX))
         }
         "request.add" => {
             let write = LeadWrite::RequestAdd {
@@ -164,7 +168,7 @@ pub(crate) async fn call(hub: &Arc<Hub>, input: &Value) -> Result<String, String
                 .read(|r| r.questions(true))
                 .await
                 .map_err(|e| e.to_string())?;
-            Ok(list_questions(&rows, usize::MAX))
+            Ok(list_questions(&rows, LIST_MAX))
         }
         "question.ask" => ask(hub, input).await,
         "question.answer" | "question.choose" | "question.withdraw" => settle(hub, op, input).await,
@@ -614,5 +618,37 @@ mod tests {
             assert!(shown > 0 && shown < 201);
             assert!(listing.ends_with(&format!("\nand {} more", 201 - shown)));
         }
+    }
+
+    #[tokio::test]
+    async fn a_large_open_set_stays_within_the_reply_line() {
+        let (store, _writer, _dir) = open_temp("open-lists-reply-size");
+        for n in 1..=120 {
+            let LeadDone::Id(id) = store
+                .lead(LeadWrite::RequestAdd {
+                    title: format!("Request {n}"),
+                    source: format!("test:{n}"),
+                    thread: None,
+                })
+                .await
+                .unwrap()
+            else {
+                panic!("no request ID")
+            };
+            store
+                .lead(LeadWrite::RequestNext {
+                    id,
+                    text: "\"".repeat(1000),
+                })
+                .await
+                .unwrap();
+        }
+        let requests = store.read(|r| r.requests(true)).await.unwrap();
+        let listing = list_requests(&requests, LIST_MAX);
+        let shown = listing.lines().filter(|l| l.starts_with("- ")).count();
+        assert!(shown > 0 && shown < 120);
+        assert!(listing.ends_with(&format!("\nand {} more", 120 - shown)));
+        let reply = json!({ "text": listing, "error": false }).to_string();
+        assert!(reply.len() <= crate::proto::MAX_LINE, "{}", reply.len());
     }
 }
