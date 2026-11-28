@@ -4,8 +4,9 @@
 //! driven through its own command line under the bounded subprocess rules.
 //!
 //! A service starts with the manager's bare environment, so the definition carries what the hub
-//! needs: a PATH holding the folders of the tools it runs, as found when the service was enabled,
-//! and an owner-only environment file with the provider keys listed in `[sessions] credentials`.
+//! needs: a PATH holding the folders of the tools it runs, absolute XDG config/state/data homes
+//! from the environment at enable or refresh, and an owner-only environment file with the provider
+//! keys listed in `[sessions] credentials`.
 //! systemd reads that file itself (`EnvironmentFile=`); launchd has no such key, so the agent runs
 //! `/bin/sh`, which reads the file and replaces itself with the hub (`exec`, same process).
 //!
@@ -87,6 +88,26 @@ fn systemd_escape(text: &str) -> String {
     text.replace('%', "%%")
 }
 
+/// One quoted systemd environment assignment, without specifier or escape expansion.
+fn systemd_environment(text: &mut String, name: &str, value: &str) {
+    let _ = write!(text, "Environment=\"{name}=");
+    for c in value.chars() {
+        match c {
+            '%' => text.push_str("%%"),
+            '"' => text.push_str("\\\""),
+            '\\' => text.push_str("\\\\"),
+            '\n' => text.push_str("\\n"),
+            '\r' => text.push_str("\\r"),
+            '\t' => text.push_str("\\t"),
+            c if c.is_control() => {
+                let _ = write!(text, "\\u{:04x}", u32::from(c));
+            }
+            c => text.push(c),
+        }
+    }
+    text.push_str("\"\n");
+}
+
 /// Text for a property list string.
 fn xml_escape(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
@@ -104,35 +125,69 @@ fn xml_escape(text: &str) -> String {
 
 /// The unit or agent text for `unit`.
 pub(crate) fn definition(unit: &Unit<'_>) -> String {
-    if cfg!(target_os = "macos") {
+    definition_with_env(unit, cfg!(target_os = "macos"), |k| std::env::var(k).ok())
+}
+
+fn definition_with_env(
+    unit: &Unit<'_>,
+    macos: bool,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> String {
+    let xdg = ["XDG_CONFIG_HOME", "XDG_STATE_HOME", "XDG_DATA_HOME"]
+        .into_iter()
+        .filter_map(|name| {
+            lookup(name)
+                .filter(|value| Path::new(value).is_absolute())
+                .map(|value| (name, value))
+        });
+    if macos {
         let exe = xml_escape(&unit.command.display().to_string());
         let env_file = xml_escape(&unit.env_file.display().to_string());
         let path = xml_escape(unit.path);
         // `$0` is the environment file and `$1` the command: no value is ever parsed as shell text.
         let script = "set -a; if [ -f \"$0\" ]; then . \"$0\"; fi; set +a; exec \"$1\" hub";
         let script = xml_escape(script);
-        format!(
+        let mut text = format!(
             "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
 <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
 <plist version=\"1.0\">\n<dict>\n\
   <key>Label</key><string>{LABEL}</string>\n\
   <key>ProgramArguments</key><array><string>/bin/sh</string><string>-c</string><string>{script}</string><string>{env_file}</string><string>{exe}</string></array>\n\
-  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string></dict>\n\
+  <key>EnvironmentVariables</key><dict><key>PATH</key><string>{path}</string>"
+        );
+        for (name, value) in xdg {
+            let _ = write!(
+                text,
+                "<key>{name}</key><string>{}</string>",
+                xml_escape(&value)
+            );
+        }
+        text.push_str(
+            "</dict>\n\
   <key>RunAtLoad</key><true/>\n\
   <key>KeepAlive</key><dict><key>SuccessfulExit</key><false/></dict>\n\
   <key>ThrottleInterval</key><integer>5</integer>\n\
-</dict>\n</plist>\n"
-        )
+</dict>\n</plist>\n",
+        );
+        text
     } else {
         let exe = systemd_escape(&unit.command.display().to_string());
         let env_file = systemd_escape(&unit.env_file.display().to_string());
         let path = systemd_escape(unit.path);
-        format!(
+        let mut text = format!(
             "[Unit]\nDescription=Cataly hub\n\n[Service]\nType=notify\nNotifyAccess=main\n\
-Environment=\"PATH={path}\"\nEnvironment=\"MALLOC_ARENA_MAX=1\"\nEnvironmentFile=-{env_file}\n\
+Environment=\"PATH={path}\"\nEnvironment=\"MALLOC_ARENA_MAX=1\"\n"
+        );
+        for (name, value) in xdg {
+            systemd_environment(&mut text, name, &value);
+        }
+        let _ = write!(
+            text,
+            "EnvironmentFile=-{env_file}\n\
 ExecStart={exe} hub\nRestart=on-failure\nRestartSec=5\nWatchdogSec=30\n\n\
 [Install]\nWantedBy=default.target\n"
-        )
+        );
+        text
     }
 }
 
@@ -447,6 +502,70 @@ mod tests {
             assert!(text.contains("EnvironmentFile=-/h/100%%/a&b\n"));
             assert!(text.contains("Environment=\"PATH=/x%%y\"\n"));
         }
+    }
+
+    #[test]
+    fn systemd_definition_keeps_absolute_xdg_homes() {
+        check_absolute_xdg_homes(false);
+    }
+
+    #[test]
+    fn launchd_definition_keeps_absolute_xdg_homes() {
+        check_absolute_xdg_homes(true);
+    }
+
+    fn check_absolute_xdg_homes(macos: bool) {
+        let vars = [
+            ("XDG_CONFIG_HOME", "/h/config home"),
+            ("XDG_STATE_HOME", "/h/state"),
+            ("XDG_DATA_HOME", "/h/data"),
+            ("XDG_RUNTIME_DIR", "/run/user/1000"),
+            ("SECRET", "do-not-copy"),
+        ];
+        let text = definition_with_env(&unit("/bin", Path::new("/h/service.env")), macos, |name| {
+            vars.iter()
+                .find(|(k, _)| *k == name)
+                .map(|(_, v)| (*v).into())
+        });
+        for (name, value) in &vars[..3] {
+            let expected = if macos {
+                format!("<key>{name}</key><string>{value}</string>")
+            } else {
+                format!("Environment=\"{name}={value}\"\n")
+            };
+            assert!(text.contains(&expected), "missing {expected:?} in {text}");
+        }
+        assert!(!text.contains("XDG_RUNTIME_DIR"));
+        assert!(!text.contains("SECRET"));
+    }
+
+    #[test]
+    fn definition_ignores_unset_empty_and_relative_xdg_homes() {
+        for macos in [false, true] {
+            for value in [None, Some(""), Some("relative"), Some("~/config")] {
+                let text =
+                    definition_with_env(&unit("/bin", Path::new("/h/service.env")), macos, |_| {
+                        value.map(str::to_string)
+                    });
+                assert!(!text.contains("XDG_"), "{text}");
+            }
+        }
+    }
+
+    #[test]
+    fn definition_escapes_xdg_homes_for_both_managers() {
+        let unit = unit("/bin", Path::new("/h/service.env"));
+        let lookup =
+            |name: &str| (name == "XDG_STATE_HOME").then(|| "/h/100%/a&b<\"q\">\\x\n\t".into());
+        let systemd = definition_with_env(&unit, false, lookup);
+        assert!(
+            systemd.contains("Environment=\"XDG_STATE_HOME=/h/100%%/a&b<\\\"q\\\">\\\\x\\n\\t\"\n"),
+            "{systemd}"
+        );
+        let launchd = definition_with_env(&unit, true, lookup);
+        assert!(launchd.contains(
+            "<key>XDG_STATE_HOME</key><string>/h/100%/a&amp;b&lt;&quot;q&quot;&gt;\\x\n\t</string>"
+        ), "{launchd}");
     }
 
     #[test]

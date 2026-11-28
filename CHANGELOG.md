@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- The user service now keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME`
+  values from the shell when enabled or refreshed, instead of starting with a different config,
+  store or program folder at the default paths.
+
 ## 0.2.8 (2026-11-28)
 
 - The upgrade to 0.2.7 could hold the lead as "ambiguous lead binding history" when its working

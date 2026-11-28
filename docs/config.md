@@ -137,6 +137,9 @@ does not see your shell's environment, so it:
 - writes one `PATH=` line into the unit, made of the folders where `omp`, `bun`, `gh`, `git` and
   the Tern executable are found now, then `/usr/local/bin:/usr/bin:/bin:/usr/sbin:/sbin`;
   repeats and folders with `:`, `"`, `\` or control characters are left out. The line is printed;
+- keeps absolute `XDG_CONFIG_HOME`, `XDG_STATE_HOME` and `XDG_DATA_HOME` values from the current
+  environment in the unit or agent, so the hub uses the same config, store and program folder;
+  unset, empty and relative values are ignored. Refresh captures these values again;
 - reads provider keys from `secrets/service.env` next to the config file (owner-only, mode `600`).
   A new file gets each `[sessions] credentials` name found in your current environment as
   `NAME=value`, and the others as commented lines to fill in. An existing file is never changed;
