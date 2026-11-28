@@ -127,8 +127,8 @@ logic can move to Rust, leaving the extension as a forwarder.
    connect timeout 1 s) and sends a hello: protocol version, OMP version, launch token if any, session ID, session
    file path, process ID, working directory, agent kind, and run mode (interactive or rpc).
 4. The daemon answers with a role (lead, lane, or none), the lane key if any, the guidance text (EXT-12), the
-   pinned model if any (EXT-14), whether shell rules apply (EXT-31), and the tools to show. "None" on the first
-   hello makes the extension inert for that session: it closes the connection and behaves as in requirement 1.
+   pinned model if any (EXT-14), whether shell rules apply (EXT-31), and the tools to show. "None" makes the
+   extension inert for that session: it closes the connection and behaves as in requirement 1.
 5. A launch token is valid for one hello identity only: the session ID and a random hello ID private to the
    extension instance, never inherited with the launch environment. Until the reply is acknowledged by a subsequent
    bridge request, that identity may retry the hello within the token's original lifetime. A nested OMP run that
@@ -152,9 +152,7 @@ logic can move to Rust, leaving the extension as a forwarder.
    parent lineage has shell rules, every shell call of the worker is blocked (rule 33).
 10. If the daemon is unreachable at hello time, including a timeout or connection loss before its answer, a
     candidate retains its launch identity and retries with backoff 1, 2, 4, 8, 16, 30, 30 ... seconds and shows one
-    warning. An explicit error or role-none reply to the first hello is a refusal, not an unreachable daemon,
-    and is not retried. A previously accepted session keeps retrying refused reconnects with its reconnect key;
-    calls remain offline until the daemon accepts it again.
+    warning. An explicit error or role-none reply is a refusal, not an unreachable daemon, and is not retried.
     Until accepted it behaves as a role session with no tools and with shell calls blocked
     when its marker says lane (fail closed), and as an ordinary session otherwise.
 
