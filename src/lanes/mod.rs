@@ -2075,6 +2075,7 @@ mod tests {
             make: Box::new(|_, _, _| panic!("registration does not start sessions")),
             bridge_link: Arc::new(|| panic!("registration does not start a bridge")),
             lead_live: Arc::new(|| false),
+            lead_nudge: Arc::new(|| panic!("registration does not nudge the lead")),
             threads: threads.clone(),
             boards: threads,
         });

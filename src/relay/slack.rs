@@ -1385,6 +1385,7 @@ mod tests {
             make: make(),
             bridge_link: Arc::new(crate::omp::extension::check),
             lead_live: Arc::new(move || live.snapshot().is_some()),
+            lead_nudge: Arc::new(|| panic!("socket tests must not nudge the lead")),
             threads: threads.clone(),
             boards: threads,
         });
