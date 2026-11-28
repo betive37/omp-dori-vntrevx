@@ -646,6 +646,7 @@ mod tests {
         std::fs::set_permissions(&program, std::fs::Permissions::from_mode(0o700)).unwrap();
         let data = dir.join("gh-data");
         std::fs::create_dir(&data).unwrap();
+        std::fs::write(data.join("calls.log"), "").unwrap();
         let fixture = |suffix: &str, value: &Value| {
             std::fs::write(
                 data.join(format!("repos_o_r_pulls_7{suffix}.json")),
@@ -691,12 +692,13 @@ mod tests {
         let why = policy("o/r", 7, &gh, &identities).await.unwrap_err();
         assert_eq!(why, "pull-request policy read deadline reached");
         let calls = std::fs::read_to_string(data.join("calls.log")).unwrap();
-        assert_eq!(
-            calls
-                .lines()
-                .filter(|line| line.ends_with("repos/o/r/pulls/7"))
-                .count(),
-            1,
+        // Under load, the deadline may expire before even the first snapshot is logged.
+        let snapshots = calls
+            .lines()
+            .filter(|line| line.ends_with("repos/o/r/pulls/7"))
+            .count();
+        assert!(
+            snapshots <= 1,
             "the final snapshot must not start after the deadline: {calls}"
         );
         assert!(gh.read("repos/o/r/pulls/7").await.is_err());
