@@ -3,10 +3,12 @@
 ## Unreleased
 
 - A backup interrupted after committing could leave that commit local forever when nothing else
-  changed. An unchanged tick now compares HEAD with the last successfully pushed commit in job
-  memory, so fetching from a separate URL cannot hide an unpushed backup or trigger a redundant
-  push. Without that memory it checks the configured remote and branch's tracking ref and pushes
-  if the ref is missing; no branch upstream is required. A repository with no HEAD is left alone.
+  changed. An unchanged tick now compares HEAD with the last successfully pushed commit and its
+  destination in job memory. Changing the push URL or branch triggers a new push. Without that
+  memory, separate fetch and push URLs also trigger a push; only matching URLs allow the configured
+  tracking ref to be used, and a missing ref triggers a push. Fetching from a separate URL cannot
+  hide an unpushed backup or trigger a redundant push to a recorded destination. No branch upstream
+  is required, and a repository with no HEAD is left alone.
 
 ## 0.2.8 (2026-11-28)
 

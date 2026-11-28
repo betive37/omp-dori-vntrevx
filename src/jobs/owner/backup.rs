@@ -193,10 +193,16 @@ async fn cataly_files(t: &Tick<'_>, b: &Backup) -> Result<(), String> {
         .map_err(|e| format!("store snapshot: {}", e.kind()))
 }
 
+/// The commit and destination confirmed by a successful push.
+struct Pushed {
+    commit: String,
+    destination: String,
+}
+
 /// What a tick found, applied to memory and events after git is done.
 enum Found {
     Nothing {
-        push: Option<Result<String, String>>,
+        push: Option<Result<Pushed, String>>,
     },
     Refused {
         files: Vec<String>,
@@ -204,7 +210,7 @@ enum Found {
     },
     Committed {
         commit: String,
-        push: Option<Result<String, String>>,
+        push: Option<Result<Pushed, String>>,
     },
 }
 
@@ -333,14 +339,26 @@ async fn own_files_not_ignored(
     Ok(found)
 }
 
-/// Compare HEAD with the last successful push; fetches may track a different repository.
-/// Without that memory, fall back to the remote-tracking ref, pushing if it is missing.
+/// Compare HEAD with the last successful push to this destination. Without that memory,
+/// only trust the tracking ref when the fetch and push URLs agree.
 async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
     let Some(head) = git_value(git, &["rev-parse", "--verify", "HEAD"]).await? else {
         return Ok(false);
     };
-    if let Some(pushed) = git.t.memory.get(PUSHED, "commit") {
-        return Ok(head != pushed);
+    let url = push_url(git, b).await?;
+    if let Some(previous) = git.t.memory.get(PUSHED, "destination") {
+        if previous.split_once('\n') != Some((b.branch.as_str(), url.as_str())) {
+            return Ok(true);
+        }
+        if let Some(pushed) = git.t.memory.get(PUSHED, "commit") {
+            return Ok(head != pushed);
+        }
+    }
+    let fetch_url = git_value(git, &["remote", "get-url", &b.remote])
+        .await?
+        .unwrap_or_else(|| b.remote.clone());
+    if url != fetch_url {
+        return Ok(true);
     }
     let target = format!("refs/remotes/{}/{}", b.remote, b.branch);
     let done = git
@@ -362,11 +380,19 @@ async fn ahead(git: &Git<'_, '_>, b: &Backup) -> Result<bool, String> {
     }
 }
 
-/// Pushes the resolved HEAD to the configured branch and returns its commit. Never forced.
-async fn push(git: &Git<'_, '_>, b: &Backup) -> Result<String, String> {
+/// All expanded push URLs, or the remote itself when it is a direct URL rather than a name.
+async fn push_url(git: &Git<'_, '_>, b: &Backup) -> Result<String, String> {
+    Ok(git_value(git, &["remote", "get-url", "--push", "--all", &b.remote])
+        .await?
+        .unwrap_or_else(|| b.remote.clone()))
+}
+
+/// Pushes the resolved HEAD to the configured branch and returns its receipt. Never forced.
+async fn push(git: &Git<'_, '_>, b: &Backup) -> Result<Pushed, String> {
     if b.include_cataly {
         remote_is_private(git, b).await?;
     }
+    let url = push_url(git, b).await?;
     let head = git.ok(&["rev-parse", "--verify", "HEAD"], LOCAL).await?;
     let head = String::from_utf8_lossy(&head);
     let commit = head.trim();
@@ -376,7 +402,10 @@ async fn push(git: &Git<'_, '_>, b: &Backup) -> Result<String, String> {
         .run(&["push", "--quiet", &b.remote, &target], PUSH)
         .await?;
     if done.success() {
-        Ok(commit.to_string())
+        Ok(Pushed {
+            commit: commit.to_string(),
+            destination: format!("{}\n{url}", b.branch),
+        })
     } else {
         Err(super::said(&done))
     }
@@ -485,8 +514,10 @@ fn apply(t: &mut Tick<'_>, found: Found) {
         }
     };
     match push {
-        Some(Ok(commit)) => {
-            t.memory.transition(PUSHED, "commit", &commit);
+        Some(Ok(pushed)) => {
+            t.memory.transition(PUSHED, "commit", &pushed.commit);
+            t.memory
+                .transition(PUSHED, "destination", &pushed.destination);
             t.memory.clear(PUSHED, "pending");
             t.memory.clear(PUSHED, "error");
         }
@@ -677,16 +708,8 @@ mod tests {
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
         assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
 
-        // Once caught up, a clean tick must not attempt another push.
-        git(
-            &work,
-            &[
-                "remote",
-                "set-url",
-                "origin",
-                root.join("missing.git").to_str().unwrap(),
-            ],
-        );
+        // Once caught up, a clean tick must not contact the unchanged destination.
+        std::fs::rename(&remote, root.join("offline.git")).unwrap();
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
     }
 
@@ -724,15 +747,7 @@ mod tests {
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
         assert_eq!(git(&remote, &["rev-parse", "backup"]), latest);
         assert_eq!(git(&upstream, &["rev-parse", "main"]), head);
-        git(
-            &work,
-            &[
-                "remote",
-                "set-url",
-                "vault",
-                root.join("missing.git").to_str().unwrap(),
-            ],
-        );
+        std::fs::rename(&remote, root.join("offline.git")).unwrap();
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
     }
 
@@ -792,6 +807,27 @@ mod tests {
         assert_eq!(git(&remote, &["rev-parse", "main"]), latest);
         git(&work, &["fetch", "-q", "origin"]);
         assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
+        std::fs::rename(&remote, root.join("offline.git")).unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_pushes_after_destination_changes() {
+        let root = crate::sys::fs::tests::scratch("backup-destination");
+        let (first, work) = repos(&root);
+        let second = root.join("second.git");
+        git(&root, &["init", "-q", "--bare", second.to_str().unwrap()]);
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-destination-ctx");
+        std::fs::write(work.join("notes.md"), "backup\n").unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&first, &["rev-parse", "main"]), head);
+
+        // The same commit must reach a new push URL, even though the fetch ref matches HEAD.
         git(
             &work,
             &[
@@ -799,10 +835,66 @@ mod tests {
                 "set-url",
                 "--push",
                 "origin",
-                root.join("missing.git").to_str().unwrap(),
+                second.to_str().unwrap(),
             ],
         );
+        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
         assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&second, &["rev-parse", "main"]), head);
+
+        // A branch change also invalidates the receipt, without changing the local HEAD.
+        let config = crate::config::parse(&format!("{cfg}branch = \"archive\"\n")).unwrap();
+        ctx.config_tx.send(std::sync::Arc::new(config)).unwrap();
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&second, &["rev-parse", "archive"]), head);
+
+        // Even equal fetch/push URLs cannot make a stale tracking ref prove a changed target.
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                first.to_str().unwrap(),
+            ],
+        );
+        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/archive"]), head);
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&first, &["rev-parse", "archive"]), head);
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
+    }
+
+    #[tokio::test]
+    async fn unchanged_tick_pushes_to_separate_url_without_memory() {
+        let root = crate::sys::fs::tests::scratch("backup-pushurl-no-memory");
+        let (fetch, work) = repos(&root);
+        let remote = root.join("backup.git");
+        git(&root, &["init", "-q", "--bare", remote.to_str().unwrap()]);
+        std::fs::write(work.join("notes.md"), "backup\n").unwrap();
+        commit(&work, "not backed up");
+        git(&work, &["push", "-q", "origin", "main"]);
+        let head = git(&work, &["rev-parse", "HEAD"]);
+        assert_eq!(git(&fetch, &["rev-parse", "main"]), head);
+        assert_eq!(git(&work, &["rev-parse", "refs/remotes/origin/main"]), head);
+        git(
+            &work,
+            &[
+                "remote",
+                "set-url",
+                "--push",
+                "origin",
+                remote.to_str().unwrap(),
+            ],
+        );
+        let cfg = format!(
+            "[jobs.bk]\nkind = \"backup\"\ndir = \"{}\"\nname = \"Backup\"\nemail = \"b@example.org\"\n",
+            work.display()
+        );
+        let (ctx, _stop, _dir) = ctx_with(&cfg, "backup-pushurl-no-memory-ctx");
+        assert_eq!(live_tick(&ctx, "bk").await, Vec::<String>::new());
+        assert_eq!(git(&remote, &["rev-parse", "main"]), head);
+        assert_eq!(git(&work, &["rev-parse", "HEAD"]), head);
     }
 
     #[tokio::test]
