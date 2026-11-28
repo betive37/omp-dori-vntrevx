@@ -984,24 +984,17 @@ pub(super) fn load(paths: &Paths) -> Result<(Snapshot, String), Failure> {
     Ok((before, text))
 }
 
-/// Writes one setting outside a setup run (`cataly service enable` pins `[omp] path`), under the same
-/// snapshot, validity, atomic-write and read-back rules.
+/// Writes one setting, already rendered as TOML, outside a setup run (`cataly service enable` pins
+/// `[omp] path` and sets `[setup] service` back to `true`), under the same snapshot, validity,
+/// atomic-write and read-back rules.
 pub(super) fn write_one(
     paths: &Paths,
     section: &str,
     key: &str,
-    value: &str,
+    rendered: &str,
 ) -> Result<(), String> {
     file::edit(&paths.config_file, NEW_FILE, |text| {
-        Ok(set_key(text, section, key, value))
-    })
-    .map(drop)
-}
-
-/// [`write_one`] for a boolean setting (`cataly service enable` sets `[setup] service` back to `true`).
-pub(super) fn write_flag(paths: &Paths, section: &str, key: &str, on: bool) -> Result<(), String> {
-    file::edit(&paths.config_file, NEW_FILE, |text| {
-        Ok(set_rendered(text, section, key, &on.to_string()))
+        Ok(set_rendered(text, section, key, rendered))
     })
     .map(drop)
 }
