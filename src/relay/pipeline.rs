@@ -10,7 +10,7 @@ use std::collections::hash_map::Entry;
 use std::collections::{HashMap, HashSet};
 use std::fmt::Write as _;
 use std::path::PathBuf;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use std::time::Instant;
 
@@ -21,7 +21,7 @@ use super::{Inbound, PartOutcome, Relay};
 use crate::config::Config;
 use crate::host::inbox::{self, Message, ReceiptState};
 use crate::host::lead::{Events, Lead};
-use crate::host::{Runtime, SessionEvent, Status};
+use crate::host::{Runtime, SessionEvent, Snapshot, Status};
 use crate::jobs::event::{Emit, EventKind, Severity};
 use crate::log;
 use crate::omp::transcript::{self, Reply};
@@ -267,9 +267,6 @@ pub(crate) struct Pipeline<R: Relay, T: Runtime> {
     marking: Mutex<HashSet<Key>>,
     /// The done marks owed from before this run were looked for.
     swept: AtomicBool,
-    /// When a read of answers last found the lead working, seeded from the session file's mtime
-    /// after an intake or hub restart (ms; 0 before either is known).
-    worked_ms: AtomicI64,
     /// Live messages not handed off yet.
     live: Mutex<LiveMessages>,
     /// Frame read time of a wake still waiting for its turn to start.
@@ -307,7 +304,6 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             done_failed: AtomicBool::new(false),
             marking: Mutex::default(),
             swept: AtomicBool::new(false),
-            worked_ms: AtomicI64::new(0),
             live: Mutex::default(),
             wake: Mutex::new(None),
             wake_latency,
@@ -1133,11 +1129,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             let settled = turn_over || snap.status == Status::Idle;
             let file = PathBuf::from(file);
             let metadata = std::fs::metadata(&file).ok();
-            if settled {
-                self.recover_work(metadata.as_ref());
-            } else {
-                self.worked_ms.store(now_ms(), Ordering::Release);
-            }
+            let worked = last_work(&snap, settled, metadata.as_ref());
             // The newest answered request's later turns: read again only when something changed.
             let length = metadata.map(|m| m.len());
             let later = newest.filter(|h| {
@@ -1158,7 +1150,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
                         .map_err(|e| e.to_string())?;
                 let later_reply = later.as_ref().and_then(|_| replies.pop());
                 for (h, reply) in waiting.iter().zip(replies) {
-                    self.settle_reply(h, reply).await?;
+                    self.settle_reply(h, reply, worked).await?;
                 }
                 if let (Some(h), Some(reply)) = (later, later_reply) {
                     self.later_turns(&h, reply).await?;
@@ -1192,27 +1184,18 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         Ok(())
     }
 
-    /// A rebuilt intake may first see an idle lead. Recover its earlier work without giving an
-    /// old, untouched transcript a fresh window at every restart.
-    fn recover_work(&self, metadata: Option<&std::fs::Metadata>) {
-        if self.worked_ms.load(Ordering::Acquire) == 0
-            && let Some(modified) = metadata
-                .and_then(|m| m.modified().ok())
-                .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
-                .and_then(|t| i64::try_from(t.as_millis()).ok())
-        {
-            self.worked_ms.fetch_max(modified, Ordering::AcqRel);
-        }
-    }
-
-    /// Stores what one read found for `h`. A request to the lead with no answer stops waiting only
-    /// once both its hand-off and the lead's last work are older than the owed window: while the
-    /// lead works, an unfinished turn (`Pending`) and a request still queued behind it (`NotFound`)
-    /// keep waiting, and a request queued behind it keeps the window after the turn ends to reach
-    /// the transcript. The next input entering the transcript ends the wait sooner (DISC-OUT req.
-    /// 21-22). A request handed to a lane is never in the lead's transcript: the lead's work does
-    /// not extend it, and it ends once its hand-off is older than the window.
-    async fn settle_reply(&self, h: &HandoffRow, reply: Reply) -> Result<(), String> {
+    /// Stores what one read found for `h`, a request to the lead. With no answer it stops waiting
+    /// only once both its hand-off and the lead's last work (`worked`) are older than the owed
+    /// window: while a turn runs, an unfinished turn (`Pending`) and a request still queued behind
+    /// it (`NotFound`) keep waiting, and a request queued behind it keeps the window after the turn
+    /// ends to reach the transcript. The next input entering the transcript ends the wait sooner
+    /// (DISC-OUT req. 21-22).
+    async fn settle_reply(
+        &self,
+        h: &HandoffRow,
+        reply: Reply,
+        worked: Option<i64>,
+    ) -> Result<(), String> {
         let answer = |answer: &str| RelayWrite::Answer {
             relay: R::NAME.into(),
             room: h.room.clone(),
@@ -1261,11 +1244,7 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
             // `NotFound` a request that never reached this transcript (another session file, or
             // outside the part read): neither waits on work still running.
             Reply::NotFound | Reply::Pending => {
-                let since = if h.target == inbox::LEAD {
-                    h.created_ms.max(self.worked_ms.load(Ordering::Acquire))
-                } else {
-                    h.created_ms
-                };
+                let since = worked.map_or(h.created_ms, |w| w.max(h.created_ms));
                 if now_ms() - since > OWED_WINDOW_MS {
                     self.store
                         .relay(answer("abandoned"))
@@ -1732,6 +1711,18 @@ impl<R: Relay, T: Runtime> Pipeline<R, T> {
         }
         Ok(true)
     }
+}
+
+/// When the lead last worked (ms): now while its turn runs or waits on a dialog, else the last
+/// write to its session file, which ended its last turn. Nothing is kept, so a restart neither
+/// loses the time nor gives an untouched transcript a fresh window.
+fn last_work(snap: &Snapshot, settled: bool, file: Option<&std::fs::Metadata>) -> Option<i64> {
+    if !settled && snap.in_turn() {
+        return Some(now_ms());
+    }
+    file.and_then(|m| m.modified().ok())
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .and_then(|t| i64::try_from(t.as_millis()).ok())
 }
 
 /// Keeps only the sources still being posted: a delivery that finished or was given up leaves no

@@ -392,7 +392,8 @@ fn intake_restart_recovers_only_recent_lead_work() {
         let source = "800000000000000023";
         assert_eq!(answer_state(&hub, source), "waiting");
         // The fake clears streaming and emits session_settled to trigger an idle readback, but
-        // keeps the final answer held. The old pipeline remembers work; the new one needs mtime.
+        // keeps the final answer held. With no turn running, the lead's last work is the session
+        // file's last write, which the restarted intake reads too.
         hub.fixture("omp", "hold-idle", Some(""));
         hub.until(WAIT, || {
             (hub.json(&["lead", "status", "--json"])["session"]["status"] == "idle").then_some(())
@@ -1024,11 +1025,11 @@ fn now_id() -> u64 {
     (now << 22) + 1
 }
 
-/// A request handed to a lane is never in the lead's transcript: the lead's work does not keep it
-/// waiting, and it ends once its hand-off is older than the 30 min owed window, while the lead's
-/// own request in a longer turn still waits.
+/// A request handed to a lane is the lane's: the lead's answer reading leaves it as it is however
+/// old it gets (retention prunes it), while the lead's own request in a turn longer than the 30 min
+/// owed window still waits and is answered.
 #[test]
-fn a_lane_hand_off_ends_after_the_owed_window_while_the_lead_works() {
+fn a_lane_hand_off_is_left_to_the_lane_while_the_lead_works() {
     let fake = FakeDiscord::start();
     let mut hub = relay_hub(&fake, &[], "");
     let work = hub.root.join("work");
@@ -1095,9 +1096,14 @@ fn a_lane_hand_off_ends_after_the_owed_window_while_the_lead_works() {
     ));
     hub.until(WAIT, || (handoffs(&hub) == 2).then_some(()));
     age_handoffs(&hub);
-    hub.until(WAIT, || {
-        (answer_state(&hub, &lane.to_string()) == "abandoned").then_some(())
+    // Typing renews every 8 s while the lead's request waits and its turn runs: the second renewal
+    // in the lead's channel comes from a round that began after the hand-offs aged.
+    let typing = format!("/channels/{CH}/typing");
+    let typed = fake.calls("POST", &typing).len();
+    fake.wait(WAIT, |f| {
+        (f.calls("POST", &typing).len() >= typed + 2).then_some(())
     });
+    assert_eq!(answer_state(&hub, &lane.to_string()), "waiting");
     assert_eq!(answer_state(&hub, long), "waiting");
     // The lead's turn ends, so the hub stops promptly. The lane's input queued in the shared fake
     // is dropped first: the lead's process would run it in its own transcript.
@@ -1106,6 +1112,7 @@ fn a_lane_hand_off_ends_after_the_owed_window_while_the_lead_works() {
     hub.until(WAIT, || {
         (answer_state(&hub, long) == "posted").then_some(())
     });
+    assert_eq!(answer_state(&hub, &lane.to_string()), "waiting");
     assert!(hub.stop().success());
 }
 
